@@ -52,24 +52,28 @@ Global rules, if at any time a ticket becomes blocked by errors, dependencies or
 9. Any ticket changing what users see or do updates the affected `docs/user-guide/` pages in the same PR: prose, formula/step appendix when those surfaces change, and re-captured screenshots (`scripts/capture-user-guide.mjs`) when visuals move. Need input mid-flight: move the ticket back "Questions" and comment exactly what's needed.
 
 **QA**
-11. When development has concluded for a ticket move to "QA" and begin QA with the GStack /qa skill. Answer questions using your judgment. If a human is needed to make a judgment call, put the question as a comment into the ticket and move it to the "Questions" status. Make a note to the human to return the ticket back to the "QA" status when the question is answered. 
+11. When development has concluded for a ticket move to "QA" and begin QA with the recommends skill. Answer questions using your judgment. If a human is needed to make a judgment call, put the question as a comment into the ticket and move it to the "Questions" status. Make a note to the human to return the ticket back to the "QA" status when the question is answered. 
 12. QA **one ticket at a time**; leverage worktree and to keep from agents stepping on each other. Order is my call, respecting dependencies. Have no more than 3 workers running at any given time.
+13. QA should both be technical and functional; for web base apps spin up Bun and actually browse the site as a user. Make sure all features work from a user perspective and the design respects the design contract, typecheck, full suite, web build + full e2e where web changed the contract and design, unit tests pass and technical principles have been adhered to. 
 14. If bugs are found send back to "Building" with notes on the issue and tell the orchestration the next ticket to work is the one that just arrived.
 15. If on a second pass bugs are found or the builder is stuck on a bug, run the /investigate skill, put the findings in the ticket and send back to "Building" to be worked.
 16. If on the third pass bugs are found, move to the "Blocked" status, note what was wrong, recommended next steps for the human to take and stop working the ticket. 
-13. If a human answered a question, pick back up the ticket and continue work on it till it is ready for review.
 
 **Review**
 14. When QA is done open the PR, move to "Review" status. 
 15. Review **one PR at a time**; this PR / Branch may contain multiple tickets. If it does then wait until all related tickets are in the "Review" step before beginning.
-16. Run GStack /ship skill to begin a PR. Answer questions using your judgment. It reviews the diff in a FRESH headless context, blinded to the PR description and plan rationale; inputs are the ticket, the plan's `### Acceptance tests`, the diff, and a throwaway worktree of the head commit that it executes (typecheck + touched workspace tests). 
+16. Run the recommended skill to begin a PR. Answer questions using your judgment. It reviews the diff in a FRESH headless context, blinded to the PR description and plan rationale; inputs are the ticket, the plan's `### Acceptance tests`, the diff, and a throwaway worktree of the head commit that it executes (typecheck + touched workspace tests). 
 	- If configured run an Independent review using a second model
 17. If a human is needed to make a judgment call, put the question as a comment into the ticket and move it to the "Questions" status. Make a note to the human to return the ticket back to the "Review" status when the question is answered. 
 
 **Merge**
-18. Once verified (typecheck, full suite, web build + full e2e where web changed, AND if configured an `## Independent review` run against the final head commit with every blocking finding fixed or explicitly waived with a reason in a PR comment; a new head commit means a new review run) run GStack /land-and-deploy. 
+18. Once verified (typecheck, full suite, web build + full e2e where web changed, AND if configured an `## Independent review` run against the final head commit with every blocking finding fixed or explicitly waived with a reason in a PR comment; a new head commit means a new review run) run the recommended skill to merge. 
 	- This should merge in dependency order. Stacked chains: merge the parent WITHOUT deleting its branch, retarget the child to main, merge, delete branches last (deleting a base branch closes dependent PRs). Resolve conflicts on the branch with the full gauntlet before merging. After the batch lands, re-validate merged main end to end.
 20. After deployment, move the ticket to "Done" and post a completion-note with what shipped (behavior + key files/PR), which `### Acceptance tests` passed, and â called out explicitly â any **edges a human must validate**: behaviors that are intended-but-surprising, data-loss-ish, spec-ambiguous, or where a default was chosen. Give concrete "to check X, do Y, expect Z" steps for each edge so validation is fast.
 19. **File a new ticket for every use case that surfaced during the work and needs a human's decision** (a gap, an out-of-scope affordance the plan flagged, a limitation a user will hit), add it to the board (Backlog), and link it in the completion-notes comment. Do this for every ticket entering "Done"; do not silently drop a surfaced use case.
 20. Add the actual dollar amount spent that has not already been accounted for to the actual field and move it to the "Done" status, leaving the ticket open.
 21. A human will review the open tickets in "Done" and close them. A bounced ticket (his comment says what's wrong) goes back to "Ready" as rework.
+
+**End of Loop** 
+22. At the end of loop when evetything has been committed to main run a full regression.
+23. Every 5th loop run a security audit on main to ensure the code stays secure. File bugs for everything found, 
