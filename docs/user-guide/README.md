@@ -113,7 +113,15 @@ so `/z-setup` and friends appear in the next session, not the current one.
 update (symlinks). On Windows the registrations are copies, so re-run
 `./setup` after pulling.
 
-**Uninstalling:** `rm -rf ~/.claude/skills/zstack ~/.claude/skills/z-{setup,plan,loop,status}`.
+**Uninstalling:** remove the pack and the four per-skill entries for every
+host setup registered (Codex/Factory only if their binaries were on PATH):
+
+```bash
+rm -rf ~/.claude/skills/zstack ~/.claude/skills/z-{setup,plan,loop,status}
+rm -rf ~/.codex/skills/zstack ~/.codex/skills/z-{setup,plan,loop,status}
+rm -rf ~/.factory/skills/zstack ~/.factory/skills/z-{setup,plan,loop,status}
+```
+
 The board keeps all recoverable state; `~/.zstack` holds only per-repo config
 and disposable run state you can also delete.
 

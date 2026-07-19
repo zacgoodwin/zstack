@@ -48,8 +48,12 @@ esac
 _link_or_copy() {
   local src="$1" dst="$2"
   if [ "$IS_WINDOWS" -eq 1 ]; then
-    rm -rf "$dst"
-    mkdir -p "$dst"
+    # Stage into a sibling temp dir and swap, so a mid-copy failure (locked
+    # file, disk full, ctrl-C) can't leave a half-registered skill behind,
+    # and a session starting mid-refresh never sees a missing entry.
+    local staging="$dst.tmp.$$"
+    rm -rf "$dst".tmp.* 2>/dev/null || true
+    mkdir -p "$staging"
     # A repo-shaped pack drags .git / node_modules / .worktrees (tens of MB
     # the skills never read) into every copy; filter them at the top level.
     local entry name
@@ -57,8 +61,10 @@ _link_or_copy() {
       [ -e "$entry" ] || continue
       name="$(basename "$entry")"
       case "$name" in .git|node_modules|.worktrees|.gstack) continue ;; esac
-      cp -R "$entry" "$dst/$name"
+      cp -R "$entry" "$staging/$name"
     done
+    rm -rf "$dst"
+    mv "$staging" "$dst"
   else
     # `ln -snf src dir` on an existing REAL dir nests the link inside it;
     # callers verify ownership before we get here, so replace outright.
@@ -87,14 +93,17 @@ register() {
   pack_parent_real="$(cd "$(dirname "$PACK_DIR")" && pwd -P)"
   if [ "$skills_real" = "$pack_parent_real" ]; then
     echo "  $label: pack already at $PACK_DIR"
-  elif [ -e "$target" ] && [ ! -L "$target" ] && [ -d "$target/.git" ]; then
-    # A real dir WITH .git is a genuinely separate clone — leave it alone.
-    # Our own Windows registration copies are .git-free (the filter in
-    # _link_or_copy strips .git), so a .git-less real dir is just a stale
-    # copy from a prior run and falls through to the refresh below. Either
-    # way the per-skill loop still runs: the user explicitly ran THIS pack's
-    # setup, so its skills get registered.
-    echo "  $target is a separate zstack clone; leaving it, registering skills from $PACK_DIR." >&2
+  elif [ -e "$target" ] && [ ! -L "$target" ] && [ -e "$target/.git" ]; then
+    # A real dir carrying .git (dir for clones, FILE for git worktrees) is a
+    # separate zstack checkout. It owns this host: every SKILL.md resolves
+    # PACK=~/.claude/skills/zstack, so registering THIS pack's skills next to
+    # that runtime would mix versions, and clobbering it could destroy
+    # uncommitted work. Refuse the whole host with the resolution printed.
+    # (Our own registration copies are .git-free — _link_or_copy filters it —
+    # so a .git-less real dir is a stale copy and falls through to refresh.)
+    echo "  $target is a separate zstack checkout; leaving $label untouched." >&2
+    echo "  To use that checkout: run ./setup from it. To replace it with this pack: rm -rf \"$target\" and re-run." >&2
+    return 0
   else
     _link_or_copy "$PACK_DIR" "$target"
     echo "  registered pack for $label: $target"

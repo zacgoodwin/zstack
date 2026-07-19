@@ -14,9 +14,10 @@ afterAll(() => {
   while (roots.length) rmSync(roots.pop()!, { recursive: true, force: true });
 });
 
-// Scenario D1: skills/zstack holds a SEPARATE real clone (has .git). setup
-// must not touch it — but the per-skill entries still register from the pack
-// the user explicitly ran.
+// Scenario D1: skills/zstack holds a SEPARATE real clone (.git dir). That
+// checkout owns the host — every SKILL.md resolves PACK to this path, so
+// registering another pack's skills next to it would mix versions. setup
+// must refuse the whole host and print the resolution.
 const scenarioD1 = (async () => {
   const env = makeEnv(roots, "zstack-setup-edge-");
   const packDir = join(env.root, "elsewhere", "zstack");
@@ -26,6 +27,21 @@ const scenarioD1 = (async () => {
   writeFileSync(join(separate, "marker"), "other install\n");
   const run = await runSetup(packDir, env);
   return { env, separate, run };
+})();
+
+// Scenario D1b: same, but .git is a FILE — the layout `git worktree add`
+// produces. Treating only .git DIRECTORIES as checkouts would rm -rf a
+// developer's worktree checkout, destroying uncommitted work.
+const scenarioD1b = (async () => {
+  const env = makeEnv(roots, "zstack-setup-edge-");
+  const packDir = join(env.root, "elsewhere", "zstack");
+  makePack(packDir, ["z-alpha"]);
+  const worktree = join(env.skills, "zstack");
+  mkdirSync(worktree, { recursive: true });
+  writeFileSync(join(worktree, ".git"), "gitdir: /somewhere/else/.git/worktrees/zstack\n");
+  writeFileSync(join(worktree, "marker"), "uncommitted work\n");
+  const run = await runSetup(packDir, env);
+  return { env, worktree, run };
 })();
 
 // Scenario D2: skills/zstack is a stale .git-less real dir (a prior run's
@@ -58,14 +74,22 @@ const scenarioE = (async () => {
 })();
 
 describe("setup register edge branches", () => {
-  test("a separate clone (with .git) at skills/zstack is left alone, but skills still register", async () => {
+  test("a separate clone (.git dir) at skills/zstack refuses the host: nothing touched, nothing mixed", async () => {
     const { env, separate, run } = await scenarioD1;
     expect(run.code).toBe(0);
-    expect(run.stderr).toContain("separate zstack clone");
+    expect(run.stderr).toContain("separate zstack checkout");
     expect(readFileSync(join(separate, "marker"), "utf8")).toContain("other install");
     expect(existsSync(join(separate, ".git"))).toBe(true);
-    // The user ran THIS pack's setup — its skills register regardless.
-    expect(existsSync(join(env.skills, "z-alpha", "SKILL.md"))).toBe(true);
+    // No per-skill entries from THIS pack — that checkout owns the host.
+    expect(existsSync(join(env.skills, "z-alpha"))).toBe(false);
+  });
+
+  test("a worktree checkout (.git FILE) at skills/zstack is refused too, never rm -rf'd", async () => {
+    const { env, worktree, run } = await scenarioD1b;
+    expect(run.code).toBe(0);
+    expect(run.stderr).toContain("separate zstack checkout");
+    expect(readFileSync(join(worktree, "marker"), "utf8")).toContain("uncommitted work");
+    expect(existsSync(join(env.skills, "z-alpha"))).toBe(false);
   });
 
   test("a stale .git-less copy at skills/zstack is refreshed, not misread as separate", async () => {

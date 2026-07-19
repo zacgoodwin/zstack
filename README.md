@@ -226,7 +226,14 @@ Two lanes, per `references/PRINCIPLES.md`:
 
 ## Uninstall
 
-Local tooling only: `rm -rf ~/.claude/skills/zstack ~/.claude/skills/z-{setup,plan,loop,status}`
-(the pack plus the four per-skill entries `./setup` registered). Board statuses
-are the recoverable state; worktrees are disposable; locks clear via
-`/z-loop --reconcile`.
+Local tooling only — the pack plus the four per-skill entries `./setup`
+registered, for every host it detected:
+
+```bash
+rm -rf ~/.claude/skills/zstack ~/.claude/skills/z-{setup,plan,loop,status}
+rm -rf ~/.codex/skills/zstack ~/.codex/skills/z-{setup,plan,loop,status}       # if codex was on PATH
+rm -rf ~/.factory/skills/zstack ~/.factory/skills/z-{setup,plan,loop,status}   # if droid was on PATH
+```
+
+Board statuses are the recoverable state; worktrees are disposable; locks
+clear via `/z-loop --reconcile`.
