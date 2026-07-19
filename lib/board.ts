@@ -28,9 +28,9 @@ export type Sleep = (ms: number) => Promise<void>;
 
 const defaultSleep: Sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// -- GraphQL operations. Each is named so the fixture router can key off it;
-// every value shape is scalar-only so the real gh executor never has to encode
-// list/object variables (see ghExecutor). --------------------------------------
+// -- GraphQL operations. Each is named so the fixture router can key off it.
+// Every value shape is scalar-only; the JSON-body executor (see ghExecutor)
+// preserves each variable's type, so no CLI-level type coercion is involved. ---
 const Q_RATE_LIMIT = `query RateLimit { rateLimit { remaining resetAt } }`;
 
 // items is cursor-paginated in list() -- z-setup forces auto-archive OFF and the
@@ -648,26 +648,62 @@ function readBody(bodyFile: string): string {
   }
 }
 
-// Production executor: shells out to `gh api graphql`. This is the only place
-// in the pack's CODE allowed to call `gh api graphql` / `gh issue` directly
-// (grep gate in tests/board.test.ts). Skill .md files DO shell out to gh for
-// reads and the planning-pass body edit; every such invocation is pinned to an
-// explicit allowlist by the same gate, so a new direct call fails it.
-// All operation variables are scalars, so -f (string) / -F (typed) suffice and
-// we never have to encode list/object variables on the CLI.
-export function ghExecutor(): GraphQLExecutor {
+// The one process seam ghExecutor spawns through. Injected in tests so the JSON
+// body encoding and BOTH error contracts (transport failure; a GraphQL `errors`
+// array inside an HTTP-200 body) are exercised on the real executor path with no
+// gh, no network. Decodes stdout/stderr to strings here so the default path owns
+// the only Buffer handling and fakes are trivial string returns.
+export interface GhProc {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+}
+export type GhSpawn = (cmd: string[], stdin: string) => GhProc;
+
+const defaultGhSpawn: GhSpawn = (cmd, stdin) => {
+  const proc = Bun.spawnSync(cmd, {
+    stdin: new TextEncoder().encode(stdin),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  return {
+    exitCode: proc.exitCode,
+    stdout: proc.stdout?.toString() ?? "",
+    stderr: proc.stderr?.toString() ?? "",
+  };
+};
+
+// Production executor. This is the only place in the pack's CODE allowed to
+// shell to `gh api` directly (grep gate in tests/board.test.ts). Skill .md files
+// DO shell out to gh for reads and the planning-pass body edit; every such
+// invocation is pinned to an explicit allowlist by the same gate, so a new
+// direct call fails it.
+//
+// We POST to the RAW GraphQL endpoint (`gh api /graphql --input -`) with the
+// whole {query, variables} object JSON-encoded on stdin, rather than passing
+// variables as `-F k=v`. gh's -F magic typing converts integers, booleans, and
+// null but NOT decimal floats: 1.64 reached `Float!` as the string "1.64" and
+// the API rejected it, breaking every non-integer NUMBER write -- Estimate
+// (1.64, 4.36, ...) and Actual (dollar totals) (issue #17). A JSON body keeps
+// every variable its own JSON type, floats included.
+//
+// The raw endpoint returns HTTP 200 even when the body carries a GraphQL
+// `errors` array (the `graphql` subcommand exits non-zero instead), so gh's exit
+// code alone would let a failed mutation pass as success. We MUST inspect
+// body.errors and throw; the non-zero-exit throw stays for transport failures.
+export function ghExecutor(spawn: GhSpawn = defaultGhSpawn): GraphQLExecutor {
   return async (query, variables) => {
-    const args = ["api", "graphql", "-f", `query=${query}`];
-    for (const [k, v] of Object.entries(variables)) {
-      if (typeof v === "number" || typeof v === "boolean") args.push("-F", `${k}=${v}`);
-      else args.push("-f", `${k}=${v}`);
-    }
-    const proc = Bun.spawnSync(["gh", ...args], { stdout: "pipe", stderr: "pipe" });
+    const body = JSON.stringify({ query, variables });
+    const proc = spawn(["gh", "api", "/graphql", "--input", "-"], body);
     if (proc.exitCode !== 0) {
-      throw new ZError(`gh api graphql failed: ${proc.stderr.toString().trim()}`);
+      throw new ZError(`gh api /graphql failed: ${proc.stderr.trim()}`);
     }
-    const out = JSON.parse(proc.stdout.toString());
-    if (out.errors) throw new ZError(`GraphQL errors: ${JSON.stringify(out.errors)}`);
+    const out = JSON.parse(proc.stdout);
+    if (Array.isArray(out.errors) && out.errors.length > 0) {
+      const e = out.errors[0];
+      const where = Array.isArray(e?.path) && e.path.length > 0 ? ` (path: ${e.path.join(".")})` : "";
+      throw new ZError(`GraphQL error: ${e?.message ?? JSON.stringify(e)}${where}`);
+    }
     return out.data;
   };
 }

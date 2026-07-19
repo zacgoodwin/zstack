@@ -8,7 +8,15 @@ import { test, expect, describe, afterEach, beforeEach } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Board, ZError, type GraphQLExecutor, type GraphQLData } from "../lib/board.ts";
+import {
+  Board,
+  ZError,
+  ghExecutor,
+  type GraphQLExecutor,
+  type GraphQLData,
+  type GhSpawn,
+  type GhProc,
+} from "../lib/board.ts";
 import { loadConfig, resolveSlug, type BoardConfig } from "../lib/config.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
@@ -1069,6 +1077,85 @@ describe("contract enforcement", () => {
       const md = "Never `gh issue close` a ticket. The gh CLI must be installed. Allow `Bash(gh *)` in settings.";
       expect(ghInvocations(md)).toEqual(["gh issue close"]);
     });
+  });
+});
+
+// -- Issue #17: the REAL ghExecutor encoding + error contracts ----------------
+// The rest of the suite mocks the executor, so gh's actual arg encoding was
+// never exercised and the `Float!` rejection slipped through: `-F number=1.64`
+// let gh's magic typing hand the API the string "1.64". These drive the REAL
+// ghExecutor through an injected spawn seam, so the JSON body asserted here is
+// the exact bytes production POSTs -- a string-typed float in this test is a
+// string-typed float in prod.
+describe("ghExecutor JSON encoding + error contracts (issue #17)", () => {
+  // Records the command + stdin body, returns a canned process result.
+  function fakeSpawn(result: GhProc, sink?: { cmd?: string[]; body?: string }): GhSpawn {
+    return (cmd, stdin) => {
+      if (sink) {
+        sink.cmd = cmd;
+        sink.body = stdin;
+      }
+      return result;
+    };
+  }
+  const ok = (data: unknown): GhProc => ({ exitCode: 0, stdout: JSON.stringify({ data }), stderr: "" });
+
+  // AC3: variables {a:1.64, b:2, c:"x", d:true} -> a JSON body whose `a` is the
+  // NUMBER 1.64, b the number 2, c a string, d a boolean. No string-typed float.
+  test("floats stay JSON numbers, not strings (the Float! bug)", async () => {
+    const sink: { cmd?: string[]; body?: string } = {};
+    const exec = ghExecutor(fakeSpawn(ok({ ok: true }), sink));
+    await exec("mutation SetNumber($number: Float!) { x }", { a: 1.64, b: 2, c: "x", d: true });
+
+    // POSTed to the raw /graphql endpoint on stdin, not passed as `-F` args.
+    expect(sink.cmd).toEqual(["gh", "api", "/graphql", "--input", "-"]);
+    const req = JSON.parse(sink.body!);
+    expect(req.query).toContain("SetNumber");
+    expect(req.variables.a).toBe(1.64);
+    expect(typeof req.variables.a).toBe("number");
+    expect(req.variables.b).toBe(2);
+    expect(typeof req.variables.b).toBe("number");
+    expect(req.variables.c).toBe("x");
+    expect(req.variables.d).toBe(true);
+    // The old `-F number=1.64` path shipped the value as the string "1.64";
+    // guard the exact regression.
+    expect(sink.body).not.toContain('"1.64"');
+  });
+
+  test("returns the data payload on success", async () => {
+    const exec = ghExecutor(fakeSpawn(ok({ updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_1" } } })));
+    expect(await exec("mutation SetNumber { x }", {})).toEqual({
+      updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_1" } },
+    });
+  });
+
+  // AC4: raw /graphql returns HTTP 200 (exit 0) with an `errors` array in the
+  // body; the executor must NOT return silent success.
+  test("a GraphQL errors array in an HTTP-200 body raises ZError naming the error", async () => {
+    const proc: GhProc = {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        data: null,
+        errors: [
+          {
+            message: "Variable $number of type Float! was provided invalid value",
+            path: ["updateProjectV2ItemFieldValue"],
+          },
+        ],
+      }),
+      stderr: "",
+    };
+    const exec = ghExecutor(fakeSpawn(proc));
+    await expect(exec("mutation SetNumber { x }", { number: 1.64 })).rejects.toThrow(ZError);
+    await expect(exec("mutation SetNumber { x }", { number: 1.64 })).rejects.toThrow(/Variable \$number of type Float!/);
+    await expect(exec("mutation SetNumber { x }", { number: 1.64 })).rejects.toThrow(/path: updateProjectV2ItemFieldValue/);
+  });
+
+  // Transport failure (non-zero exit) still raises, carrying stderr.
+  test("a non-zero exit (transport failure) raises ZError with stderr", async () => {
+    const proc: GhProc = { exitCode: 1, stdout: "", stderr: "error connecting to api.github.com" };
+    const exec = ghExecutor(fakeSpawn(proc));
+    await expect(exec("mutation SetNumber { x }", {})).rejects.toThrow(/gh api \/graphql failed: error connecting to api\.github\.com/);
   });
 });
 
