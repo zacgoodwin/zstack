@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Thin entry for the ticket-schema gate: everything lives in lib/ticket-schema.ts
+# under bun. This wrapper only resolves its own location and hands off. This is
+# the gate script the ticket "### Acceptance Criteria" cases lint against.
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+exec bun "$HERE/../lib/ticket-schema.ts" "$@"
