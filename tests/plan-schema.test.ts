@@ -244,3 +244,98 @@ describe("tier -> z-estimate is reproducible (issue #7 AC2)", () => {
     });
   }
 });
+
+// -- Step 10 Backlog scan contract (issue #13) -------------------------------
+// The SKILL is executed by an agent, not this test suite, so these are doc
+// canaries: they pin the exact contract strings in z-plan/SKILL.md that make
+// AC1-AC4 true, and fail loudly if a future edit silently drops Step 10, the
+// `--backlog` flag, or the "stays in Backlog" rule instead of raising it as a
+// spec question (CLAUDE.md: weakening a planned AC is never a silent edit).
+describe("z-plan/SKILL.md: Step 10 Backlog scan contract (issue #13)", () => {
+  const zPlan = () => readFileSync(join(import.meta.dir, "..", "z-plan", "SKILL.md"), "utf8");
+
+  // Returns the body of a "## <heading>" section up to the next "## " heading
+  // (mirrors tests/loop-skill-fixes.test.ts's section() helper).
+  function section(md: string, heading: string): string {
+    const start = md.indexOf(heading);
+    if (start < 0) return "";
+    const rest = md.slice(start + heading.length);
+    const next = rest.indexOf("\n## ");
+    return next < 0 ? rest : rest.slice(0, next);
+  }
+
+  test("Step 10 exists, after Step 9, before Dry-run/eval mode", () => {
+    const md = zPlan();
+    const step9 = md.indexOf("## Step 9");
+    const step10 = md.indexOf("## Step 10 — Backlog scan");
+    const dryRun = md.indexOf("## Dry-run / eval mode");
+    expect(step9).toBeGreaterThan(-1);
+    expect(step10).toBeGreaterThan(step9);
+    expect(dryRun).toBeGreaterThan(step10);
+  });
+
+  test("--backlog is parsed as its own flag and bypasses spec resolution (AC4)", () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toContain("--backlog");
+    expect(step1).toContain("BACKLOG_ONLY=1");
+    expect(step1).toContain("skip straight to Step 10");
+    expect(step1).toContain('no "No spec file found" failure');
+  });
+
+  test("a normal spec run runs the scan too, as its final step", () => {
+    expect(zPlan()).toContain("Backlog scan runs as the final step of every normal spec run");
+  });
+
+  test("Step 10 lists Backlog, gates every ticket through z-ticket-lint, and fields it", () => {
+    const step10 = section(zPlan(), "## Step 10 — Backlog scan");
+    expect(step10).not.toBe("");
+    expect(step10).toContain('"$Z_BOARD" list --status Backlog --json');
+    expect(step10).toContain('"$Z_LINT" "$TMP/body-<N>.md"');
+    expect(step10).toContain("lib/ticket-schema.ts:97-144");
+    expect(step10).toContain('"$Z_BOARD" field-get <N> <Field>');
+  });
+
+  test("Step 10 never promotes to Ready; Step 7.4's pull remains the only path to Ready", () => {
+    const step10 = section(zPlan(), "## Step 10 — Backlog scan");
+    expect(step10).toContain("Step 10 never calls");
+    expect(step10).toContain('"$Z_BOARD" move <N> Ready');
+    expect(step10).toMatch(/Step 7\.4's\s+dependency pull/); // tolerant of source line-wrap
+    // Ready never appears as a `z-board move` target anywhere in Step 10.
+    expect(step10).not.toMatch(/"\$Z_BOARD" move <N> Ready --slug/);
+    // The claim is scoped to Ready specifically -- Step 10 also moves tickets
+    // to Questions (item 3's ambiguity path) and must say so is a *different*,
+    // allowed movement, not a second Ready exception (this is the reworded
+    // contract; a version that still claims Step 7.4 is the only ticket
+    // movement anywhere in the skill is the bug this test guards against).
+    expect(step10).toMatch(/different, allowed movement/);
+    expect(step10).not.toMatch(/only ticket-movement exception anywhere in this skill/);
+  });
+
+  test("Step 10 idempotent re-run: a passing, fully-fielded ticket gets zero writes", () => {
+    const step10 = section(zPlan(), "## Step 10 — Backlog scan");
+    expect(step10).toMatch(/zero body edits, zero\s*\n?\s*field writes, and zero comments/);
+  });
+
+  test("--dry-run --backlog mirrors the existing dry-run contract with no board writes", () => {
+    const dryRun = section(zPlan(), "## Dry-run / eval mode");
+    expect(dryRun).toContain("--dry-run --backlog");
+    expect(dryRun).toMatch(/No board writes,\s+no GitHub writes/); // tolerant of source line-wrap
+  });
+
+  test("Done criteria names the Step 10 gate, scoped to tickets still in Backlog", () => {
+    const done = section(zPlan(), "## Done criteria");
+    // The lint-pass claim must carve out item 3's ambiguity path (a ticket
+    // moved to Questions never gets a drafted body, so it can't be linted) --
+    // a version that claims literally "every ticket in Backlog at scan time"
+    // passes lint is the bug this test guards against.
+    expect(done).toMatch(/still in Backlog after the scan/);
+    expect(done).toMatch(/not moved to Questions/);
+    expect(done).toMatch(/passes `z-ticket-lint`/);
+    expect(done).not.toMatch(/Every ticket in Backlog at scan time passes `z-ticket-lint`/);
+    // The Ready-promotion claim must be scoped to Ready, not asserted as the
+    // only ticket movement anywhere in the skill (Questions is another).
+    expect(done).toMatch(/never promotes a ticket to Ready/);
+    expect(done).toMatch(/Step 7\.4's\s+dependency pull/);
+    expect(done).not.toMatch(/only ticket-movement exception anywhere in this skill/);
+  });
+});
