@@ -25,6 +25,7 @@ import {
 import { completionNote, reviewerPrompt, type CompletionNoteInput } from "../../lib/stage-prompts.ts";
 import { costOfFiles, expandGlob, loadRates, ratesPath } from "../../lib/cost.ts";
 import { SKILL_NAMES } from "../../lib/skill-invoker.ts";
+import { DEFAULT_AUDIT_EVERY_N_LOOPS } from "../../lib/config.ts";
 
 export interface AssertionResult {
   name: string;
@@ -284,23 +285,35 @@ export function assertReport(report: ReportFacts, board: BoardItem[]): Assertion
 }
 
 // The loop counter is honored two ways: the report's loop number equals the
-// persisted counter, and the 5th-loop audits (cso + health) appear in the
-// invocation log IFF the counter is a multiple of 5 (epic DoD 8).
+// persisted counter, and the Nth-loop audits (cso + health) appear in the
+// invocation log IFF the counter is a multiple of the cadence (config
+// `auditEveryNLoops`, default 5 -- epic DoD 8 / issue #18).
+//
+// The cadence itself comes from state-initial.json when the fixture carries an
+// `auditEveryNLoops` field (mirroring how assertLaneCap reads `initial.maxLanes`
+// off the same file), else the same default lib/config.ts falls back to, so a
+// run recorded before this field existed keeps evaluating the same way.
+function readAuditEveryNLoops(runDir: string): number {
+  const raw = loadJson<{ auditEveryNLoops?: number }>(join(runDir, "state-initial.json"));
+  return raw.auditEveryNLoops ?? DEFAULT_AUDIT_EVERY_N_LOOPS;
+}
+
 export function assertLoopCounter(runDir: string, report: ReportFacts): AssertionResult {
   const counterPath = join(runDir, "loop-counter");
   const counter = Number(readFileSync(counterPath, "utf8").trim());
   if (!Number.isInteger(counter) || counter < 1) return fail("loop-counter", `loop-counter is not a positive integer (${counter})`);
   if (counter !== report.loopCount) return fail("loop-counter", `report says loop ${report.loopCount} but loop-counter file is ${counter}`);
+  const auditEveryNLoops = readAuditEveryNLoops(runDir);
   const invPath = firstGlob(runDir, "reports/invocations-*.jsonl");
   const invSkills = invPath
     ? readFileSync(invPath, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l).skill as string)
     : [];
   const auditsPresent = invSkills.includes("cso") || invSkills.includes("health");
-  const auditsExpected = counter % 5 === 0;
+  const auditsExpected = counter % auditEveryNLoops === 0;
   if (auditsPresent !== auditsExpected) {
-    return fail("loop-counter", `loop ${counter}: audits present=${auditsPresent} but expected=${auditsExpected} (cso+health fire only on every 5th loop)`);
+    return fail("loop-counter", `loop ${counter}: audits present=${auditsPresent} but expected=${auditsExpected} (cso+health fire only every ${auditEveryNLoops}th loop)`);
   }
-  return ok("loop-counter", `report loop ${counter} matches the counter; 5th-loop audits ${auditsExpected ? "present" : "correctly absent"}`);
+  return ok("loop-counter", `report loop ${counter} matches the counter; every-${auditEveryNLoops}th-loop audits ${auditsExpected ? "present" : "correctly absent"}`);
 }
 
 export function assertCompletionNotes(runDir: string, report: ReportFacts, doneTickets: number[]): AssertionResult {
