@@ -8,7 +8,7 @@
 import { test, expect, describe, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 import { costOfFiles, expandGlob, main, parseLine, ZError } from "../lib/cost.ts";
 import type { RatesFile } from "../lib/estimate.ts";
 
@@ -233,6 +233,71 @@ describe("expandGlob: absolute patterns (ticket #22)", () => {
     expect(code).not.toBe(0);
     expect(logs.join("\n")).toContain(pattern);
     expect(logs.join("\n")).toMatch(/No files matched/);
+  });
+});
+
+// -- UNC patterns are refused, not silently mismatched (ticket #22 rework) --
+//
+// Adversarial review found that the fix above has a regression: a UNC path
+// (\\server\share\... or //server/share/...) matches ABSOLUTE_PATTERN's
+// driveless-leading-slash branch, but splitAbsoluteGlob's
+// `pattern.split(/[\\/]+/)` collapses the leading double separator into one
+// segment, so resolve() roots the (now single-slash) prefix onto the
+// CURRENT drive instead of the network host -- silently redirecting to a
+// same-named local directory if one happens to exist, instead of the loud
+// ENOENT a missing UNC share should give. That's a silent wrong answer
+// (priced!) where the pre-fix code merely failed loud on the literal UNC
+// path. Since z-cost's transcripts always live under the user's home
+// directory (no real UNC demand), UNC patterns are refused outright with a
+// ZError naming the limitation, preserving the fail-loud contract with the
+// smallest possible surface.
+describe("expandGlob: UNC patterns are refused (ticket #22 rework)", () => {
+  test("a //server/share/*.jsonl-style pattern throws naming UNC", () => {
+    expect(() => expandGlob("//myserver/share/*.jsonl")).toThrow(ZError);
+    expect(() => expandGlob("//myserver/share/*.jsonl")).toThrow(/UNC/);
+  });
+
+  test("a \\\\server\\share\\...-style pattern (native Windows UNC backslashes) throws naming UNC", () => {
+    expect(() => expandGlob("\\\\myserver\\share\\*.jsonl")).toThrow(ZError);
+    expect(() => expandGlob("\\\\myserver\\share\\*.jsonl")).toThrow(/UNC/);
+  });
+
+  test("main() exits 1 and prints the UNC error for a UNC pattern", async () => {
+    const logs: string[] = [];
+    const origError = console.error;
+    console.error = (...a: unknown[]) => void logs.push(a.join(" "));
+    let code: number;
+    try {
+      code = await main(["--json", "//myserver/share/*.jsonl"]);
+    } finally {
+      console.error = origError;
+    }
+    expect(code).toBe(1);
+    expect(logs.join("\n")).toMatch(/UNC/);
+  });
+
+  test("shadow-dir: a UNC pattern still throws even when a local dir mirrors its segments", () => {
+    // Reproduces the reviewer's exact regression scenario: build a REAL local
+    // directory at the drive root that splitAbsoluteGlob+resolve() would
+    // silently redirect the UNC pattern onto if the guard did not exist
+    // (confirmed empirically: path.resolve("/host/share") on this machine
+    // returns "<cwd's drive>:\host\share", i.e. the drive root -- not the
+    // network host), containing a real transcript file. Without the guard
+    // this local file would be the silent wrong match the reviewer found;
+    // with the guard, expandGlob must throw before ever reaching that path,
+    // never returning the local file.
+    const rand = Math.random().toString(36).slice(2);
+    const host = `zcost-shadow-host-${rand}`;
+    const share = `zcost-shadow-share-${rand}`;
+    const root = parse(process.cwd()).root; // e.g. "D:\\"
+    const shadowDir = join(root, host, share);
+    mkdirSync(shadowDir, { recursive: true });
+    tmpPaths.push(join(root, host));
+    writeFileSync(join(shadowDir, "local.jsonl"), readFileSync(FIXTURE, "utf8"));
+
+    const pattern = `//${host}/${share}/*.jsonl`;
+    expect(() => expandGlob(pattern)).toThrow(ZError);
+    expect(() => expandGlob(pattern)).toThrow(/UNC/);
   });
 });
 

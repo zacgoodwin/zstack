@@ -189,6 +189,24 @@ export function costOfFiles(paths: string[], rates: RatesFile): CostResult {
 // are re-joined onto the prefix to stay absolute. Relative patterns are
 // untouched -- they already scan correctly from the caller's cwd.
 const ABSOLUTE_PATTERN = /^(?:[a-zA-Z]:[\\/]|[\\/])/; // POSIX "/..." or Windows "X:/..." / "X:\..."
+// A UNC path (\\server\share\... or //server/share/...) matches
+// ABSOLUTE_PATTERN's driveless-leading-slash branch, but splitAbsoluteGlob's
+// `pattern.split(/[\\/]+/)` collapses the leading double separator into one
+// empty segment, so the rejoined prefix becomes a single-slash path ("/host/
+// share") indistinguishable from an ordinary driveless-absolute one.
+// resolve() then roots that onto the CURRENT drive (confirmed empirically:
+// resolve("/host/share") on this machine returns "D:\host\share", the drive
+// of process.cwd(), never the network host) -- so a UNC pattern silently
+// redirects to a same-named local directory on whatever drive the process
+// happens to be running from if one exists, instead of the loud ENOENT a
+// missing network share should give. That's a silent wrong answer, which
+// breaks this file's fail-loud contract (see AC4's format-drift gate above).
+// Teaching splitAbsoluteGlob to preserve/resolve a UNC root is a bigger
+// change with its own edge cases (Bun.Glob's `cwd` option was never
+// confirmed to accept a UNC root at all) that nothing here needs --
+// transcripts always live under the user's home directory -- so UNC patterns
+// are refused outright instead.
+const UNC_PATTERN = /^[\\/]{2}/;
 const GLOB_META = /[*?[\]{}]/;
 
 // Splits an absolute pattern into { prefix, rest } where `prefix` has no glob
@@ -213,6 +231,11 @@ export function expandGlob(pattern: string, cwd: string = process.cwd()): string
   let scanCwd = cwd;
   let scanPattern = pattern;
   if (ABSOLUTE_PATTERN.test(pattern)) {
+    if (UNC_PATTERN.test(pattern)) {
+      throw new ZError(
+        `UNC patterns (\\\\server\\share\\...) are not supported by z-cost; use a mapped drive letter or a local path. Got: "${pattern}"`
+      );
+    }
     const split = splitAbsoluteGlob(pattern);
     // resolve(): a driveless POSIX-style prefix ("/Users/...") is a real,
     // existing directory to node:fs (Windows maps it onto the current
