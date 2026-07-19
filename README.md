@@ -14,7 +14,7 @@ directory per skill (`SKILL.md`, `bin/`, `lib/`), a `setup` script, a `VERSION`.
 ## Install
 
 ```bash
-git clone <this-repo> ~/.claude/skills/zstack
+git clone https://github.com/zacgoodwin/zstack/ ~/.claude/skills/zstack
 cd ~/.claude/skills/zstack && ./setup          # add --team to also register Codex/Factory
 ```
 
