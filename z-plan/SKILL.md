@@ -7,10 +7,14 @@ description: |
   fielded with a Model / Model Effort recommendation and a reproducible dollar
   Estimate, and linked to its dependencies both directions. Idempotent: re-running
   on the same spec matches existing tickets by title slug and updates them instead
-  of duplicating. This is the "planner" box of the develop stage, usable outside
+  of duplicating. Also plan-gates the Backlog itself (Step 10): every ticket
+  already sitting in Backlog — human brain-dumps, and the surfaced use cases the
+  loop's completion flow files there — gets the same schema gate and fields
+  without being promoted; `/z-plan --backlog` runs this scan alone, with no spec
+  file needed. This is the "planner" box of the develop stage, usable outside
   the loop. Use when asked to "plan this spec", "z-plan", "turn the plan into
-  tickets", or before the first build pass on a repo whose board is already set
-  up by /z-setup.
+  tickets", "scan the backlog", "plan-gate the backlog", or before the first
+  build pass on a repo whose board is already set up by /z-setup.
 ---
 
 # /z-plan — Spec to milestones + board-ready tickets
@@ -52,13 +56,32 @@ export ZSTACK_SLUG="$SLUG"   # H13: so any z-board call that omits --slug still
 
 ---
 
-## Step 1 — Resolve the input spec
+## Step 1 — Resolve the input spec, and the `--backlog` / `--dry-run` flags
 
-The spec path is the skill's argument. When none is given, default to the newest
-file in gstack's CEO-plans directory for this project:
+Two flags are recognized ahead of the spec path; parse them first and treat
+whatever argument remains as the spec:
 
 ```bash
-SPEC="$1"
+BACKLOG_ONLY=""
+DRY_RUN=""
+SPEC=""
+for arg in "$@"; do
+  case "$arg" in
+    --backlog) BACKLOG_ONLY=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    *) SPEC="$arg" ;;
+  esac
+done
+```
+
+**When `--backlog` is set:** skip straight to Step 10 — no spec resolution, and
+no "No spec file found" failure (AC4). Steps 2–9 do not run; `--dry-run` still
+applies (Dry-run / eval mode below).
+
+**Otherwise**, resolve the spec as always: when none is given, default to the
+newest file in gstack's CEO-plans directory for this project:
+
+```bash
 if [ -z "$SPEC" ]; then
   PLANS="$HOME/.gstack/projects/$SLUG/ceo-plans"
   SPEC=$(ls -t "$PLANS"/* 2>/dev/null | head -1)
@@ -67,7 +90,9 @@ fi
 ```
 
 Read the whole spec. It is the source of the milestones and tickets; do not
-invent scope it does not contain.
+invent scope it does not contain. Run Steps 2–9 on it, then Step 10 — the
+Backlog scan runs as the final step of every normal spec run too, not only via
+`--backlog`.
 
 ---
 
@@ -276,6 +301,61 @@ spec in → same set of tickets, no dupes.
 
 ---
 
+## Step 10 — Backlog scan
+
+z-loop's planning pass (z-loop/SKILL.md Step 1) gates only Ready; Backlog
+tickets — human brain-dumps, and the surfaced use cases the loop's completion
+flow files there (z-loop/SKILL.md Step 6.2) — otherwise sit unplanned until a
+human hand-promotes them. This step closes that gap: every ticket already in
+Backlog gets the same schema gate and fields a Ready ticket gets, without being
+promoted. It runs as the final step of a normal spec run (right after Step 9)
+and it also runs alone via `/z-plan --backlog` (Step 1's flag parsing — no spec
+file needed either way, AC4).
+
+```bash
+TMP="$HOME/.zstack/projects/$SLUG/z-plan/tmp"; mkdir -p "$TMP"
+"$Z_BOARD" list --status Backlog --json --slug "$SLUG" > "$TMP/backlog.json"
+```
+
+For each ticket number `<N>` in that list:
+
+1. **Fetch the body:** `gh issue view <N> --json body -q .body > "$TMP/body-<N>.md"`
+   (the same read the loop's planning pass uses; z-board has no body-read
+   subcommand).
+2. **Gate it:** `"$Z_LINT" "$TMP/body-<N>.md"` — `bin/z-ticket-lint`, the same
+   validator contract as everywhere else (`lib/ticket-schema.ts:97-144`).
+3. **On a lint failure**, one of two paths applies:
+   - **Genuine ambiguity** (the ask contradicts an existing pattern, or a
+     decision is missing that changes the approach — the Confusion Protocol
+     bar, same test Step 8 uses): write the question as a comment and
+     `"$Z_BOARD" move <N> Questions --slug "$SLUG"`. Do not draft a body. This
+     is the ONE case in this step that moves a Backlog ticket off Backlog.
+   - **Otherwise**, ground in the actual code this ticket's ask touches (Step 2
+     applies here too — no file ref you have not opened), draft the body to
+     the Step 4 schema, update it with `gh issue edit <N> --body-file ...`,
+     re-run `"$Z_LINT"` on the rewritten body to confirm it now passes, and
+     comment that the scan added the plan
+     (`"$Z_BOARD" comment <N> --body-file note.md --slug "$SLUG"`; one line:
+     the scan added the plan above, the ticket is still in Backlog for a human
+     to promote).
+4. **Fields**, independent of whether step 3 ran: read Model, Model Effort, and
+   Estimate (`"$Z_BOARD" field-get <N> <Field> --slug "$SLUG"`, once each). If
+   ANY is empty, choose Model + Model Effort per Step 6's rules of thumb and run
+   the full Step 6 tier chain (`z-plan/tiers.json` → `"$Z_ESTIMATE"`) to
+   `field-set` all three — no arithmetic in prose, same rule as Step 6.
+5. **Nothing needed, nothing written.** A Backlog ticket whose body already
+   passes lint AND already carries all three fields gets zero body edits, zero
+   field writes, and zero comments this run — the same idempotent-rerun
+   guarantee Step 9 gives spec-derived tickets.
+6. **Stay in Backlog.** Every ticket this step plans (step 3's draft path, step
+   4's fields) stays exactly where it was found. Step 10 never calls
+   `"$Z_BOARD" move <N> Ready`; promotion is a human decision. The only
+   ticket-movement exception anywhere in this skill remains Step 7.4's
+   dependency pull (a dependency discovered while planning OTHER work that must
+   be analyzed next) — Step 10 does not add a second one.
+
+---
+
 ## Dry-run / eval mode
 
 For the planner eval (`evals/planner/`, wired by C10) and any offline check,
@@ -285,6 +365,15 @@ Model / Model Effort / Estimate, and its `Depends on:` lines — so a scorer can
 grade the output with no live board and no network. The eval harness runs this
 through local `claude -p` (never a hosted API, PRINCIPLES.md) and scores it
 against `evals/planner/rubric.md`.
+
+**`--dry-run --backlog`** applies the identical contract to Step 10: list
+Backlog, decide per ticket exactly as Step 10 describes, but instead of
+`gh issue edit <N> --body-file ...`, `"$Z_BOARD" field-set`, or
+`"$Z_BOARD" comment`, emit each ticket that needed a change as one markdown
+block to stdout — its number, the drafted body, the fields it would set, and
+(on the ambiguity path) the question that would be commented. No board writes,
+no GitHub writes. This is what `evals/planner/`'s backlog-scan pass
+(`fixture-backlog-ticket.md`) grades.
 
 ---
 
@@ -302,3 +391,7 @@ Report DONE only when all hold:
   order recorded in the parent (Step 5).
 - Open questions are commented and their tickets are in Questions (Step 8).
 - A re-run on the same spec updates in place and creates zero duplicates (Step 9).
+- Every ticket in Backlog at scan time passes `z-ticket-lint` and carries
+  Model, Model Effort, and Estimate (Step 10); none were promoted to Ready by
+  this step — the only ticket-movement exception anywhere in this skill remains
+  Step 7.4's dependency pull.

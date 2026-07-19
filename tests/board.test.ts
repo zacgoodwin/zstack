@@ -957,6 +957,13 @@ describe("contract enforcement", () => {
       // slug lookup: read-only (trailing shell comment is part of the line)
       `gh repo view --json name -q .name) # one board per repo; matches /z-setup`,
       `gh auth status`, // read-only auth probe (prereq checklist)
+      // Step 10 Backlog scan (issue #13): same read the loop's planning pass
+      // uses (z-loop/SKILL.md); z-board has no body-read subcommand
+      `gh issue view <N> --json body -q .body > "$TMP/body-<N>.md"`,
+      // Step 10 Backlog scan (issue #13): same write the loop's planning pass
+      // uses; z-board has no issue-body-edit subcommand (the one mutation
+      // outside z-board, already sanctioned for z-loop above)
+      `gh issue edit <N> --body-file ...`,
     ],
     "z-status/SKILL.md": [
       `gh repo view --json name -q .name)`, // slug lookup: read-only

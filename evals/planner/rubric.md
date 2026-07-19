@@ -63,3 +63,37 @@ Three tickets, in build order:
 
 A run that emits these three, each passing `z-ticket-lint`, grounded in
 `store.ts`, tiered at sonnet/haiku, with the chain linked, scores 10/10.
+
+## Backlog scan pass (issue #13)
+
+Scores one `/z-plan --backlog --dry-run` run against `fixture-backlog-ticket.md`
+— Step 10's scan (z-plan/SKILL.md), not the spec-to-tickets flow above. Same
+five dimensions, same 0–2 each, **10 points total, pass threshold: average ≥
+8/10** — scored against the single ticket this pass plans instead of the
+three-ticket chain.
+
+The grader is the same fresh local `claude -p` pass, given this rubric, the
+fixture Backlog ticket body (`fixture-backlog-ticket.md` — a two-line brain-dump
+that fails `z-ticket-lint` as-is), `fixture-app/`, and the pass's output.
+
+1. **Schema gate (0–2).** The one emitted body passes `bin/z-ticket-lint` (exit
+   0). This is the deterministic half issue #13's Tests + evals names directly
+   — check it with the lint CLI, don't eyeball it.
+2. **Grounded file refs (0–2).** The drafted ticket cites `src/store.ts` (the
+   `Store` class, ideally with line refs) rather than inventing a file or
+   ignoring the codebase — the graded half issue #13 names directly.
+3. **Testable acceptance criteria (0–2).** Same bar as dimension 3 above,
+   applied to the one ticket.
+4. **Correct model tier (0–2).** Same bar as dimension 4 above; the fixture's
+   ask (delete-by-code on an existing in-memory store) is small and
+   single-file, so `sonnet`/`haiku` is expected.
+5. **Dependency completeness (0–2).** The fixture ticket is standalone — full
+   marks means no invented `Depends on:` line; inventing a dependency it does
+   not need loses the point.
+
+### Expected shape of a passing backlog-scan run
+
+One ticket, body rewritten to the schema, passing `z-ticket-lint`, grounded in
+`src/store.ts`, tiered at sonnet or haiku, no invented dependency, all three
+fields (Model, Model Effort, Estimate) filled via the Step 6 tier chain, and the
+ticket left in Backlog (Step 10 never promotes) — scores 10/10.

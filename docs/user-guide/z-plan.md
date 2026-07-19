@@ -19,6 +19,19 @@ After `/z-setup`, whenever you have a spec to turn into tickets:
 
 With no argument it defaults to the newest gstack CEO plan for the repo.
 
+Separately, whenever you want every ticket already sitting in Backlog —
+human brain-dumps, or the surfaced use cases the loop's completion flow files
+there — gated and fielded without a spec, run:
+
+```bash
+/z-plan --backlog
+```
+
+This needs no spec file and no CEO plan on disk; it runs the Backlog scan
+(below) alone. A normal `/z-plan path/to/spec.md` run performs the same scan
+too, as its final step, so Backlog never falls behind just because you keep
+planning new specs.
+
 ## What it does
 
 1. **Grounds in the codebase first.** Reads the files the spec touches; every
@@ -44,6 +57,12 @@ With no argument it defaults to the newest gstack CEO plan for the repo.
 7. **Questions to a human.** A genuine ambiguity (Confusion Protocol bar) is
    commented on the ticket and the ticket moved to Questions — never guessed into
    the plan.
+8. **Backlog scan.** Every ticket already in Backlog gets the same lint gate and
+   the same fields (Model/Model Effort/Estimate) a Ready ticket gets — without
+   being promoted. A ticket that already passes and is already fielded gets zero
+   writes (idempotent). A genuine ambiguity still goes to Questions, same as
+   step 7. Runs as the final step of every spec run, and alone via
+   `/z-plan --backlog`.
 
 ## Dry-run / eval mode
 
@@ -52,8 +71,14 @@ With no argument it defaults to the newest gstack CEO plan for the repo.
 offline. This is what the planner eval (`evals/planner/`) runs through local
 `claude -p`.
 
+`/z-plan --dry-run --backlog` does the same for the Backlog scan: no
+`gh issue edit`, no `z-board` writes, no comments — just each ticket that
+needed a change, emitted to stdout as one markdown block.
+
 ## Done when
 
 Every filed ticket passes the lint gate, carries Model/Effort/Estimate via
 `z-board`, links its dependencies both ways, splits anything over the context
-gate, parks open questions, and a re-run creates zero duplicates.
+gate, parks open questions, and a re-run creates zero duplicates. Every ticket
+already in Backlog at scan time passes the same lint gate and carries the same
+three fields, without being promoted.
