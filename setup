@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# zstack setup: verify preconditions and register the pack directory for
-# Claude Code (and Codex/Factory when installed). Modeled on gstack's setup.
+# zstack setup: verify preconditions, then register the pack directory (runtime
+# assets) AND each z-* skill as its own top-level entry for Claude Code (and
+# Codex/Factory when installed). Modeled on gstack's setup.
 set -e
 
 TEAM_MODE=0
@@ -86,17 +87,15 @@ register() {
   pack_parent_real="$(cd "$(dirname "$PACK_DIR")" && pwd -P)"
   if [ "$skills_real" = "$pack_parent_real" ]; then
     echo "  $label: pack already at $PACK_DIR"
+  elif [ -e "$target" ] && [ ! -L "$target" ] && [ -d "$target/.git" ]; then
+    # A real dir WITH .git is a genuinely separate clone — leave it alone.
+    # Our own Windows registration copies are .git-free (the filter in
+    # _link_or_copy strips .git), so a .git-less real dir is just a stale
+    # copy from a prior run and falls through to the refresh below. Either
+    # way the per-skill loop still runs: the user explicitly ran THIS pack's
+    # setup, so its skills get registered.
+    echo "  $target is a separate zstack clone; leaving it, registering skills from $PACK_DIR." >&2
   else
-    # Target exists as a real (non-symlink) dir pointing somewhere else? Don't
-    # clobber a separate install.
-    if [ -e "$target" ] && [ ! -L "$target" ]; then
-      local existing_real
-      existing_real="$(cd "$target" 2>/dev/null && pwd -P || echo "")"
-      if [ -n "$existing_real" ] && [ "$existing_real" != "$PACK_DIR" ]; then
-        echo "  $target already exists as a separate install; skipping $label registration." >&2
-        return 0
-      fi
-    fi
     _link_or_copy "$PACK_DIR" "$target"
     echo "  registered pack for $label: $target"
   fi
@@ -112,14 +111,19 @@ register() {
     # else's skill that happens to collide — leave it alone. Symlinks and
     # zstack-named entries are ours to refresh (same call gstack makes).
     if [ -e "$dst" ] && [ ! -L "$dst" ] && \
-       ! head -3 "$dst/SKILL.md" 2>/dev/null | grep -q "^name: $skill_name"; then
+       ! head -3 "$dst/SKILL.md" 2>/dev/null | grep -q "^name: $skill_name[[:space:]]*$"; then
       echo "  $dst exists and is not a zstack skill; skipping." >&2
       continue
     fi
     _link_or_copy "${skill_dir%/}" "$dst"
     registered="$registered $skill_name"
   done
-  [ -n "$registered" ] && echo "  registered $label skills:$registered"
+  # if-form, not `[ -n ] && echo`: an all-skipped pass would make the AND-list
+  # the function's failing last command and abort the whole script under set -e.
+  if [ -n "$registered" ]; then
+    echo "  registered $label skills:$registered"
+  fi
+  return 0
 }
 
 register "$HOME/.claude/skills" "Claude Code"

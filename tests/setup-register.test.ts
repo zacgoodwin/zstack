@@ -5,81 +5,24 @@
 // appear" — the cloned-straight-into-~/.claude/skills/zstack path used to
 // early-return before registering anything.
 //
-// Runs the real script via bash against a throwaway $HOME with a stubbed gh,
-// so it's deterministic, network-free, and inside the gate budget. Windows
-// bash spawns cost ~1s each, so the three scenarios launch concurrently at
-// module load and each test just awaits its result.
+// Scenarios launch concurrently at module load (Windows bash spawns cost ~1s
+// each) and each test just awaits its result. Harness: tests/helpers/setup-harness.ts.
 import { test, expect, describe, afterAll } from "bun:test";
-import {
-  mkdtempSync,
-  rmSync,
-  mkdirSync,
-  writeFileSync,
-  copyFileSync,
-  existsSync,
-  readFileSync,
-} from "node:fs";
+import { rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, lstatSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
-const SETUP_SRC = join(import.meta.dir, "..", "setup");
+import { makeEnv, makePack, runSetup } from "./helpers/setup-harness.ts";
 
 const roots: string[] = [];
 afterAll(() => {
   while (roots.length) rmSync(roots.pop()!, { recursive: true, force: true });
 });
 
-function makeEnv() {
-  const root = mkdtempSync(join(tmpdir(), "zstack-setup-reg-"));
-  roots.push(root);
-  const home = join(root, "home");
-  const skills = join(home, ".claude", "skills");
-  mkdirSync(join(skills, "gstack"), { recursive: true }); // precondition gate
-  const stubBin = join(root, "stub-bin");
-  mkdirSync(stubBin);
-  writeFileSync(join(stubBin, "gh"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-  return { root, home, skills, stubBin };
-}
-
-// A minimal pack: the real setup script plus synthetic z-* skills, so the test
-// pins the registration contract without copying the whole repo around.
-function makePack(dir: string, skillNames: string[]) {
-  mkdirSync(dir, { recursive: true });
-  copyFileSync(SETUP_SRC, join(dir, "setup"));
-  for (const name of skillNames) {
-    mkdirSync(join(dir, name), { recursive: true });
-    writeFileSync(
-      join(dir, name, "SKILL.md"),
-      `---\nname: ${name}\ndescription: test skill\n---\nbody\n`
-    );
-  }
-}
-
-async function runSetup(packDir: string, env: { home: string; stubBin: string }) {
-  const proc = Bun.spawn(
-    ["bash", join(packDir, "setup").replaceAll("\\", "/")],
-    {
-      env: {
-        ...process.env,
-        HOME: env.home,
-        PATH: `${env.stubBin}${process.platform === "win32" ? ";" : ":"}${process.env.PATH}`,
-      },
-      stdout: "pipe",
-      stderr: "pipe",
-    }
-  );
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { stdout, stderr, code };
-}
-
 // Scenario A (the reported bug): pack cloned straight into the skills dir,
 // run twice to also pin idempotence (the documented Windows update path).
 const scenarioA = (async () => {
-  const env = makeEnv();
+  const env = makeEnv(roots);
   const packDir = join(env.skills, "zstack");
   makePack(packDir, ["z-alpha", "z-beta"]);
   const first = await runSetup(packDir, env);
@@ -87,27 +30,56 @@ const scenarioA = (async () => {
   return { env, packDir, first, second };
 })();
 
-// Scenario B: pack cloned elsewhere.
+// Scenario B: pack cloned elsewhere, run twice. The re-run must REFRESH the
+// registered copies — pre-fix, the separate-install guard misread our own
+// .git-free Windows copy as a foreign install and silently updated nothing,
+// breaking the documented "re-run ./setup after git pull" flow.
 const scenarioB = (async () => {
-  const env = makeEnv();
+  const env = makeEnv(roots);
   const packRoot = mkdtempSync(join(tmpdir(), "zstack-pack-"));
   roots.push(packRoot);
   const packDir = join(packRoot, "zstack");
   makePack(packDir, ["z-alpha"]);
-  const run = await runSetup(packDir, env);
-  return { env, run };
+  const first = await runSetup(packDir, env);
+  // Plant a sentinel in the registered pack copy; a real refresh removes it.
+  // Only meaningful on Windows — on POSIX the registration is a symlink and
+  // writing through it would mutate the source pack.
+  const sentinel = join(env.skills, "zstack", "stale-sentinel");
+  if (process.platform === "win32") writeFileSync(sentinel, "stale\n");
+  const second = await runSetup(packDir, env);
+  return { env, sentinel, first, second };
 })();
 
-// Scenario C: a colliding skill dir owned by someone else.
+// Scenario C: a colliding skill dir owned by someone else (frontmatter name
+// mismatch) must be left untouched — including the near-miss where the foreign
+// name merely EXTENDS ours ("z-alpha-extended" in a dir named z-alpha), which
+// an unanchored grep would misread as ours and clobber.
 const scenarioC = (async () => {
-  const env = makeEnv();
+  const env = makeEnv(roots);
   const packDir = join(env.skills, "zstack");
-  makePack(packDir, ["z-alpha", "z-beta"]);
+  makePack(packDir, ["z-alpha", "z-beta", "z-gamma"]);
+  const foreign = join(env.skills, "z-alpha");
+  mkdirSync(foreign, { recursive: true });
+  writeFileSync(join(foreign, "SKILL.md"), "---\nname: not-ours\n---\nkeep me\n");
+  const nearMiss = join(env.skills, "z-gamma");
+  mkdirSync(nearMiss, { recursive: true });
+  writeFileSync(join(nearMiss, "SKILL.md"), "---\nname: z-gamma-extended\n---\nkeep me too\n");
+  const run = await runSetup(packDir, env);
+  return { env, foreign, nearMiss, run };
+})();
+
+// Scenario F: EVERY pack skill collides with a foreign dir. Pre-fix, the
+// empty-registration summary (`[ -n ] && echo` as register()'s last command
+// under set -e) aborted the whole script with exit 1.
+const scenarioF = (async () => {
+  const env = makeEnv(roots);
+  const packDir = join(env.skills, "zstack");
+  makePack(packDir, ["z-alpha"]);
   const foreign = join(env.skills, "z-alpha");
   mkdirSync(foreign, { recursive: true });
   writeFileSync(join(foreign, "SKILL.md"), "---\nname: not-ours\n---\nkeep me\n");
   const run = await runSetup(packDir, env);
-  return { env, foreign, run };
+  return { env, run };
 })();
 
 describe("setup registers each skill one level deep", () => {
@@ -118,26 +90,73 @@ describe("setup registers each skill one level deep", () => {
       expect(existsSync(join(env.skills, name, "SKILL.md"))).toBe(true);
     }
     expect(first.stdout).toContain("z-alpha");
-    // The pack itself must survive (the old early-return existed to avoid
+    // The pack itself must survive (the pack-parent guard exists to avoid
     // self-clobbering; the fix keeps that while adding per-skill entries).
     expect(existsSync(join(packDir, "setup"))).toBe(true);
     expect(second.code).toBe(0);
     expect(existsSync(join(env.skills, "z-alpha", "SKILL.md"))).toBe(true);
   });
 
-  test("cloned elsewhere: pack registered as skills/zstack plus top-level z-* entries", async () => {
-    const { env, run } = await scenarioB;
-    expect(run.code).toBe(0);
+  test("cloned elsewhere: pack + z-* entries registered, and a re-run refreshes the copies", async () => {
+    const { env, sentinel, first, second } = await scenarioB;
+    expect(first.code).toBe(0);
     expect(existsSync(join(env.skills, "zstack", "setup"))).toBe(true);
     expect(existsSync(join(env.skills, "z-alpha", "SKILL.md"))).toBe(true);
+    expect(second.code).toBe(0);
+    expect(existsSync(join(env.skills, "z-alpha", "SKILL.md"))).toBe(true);
+    if (process.platform === "win32") {
+      // The refresh replaced our stale copy — the sentinel is gone.
+      expect(existsSync(sentinel)).toBe(false);
+    }
   });
 
-  test("a colliding non-zstack skill dir is left untouched", async () => {
-    const { env, foreign, run } = await scenarioC;
+  test("colliding non-zstack skill dirs are left untouched, including a name-prefix near-miss", async () => {
+    const { env, foreign, nearMiss, run } = await scenarioC;
     expect(run.code).toBe(0);
     expect(readFileSync(join(foreign, "SKILL.md"), "utf8")).toContain("keep me");
+    expect(readFileSync(join(nearMiss, "SKILL.md"), "utf8")).toContain("keep me too");
     expect(run.stderr).toContain("not a zstack skill");
     // The non-colliding sibling still registered.
     expect(existsSync(join(env.skills, "z-beta", "SKILL.md"))).toBe(true);
+  });
+
+  test("all skills colliding is a warning, not a fatal exit (set -e regression)", async () => {
+    const { run } = await scenarioF;
+    expect(run.code).toBe(0);
+    expect(run.stdout).toContain("zstack setup complete.");
+    expect(run.stderr).toContain("not a zstack skill");
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "POSIX: an owned real dir at the destination is replaced by a symlink, not nested into",
+    async () => {
+      // ln -snf into an existing real dir would nest the link INSIDE it,
+      // leaving stale skill content live. _link_or_copy must replace it.
+      const env = makeEnv(roots);
+      const packDir = join(env.skills, "zstack");
+      makePack(packDir, ["z-alpha"]);
+      const stale = join(env.skills, "z-alpha");
+      mkdirSync(stale, { recursive: true });
+      writeFileSync(join(stale, "SKILL.md"), "---\nname: z-alpha\n---\nold copy\n");
+      const run = await runSetup(packDir, env);
+      expect(run.code).toBe(0);
+      expect(lstatSync(stale).isSymbolicLink()).toBe(true);
+      expect(readFileSync(join(stale, "SKILL.md"), "utf8")).toContain("test skill");
+    }
+  );
+
+  test("real z-*/SKILL.md files keep `name:` inside the head -3 window setup parses", () => {
+    // The Windows refresh path greps the first 3 lines for `name: <dir>`;
+    // reordering frontmatter would silently demote every re-run to "not a
+    // zstack skill". Pin the contract against the real skill files.
+    const repoRoot = join(import.meta.dir, "..");
+    const skillDirs = readdirSync(repoRoot).filter((d) => d.startsWith("z-"));
+    expect(skillDirs.length).toBeGreaterThanOrEqual(4);
+    for (const dir of skillDirs) {
+      const head = readFileSync(join(repoRoot, dir, "SKILL.md"), "utf8")
+        .split("\n")
+        .slice(0, 3);
+      expect(head.some((l) => l.trimEnd() === `name: ${dir}`)).toBe(true);
+    }
   });
 });
