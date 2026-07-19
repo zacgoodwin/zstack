@@ -186,6 +186,104 @@ the end of the loop. Follow its prompts for this repo.
 
 ---
 
+## Step 7 — Auto-approvals (optional, after deploy is wired up)
+
+/z-setup's own job is done once Steps 1-6 pass; this step is a separate,
+**optional** offer that does not gate Done criteria below. Offer it every
+time anyway — never skip asking because deploy already worked. It exists
+because of an incident discovered live on 2026-07-18: running the loop with
+default permissions turns the human into a click-through machine, since every
+novel agent command re-prompts and stacks a one-off allow rule in
+`~/.claude/settings.json` forever.
+
+Ask the user via AskUserQuestion, decision-brief format (D3):
+
+```
+D3 — How permissive should Claude Code be on this machine going forward?
+Project/branch/task: First-time zstack setup for <OWNER>/<REPO>.
+ELI10: Claude Code asks permission before running most commands. In a loop
+  that runs unattended, every never-seen-before command re-prompts, and each
+  approval only allowlists that one exact command — so the list grows
+  forever and you become a click-through machine. There are three levers:
+  (1) a hook that answers every permission prompt "allow" automatically,
+  (2) a default mode that skips the dialog for future sessions, (3) a short
+  list of broad rules (any git/gh/bun/bunx/bash/claude command, any Edit, any
+  Write) that cover almost everything the loop does, with no hook at all.
+Stakes if we pick wrong: THIS EDITS ~/.claude/settings.json, which is
+  MACHINE-WIDE — every project on this machine inherits whatever you pick
+  here, not just this one. Picking A and regretting it means every repo you
+  touch ran with zero prompts until you undo it (see Undo below).
+Recommendation: A (full auto-approvals) for a machine dedicated to running
+  the zstack loop unattended; B if you still want prompts for anything
+  outside git/gh/bun/bunx/bash/claude/Edit/Write; C if this machine is shared
+  or you are not ready to hand over blanket approval yet.
+Completeness: A=9/10, B=8/10, C=10/10 (C is "do nothing", so it can't be wrong)
+Pros / cons:
+A) Full auto-approvals (recommended for solo loop use)
+   [PermissionRequest allow hook + defaultMode: bypassPermissions +
+   skipDangerousModePermissionPrompt/skipAutoPermissionPrompt: true + the
+   broad allow rules from B]
+  ✅ Zero prompts, this session and every future one — the loop runs unattended
+  ✅ Survives a session restart (defaultMode + skip flags are read at startup)
+  ❌ Machine-wide: every other project on this machine also runs unprompted
+B) Loop allowlist only
+   [just the broad allow rules: Bash(git *), Bash(gh *), Bash(bun *),
+   Bash(bunx *), Bash(bash *), Bash(claude *), Edit, Write]
+  ✅ Covers what the loop actually runs, no hook, no mode change
+  ✅ Smaller blast radius: anything outside those six prefixes still prompts
+  ❌ A genuinely novel command still stops and waits for a human
+C) Skip
+  ✅ No permission changes at all; today's behavior continues untouched
+  ❌ Back to a prompt per novel command; one-off rules keep piling up
+Net: A trades machine-wide blast radius for zero babysitting; B is the middle
+  ground; C changes nothing. There's no wrong answer, only a tradeoff — ask,
+  don't guess.
+```
+
+Apply the answer with the deterministic half (never hand-edit the file):
+
+```bash
+case "$ANSWER" in
+  A) "$PACK/bin/z-setup-permissions" full ;;
+  B) "$PACK/bin/z-setup-permissions" allowlist ;;
+  C) : ;; # no permission changes
+esac
+```
+
+`z-setup-permissions` merges into `~/.claude/settings.json` (default path; pass
+`--path` to target a different file, e.g. in tests) — it never clobbers
+existing keys or rules, JSON-validates before and after, and writes atomically
+(tmp file + rename) so a crash mid-write can't corrupt the file you already
+have. Re-running it once everything is configured makes zero changes and says
+so. `"$PACK/bin/z-setup-permissions" --check` reports each of the three layers
+(hook / bypassMode / allowlist) independently present or absent, with zero
+writes.
+
+**Undo**, if A or B turns out to be wrong: open `~/.claude/settings.json` and
+- remove the `hooks.PermissionRequest` array entry whose command contains
+  `"permissionDecision":"allow"`,
+- restore `permissions.defaultMode` to whatever it was before (or delete the
+  key), and remove `skipDangerousModePermissionPrompt` /
+  `skipAutoPermissionPrompt`,
+- optionally also drop the broad `Bash(git *)` / `Bash(gh *)` / `Bash(bun *)` /
+  `Bash(bunx *)` / `Bash(bash *)` / `Bash(claude *)` / `Edit` / `Write` entries
+  from `permissions.allow` if you want B's changes gone too.
+There is no automated undo command — the change is small enough to hand-edit
+and re-validate as JSON afterward.
+
+**Implementation note (from a live incident on 2026-07-18):** a running
+Claude Code session persists its in-memory permission state back to
+`settings.json` on every approval event, and can clobber a concurrent edit if
+one lands mid-session. `z-setup-permissions` writes atomically and re-reads
+the file to verify its own write survived, failing loudly instead of
+reporting success on a write that didn't stick. The hook itself takes effect
+through Claude Code's settings watcher — no restart needed. `defaultMode` and
+the skip flags are read at session startup only, so a session already running
+keeps prompting until it's restarted; if a prompt slips through right after
+answering A, that's a straggler session, not a bug — restart it.
+
+---
+
 ## Done criteria
 
 Report DONE only when all of these hold:
@@ -195,5 +293,7 @@ Report DONE only when all of these hold:
 - The user confirmed auto-archive and issue-auto-close are OFF (Step 4, D2 = A).
 - `~/.zstack/projects/<slug>/config.json` exists and loads (Step 5).
 - `/setup-deploy` ran.
+- Step 7 (auto-approvals) was offered via AskUserQuestion; its answer (A/B/C)
+  does not gate DONE.
 
 A re-run of /z-setup on an already-set-up repo must make zero changes (idempotent).
