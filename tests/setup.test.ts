@@ -672,6 +672,10 @@ describe("writeConfig", () => {
     expect(loaded.projectId).toBe("PVT_new");
     expect(loaded.statusField.options!.Done).toBeDefined();
     expect(loaded.maxLanes).toBe(3);
+    // issue #18: SetupBoard never writes this knob, so a config from /z-setup
+    // omits it entirely -- loadConfig must still default it to 5 (AC2:
+    // existing "every 5th loop" behavior unchanged for every already-set-up project).
+    expect(loaded.auditEveryNLoops).toBe(5);
   });
 });
 
@@ -812,6 +816,26 @@ describe("validateConfig", () => {
       }
     });
   });
+
+  // -- issue #18: the /cso + /health audit cadence knob -----------------------
+  describe("auditEveryNLoops (issue #18)", () => {
+    test("accepts a positive integer and is optional", () => {
+      const cfg = goodConfig() as any;
+      cfg.auditEveryNLoops = 3;
+      expect(() => validateConfig(cfg)).not.toThrow();
+      delete cfg.auditEveryNLoops;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    // AC3: 0, -1, and 2.5 must all fail, naming the field and the integer >= 1
+    // requirement -- unlike maxLanes/watchdogMinutes/lockStalenessMinutes
+    // (requirePositiveNumber alone), a fraction is rejected too.
+    test.each([0, -1, 2.5, NaN, "3"])("rejects %p, naming the field and the integer >= 1 rule", (bad) => {
+      const cfg = goodConfig() as any;
+      cfg.auditEveryNLoops = bad;
+      expect(() => validateConfig(cfg)).toThrow(/"auditEveryNLoops" must be a positive integer \(>= 1\)/);
+    });
+  });
 });
 
 // -- loadConfig surfaces schema errors (deep validation is wired in) ---------
@@ -842,5 +866,37 @@ describe("loadConfig deep validation", () => {
       fields: {},
     });
     expect(() => loadConfig("zstack", home)).toThrow(/is invalid:.*statusField\.options/);
+  });
+
+  // -- issue #18 AC2/AC3: auditEveryNLoops end to end through loadConfig -------
+  function validRawConfig(extra: object = {}): object {
+    return {
+      slug: "zstack",
+      owner: "zacgoodwin",
+      repo: "zstack",
+      projectNumber: 1,
+      projectId: "PVT_1",
+      repositoryId: "R_1",
+      statusField: { id: "F_status", dataType: "SINGLE_SELECT", options: { Backlog: "o1", Done: "o2" } },
+      fields: {},
+      ...extra,
+    };
+  }
+
+  test("AC3: auditEveryNLoops 0, -1, and 2.5 all fail loadConfig, naming the field + integer >= 1 rule", () => {
+    for (const bad of [0, -1, 2.5]) {
+      const home = writeRaw("zstack", validRawConfig({ auditEveryNLoops: bad }));
+      expect(() => loadConfig("zstack", home)).toThrow(/"auditEveryNLoops" must be a positive integer \(>= 1\)/);
+    }
+  });
+
+  test("AC2: auditEveryNLoops absent -> loadConfig defaults it to 5 (existing every-5th-loop behavior unchanged)", () => {
+    const home = writeRaw("zstack", validRawConfig());
+    expect(loadConfig("zstack", home).auditEveryNLoops).toBe(5);
+  });
+
+  test("AC1: auditEveryNLoops 3 in config.json is honored through loadConfig, not overridden by the default", () => {
+    const home = writeRaw("zstack", validRawConfig({ auditEveryNLoops: 3 }));
+    expect(loadConfig("zstack", home).auditEveryNLoops).toBe(3);
   });
 });

@@ -48,8 +48,12 @@ After the batch drains, the end-of-loop stage runs a regression on merged main
   file, and **no deploy skill runs**.
 - **Green** → `/land-and-deploy` → `/canary` → `/document-release`, in that order,
   each logged as it returns.
-- **Every 5th loop** (the persisted loop counter, red or green) → `/cso` +
-  `/health`, findings filed to Backlog.
+- **Every Nth loop** (the persisted loop counter, red or green) → `/cso` +
+  `/health`, findings filed to Backlog. `N` is the config knob
+  `auditEveryNLoops` (default 5) in `~/.zstack/projects/<slug>/config.json` —
+  set it lower (e.g. 3) for a high-churn repo, higher (e.g. 10) for a
+  docs-only one. Must be a positive integer; invalid values fail `loadConfig`
+  loudly rather than silently falling back.
 
 It writes `reports/loop-<ts>.md` and bumps `~/.zstack/projects/<slug>/loop-counter`.
 

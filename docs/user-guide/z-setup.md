@@ -48,6 +48,24 @@ does not exist yet, you need `/z-setup`.
    never clobbers existing keys). `z-setup-permissions --check` reports which of
    the three layers are present. Undo is a documented hand-edit (see the SKILL).
 
+## Config knobs (hand-edit `config.json` after setup)
+
+Beyond the board IDs, `config.json` carries optional per-project tuning knobs,
+each defaulted by `loadConfig` when absent:
+
+- `maxLanes` (default 3) — concurrent worktree lanes.
+- `watchdogMinutes` (default 10) — silent-worker timeout.
+- `lockStalenessMinutes` (default 60) — when a crashed loop's lock is judged stale.
+- `auditEveryNLoops` (default 5) — how often the end-of-loop stage runs the
+  `/cso` + `/health` audits (`loopCount % auditEveryNLoops === 0`). Lower it
+  (e.g. 3) for a high-churn repo, raise it (e.g. 10) for a docs-only one. Must
+  be a positive integer — `/z-loop` refuses to start with a loud error
+  otherwise, never a silent fallback.
+
+`maxLanes` and `watchdogMinutes` can also be set at setup time with
+`--max-lanes` / `--watchdog-minutes`; the others are hand-edited in
+`config.json` directly.
+
 ## Done when
 
 - The scoped GraphQL probe passed, `verify` exited 0, the two workflows are OFF,
