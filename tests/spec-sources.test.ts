@@ -102,6 +102,33 @@ describe("discoverSpecSources: kind filtering", () => {
     expect(sources[0].path).toBe(join(dir, "specs", "PLAN.MD"));
   });
 
+  // Same reviewer finding, but for the ceo-plans category: the case-insensitive
+  // net must cover every subdir matcher, not just specs/. Reverting only
+  // ceo-plans' matcher to case-sensitive (while leaving specs/test-plan alone)
+  // must turn this test red.
+  test("an uppercase .MD extension is matched in ceo-plans, not silently skipped", () => {
+    const dir = projectDir();
+    fileAt(join(dir, "ceo-plans", "UPPER.MD"), T0);
+    const sources = discoverSpecSources(dir);
+    expect(sources).toHaveLength(1);
+    expect(sources[0].kind).toBe("ceo-plans");
+    expect(sources[0].path).toBe(join(dir, "ceo-plans", "UPPER.MD"));
+  });
+
+  // Same reviewer finding, but for the checkpoints category. A specs/ entry
+  // rides along so the assertion isolates the case-insensitive checkpoints
+  // match from the separate no-primary-candidate check above (checkpoints
+  // alone is not a primary kind -- see that describe block) -- same pairing
+  // the mixed-case test-plan test above uses for the same reason.
+  test("an uppercase .MD extension is matched in checkpoints, not silently skipped", () => {
+    const dir = projectDir();
+    fileAt(join(dir, "specs", "a.md"), T0);
+    fileAt(join(dir, "checkpoints", "UPPER.MD"), T0);
+    const sources = discoverSpecSources(dir);
+    const checkpoint = sources.find((s) => s.kind === "checkpoints");
+    expect(checkpoint?.path).toBe(join(dir, "checkpoints", "UPPER.MD"));
+  });
+
   test("a mixed-case -Test-Plan- infix is matched", () => {
     const dir = projectDir();
     // A specs/ entry too, so this test isolates the case-insensitive infix

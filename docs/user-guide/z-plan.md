@@ -32,6 +32,13 @@ planning documents exist in any searched directory, it fails loud, naming
 every directory it searched, instead of the old "No spec file found" dead end
 (no board writes on this path).
 
+There is a second, distinct failure mode: documents were found, but none of
+them live under `specs/` or `ceo-plans/` -- only `checkpoints/` and/or loose
+test-plan files exist. `/z-plan` never auto-plans from checkpoints or test
+plans alone; they are grounding context, not a substitute primary spec. In
+that case it stops with a separate error naming exactly what it found (kind
+and path for each) and asks you to pass an explicit spec path instead.
+
 Separately, whenever you want every ticket already sitting in Backlog —
 human brain-dumps, or the surfaced use cases the loop's completion flow files
 there — gated and fielded without a spec, run:
