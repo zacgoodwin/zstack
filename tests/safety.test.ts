@@ -1,0 +1,476 @@
+// Gate tests for C7 (issue #2): the six safety controls of the in-session
+// /z-loop, remapped from super-board's headless runner. Every test is
+// deterministic -- injected clocks, fixture executors, temp dirs -- with zero
+// network and zero writes to a real ~/.zstack. Control -> test:
+//
+//   1. Second /z-loop refuses, naming the live session          -> "loop lock"
+//   2. Crash -> restart detects orphans, reconcile parks + prunes -> "orphan scan"
+//   3. Claim race: one proceeds, the loser never writes a lock   -> "claim race"
+//   4. Lane cap: 5 queued, on-disk locks never exceed 3          -> "lane cap"
+//   5. Quota exhaustion mid-loop: sweep pauses then resumes      -> "quota guard"
+//   6. Human moves a ticket mid-loop: the lane stops cleanly     -> "wave reconcile"
+import { test, expect, describe, afterEach } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  acquireLoopLock,
+  inspectLoopLock,
+  listLaneLocks,
+  loopLockLiveness,
+  processAlive,
+  readLoopLock,
+  removeLaneLock,
+  writeLaneLock,
+  type LoopLock,
+} from "../lib/locks.ts";
+import {
+  applyReconcile,
+  hasOrphans,
+  reconcileBoardMoves,
+  reconcilePlan,
+  scanOrphans,
+  type ReconcileAction,
+  type ReconcileEffects,
+} from "../lib/reconcile.ts";
+import {
+  applyAction,
+  ingestBoardItems,
+  nextAction,
+  recordOutcome,
+  type LaneState,
+  type LoopState,
+  type Stage,
+  type TicketSnapshot,
+} from "../lib/loop.ts";
+import { Board, type GraphQLData, type GraphQLExecutor } from "../lib/board.ts";
+import type { BoardConfig } from "../lib/config.ts";
+
+const REPO_ROOT = join(import.meta.dir, "..");
+
+// -- temp dirs (no real ~/.zstack ever touched) -------------------------------
+const dirs: string[] = [];
+function tmp(prefix = "zstack-safety-"): string {
+  const d = mkdtempSync(join(tmpdir(), prefix));
+  dirs.push(d);
+  return d;
+}
+afterEach(() => {
+  while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+});
+
+// -- fixture builders (mirror tests/loop.test.ts) -----------------------------
+function ticket(number: number, status: TicketSnapshot["status"], dependsOn: number[] = []): TicketSnapshot {
+  return { number, title: `Ticket ${number}`, status, dependsOn, model: "sonnet" };
+}
+function lane(ticketNumber: number, stage: Stage, over: Partial<LaneState> = {}): LaneState {
+  return { ticket: ticketNumber, stage, lastActivityMs: 0, qaBounces: 0, ...over };
+}
+function state(tickets: TicketSnapshot[], lanes: LaneState[] = [], maxLanes = 3): LoopState {
+  return { tickets, lanes, maxLanes, watchdogMinutes: 10, mergedThisRun: [] };
+}
+const OPTS = (s: LoopState, nowMs = 0) => ({ nowMs, maxLanes: s.maxLanes, watchdogMinutes: s.watchdogMinutes, mergedThisRun: s.mergedThisRun });
+const HAPPY: Record<Stage, string> = {
+  builder: "BUILT: ok",
+  qa: "QA-PASS: ok",
+  reviewer: "REVIEW-APPROVE: ok",
+  merge: "MERGED: https://pr/1",
+};
+
+// ============================================================================
+// Control 1 -- second /z-loop refuses, naming the live session
+// ============================================================================
+describe("control 1: loop lock (second-invocation refusal)", () => {
+  const STALE = 60 * 60_000; // 60 min staleness (config default)
+
+  test("a live lock refuses a second acquire, naming the holder", () => {
+    const d = tmp();
+    const first = acquireLoopLock(d, { session: "sess-A", startedAt: 1000 }, { nowMs: 1000, stalenessMs: STALE });
+    expect(first.acquired).toBe(true);
+
+    const second = acquireLoopLock(d, { session: "sess-B", startedAt: 2000 }, { nowMs: 2000, stalenessMs: STALE });
+    expect(second.acquired).toBe(false);
+    expect(second.reason).toBe("live");
+    expect(second.held!.session).toBe("sess-A"); // the message names the live session
+    // The holder's lock is untouched (B never overwrote it).
+    expect(readLoopLock(d)!.session).toBe("sess-A");
+  });
+
+  test("pid decides liveness: a dead pid reads stale, a live pid reads live", () => {
+    const withPid = (pid: number): LoopLock => ({ session: "s", startedAt: 0, pid });
+    expect(loopLockLiveness(withPid(4242), 0, STALE, () => false)).toBe("stale");
+    expect(loopLockLiveness(withPid(4242), 0, STALE, () => true)).toBe("live");
+    // Real check against this very process (definitely alive) and pid 1 semantics.
+    expect(processAlive(process.pid)).toBe(true);
+    expect(processAlive(-1)).toBe(false);
+  });
+
+  test("no pid: age vs the staleness threshold is the heuristic", () => {
+    const noPid: LoopLock = { session: "s", startedAt: 0 };
+    expect(loopLockLiveness(noPid, STALE, STALE)).toBe("live"); // exactly at the budget
+    expect(loopLockLiveness(noPid, STALE + 1, STALE)).toBe("stale"); // one ms past
+  });
+
+  test("a stale lock refuses without --reconcile, and is cleared with it", () => {
+    const d = tmp();
+    acquireLoopLock(d, { session: "crashed", startedAt: 0 }, { nowMs: 0, stalenessMs: STALE });
+    const now = STALE + 10 * 60_000; // 70 min later: the crashed lock is stale
+
+    const refuse = acquireLoopLock(d, { session: "fresh", startedAt: now }, { nowMs: now, stalenessMs: STALE });
+    expect(refuse.acquired).toBe(false);
+    expect(refuse.reason).toBe("stale");
+
+    const recon = acquireLoopLock(d, { session: "fresh", startedAt: now }, { nowMs: now, stalenessMs: STALE, reconcile: true });
+    expect(recon.acquired).toBe(true);
+    expect(readLoopLock(d)!.session).toBe("fresh");
+  });
+
+  test("a LIVE lock never clears, even with --reconcile (never nuke a running loop)", () => {
+    const d = tmp();
+    acquireLoopLock(d, { session: "running", startedAt: 1000 }, { nowMs: 1000, stalenessMs: STALE });
+    const res = acquireLoopLock(d, { session: "intruder", startedAt: 1500 }, { nowMs: 1500, stalenessMs: STALE, reconcile: true });
+    expect(res.acquired).toBe(false);
+    expect(res.reason).toBe("live");
+    expect(readLoopLock(d)!.session).toBe("running");
+  });
+
+  test("inspect reports free / live / stale", () => {
+    const d = tmp();
+    expect(inspectLoopLock(d, 0, STALE).state).toBe("free");
+    acquireLoopLock(d, { session: "s", startedAt: 0 }, { nowMs: 0, stalenessMs: STALE });
+    expect(inspectLoopLock(d, 1000, STALE).state).toBe("live");
+    expect(inspectLoopLock(d, STALE + 1, STALE).state).toBe("stale");
+  });
+});
+
+// ============================================================================
+// Control 2 -- crash simulation: restart detects orphans; reconcile parks + prunes
+// ============================================================================
+describe("control 2: orphan scan (crash recovery)", () => {
+  function byKind(plan: ReconcileAction[], kind: ReconcileAction["kind"]): number[] {
+    return plan.filter((a) => a.kind === kind).map((a) => (a as any).ticket).sort((x, y) => x - y);
+  }
+
+  test("scan finds all three orphan categories; plan parks to Ready and prunes", () => {
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    // #5: crashed lane -- lock + worktree, board still Building.
+    writeLaneLock(locksDir, { ticket: 5, stage: "builder", session: "dead", claimedAt: 0 });
+    mkdirSync(join(worktreesDir, "ticket-5"));
+    // #7: worktree with no lock, board still shows it in-flight (QA).
+    mkdirSync(join(worktreesDir, "ticket-7"));
+    // (a plain file that isn't a ticket dir must be ignored.)
+    // #9: Building on the board with neither lock nor worktree.
+    const board = [ticket(5, "Building"), ticket(7, "QA"), ticket(9, "Building")].map((t) => ({ number: t.number, status: t.status }));
+
+    const orphans = scanOrphans(locksDir, worktreesDir, board, 30 * 60_000);
+    expect(hasOrphans(orphans)).toBe(true);
+    expect(orphans.crashedLanes.map((c) => c.ticket)).toEqual([5]);
+    expect(orphans.crashedLanes[0].worktreePath).toContain("ticket-5");
+    expect(orphans.orphanWorktrees.map((w) => w.ticket)).toEqual([7]);
+    expect(orphans.buildingWithoutState).toEqual([9]);
+
+    const plan = reconcilePlan(orphans);
+    expect(byKind(plan, "park-ready")).toEqual([5, 7, 9]); // all three return to Ready
+    expect(byKind(plan, "prune-worktree")).toEqual([5, 7]); // both worktrees pruned
+    expect(byKind(plan, "remove-lock")).toEqual([5]); // only the crashed lane had a lock
+    expect(byKind(plan, "release-claim")).toEqual([5, 7, 9]); // every parked ticket is released
+  });
+
+  test("a lockless worktree whose ticket is NOT in-flight is only pruned, not parked", () => {
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    mkdirSync(join(worktreesDir, "ticket-3"));
+    const orphans = scanOrphans(locksDir, worktreesDir, [{ number: 3, status: "Done" }], 0);
+    const plan = reconcilePlan(orphans);
+    expect(plan).toEqual([{ kind: "prune-worktree", ticket: 3, path: join(worktreesDir, "ticket-3") }]);
+  });
+
+  test("no orphans -> empty plan, hasOrphans false", () => {
+    const orphans = scanOrphans(tmp(), tmp(), [ticket(1, "Ready")].map((t) => ({ number: t.number, status: t.status })), 0);
+    expect(hasOrphans(orphans)).toBe(false);
+    expect(reconcilePlan(orphans)).toEqual([]);
+  });
+
+  test("apply half executes each action: the lock file is actually removed", async () => {
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    writeLaneLock(locksDir, { ticket: 5, stage: "builder", session: "dead", claimedAt: 0 });
+    mkdirSync(join(worktreesDir, "ticket-5"));
+    const lockPath = join(locksDir, "ticket-5.json");
+    expect(existsSync(lockPath)).toBe(true);
+
+    const orphans = scanOrphans(locksDir, worktreesDir, [{ number: 5, status: "Building" }], 0);
+    const plan = reconcilePlan(orphans);
+
+    const parked: number[] = [];
+    const released: number[] = [];
+    const pruned: string[] = [];
+    const fx: ReconcileEffects = {
+      removeLock: (p) => rmSync(p, { force: true }), // real fs, prove the file goes away
+      pruneWorktree: (_t, p) => void pruned.push(p), // faked: no git in a temp dir
+      parkReady: (n) => void parked.push(n),
+      releaseClaim: (n) => void released.push(n),
+    };
+    await applyReconcile(plan, fx);
+
+    expect(existsSync(lockPath)).toBe(false); // remove-lock ran for real
+    expect(parked).toEqual([5]);
+    expect(released).toEqual([5]);
+    expect(pruned[0]).toContain("ticket-5");
+  });
+});
+
+// ============================================================================
+// Control 3 -- claim race: exactly one proceeds; the loser never writes a lock
+// ============================================================================
+// A stateful in-memory board backend (mirrors tests/board.test.ts): assignee
+// mutations are additive and returned in assignment order, so the C2 contract's
+// first-assignee-wins tiebreaker is what decides the race.
+function opName(query: string): string {
+  return query.match(/(?:query|mutation)\s+(\w+)/)![1];
+}
+function claimBackend(initial: string[] = []): GraphQLExecutor {
+  const assignees = [...initial];
+  const login = (userId: string) => userId.replace(/^U_/, "");
+  return async (query, vars: any) => {
+    switch (opName(query)) {
+      case "RateLimit":
+        return { rateLimit: { remaining: 5000, resetAt: "2026-07-19T00:00:00Z" } };
+      case "IssueLookup":
+        return { repository: { issue: { id: "I_9", number: 9, title: "t", body: "", assignees: { nodes: assignees.map((l) => ({ login: l })) }, projectItems: { nodes: [{ id: "PVTI_9", project: { number: 1 } }] } } } };
+      case "UserId":
+        return { user: { id: `U_${vars.login}` } };
+      case "AddAssignees": {
+        const l = login(vars.user);
+        if (!assignees.includes(l)) assignees.push(l);
+        return { addAssigneesToAssignable: { clientMutationId: null } };
+      }
+      case "RemoveAssignees": {
+        const i = assignees.indexOf(login(vars.user));
+        if (i >= 0) assignees.splice(i, 1);
+        return { removeAssigneesFromAssignable: { clientMutationId: null } };
+      }
+      case "IssueAssignees":
+        return { repository: { issue: { assignees: { nodes: assignees.map((l) => ({ login: l })) } } } };
+      default:
+        throw new Error(`claimBackend: unexpected op ${opName(query)}`);
+    }
+  };
+}
+const CFG: BoardConfig = {
+  slug: "zstack",
+  owner: "zacgoodwin",
+  repo: "zstack",
+  projectNumber: 1,
+  projectId: "PVT_1",
+  repositoryId: "R_1",
+  statusField: {
+    id: "F_status",
+    dataType: "SINGLE_SELECT",
+    options: { Backlog: "o0", Ready: "o1", Questions: "o2", Building: "o3", QA: "o4", Review: "o5", Blocked: "o6", Skipped: "o7", Done: "o8" },
+  },
+  fields: { Model: { id: "F_m", dataType: "SINGLE_SELECT", options: { opus: "o_op" } } },
+  quota: { threshold: 200, mode: "sleep" },
+};
+
+describe("control 3: claim race (lock only after a won claim)", () => {
+  // Mirrors the SKILL's claim row: z-board claim first, lane lock ONLY on success.
+  async function claimThenLock(exec: GraphQLExecutor, locksDir: string, n: number, me: string, session: string, stage: Stage) {
+    const board = new Board(CFG, exec);
+    await board.claim(n, me); // throws for the loser -> the next line never runs
+    writeLaneLock(locksDir, { ticket: n, stage, session, claimedAt: 0 });
+  }
+
+  test("two claimers, one proceeds; the loser leaves no lock behind", async () => {
+    const locksDir = tmp();
+    const exec = claimBackend(); // shared backend = the same GitHub issue
+    const claimers = [
+      { me: "alice", session: "sess-alice" },
+      { me: "bob", session: "sess-bob" },
+    ];
+    const results = await Promise.allSettled(
+      claimers.map((c) => claimThenLock(exec, locksDir, 9, c.me, c.session, "builder"))
+    );
+    const winners = results.map((r, i) => ({ r, c: claimers[i] })).filter((x) => x.r.status === "fulfilled");
+    expect(winners.length).toBe(1); // exactly one claim proceeded
+
+    const locks = listLaneLocks(locksDir);
+    expect(locks.length).toBe(1); // the loser wrote nothing
+    expect(locks[0].lock.session).toBe(winners[0].c.session); // the lock belongs to the winner
+  });
+
+  test("a claim lost to a prior assignee writes no lock", async () => {
+    const locksDir = tmp();
+    const exec = claimBackend(["someone-else"]); // already claimed
+    await expect(claimThenLock(exec, locksDir, 9, "alice", "sess-alice", "builder")).rejects.toThrow(/already claimed/);
+    expect(listLaneLocks(locksDir)).toEqual([]);
+  });
+});
+
+// ============================================================================
+// Control 4 -- lane cap: 5 queued, on-disk locks never exceed 3
+// ============================================================================
+describe("control 4: lane cap enforced at the locks layer", () => {
+  // Drives the reducer to drain, mirroring every lane on disk exactly as the
+  // SKILL does (write on claim/advance, remove at lane end). The peak count of
+  // lock FILES is the physical proof the cap held.
+  function driveWithLocks(s: LoopState, locksDir: string): { peakLocks: number; end: LoopState } {
+    let peakLocks = 0;
+    for (let i = 0; i < 500; i++) {
+      const a = nextAction(s.tickets, s.lanes, OPTS(s));
+      if (a.kind === "drain-complete") return { peakLocks, end: s };
+      if (a.kind === "wait") {
+        const idle = s.lanes.find((l) => !l.outcome);
+        if (!idle) throw new Error("wait with no lane to progress");
+        s = recordOutcome(s, idle.ticket, HAPPY[idle.stage], 0);
+        continue;
+      }
+      if (a.kind === "claim") writeLaneLock(locksDir, { ticket: a.ticket, stage: a.stage, session: "s", claimedAt: 0 });
+      else if (a.kind === "advance") writeLaneLock(locksDir, { ticket: a.ticket, stage: a.to, session: "s", claimedAt: 0 });
+      else if (a.kind === "park" || a.kind === "skip" || a.kind === "complete" || a.kind === "stop-lane") removeLaneLock(locksDir, a.ticket);
+      s = applyAction(s, a, 0);
+      peakLocks = Math.max(peakLocks, listLaneLocks(locksDir).length);
+    }
+    throw new Error("no drain within 500 steps");
+  }
+
+  test("5 queued tickets: at most 3 lane locks on disk at once, none left at the end", () => {
+    const locksDir = tmp();
+    const s = state([1, 2, 3, 4, 5].map((n) => ticket(n, "Building")));
+    const { peakLocks, end } = driveWithLocks(s, locksDir);
+    expect(peakLocks).toBe(3); // never more than maxLanes locks coexist
+    expect(end.tickets.every((t) => t.status === "Done")).toBe(true);
+    expect(listLaneLocks(locksDir)).toEqual([]); // every lock removed at lane end
+  });
+
+  test("a smaller maxLanes caps the on-disk locks too", () => {
+    const locksDir = tmp();
+    const { peakLocks } = driveWithLocks(state([1, 2, 3, 4].map((n) => ticket(n, "Building")), [], 1), locksDir);
+    expect(peakLocks).toBe(1);
+  });
+});
+
+// ============================================================================
+// Control 5 -- quota exhaustion mid-loop: the board sweep pauses, then resumes
+// ============================================================================
+describe("control 5: quota guard (pause/resume, no bypass)", () => {
+  const at = (iso: string) => Date.parse(iso);
+  const LOW: GraphQLData = { rateLimit: { remaining: 150, resetAt: "2026-07-18T23:30:00Z" } };
+  const HEALTHY: GraphQLData = { rateLimit: { remaining: 5000, resetAt: "2026-07-19T00:00:00Z" } };
+
+  // Executor for a loop board sweep: RateLimit responses come from a queue (low
+  // first, then healthy = the window reset); list ops return empty item sets.
+  function sweepExecutor(rateLimits: GraphQLData[], calls: string[]): GraphQLExecutor {
+    let i = 0;
+    return async (query) => {
+      const op = opName(query);
+      calls.push(op);
+      if (op === "RateLimit") return rateLimits[Math.min(i++, rateLimits.length - 1)];
+      if (op === "ProjectItems") return { node: { items: { nodes: [] } } };
+      throw new Error(`unexpected op ${op}`);
+    };
+  }
+
+  test("remaining < threshold mid-sweep sleeps until reset, then resumes", async () => {
+    const slept: number[] = [];
+    const calls: string[] = [];
+    const board = new Board(
+      CFG,
+      sweepExecutor([LOW, HEALTHY], calls),
+      async (ms) => void slept.push(ms),
+      () => at("2026-07-18T23:00:00Z")
+    );
+    // The loop's board sweep: list several statuses in a row.
+    await board.list("Building"); // probe LOW -> pause
+    await board.list("QA"); // probe HEALTHY -> resume, no pause
+    await board.list("Review");
+    expect(slept).toEqual([at("2026-07-18T23:30:00Z") - at("2026-07-18T23:00:00Z")]); // paused exactly once, 30 min
+  });
+
+  test("no code path reaches the executor without the guard (runtime proof)", async () => {
+    const calls: string[] = [];
+    const board = new Board(CFG, sweepExecutor([HEALTHY], calls), async () => {});
+    await board.list("Building");
+    await board.move(0, "Ready").catch(() => {}); // move probes too; item lookup may 404, fine
+    // Every real backend op is immediately preceded by a RateLimit probe.
+    for (let i = 0; i < calls.length; i++) {
+      if (calls[i] !== "RateLimit") expect(calls[i - 1]).toBe("RateLimit");
+    }
+    expect(calls.filter((c) => c === "ProjectItems").length).toBeGreaterThan(0);
+  });
+
+  test("no code path reaches the executor without the guard (structural proof)", () => {
+    const src = readFileSync(join(REPO_ROOT, "lib", "board.ts"), "utf8");
+    // Every this.exec() call is either the single dynamic-query funnel (gql) or
+    // the zero-cost rate-limit probe. There is exactly ONE dynamic exec, so no
+    // subcommand can pass an arbitrary query to the backend except through gql.
+    const execArgs = [...src.matchAll(/this\.exec\((\w+)/g)].map((m) => m[1]);
+    expect(execArgs.filter((a) => a !== "Q_RATE_LIMIT")).toEqual(["query"]);
+    // ...and that single funnel is guarded: enforceQuota runs immediately before it.
+    expect(src).toMatch(/enforceQuota\(\);\s*return this\.exec\(query, variables\);/);
+    // Real operations go through gql (the guarded funnel), many of them.
+    expect([...src.matchAll(/this\.gql\(/g)].length).toBeGreaterThan(5);
+  });
+});
+
+// ============================================================================
+// Control 6 -- human moves a ticket mid-loop: the lane stops cleanly at a boundary
+// ============================================================================
+describe("control 6: wave reconciliation (mid-loop human moves)", () => {
+  test("reconcileBoardMoves flags a lane whose ticket was parked by a human", () => {
+    const tickets = [ticket(5, "Blocked"), ticket(6, "Building"), ticket(7, "Questions")];
+    const lanes = [lane(5, "builder"), lane(6, "builder")];
+    // #5 was moved to Blocked and #6 is still Building -> only #5 stops. #7 has
+    // no lane, so it is not in the set.
+    expect([...reconcileBoardMoves(tickets, lanes)].sort()).toEqual([5]);
+  });
+
+  test("a mid-stage lane is NOT stopped until its boundary; then stop-lane fires", () => {
+    // #5's ticket is Blocked but its builder is still running (no outcome yet):
+    // the reducer must not kill it -- it schedules the other lane's work instead.
+    let s = state([ticket(5, "Blocked"), ticket(6, "Building")], [lane(5, "builder"), lane(6, "builder")]);
+    const a1 = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(a1.kind).not.toBe("stop-lane"); // no boundary reached for #5 yet
+
+    // #5's stage finishes (outcome recorded) -> now it is at a boundary.
+    s = recordOutcome(s, 5, HAPPY.builder, 0);
+    const a2 = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(a2).toMatchObject({ kind: "stop-lane", ticket: 5 });
+  });
+
+  test("stop-lane drops the lane, honors the human's status, and other lanes finish", () => {
+    // Two live lanes; a human drags #5 to Blocked mid-run. Re-ingest (the board
+    // re-read the SKILL does before each transition) picks up the move.
+    let s = state([ticket(5, "Building"), ticket(6, "Building")], [lane(5, "builder"), lane(6, "builder")]);
+    s = recordOutcome(s, 5, HAPPY.builder, 0); // #5's builder finished (a boundary)
+    s = ingestBoardItems(
+      s,
+      [
+        { number: 5, title: "t5", fields: { Status: "Blocked" } }, // human move
+        { number: 6, title: "t6", fields: { Status: "Building" } },
+      ],
+      { "5": "", "6": "" }
+    );
+    expect(s.lanes.find((l) => l.ticket === 5)!.outcome).toBeDefined(); // ingest preserved the lane
+
+    const stop = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(stop).toMatchObject({ kind: "stop-lane", ticket: 5 });
+    s = applyAction(s, stop, 0);
+    expect(s.lanes.some((l) => l.ticket === 5)).toBe(false); // lane dropped
+    expect(s.tickets.find((t) => t.number === 5)!.status).toBe("Blocked"); // human's status honored, not overwritten
+
+    // #6 is untouched and drains to Done normally.
+    for (let i = 0; i < 50 && s.lanes.length; i++) {
+      const a = nextAction(s.tickets, s.lanes, OPTS(s));
+      if (a.kind === "drain-complete") break;
+      if (a.kind === "wait") {
+        const idle = s.lanes.find((l) => !l.outcome)!;
+        s = recordOutcome(s, idle.ticket, HAPPY[idle.stage], 0);
+        continue;
+      }
+      s = applyAction(s, a, 0);
+    }
+    expect(s.tickets.find((t) => t.number === 6)!.status).toBe("Done");
+  });
+});

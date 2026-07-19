@@ -392,6 +392,24 @@ describe("claim", () => {
   });
 });
 
+// -- release (C7, issue #2): reconcile a stale claim -------------------------
+describe("release", () => {
+  test("removes every assignee so a future loop can re-claim", async () => {
+    const backend = claimBackend(["alice"]);
+    const board = new Board(CFG, backend.exec);
+    const removed = await board.release(9);
+    expect(removed).toEqual(["alice"]);
+    expect(backend.assignees).toEqual([]);
+  });
+
+  test("is a no-op on an unassigned issue", async () => {
+    const backend = claimBackend();
+    const board = new Board(CFG, backend.exec);
+    expect(await board.release(9)).toEqual([]);
+    expect(backend.assignees).toEqual([]);
+  });
+});
+
 // -- AC3: grep contract-enforcement gate for the whole pack ------------------
 describe("contract enforcement", () => {
   function trackedFiles(): string[] {
@@ -454,6 +472,7 @@ describe("config loader", () => {
     const loaded = loadConfig("zstack", home);
     expect(loaded.projectId).toBe("PVT_1");
     expect(loaded.quota).toEqual({ threshold: 200, mode: "sleep" });
+    expect(loaded.lockStalenessMinutes).toBe(60); // C7 default applied (issue #2)
   });
 
   test("malformed config (missing keys) names what is missing", () => {

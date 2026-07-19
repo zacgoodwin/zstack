@@ -22,6 +22,7 @@ import {
   parseDependsOn,
   watchdogExpired,
 } from "./lanes.ts";
+import { reconcileBoardMoves } from "./reconcile.ts";
 
 export { ZError } from "./config.ts";
 
@@ -182,6 +183,7 @@ export type Action =
   | { kind: "advance"; ticket: number; to: Stage; note?: string; investigateFirst?: boolean; stackedOn?: number[] }
   | { kind: "park"; ticket: number; status: "Questions" | "Blocked"; note: string }
   | { kind: "skip"; ticket: number; note: string }
+  | { kind: "stop-lane"; ticket: number; note: string }
   | { kind: "check-worker"; ticket: number }
   | { kind: "complete"; ticket: number; note: string }
   | { kind: "wait" }
@@ -233,7 +235,10 @@ export interface LoopOpts {
 }
 
 // The scheduler. Deterministic priority order:
-//   1. resolve a finished stage (any lane with a non-merge-gated outcome);
+//   1. wave reconciliation + finished stages: a human move that parked a lane's
+//      ticket out from under it stops that lane cleanly at its boundary;
+//      otherwise resolve a finished stage (any lane with a non-merge-gated
+//      outcome);
 //   2. merge gate: of the lanes approved for merge, advance exactly one, in
 //      topological merge order, only when no other lane is mid-merge;
 //   3. watchdog: a silent lane is probed (check-worker) or, once known dead,
@@ -248,9 +253,24 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
   const wd = opts.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES;
   const byNumber = new Map(tickets.map((t) => [t.number, t]));
 
-  // 1. Finished stages, lane order; merge approvals wait for the gate.
+  // 1. Wave reconciliation + finished stages, in lane order. A human who moved a
+  //    lane's ticket to a stop status mid-run (the board is re-read before each
+  //    transition) stops that lane cleanly at its next boundary: only a lane that
+  //    has reached a boundary (an outcome recorded, including a gated merge
+  //    approval) is stopped, so a mid-stage worker is never killed -- it finishes,
+  //    records its outcome, and is caught here on the following tick. Merge
+  //    approvals still wait for the gate below.
+  const parkedByHuman = reconcileBoardMoves(tickets, lanes);
   for (const lane of lanes) {
-    if (!lane.outcome || lane.outcome.kind === "review-approve") continue;
+    if (!lane.outcome) continue;
+    if (parkedByHuman.has(lane.ticket)) {
+      return {
+        kind: "stop-lane",
+        ticket: lane.ticket,
+        note: `A human moved #${lane.ticket} to ${byNumber.get(lane.ticket)!.status} during the run; stopping its lane cleanly at the ${lane.stage} boundary (other lanes continue).`,
+      };
+    }
+    if (lane.outcome.kind === "review-approve") continue;
     const action = resolveOutcome(lane);
     if (action) return action;
   }
@@ -371,6 +391,12 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
     case "skip": {
       dropLane(next, action.ticket);
       setStatus(findTicket(next, action.ticket), "Skipped");
+      return next;
+    }
+    case "stop-lane": {
+      // A human already set the board status; honor it, just drop our lane. No
+      // setStatus (the ticket is not ours to move anymore).
+      dropLane(next, action.ticket);
       return next;
     }
     case "complete": {

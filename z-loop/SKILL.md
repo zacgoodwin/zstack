@@ -46,9 +46,11 @@ Z_ESTIMATE="$PACK/bin/z-estimate"; Z_LINT="$PACK/bin/z-ticket-lint"
 SLUG=$(gh repo view --json name -q .name)
 BASE=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
 ME=$(gh api user -q .login)
+SESSION="$ME-$(date +%s)"   # names this loop in the lock (second-invocation refusal)
 STATE_DIR="$HOME/.zstack/projects/$SLUG/loop"
 STATE="$STATE_DIR/state.json"; TMP="$STATE_DIR/tmp"
-mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports"
+LOCKS="$HOME/.zstack/projects/$SLUG/locks"
+mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports" "$LOCKS"
 ```
 
 ---
@@ -65,6 +67,32 @@ mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports"
 read -r MAX_LANES WATCHDOG <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
   const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes)")"
 ```
+
+5. **Startup orphan scan (C7).** A crashed prior loop leaves lane locks in
+   `$LOCKS` and worktrees in `.worktrees/`; a still-running loop holds
+   `loop.lock`. Refuse to start on either unless the human passed `--reconcile`
+   (see the `--reconcile` section below for the full contract):
+
+```bash
+# a) Second-invocation guard: refuse if another loop is live, naming its session.
+#    A crashed loop leaves a STALE lock; --reconcile clears it (a LIVE lock never
+#    clears -- you cannot reconcile over a running loop).
+bun "$PACK/lib/locks.ts" acquire --slug "$SLUG" --session "$SESSION" ${RECONCILE:+--reconcile} \
+  || exit 1   # the CLI already printed which session holds it and what to do
+
+# b) Orphan scan: refuse if orphans exist and --reconcile was not passed.
+HAS_ORPHANS=$(bun "$PACK/lib/reconcile.ts" scan --slug "$SLUG" | jq -r .hasOrphans)
+if [ "$HAS_ORPHANS" = "true" ] && [ -z "$RECONCILE" ]; then
+  echo "Orphans present (crashed lanes / stray worktrees / Building tickets with no state)."
+  echo "Re-run /z-loop with --reconcile to release claims, park them to Ready, and prune."
+  bun "$PACK/lib/locks.ts" release --slug "$SLUG"   # don't hold the lock while refusing
+  exit 1
+fi
+[ -n "$RECONCILE" ] && bun "$PACK/lib/reconcile.ts" apply --slug "$SLUG"
+```
+
+Set `RECONCILE=1` when the human invoked `/z-loop --reconcile`; leave it empty
+otherwise.
 
 ---
 
@@ -134,13 +162,14 @@ Perform exactly that action, then record it. Action → side effects:
 
 | Action | What you do |
 |---|---|
-| `claim N` | 1. `"$Z_BOARD" claim <N> "$ME"` **before anything else**. Claim lost → `bun "$PACK/lib/loop.ts" claim-lost "$STATE" <N>` and re-run `next` (next ticket). 2. Worktree (skip if it exists — a resume claim at stage qa/reviewer reuses it): `TSLUG=$(bun -e "import {slugifyTitle} from '$PACK/lib/ticket-schema.ts'; console.log(slugifyTitle(process.argv[1]))" "<title>")` then `git worktree add ".worktrees/ticket-<N>" -b "z/ticket-<N>-$TSLUG" "$BASE"`. 3. Apply: write the action JSON to a file, `bun "$PACK/lib/loop.ts" apply "$STATE" action.json`. 4. Spawn the action's stage (table below). |
-| `advance N to S` | Apply, then spawn stage S fresh. Before applying, read the lane's CURRENT stage from the state file: an advance to `builder` from `qa` passes the action's `note` as `qaNotes` (+ `investigateFirst`); from `reviewer`, as `reviewNotes`. |
-| `park N Questions` | Comment the note as `## Needs input --` + the question, `"$Z_BOARD" move <N> Questions`, apply. Tell the human in the comment which status to return the ticket to. Keep the worktree. |
-| `park N Blocked` | Comment the note (what was wrong + recommended next steps), `move <N> Blocked`, apply. |
-| `skip N` | Comment the note (the confusion or the dead-worker evidence), `move <N> Skipped`, apply. (PROCESS.md global rule.) |
+| `claim N` | 1. `"$Z_BOARD" claim <N> "$ME"` **before anything else**. Claim lost → `bun "$PACK/lib/loop.ts" claim-lost "$STATE" <N>` and re-run `next` (next ticket). 2. **Write the lane lock ONLY after the claim succeeds** (C7 — a claim loser never leaves a lock): `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <stage> --session "$SESSION"`. 3. Worktree (skip if it exists — a resume claim at stage qa/reviewer reuses it): `TSLUG=$(bun -e "import {slugifyTitle} from '$PACK/lib/ticket-schema.ts'; console.log(slugifyTitle(process.argv[1]))" "<title>")` then `git worktree add ".worktrees/ticket-<N>" -b "z/ticket-<N>-$TSLUG" "$BASE"`. 4. Apply: write the action JSON to a file, `bun "$PACK/lib/loop.ts" apply "$STATE" action.json`. 5. Spawn the action's stage (table below). |
+| `advance N to S` | **Re-stamp the lane lock** to the new stage: `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <S> --session "$SESSION"`. Apply, then spawn stage S fresh. Before applying, read the lane's CURRENT stage from the state file: an advance to `builder` from `qa` passes the action's `note` as `qaNotes` (+ `investigateFirst`); from `reviewer`, as `reviewNotes`. |
+| `park N Questions` | Comment the note as `## Needs input --` + the question, `"$Z_BOARD" move <N> Questions`, apply, then **remove the lane lock** (`bun "$PACK/lib/locks.ts" lane-remove --slug "$SLUG" <N>`). Tell the human in the comment which status to return the ticket to. Keep the worktree. |
+| `park N Blocked` | Comment the note (what was wrong + recommended next steps), `move <N> Blocked`, apply, remove the lane lock. |
+| `skip N` | Comment the note (the confusion or the dead-worker evidence), `move <N> Skipped`, apply, remove the lane lock. (PROCESS.md global rule.) |
+| `stop-lane N` | A human moved #N to a stop status (Blocked/Questions/Skipped/Done) mid-run; the board already reflects it — do NOT move or comment it. Tear down the lane's background agent, remove the lane lock (`lane-remove`), keep the worktree for inspection, and apply (drops the lane, leaves the human's status). Other lanes are unaffected. |
 | `check-worker N` | Is the lane's background agent still running (harness task list)? Alive → `bun "$PACK/lib/loop.ts" probe "$STATE" <N> alive`. Dead with no final message → `probe "$STATE" <N> dead` (the next `next` returns the skip). |
-| `complete N` | The completion flow — Step 6 — then apply. |
+| `complete N` | The completion flow — Step 6 — then apply, then **remove the lane lock**. |
 | `wait` | Block until a background stage agent finishes (the harness notifies you) or one minute passes, then re-run `next` — the watchdog only fires if `next` is called with a fresh clock. When an agent finishes: save its final message to a file and `bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`, then update Actual (below), then re-run `next`. |
 | `drain-complete` | Step 7. |
 
@@ -226,8 +255,55 @@ bun "$PACK/lib/stage-prompts.ts" note "$TMP/note-<N>.json" > "$TMP/note-<N>.md"
    Questions ticket with its question, each Blocked/Skipped ticket with its
    note, tickets left to other sessions (lost claims), total spend
    (`"$Z_COST" "$STATE_DIR/transcripts/*/*.jsonl"`), and the C8 handoff line.
-4. **Exit.** No daemon, no polling for new work. The next batch is the next
+4. **Release the loop lock** so the next invocation can start:
+   `bun "$PACK/lib/locks.ts" release --slug "$SLUG"`. (Do this even on an early
+   exit — wrap the run so a crash is the only way the lock survives, which is
+   exactly what the next run's orphan scan is for.)
+5. **Exit.** No daemon, no polling for new work. The next batch is the next
    /z-loop invocation.
+
+---
+
+## `--reconcile` and the safety locks (C7, issue #2)
+
+Two lock kinds live under `$LOCKS` (`~/.zstack/projects/<slug>/locks/`):
+
+- **Lane locks** `ticket-<N>.json` `{ticket, stage, session, claimedAt}` — one per
+  in-flight lane, written right after a successful claim, re-stamped on each
+  stage transition, removed at lane end. They survive a crash, which is how the
+  next run knows a lane was mid-flight.
+- **Loop lock** `loop.lock` `{session, startedAt, pid?}` — one per project. A
+  second `/z-loop` on the same project reads it and **refuses to start, naming
+  the live session**: `Refusing to start: a /z-loop is already running on this
+  project in session "<session>" ...`. A crashed loop's lock is judged *stale*
+  (dead pid, or older than the config `lockStalenessMinutes`) and reported as
+  such rather than live.
+
+**Startup, without `--reconcile`:** if `loop.lock` is live → refuse (name the
+session). If it is stale, or any orphans exist (lane locks with no running loop,
+worktrees with no lock, Building tickets with neither) → refuse and tell the
+human to re-run with `--reconcile`.
+
+**Startup, with `--reconcile`:** `bun "$PACK/lib/reconcile.ts" apply --slug "$SLUG"`
+first clears the wedge, then the loop starts normally. Reconcile:
+
+- **releases claims** — `z-board release <N>` unassigns the ticket so it can be
+  re-claimed;
+- **parks tickets back to Ready** — `z-board move <N> Ready`;
+- **prunes worktrees** — `git worktree remove --force` (a crashed builder's
+  uncommitted work is discarded; the ticket rebuilds fresh from Ready);
+- **removes stale lane locks** — and clears the stale `loop.lock`.
+
+Reconcile **never**: deletes a branch, deletes a board comment, or touches a
+ticket that has a live lane. It only undoes the parts of a crashed run that a
+human would otherwise have to unwind by hand.
+
+**Mid-loop human moves (wave reconciliation).** The board is re-read (ingest)
+before every stage transition, so a human who drags a Building/QA ticket to
+Blocked or Questions mid-run is respected: `loop.ts next` returns `stop-lane`
+for that ticket at its next stage boundary. The lane stops cleanly (agent torn
+down, lock removed, worktree kept, the human's status honored) and every other
+lane keeps running. This replaces super-board's 120-second tick.
 
 ---
 

@@ -352,6 +352,20 @@ export class Board {
     throw new ZError(`Issue #${n} was claimed concurrently by ${after[0] ?? "another agent"}.`);
   }
 
+  // Releases a claim: removes every current assignee so a future loop can
+  // re-claim the ticket. Used by /z-loop --reconcile (C7, issue #2) when a
+  // crashed lane left a ticket assigned to a dead session. A no-op when
+  // unassigned. Returns the logins it removed.
+  async release(n: number): Promise<string[]> {
+    const issue = await this.lookup(n);
+    const logins = issue.assignees.nodes.map((a) => a.login);
+    for (const login of logins) {
+      const user = await this.userId(login);
+      await this.gql(M_REMOVE_ASSIGNEES, { assignable: issue.id, user });
+    }
+    return logins;
+  }
+
   // -- helpers ---------------------------------------------------------------
   private assertStatus(status: string): void {
     const valid = Object.keys(this.cfg.statusField.options ?? {});
@@ -487,6 +501,7 @@ const USAGE = `z-board <command> [args]
   create --title T --body-file F --milestone M [--label L]
   link <N> <M>                      record N depends on M (both directions)
   claim <N> <assignee>             atomic assignee claim
+  release <N>                      remove every assignee (reconcile a stale claim)
   quota                            remaining GraphQL points
 
   --slug <name>                     which ~/.zstack/projects/<slug> to use`;
@@ -504,6 +519,7 @@ const COMMANDS = new Set([
   "create",
   "link",
   "claim",
+  "release",
   "quota",
 ]);
 
@@ -632,6 +648,12 @@ export async function main(argv: string[]): Promise<number> {
         if (!assignee) throw new ZError("Usage: z-board claim <N> <assignee>");
         await board.claim(n, assignee);
         console.log(`claimed #${n} for ${assignee}`);
+        return 0;
+      }
+      case "release": {
+        const n = requireInt(positionals[0], "issue");
+        const removed = await board.release(n);
+        console.log(removed.length ? `released #${n} from ${removed.join(", ")}` : `#${n} had no assignees`);
         return 0;
       }
       case "quota": {

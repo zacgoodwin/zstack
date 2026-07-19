@@ -84,7 +84,7 @@ export function validateConfig(cfg: unknown): BoardConfig {
   if (c.epicStyle !== undefined && c.epicStyle !== "milestones" && c.epicStyle !== "issue-type") {
     throw new ZError(`Config "epicStyle" must be "milestones" or "issue-type", got ${JSON.stringify(c.epicStyle)}.`);
   }
-  for (const k of ["maxLanes", "watchdogMinutes"]) {
+  for (const k of ["maxLanes", "watchdogMinutes", "lockStalenessMinutes"]) {
     if (c[k] !== undefined && (typeof c[k] !== "number" || !Number.isFinite(c[k]) || c[k] <= 0)) {
       throw new ZError(`Config "${k}" must be a positive number, got ${JSON.stringify(c[k])}.`);
     }

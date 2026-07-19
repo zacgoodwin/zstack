@@ -40,6 +40,11 @@ export interface BoardConfig {
   epicStyle?: EpicStyle; // set at /z-setup; defaults to "milestones"
   maxLanes?: number; // max concurrent workers (PROCESS.md: no more than 3)
   watchdogMinutes?: number; // stuck-worker timeout in minutes (PROCESS.md: 10)
+  // A project loop lock (lib/locks.ts) with no verifiable pid and older than this
+  // is judged stale rather than live, so a crashed loop's lock never wedges the
+  // next /z-loop (C7, issue #2). Sized well above a realistic batch so two near-
+  // simultaneous invocations still see each other's lock as live and refuse.
+  lockStalenessMinutes?: number;
   quota?: Partial<QuotaConfig>;
 }
 
@@ -47,6 +52,7 @@ export const DEFAULT_QUOTA: QuotaConfig = { threshold: 200, mode: "sleep" };
 export const DEFAULT_EPIC_STYLE: EpicStyle = "milestones";
 export const DEFAULT_MAX_LANES = 3;
 export const DEFAULT_WATCHDOG_MINUTES = 10;
+export const DEFAULT_LOCK_STALENESS_MINUTES = 60;
 
 // Every actionable failure in the pack is a ZError; main() prints .message to
 // stderr and exits non-zero. Anything else is a bug and bubbles up with a stack.
@@ -142,5 +148,6 @@ export function loadConfig(slug?: string, home = homedir()): BoardConfig {
   cfg.epicStyle = cfg.epicStyle ?? DEFAULT_EPIC_STYLE;
   cfg.maxLanes = cfg.maxLanes ?? DEFAULT_MAX_LANES;
   cfg.watchdogMinutes = cfg.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES;
+  cfg.lockStalenessMinutes = cfg.lockStalenessMinutes ?? DEFAULT_LOCK_STALENESS_MINUTES;
   return cfg;
 }
