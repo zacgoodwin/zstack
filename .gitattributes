@@ -1,2 +1,13 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# The `setup` script is bash, checked in without a .sh suffix. Without this,
+# Windows checkouts with core.autocrlf=true rewrite it to CRLF, which breaks
+# bash keywords ("fi\r", "then\r" aren't recognized). Same fix as gstack's setup.
+setup   text eol=lf
+*.ts    text eol=lf
+*.json  text eol=lf
+*.toml  text eol=lf
+
+# Diagrams: never touch bytes.
+*.png binary
