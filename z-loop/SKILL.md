@@ -5,11 +5,15 @@ description: |
   planning pass over Ready tickets, batch-commits the workable ones to Building,
   then drives up to maxLanes concurrent worktree lanes through four fresh-agent
   stages (builder, QA, adversarial reviewer, merge) until the batch is drained
-  (every ticket Done, Questions, Blocked, or Skipped), writes a run report, and
-  exits. No daemon. Every scheduling, transition, watchdog, and merge-order
-  decision is computed by lib/loop.ts / lib/lanes.ts / lib/stage-prompts.ts --
-  never in prose. Use when asked to "run the loop", "z-loop", "work the board",
-  or "drain the Ready queue" on a repo /z-setup has configured.
+  (every ticket Done, Questions, Blocked, or Skipped), then runs an end-of-loop
+  stage on the merged base -- regression first; red files bugs and stops (no
+  deploy), green ships (land-and-deploy -> canary -> document-release) and,
+  every 5th loop, runs the security + quality audits -- writes a run report,
+  and exits. No daemon. Every scheduling, transition, watchdog, merge-order,
+  and end-of-loop decision is computed by lib/loop.ts / lib/lanes.ts /
+  lib/stage-prompts.ts / lib/endloop.ts -- never in prose. Use when asked to
+  "run the loop", "z-loop", "work the board", or "drain the Ready queue" on a
+  repo /z-setup has configured.
 ---
 
 # /z-loop — Drain the batch: build → QA → review → merge, then exit
@@ -45,6 +49,7 @@ Z_BOARD="$PACK/bin/z-board"; Z_COST="$PACK/bin/z-cost"
 Z_ESTIMATE="$PACK/bin/z-estimate"; Z_LINT="$PACK/bin/z-ticket-lint"
 SLUG=$(gh repo view --json name -q .name)
 BASE=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
+BASE_SHA_START=$(git rev-parse "origin/$BASE" 2>/dev/null || git rev-parse "$BASE")  # C8: the e2e-detection diff base
 ME=$(gh api user -q .login)
 SESSION="$ME-$(date +%s)"   # names this loop in the lock (second-invocation refusal)
 STATE_DIR="$HOME/.zstack/projects/$SLUG/loop"
@@ -246,21 +251,135 @@ bun "$PACK/lib/stage-prompts.ts" note "$TMP/note-<N>.json" > "$TMP/note-<N>.md"
 1. **Batch cleanup:** every dependent PR has landed, so delete the merged
    `z/ticket-*` branches now (PROCESS.md step 18: delete last), and remove any
    leftover throwaway review worktrees.
-2. **End-of-loop handoff:** run the End-of-Loop section — C8 (full regression
-   on the merged base; every 5th loop, the security audit). C8 lands next;
-   until it exists, write "end-of-loop stage pending (C8)" in the report and
-   continue.
-3. **Report:** write `~/.zstack/projects/$SLUG/reports/loop-$(date +%Y%m%d-%H%M%S).md`:
-   a per-ticket table (number, title, final status, PR, Actual), each parked
-   Questions ticket with its question, each Blocked/Skipped ticket with its
-   note, tickets left to other sessions (lost claims), total spend
-   (`"$Z_COST" "$STATE_DIR/transcripts/*/*.jsonl"`), and the C8 handoff line.
-4. **Release the loop lock** so the next invocation can start:
+2. **End-of-loop (PROCESS.md steps 22–23, C8):** run Step 7a below in full.
+   It decides red/green from a real regression on the merged base, never
+   deploys on red, walks the deploy chain in order on green, runs the 5th-loop
+   audits, and writes the loop report -- Step 7's old "build a report" duty
+   lives there now, not here.
+3. **Release the loop lock** so the next invocation can start:
    `bun "$PACK/lib/locks.ts" release --slug "$SLUG"`. (Do this even on an early
    exit — wrap the run so a crash is the only way the lock survives, which is
    exactly what the next run's orphan scan is for.)
-5. **Exit.** No daemon, no polling for new work. The next batch is the next
+4. **Exit.** No daemon, no polling for new work. The next batch is the next
    /z-loop invocation.
+
+## Step 7a — End-of-Loop: regression, deploy, canary, docs, 5th-loop audits (C8)
+
+PROCESS.md steps 22–23 as a fixed sequence: `lib/endloop.ts` decides red/green
+consequences and the 5th-loop cadence; you perform the side effects it names
+and never re-derive the order in prose. Nothing here may edit `$BASE` except
+through `/land-and-deploy` on the green path -- the regression pass itself
+(gates + `/qa-only`) is read-only by construction.
+
+**1. Bump the loop counter first** — every loop counts toward the 5th-loop
+cadence, red or green:
+
+```bash
+LOOP_COUNTER_PATH="$HOME/.zstack/projects/$SLUG/loop-counter"
+LOOP_COUNT=$(bun "$PACK/lib/endloop.ts" counter bump "$LOOP_COUNTER_PATH")
+```
+
+**2. Regression on merged main** (step 22). Sync the checkout to what actually
+landed, then run every gate the target repo has — detected from its
+`package.json`, never assumed:
+
+```bash
+git checkout "$BASE" && git pull --ff-only origin "$BASE"
+SCRIPTS=$(jq -c '.scripts // {}' package.json 2>/dev/null || echo '{}')
+HAS() { echo "$SCRIPTS" | jq -e --arg s "$1" 'has($s)' >/dev/null 2>&1; }
+```
+
+Run, and record pass/fail plus a one-line evidence fragment, for each gate
+that EXISTS; a gate that doesn't exist gets its own "no `<name>` script" line
+in the evidence — that line **is** the required detection documentation, not
+an afterthought:
+
+- `HAS typecheck` → run it.
+- `HAS test` → the full suite.
+- `HAS build` → the build.
+- e2e, ONLY when both hold: the batch touched a web-served surface
+  (`git diff "$BASE_SHA_START"..HEAD --name-only` matches
+  `app/|src/|public/|pages/|components/|\.tsx$|\.jsx$|\.css$|\.html$` — your
+  judgment, the same heuristic the QA stage's `webTarget` already uses) AND a
+  `test:e2e` or `e2e` script exists.
+
+Then, always, gstack `/qa-only` against the merged `$BASE` — report-only, so
+this stage can never edit main. Fold any findings in as regression findings.
+
+Assemble `"$TMP/regression.json"` (the `RegressionResult` shape): `verdict` is
+`"red"` if any gate failed or `/qa-only` found anything, else `"green"`;
+`evidence` is one line per gate (including the skipped-for-absence ones);
+`findings` is one `{title, repro, firstSuspectFile}` per failure (a failing
+test is its own finding; typecheck errors group by file; an e2e or `/qa-only`
+finding names the page/flow as the repro).
+
+```bash
+PLAN=$(bun "$PACK/lib/endloop.ts" plan "$TMP/regression.json" "$LOOP_COUNT")   # e.g. ["file-bugs","report"]
+```
+
+**3a. Red path** (`$PLAN` is `["file-bugs","report"]`) — every finding becomes
+a Backlog bug, NO deploy Skill is ever invoked:
+
+```bash
+jq -c '.findings[]' "$TMP/regression.json" | while read -r FINDING; do
+  echo "$FINDING" > "$TMP/finding.json"
+  bun "$PACK/lib/endloop.ts" bug "$TMP/finding.json" regression "$LOOP_COUNT" > "$TMP/bug.json"
+  jq -r .body "$TMP/bug.json" > "$TMP/bug-body.md"
+  NEW=$("$Z_BOARD" create --title "$(jq -r .title "$TMP/bug.json")" --body-file "$TMP/bug-body.md" \
+    --milestone <the batch's milestone> --slug "$SLUG")   # "#<N> <url>"
+  "$Z_BOARD" move <N> Backlog --slug "$SLUG"
+  # append {number, title} to "$TMP/endloop-bugs.json" for the report (step 5)
+done
+```
+
+Report this plainly (Step 5 handles the wording) and stop — no `/land-and-deploy`,
+`/canary`, or `/document-release` runs this loop.
+
+**3b. Green path, in order** (`$PLAN` starts `["land-and-deploy","canary","document-release",...]`):
+invoke each Skill in exactly that order, logging every invocation immediately
+after it returns so the order is auditable even if the session dies mid-chain:
+
+```bash
+INVOKE_LOG="$HOME/.zstack/projects/$SLUG/reports/invocations-$(date +%Y%m%d-%H%M%S).jsonl"
+```
+
+For `land-and-deploy`, then `canary`, then `document-release`:
+1. Invoke it (Skill tool). `/land-and-deploy` waits CI + deploy and verifies
+   production health; `/canary` is post-deploy monitoring; `/document-release`
+   updates docs for what shipped, every release.
+2. `bun "$PACK/lib/skill-invoker.ts" record --log "$INVOKE_LOG" --skill <name> --note "<one-line result>"`
+   — before starting the next one, so a crash mid-chain leaves a log that ends
+   exactly where the chain actually stopped.
+
+**4. 5th-loop audits** (only when `$PLAN` contains `cso`, i.e.
+`$LOOP_COUNT % 5 == 0`, step 23): invoke `/cso` then `/health`, logging each
+the same way as 3b. Every finding from either becomes a Backlog bug the same
+way as 3a (`bun "$PACK/lib/endloop.ts" bug finding.json cso "$LOOP_COUNT"` /
+`... health "$LOOP_COUNT"`, then `z-board create` + `move ... Backlog`). File a
+bug for everything found — step 23 has no exceptions.
+
+**5. Report:** assemble the `EndLoopReportInput` and render it:
+
+- `regression`: `"$TMP/regression.json"` verbatim.
+- `loopCount`: `$LOOP_COUNT`.
+- `auditsRan`: `true` iff `$PLAN` contains `cso`.
+- `tickets`: `{number, title, status}` for every ticket in the drained state
+  (`jq '.tickets'` on `$STATE` already carries each one's final status), plus
+  `actualDollars` from `"$Z_BOARD" field-get <N> Actual` for each.
+- `edges`: `{ticket, edges}` per ticket, read back from each
+  `"$TMP/note-<N>.json"` written in Step 6 (its `.edges` field) — this IS the
+  completion-note edges rollup.
+- `bugsFiled`: every `filedTickets` entry from those same `note-<N>.json`
+  files (the per-ticket surfaced use cases), plus every bug this stage just
+  filed in 3a/4 (`"$TMP/endloop-bugs.json"`) — the full picture of what this
+  run added to Backlog.
+
+```bash
+bun "$PACK/lib/endloop.ts" report "$TMP/report-input.json" \
+  > "$HOME/.zstack/projects/$SLUG/reports/loop-$(date +%Y%m%d-%H%M%S).md"
+```
+
+That file is the loop's report — nothing else builds one.
 
 ---
 
@@ -320,5 +439,12 @@ Report DONE only when all hold:
   and what a human should do next.
 - Merged branches are deleted, worktrees removed, and the loop report exists
   at the printed path.
+- The End-of-Loop stage ran to a verdict: red means every finding is filed to
+  Backlog and NO deploy Skill was invoked; green means `/land-and-deploy` →
+  `/canary` → `/document-release` ran in that order (invocation log on disk),
+  plus `/cso` + `/health` on every 5th loop with their findings filed too.
+- The loop counter was bumped and persisted at
+  `~/.zstack/projects/<slug>/loop-counter`.
 - You made zero scheduling decisions in prose: every claim/advance/park/skip
-  came from `loop.ts next`.
+  came from `loop.ts next`, and the end-of-loop sequencing came from
+  `endloop.ts plan`.
