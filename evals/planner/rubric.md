@@ -97,3 +97,45 @@ One ticket, body rewritten to the schema, passing `z-ticket-lint`, grounded in
 `src/store.ts`, tiered at sonnet or haiku, no invented dependency, all three
 fields (Model, Model Effort, Estimate) filled via the Step 6 tier chain, and the
 ticket left in Backlog (Step 10 never promotes) — scores 10/10.
+
+## Multi-document coverage pass (issue #16)
+
+Scores one no-argument `/z-plan --dry-run` run against a gstack project dir
+carrying BOTH `fixture-spec.md` (older) and `fixture-spec-2.md` (newer) —
+z-plan/SKILL.md Step 1's multi-document discovery (`lib/spec-sources.ts`), not
+the single explicit-path pass above. Same 0–2 scale, **10 points total, pass
+threshold: average ≥ 8/10**. Four dimensions are unchanged from the
+spec-to-tickets pass above; dimension 5 is replaced with **cross-document
+coverage** instead of dependency completeness, because this fixture pair is
+two independent single-feature documents on the same project with no
+dependency chain between them to test (that is already covered by the pass
+above) — the thing this pass exists to check is whether BOTH documents' scope
+reached the plan, not just the newest file's.
+
+The grader is the same fresh local `claude -p` pass, given this rubric, both
+fixture documents, `fixture-app/`, and the run's output.
+
+1. **Schema gate (0–2).** Same bar as dimension 1 above.
+2. **Grounded file refs (0–2).** Same bar as dimension 2 above; both the
+   persistence/shorten/resolve/CLI tickets (`fixture-spec.md`) and the
+   expiration ticket (`fixture-spec-2.md`) cite `src/store.ts`.
+3. **Testable acceptance criteria (0–2).** Same bar as dimension 3 above.
+4. **Correct model tier (0–2).** Same bar as dimension 4 above.
+5. **Cross-document coverage (0–2).** Does the plan include the expiration
+   scope from `fixture-spec-2.md` in addition to the `fixture-spec.md` scope —
+   proof the run read the newer document AND kept reading past it, rather than
+   stopping at the single newest file (the exact bug issue #16 fixes)?
+   - 2 — at least one ticket clearly builds on the TTL/expiration behavior
+     (`fixture-spec-2.md`), and the persistence/shorten/resolve/CLI scope from
+     `fixture-spec.md` is also present — both documents show up in the plan.
+   - 1 — expiration is mentioned only in passing (e.g. folded as an aside into
+     another ticket's Out of scope, or missing a real Acceptance Criteria case
+     for it) rather than planned as real scope.
+   - 0 — expiration is entirely absent; the plan reflects only one document.
+
+### Expected shape of a passing multi-document run
+
+The same three tickets as the spec-to-tickets pass above (persistence,
+shorten/resolve, CLI), PLUS a fourth ticket for TTL/expiration that cites
+`src/store.ts` and depends on the persistence ticket (expiry needs a place to
+live), each passing `z-ticket-lint`, tiered at sonnet or haiku — scores 10/10.

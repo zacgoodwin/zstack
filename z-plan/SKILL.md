@@ -78,19 +78,45 @@ done
 no "No spec file found" failure (AC4). Steps 2–9 do not run; `--dry-run` still
 applies (Dry-run / eval mode below).
 
-**Otherwise**, resolve the spec as always: when none is given, default to the
-newest file in gstack's CEO-plans directory for this project:
+**Otherwise**, resolve the spec:
+
+**An explicit path argument wins unchanged** (back-compat, AC2 of issue #16):
+when `$SPEC` is non-empty, use exactly that file — no discovery run, no
+reading of any other document.
+
+**With no argument**, gstack writes several planning artifacts per project
+under `~/.gstack/projects/<slug>/` — not only the newest `ceo-plans/` file:
+`specs/`, `ceo-plans/`, loose `*-test-plan-*.md` files, and `checkpoints/`. A
+plan grounded on only the single newest file misses scope recorded in the
+others (issue #16), so discover and read EVERY one of them:
 
 ```bash
-if [ -z "$SPEC" ]; then
-  PLANS="$HOME/.gstack/projects/$SLUG/ceo-plans"
-  SPEC=$(ls -t "$PLANS"/* 2>/dev/null | head -1)
-fi
-[ -n "$SPEC" ] && [ -f "$SPEC" ] || { echo "No spec file found; pass a path." >&2; exit 1; }
+DOCS_JSON=$(bun "$PACK/lib/spec-sources.ts" "$HOME/.gstack/projects/$SLUG") || exit 1
 ```
 
-Read the whole spec. It is the source of the milestones and tickets; do not
-invent scope it does not contain. Run Steps 2–9 on it, then Step 10 — the
+`lib/spec-sources.ts` (issue #16) is the deterministic half: it lists
+`specs/*.md`, `ceo-plans/*.md`, `*-test-plan-*.md`, and `checkpoints/*.md`
+under the project dir, newest-first within each kind. On success it prints a
+JSON array of `{path, kind, mtimeMs}`; **read every file it names** — the
+newest entry whose `kind` is `specs` or `ceo-plans` (compare `mtimeMs` across
+just those two kinds; do not simply take the array's first element, since
+`specs` entries are always listed before `ceo-plans` entries regardless of
+which is actually newer) is the **primary spec** — the source of the
+milestones and tickets, same as a single-file run. Every other document
+returned (the rest of `specs`/`ceo-plans`, all of `test-plan`, all of
+`checkpoints`) is **mandatory grounding context**: do not invent scope no
+document contains, but scope named ONLY in one of these other documents still
+belongs in the plan (AC1) — it is not optional background reading.
+
+**On failure** (`lib/spec-sources.ts` exits non-zero: no planning documents
+exist in any searched directory), there is no "No spec file found" dead end
+(the bug that motivated this ticket) — the command substitution above only
+captures stdout, so its stderr message, already naming every directory it
+searched (AC3), has printed directly; just `exit 1`. No board writes happen on
+this path.
+
+Run Steps 2–9 on the primary spec (grounded with the other documents' scope
+folded in), then Step 10 — the
 Backlog scan runs as the final step of every normal spec run too, not only via
 `--backlog`.
 

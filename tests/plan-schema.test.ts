@@ -339,3 +339,64 @@ describe("z-plan/SKILL.md: Step 10 Backlog scan contract (issue #13)", () => {
     expect(done).not.toMatch(/only ticket-movement exception anywhere in this skill/);
   });
 });
+
+// -- Step 1 multi-document input contract (issue #16) ------------------------
+// /z-plan used to resolve exactly one spec file (the newest ceo-plans/ entry),
+// missing scope recorded in gstack's other planning artifacts -- and failing
+// outright ("No spec file found") on a project with a specs/ archive but no
+// ceo-plans/ dir at all. These are doc canaries on z-plan/SKILL.md's Step 1
+// (the skill is executed by an agent, not this suite) pinning the contract
+// strings that make AC1-AC3 true: an explicit path still wins unchanged
+// (AC2), the no-arg case discovers and reads EVERY document via
+// lib/spec-sources.ts rather than defaulting to one file, and an empty result
+// fails loud naming every searched directory instead of the old dead end
+// (AC3) -- never a silent regression to single-file behavior.
+describe("z-plan/SKILL.md: Step 1 multi-document input contract (issue #16)", () => {
+  const zPlan = () => readFileSync(join(import.meta.dir, "..", "z-plan", "SKILL.md"), "utf8");
+
+  function section(md: string, heading: string): string {
+    const start = md.indexOf(heading);
+    if (start < 0) return "";
+    const rest = md.slice(start + heading.length);
+    const next = rest.indexOf("\n## ");
+    return next < 0 ? rest : rest.slice(0, next);
+  }
+
+  test("an explicit path argument still wins unchanged, with no discovery run (AC2)", () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toContain("An explicit path argument wins unchanged");
+    expect(step1).toContain("no discovery run");
+  });
+
+  test("no argument runs lib/spec-sources.ts over every gstack planning-document kind", () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toContain('bun "$PACK/lib/spec-sources.ts"');
+    expect(step1).toContain("$HOME/.gstack/projects/$SLUG");
+    // All four discovered kinds named explicitly -- a version that silently
+    // drops one back to single-file behavior is the regression this guards.
+    expect(step1).toContain("specs/*.md");
+    expect(step1).toContain("ceo-plans/*.md");
+    expect(step1).toContain("*-test-plan-*.md");
+    expect(step1).toContain("checkpoints/*.md");
+  });
+
+  test("every returned document must be read; the primary spec is the newest specs/ceo-plans entry, not just list[0] (AC1)", () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toMatch(/read every file it names/i);
+    expect(step1).toMatch(/newest entry whose\s+`kind` is `specs` or `ceo-plans`/);
+    // Guards the exact bug a naive port would reintroduce: `specs` entries
+    // sort before `ceo-plans` entries in the array regardless of mtime, so
+    // "primary = the first element" is wrong when ceo-plans is newer.
+    expect(step1).toMatch(/do not simply take the array's first element/);
+    expect(step1).toContain("mandatory grounding context");
+    expect(step1).toMatch(/scope named ONLY in one of these other documents/);
+    expect(step1).toMatch(/\(AC1\)/);
+  });
+
+  test("an empty discovery result fails loud naming every searched directory, no board writes (AC3)", () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toMatch(/no "No spec file found" dead end/);
+    expect(step1).toMatch(/already naming every directory it\s*\n?\s*searched/);
+    expect(step1).toMatch(/No board writes happen on\s*\n?\s*this path/);
+  });
+});
