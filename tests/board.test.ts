@@ -85,7 +85,15 @@ function makeExecutor(
     if (op === "RateLimit") return loadFixture(opts.rateLimit ?? "rate-limit-healthy");
     const fixture = FIXTURE_BY_OP[op];
     if (!fixture) throw new Error(`no fixture registered for op ${op}`);
-    return loadFixture(fixture);
+    const data = loadFixture(fixture);
+    // The recorded project-items fixture predates the F3 malformed-response
+    // guard and omits pageInfo; a REAL ProjectItems response always carries it
+    // (it is selected in the query), so complete the recording here rather
+    // than weaken the guard.
+    if (op === "ProjectItems" && data.node?.items && !data.node.items.pageInfo) {
+      data.node.items.pageInfo = { hasNextPage: false, endCursor: null };
+    }
+    return data;
   };
 }
 
@@ -104,6 +112,26 @@ afterEach(() => {
 
 // -- AC1: every subcommand against fixtures, zero network --------------------
 describe("list", () => {
+  // Shapes one ProjectItems page; status parameterized so multi-status boards
+  // can be modeled (F0 all-statuses list).
+  const page = (
+    numbers: number[],
+    pageInfo: { hasNextPage: boolean; endCursor: string | null },
+    status = "Todo"
+  ) => ({
+    node: {
+      items: {
+        pageInfo,
+        nodes: numbers.map((n) => ({
+          content: { number: n, title: `T${n}`, url: `http://x/${n}` },
+          fieldValues: {
+            nodes: [{ __typename: "ProjectV2ItemFieldSingleSelectValue", name: status, field: { name: "Status" } }],
+          },
+        })),
+      },
+    },
+  });
+
   test("returns items in a status with their fields", async () => {
     const board = new Board(CFG, makeExecutor());
     const items = await board.list("In progress");
@@ -123,22 +151,39 @@ describe("list", () => {
     await expect(board.list("Backlog")).rejects.toThrow(/Unknown status "Backlog".*Todo.*In progress.*Done/);
   });
 
+  // F0: --status is optional; the no-status list is the one-call atomic
+  // snapshot contract z-status consumes (`z-board list --json`).
+  test("list() with no status returns every item across statuses", async () => {
+    const board = new Board(CFG, makeExecutor());
+    const items = await board.list();
+    expect(items.map((i) => i.number)).toEqual([4, 5, 6]);
+    expect(new Set(items.map((i) => i.fields.Status))).toEqual(new Set(["Done", "In progress"]));
+  });
+
+  test("no-status list still paginates past 100 items and spans statuses (F0)", async () => {
+    const firstPage = Array.from({ length: 100 }, (_, i) => i + 1);
+    const calls: Call[] = [];
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        calls,
+        overrides: {
+          ProjectItems: (vars) =>
+            vars.cursor === "CUR_100"
+              ? page([101], { hasNextPage: false, endCursor: null }, "Done")
+              : page(firstPage, { hasNextPage: true, endCursor: "CUR_100" }, "Todo"),
+        },
+      })
+    );
+    const items = await board.list();
+    expect(items.length).toBe(101);
+    expect(new Set(items.map((i) => i.fields.Status))).toEqual(new Set(["Todo", "Done"]));
+    expect(calls.filter((c) => c.op === "ProjectItems").length).toBe(2); // followed the cursor
+  });
+
   // Issue #14 item 1: >100-item boards silently dropped tickets before cursor
   // pagination. Two fake pages (100 + 1) must all come back.
   test("paginates past 100 items: a 101-item board lists fully", async () => {
-    const page = (numbers: number[], pageInfo: { hasNextPage: boolean; endCursor: string | null }) => ({
-      node: {
-        items: {
-          pageInfo,
-          nodes: numbers.map((n) => ({
-            content: { number: n, title: `T${n}`, url: `http://x/${n}` },
-            fieldValues: {
-              nodes: [{ __typename: "ProjectV2ItemFieldSingleSelectValue", name: "Todo", field: { name: "Status" } }],
-            },
-          })),
-        },
-      },
-    });
     const firstPage = Array.from({ length: 100 }, (_, i) => i + 1);
     const calls: Call[] = [];
     const board = new Board(
@@ -171,6 +216,62 @@ describe("list", () => {
       })
     );
     await expect(board.list("Todo")).rejects.toThrow(/no endCursor/);
+  });
+
+  test("hasNextPage with an empty-string endCursor throws instead of looping (F3a)", async () => {
+    let fetches = 0;
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        overrides: {
+          ProjectItems: () => {
+            // Bounded fake: with the guard gone this test must FAIL fast, not
+            // hang the suite looping on the "" cursor.
+            if (++fetches > 4) throw new Error("cursor loop did not terminate");
+            return { node: { items: { pageInfo: { hasNextPage: true, endCursor: "" }, nodes: [] } } };
+          },
+        },
+      })
+    );
+    await expect(board.list("Todo")).rejects.toThrow(/no endCursor/);
+    expect(fetches).toBe(1); // refused on the first malformed page
+  });
+
+  test("an endCursor that does not advance throws instead of refetching forever (F3b)", async () => {
+    let fetches = 0;
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        overrides: {
+          ProjectItems: () => {
+            // Bounded fake: with the guard gone this test must FAIL fast on the
+            // wrong error, never hang the suite in the real infinite loop.
+            if (++fetches > 4) throw new Error("cursor loop did not terminate");
+            return page([1], { hasNextPage: true, endCursor: "CUR_STUCK" });
+          },
+        },
+      })
+    );
+    await expect(board.list("Todo")).rejects.toThrow(/same endCursor/);
+    expect(fetches).toBe(2); // page 1 issued CUR_STUCK, page 2 repeated it
+  });
+
+  test("a page with items but no pageInfo throws instead of reporting the board drained (F3c)", async () => {
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        overrides: {
+          ProjectItems: {
+            node: {
+              items: {
+                nodes: [{ content: { number: 1, title: "T1", url: "http://x/1" }, fieldValues: { nodes: [] } }],
+              },
+            },
+          },
+        },
+      })
+    );
+    await expect(board.list("Todo")).rejects.toThrow(/no pageInfo/);
   });
 });
 
@@ -308,6 +409,30 @@ describe("field-get / field-set", () => {
     const board = new Board(CFG, makeExecutor());
     await expect(board.fieldSet(5, "Estimate", "soon")).rejects.toThrow(/expects a number/);
   });
+
+  // F4: Number("") and Number("  ") are 0 -- a blank from a failed upstream
+  // pipeline (e.g. the cost pipeline writing Actual) must never silently zero
+  // a board field, and non-finite values are equally corrupt.
+  test("field-set NUMBER refuses blank and non-finite values with no mutation (F4)", async () => {
+    for (const bad of ["", "  ", "abc", "Infinity", "NaN"]) {
+      const calls: Call[] = [];
+      const board = new Board(CFG, makeExecutor({ calls }));
+      await expect(board.fieldSet(5, "Actual", bad)).rejects.toThrow(
+        new RegExp(`Actual expects a number, got "${bad}"`)
+      );
+      expect(calls.some((c) => c.op === "SetNumber")).toBe(false); // refused before any mutation
+    }
+  });
+
+  test("field-set NUMBER still accepts '3.5' and '0' (F4)", async () => {
+    for (const [raw, num] of [["3.5", 3.5], ["0", 0]] as const) {
+      const calls: Call[] = [];
+      const board = new Board(CFG, makeExecutor({ calls }));
+      await board.fieldSet(5, "Actual", raw);
+      const set = calls.find((c) => c.op === "SetNumber")!;
+      expect(set.vars.number).toBe(num);
+    }
+  });
 });
 
 // -- issue #14 item 18: TEXT field path + not-found branches ------------------
@@ -439,12 +564,22 @@ describe("create", () => {
 // our line, as it would live).
 function linkBackend(
   initialBodies: Record<number, string>,
-  opts: { loseWrites?: (id: string) => boolean } = {}
+  opts: {
+    loseWrites?: (id: string) => boolean;
+    // F1 verify-path fixture: what the store actually keeps for a write --
+    // lets a test model a concurrent clobber that REPLACES our body with
+    // different content (loseWrites can only drop the write wholesale).
+    transformWrite?: (id: string, body: string) => string;
+    // F2: yield a macrotask per op so unserialized concurrent flows interleave
+    // deterministically instead of depending on microtask scheduling order.
+    delay?: boolean;
+  } = {}
 ) {
   const bodies: Record<string, string> = {};
   for (const [n, b] of Object.entries(initialBodies)) bodies[`I_${n}`] = b;
   const calls: Call[] = [];
   const exec: GraphQLExecutor = async (query, vars: any) => {
+    if (opts.delay) await new Promise<void>((r) => setTimeout(r, 0));
     const op = opName(query);
     calls.push({ op, vars });
     switch (op) {
@@ -464,7 +599,9 @@ function linkBackend(
           },
         };
       case "UpdateIssueBody": {
-        if (!opts.loseWrites?.(vars.id)) bodies[vars.id] = vars.body;
+        if (!opts.loseWrites?.(vars.id)) {
+          bodies[vars.id] = opts.transformWrite ? opts.transformWrite(vars.id, vars.body) : vars.body;
+        }
         return { updateIssue: { issue: { number: 0 } } };
       }
       case "AddComment":
@@ -525,6 +662,58 @@ describe("link", () => {
     expect(b.bodies["I_5"]).toContain("Depends on #7");
     expect(b.bodies["I_6"]).toContain("Blocks #5");
     expect(b.bodies["I_7"]).toContain("Blocks #5");
+  });
+
+  // line-exact presence helper mirroring lib/board.ts hasLine (F1 assertions)
+  const bodyHasLine = (body: string, line: string) => body.split("\n").some((l) => l.trimEnd() === line);
+
+  // F1 verify path: substring includes() let "Depends on #12" false-verify a
+  // check for "Depends on #1" -- a clobbered write reported success and the
+  // lost line was never re-appended.
+  test("verify is line-exact: a clobber leaving 'Depends on #12' cannot false-verify 'Depends on #1'", async () => {
+    let clobbers = 1; // the first write to #5 is replaced by a concurrent writer's own snapshot
+    const b = linkBackend(
+      { 5: "Body.", 1: "" },
+      { transformWrite: (id, body) => (id === "I_5" && clobbers-- > 0 ? "Body.\n\nDepends on #12" : body) }
+    );
+    const board = new Board(CFG, b.exec);
+    await board.link(5, 1);
+    expect(bodyHasLine(b.bodies["I_5"], "Depends on #1")).toBe(true); // loss detected, re-appended
+    expect(bodyHasLine(b.bodies["I_5"], "Depends on #12")).toBe(true); // the other writer's line kept
+    expect(b.calls.filter((c) => c.op === "UpdateIssueBody" && c.vars.id === "I_5").length).toBe(2);
+  });
+
+  // F1 pre-check path: with only "Depends on #12" present, link(5,1) must
+  // WRITE "Depends on #1", not no-op on the substring hit.
+  test("pre-check is line-exact: link(5,1) with only 'Depends on #12' present still writes", async () => {
+    const b = linkBackend({ 5: "Body.\n\nDepends on #12", 1: "" });
+    const board = new Board(CFG, b.exec);
+    await board.link(5, 1);
+    expect(bodyHasLine(b.bodies["I_5"], "Depends on #1")).toBe(true);
+    expect(b.calls.some((c) => c.op === "UpdateIssueBody" && c.vars.id === "I_5")).toBe(true);
+    // and the relation comment was posted -- this was NOT treated as pre-existing
+    expect(b.calls.filter((c) => c.op === "AddComment" && c.vars.body === "Depends on #1").length).toBe(1);
+  });
+
+  // F2: without per-issue serialization, writer B's stale-snapshot write can
+  // land AFTER writer A's verification passed -- a lost line no retry catches.
+  // With the lock, read/write phases run strictly sequentially: exactly one
+  // write per link, and the second write's read already saw the first line.
+  test("concurrent link() on one issue serializes: second write builds on the first, no clobber", async () => {
+    const b = linkBackend({ 5: "Body.", 6: "", 7: "" }, { delay: true });
+    const boardA = new Board(CFG, b.exec);
+    const boardB = new Board(CFG, b.exec);
+    await Promise.all([boardA.link(5, 6), boardB.link(5, 7)]);
+    const updates = b.calls.filter((c) => c.op === "UpdateIssueBody" && c.vars.id === "I_5");
+    expect(updates.length).toBe(2); // no interleave means no clobber means no retry writes
+    const [first, second] = updates.map((u) => u.vars.body as string);
+    const firstLine = bodyHasLine(first, "Depends on #6") ? "Depends on #6" : "Depends on #7";
+    const otherLine = firstLine === "Depends on #6" ? "Depends on #7" : "Depends on #6";
+    expect(bodyHasLine(first, firstLine)).toBe(true);
+    expect(bodyHasLine(second, firstLine)).toBe(true); // second writer read AFTER first write
+    expect(bodyHasLine(second, otherLine)).toBe(true);
+    expect(bodyHasLine(b.bodies["I_5"], "Depends on #6")).toBe(true); // both survive
+    expect(bodyHasLine(b.bodies["I_5"], "Depends on #7")).toBe(true);
   });
 });
 
@@ -731,17 +920,45 @@ describe("contract enforcement", () => {
 
   // Issue #14 item 2: the code gate above excludes *.md, so the skill files --
   // the pack's actual executed surface -- were never scanned and the gate
-  // passed vacuously. Skill files DO shell out to gh. Every direct
-  // `gh api graphql` / `gh issue` invocation in a SKILL.md must match this
-  // explicit allowlist exactly (whitespace-normalized, so incidental reflow
-  // within a line doesn't break it); a NEW direct call fails until it is
-  // consciously sanctioned here.
+  // passed vacuously. Skill files DO shell out to gh. Every `gh <anything>`
+  // invocation in a SKILL.md code context (F5: ANY subcommand, not just
+  // api graphql / issue) must match this explicit allowlist exactly
+  // (whitespace-normalized, so incidental reflow within a line doesn't break
+  // it); a NEW direct call fails until it is consciously sanctioned here.
   const SKILL_GH_ALLOWLIST: Record<string, string[]> = {
     "z-setup/SKILL.md": [
-      // Step 1 auth-scope probe: read-only, mutates nothing
-      `gh api graphql -f query='query { viewer { login } }' >/dev/null`,
+      // Step 0 repo-identity lookups: read-only
+      `gh repo view --json owner -q .owner.login)`,
+      `gh repo view --json name -q .name)`,
+      // Step 1 auth probes: read-only scope check ("; then" is the enclosing
+      // shell conditional the scanner keeps on the line)
+      `gh auth status 2>&1 | grep -q "'project'"; then`,
+      `gh auth status`, // read-only auth probe (prereq checklist)
+      `gh auth login`, // printed instruction for the user; interactive auth, no repo/board mutation
+      // token-scope repair: mutates only the LOCAL gh token's scopes, never repo/board state
+      `gh auth refresh -s project`,
+      // Step 1 scoped probe: read-only viewer query; the shell glue after
+      // >/dev/null is error reporting, not a second command (the source line
+      // uses backslash continuations, joined by the scanner)
+      `gh api graphql -f query='query { viewer { login } }' >/dev/null && echo "gh scopes OK" || { echo "Still cannot query GraphQL; resolve gh auth before continuing." >&2; exit 1; }`,
+      // Step 5 verification checklist: read-only project views for the human
+      `gh project view <NUMBER> --owner <OWNER> --web`,
+      `gh project list --owner "$OWNER"`,
+    ],
+    "z-plan/SKILL.md": [
+      // slug lookup: read-only (trailing shell comment is part of the line)
+      `gh repo view --json name -q .name) # one board per repo; matches /z-setup`,
+      `gh auth status`, // read-only auth probe (prereq checklist)
+    ],
+    "z-status/SKILL.md": [
+      `gh repo view --json name -q .name)`, // slug lookup: read-only
     ],
     "z-loop/SKILL.md": [
+      // preamble identity lookups: all read-only
+      `gh repo view --json name -q .name)`,
+      `gh repo view --json defaultBranchRef -q .defaultBranchRef.name)`,
+      `gh api user -q .login)`,
+      `gh auth status`, // read-only auth probe (prereq checklist)
       // read-only body fetches (planning pass + board snapshot); z-board has no
       // body-read subcommand
       `gh issue view <N> --json body -q .body > "$TMP/body-<N>.md"`,
@@ -750,27 +967,55 @@ describe("contract enforcement", () => {
       // planning-pass body write; z-board has no issue-body-edit subcommand
       // (flagged in issue #14 item 2 findings as the one mutation outside z-board)
       `gh issue edit <N> --body-file ...`,
+      // H9 dead-merge-lane resolution: read-only PR state check
+      `gh pr view <branch> --json state,url -q '.state'`,
+      `gh pr view`, // prose reference in the H9 dead-merge paragraph: read-only check
+      `gh pr merge`, // prose reference naming what a dead worker MAY have run; not an instruction
       `gh issue close`, // prose PROHIBITION: "never gh issue close"
     ],
   };
 
-  // Extracts each gh invocation: from the `gh` token to end of line or closing
-  // backtick, whitespace collapsed, any line-continuation backslash stripped.
+  // F5 scanner. Order matters: backslash-continued lines are logically joined
+  // FIRST (a continuation could otherwise split `gh \` from its verb so the
+  // invocation was never scanned, or truncate `gh issue close \` + `123` to a
+  // prose-allowlisted prefix), THEN every `gh <args>` invocation -- any
+  // subcommand -- is extracted from code contexts (fenced blocks and inline
+  // backtick spans; bare prose is not scanned) and whitespace-normalized for
+  // exact-matching against the allowlist. `gh *` matches are permission
+  // PATTERN syntax (`Bash(gh *)`), not runnable invocations, and are skipped.
   function ghInvocations(content: string): string[] {
+    const joined = content.replace(/\\\r?\n/g, " ");
+    const contexts: string[] = [];
+    const fenced = /```[^\n]*\n([\s\S]*?)```/g;
+    let rest = "";
+    let last = 0;
+    let m: RegExpExecArray | null;
+    while ((m = fenced.exec(joined))) {
+      rest += joined.slice(last, m.index) + "\n";
+      contexts.push(m[1]);
+      last = m.index + m[0].length;
+    }
+    rest += joined.slice(last);
+    for (const im of rest.matchAll(/`([^`\n]+)`/g)) contexts.push(im[1]);
     const out: string[] = [];
-    for (const line of content.split(/\r?\n/)) {
-      for (const m of line.matchAll(/\bgh\s+(?:api\s+graphql|issue)\b[^`]*/g)) {
-        out.push(m[0].replace(/\s+/g, " ").replace(/\s*\\$/, "").trim());
+    for (const ctx of contexts) {
+      for (const line of ctx.split(/\r?\n/)) {
+        // the leading " " makes start-of-line uniform with the boundary chars
+        for (const g of (" " + line).matchAll(/[\s;|&$(]gh\s+\S[^`]*/g)) {
+          const inv = g[0].slice(1).replace(/\s+/g, " ").trim();
+          if (!inv.startsWith("gh *")) out.push(inv);
+        }
       }
     }
     return out;
   }
 
-  test("skill .md files: every direct gh api graphql / gh issue call is allowlisted", () => {
+  test("skill .md files: every gh invocation in code contexts is allowlisted", () => {
     const skillFiles = trackedFiles().filter((f) => f.endsWith("/SKILL.md"));
     // Canary: the scan must actually contain the real skill files, or this gate
     // has gone vacuous again (the exact bug it replaces).
     expect(skillFiles).toContain("z-loop/SKILL.md");
+    expect(skillFiles).toContain("z-plan/SKILL.md");
     expect(skillFiles).toContain("z-setup/SKILL.md");
     expect(skillFiles).toContain("z-status/SKILL.md");
 
@@ -782,6 +1027,48 @@ describe("contract enforcement", () => {
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  // F5 scanner self-tests: both confirmed evasion vectors plus a plain planted
+  // mutation, against crafted markdown -- the gate is only as strong as its
+  // extractor.
+  describe("gh invocation scanner (F5)", () => {
+    test("backslash continuation cannot hide the verb from the scan", () => {
+      const md = "```bash\ngh \\\n  api graphql -f query='mutation { m }'\n```\n";
+      expect(ghInvocations(md)).toEqual(["gh api graphql -f query='mutation { m }'"]);
+    });
+
+    test("continuation cannot truncate an invocation to an allowlisted prefix", () => {
+      const md = "```bash\ngh issue close \\\n  123\n```\n";
+      expect(ghInvocations(md)).toEqual(["gh issue close 123"]);
+    });
+
+    test("non-graphql gh forms are visible, not just api graphql / issue", () => {
+      const md = [
+        "```bash",
+        "gh api -X POST /repos/o/r/issues",
+        "gh pr merge 7 --squash",
+        "gh project item-add 1 --owner o",
+        "gh auth refresh -s project",
+        "```",
+      ].join("\n");
+      expect(ghInvocations(md)).toEqual([
+        "gh api -X POST /repos/o/r/issues",
+        "gh pr merge 7 --squash",
+        "gh project item-add 1 --owner o",
+        "gh auth refresh -s project",
+      ]);
+    });
+
+    test("a planted gh api graphql mutation in a fenced block is extracted", () => {
+      const md = "Prose.\n\n```sh\ngh api graphql -f query='mutation { updateIssue }'\n```\n";
+      expect(ghInvocations(md)).toContain("gh api graphql -f query='mutation { updateIssue }'");
+    });
+
+    test("inline backtick invocations are scanned; bare prose and permission patterns are not", () => {
+      const md = "Never `gh issue close` a ticket. The gh CLI must be installed. Allow `Bash(gh *)` in settings.";
+      expect(ghInvocations(md)).toEqual(["gh issue close"]);
+    });
   });
 });
 

@@ -109,13 +109,22 @@ To adopt a specific existing project instead of matching by title, add
 `--project-number <N>`. `apply` is idempotent: re-running plans and executes zero
 mutations once the board is correct.
 
-**Destructive adopt guard.** Replacing the Status options on an adopted board
-deletes every non-canonical option (e.g. GitHub's default Todo / In Progress),
-and items assigned to a deleted option silently lose their Status. When such
-options still have items, `apply` refuses before running any mutation and lists
-each option with its item count. Show that list to the user and only re-run with
+**Destructive adopt guard.** Replacing the options of any single-select field
+(Status, Model, Model Effort) on an adopted board deletes every non-canonical
+option (e.g. GitHub's default Todo / In Progress), and items assigned to a
+deleted option silently lose that field's value. When such options still have
+items, `apply` refuses before running any mutation and lists each field and
+option with its item count. Show that list to the user and only re-run with
 `--force` after they explicitly confirm the loss; `--force` proceeds and prints
-what was dropped.
+what was dropped, per field.
+
+**Run adopt while the board is quiescent.** The guard re-checks usage
+immediately before the replace runs and refuses (even under `--force`) if an
+option was populated in the meantime, but the Projects API has no conditional
+mutation, so a small window between that recheck and the replace remains: an
+item assigned to a deleted option inside it still loses its value silently.
+Make sure no other sessions, loops, or humans are moving items on the board
+while `apply` adopts it.
 
 ---
 

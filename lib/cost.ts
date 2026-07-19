@@ -55,7 +55,7 @@ interface RawUsage {
 }
 
 interface ParsedUsageLine {
-  requestId: string;
+  dedupKeys: string[]; // 1-2 keys naming this line's response (requestId and/or msgid:<id>)
   model: string;
   usage: RawUsage;
 }
@@ -111,28 +111,30 @@ export function parseLine(line: string, where: string): ParsedUsageLine | null {
   if (typeof model !== "string" || !model) {
     throw new ZError(`${where}: assistant message missing "model".`);
   }
-  // Dedup key for split-content-block lines (fact 1 above): requestId when
-  // present; else the API message id -- every block line of one response
-  // repeats the identical `message` object including its `id`, and message.id
-  // is 1:1 with requestId (verified: 0 mismatches across 8 requestIds / 27
-  // lines in a real session). A file:line fallback here would price an N-block
-  // response N times, the exact overcount the dedup exists to prevent; it
-  // remains only as the last resort when BOTH ids are absent, so a line is
-  // never silently dropped -- worst case it's priced once, uniquely. The
-  // "msgid:" prefix keeps the two id namespaces from ever colliding.
-  const requestId =
-    typeof obj.requestId === "string" && obj.requestId
-      ? obj.requestId
-      : typeof obj.message.id === "string" && obj.message.id
-        ? `msgid:${obj.message.id}`
-        : where;
-  return { requestId, model, usage };
+  // Dedup keys for split-content-block lines (fact 1 above): a line carries
+  // requestId, the API message id, or BOTH -- and one response's lines don't
+  // all carry the same fields (F14: a requestId+message.id line can sit next
+  // to a message.id-only sibling). So a line contributes EVERY id it has, and
+  // costOfFiles treats it as duplicate if ANY key was already seen; keying by
+  // a single id gave the two halves different keys and priced the response
+  // twice. message.id is 1:1 with requestId (verified: 0 mismatches across 8
+  // requestIds / 27 lines in a real session). A file:line fallback would price
+  // an N-block response N times; it remains only as the last resort when BOTH
+  // ids are absent, so a line is never silently dropped -- worst case it's
+  // priced once, uniquely. The "msgid:" prefix keeps the id namespaces from
+  // ever colliding.
+  const dedupKeys: string[] = [];
+  if (typeof obj.requestId === "string" && obj.requestId) dedupKeys.push(obj.requestId);
+  if (typeof obj.message.id === "string" && obj.message.id) dedupKeys.push(`msgid:${obj.message.id}`);
+  if (dedupKeys.length === 0) dedupKeys.push(where);
+  return { dedupKeys, model, usage };
 }
 
 export function costOfFiles(paths: string[], rates: RatesFile): CostResult {
-  const seenRequests = new Set<string>();
+  const seenKeys = new Set<string>();
   const perModel = new Map<string, TokenTotals>();
   let linesParsed = 0;
+  let requests = 0;
 
   for (const path of paths) {
     const text = readFileSync(path, "utf8");
@@ -142,8 +144,13 @@ export function costOfFiles(paths: string[], rates: RatesFile): CostResult {
       if (!parsed) continue;
       linesParsed++;
 
-      if (seenRequests.has(parsed.requestId)) continue; // duplicate content-block line
-      seenRequests.add(parsed.requestId);
+      // Duplicate if ANY of the line's ids was seen; register ALL of them
+      // either way, so a line linking requestId<->message.id also claims the
+      // id its earlier sibling lacked (F14: mixed-id lines of one response).
+      const duplicate = parsed.dedupKeys.some((k) => seenKeys.has(k));
+      for (const k of parsed.dedupKeys) seenKeys.add(k);
+      if (duplicate) continue; // duplicate content-block line
+      requests++;
 
       const { key } = resolveRate(parsed.model, rates);
       const bucket = perModel.get(key) ?? { fresh_input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 };
@@ -163,7 +170,7 @@ export function costOfFiles(paths: string[], rates: RatesFile): CostResult {
     total += dollars;
   }
 
-  return { total: roundCents(total), by_model, requests: seenRequests.size, lines_parsed: linesParsed };
+  return { total: roundCents(total), by_model, requests, lines_parsed: linesParsed };
 }
 
 // Native glob (Bun.Glob is already part of the runtime -- no new dependency).

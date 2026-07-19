@@ -164,10 +164,6 @@ export function loadBuckets(path: string): Buckets {
   // alone let a string token count coerce through the arithmetic and a
   // non-string model leak a raw TypeError from resolveRate. Wrong types must
   // reject with a ZError naming the field, before any math runs.
-  // Type validation at the trust boundary (issue #14 item 18): key presence
-  // alone let a string token count coerce through the arithmetic and a
-  // non-string model leak a raw TypeError from resolveRate. Wrong types must
-  // reject with a ZError naming the field, before any math runs.
   const tokenKeys = ["output_tokens", "fresh_input_tokens", "cached_input_tokens"] as const;
   for (const k of tokenKeys) {
     const v = b[k];

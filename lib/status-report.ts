@@ -2,7 +2,8 @@
 // Takes a snapshot of the board + locks + last report + clock, returns markdown.
 // No mutations, no side effects: the SKILL assembles the snapshot and writes output.
 import { readFileSync } from "node:fs";
-import { handleCliError, parseFlags, requireFlag, str } from "./cli.ts";
+import { handleCliError, parseFlags, readJson, requireFlag, str } from "./cli.ts";
+import { ZError } from "./config.ts";
 import { listLaneLocks } from "./locks.ts";
 import type { BoardItem } from "./board.ts";
 import type { LaneLock } from "./locks.ts";
@@ -22,8 +23,25 @@ export interface StatusReportInput {
 // their age, last loop report summary (path + verdict line), and Estimate vs
 // Actual totals for the milestone. No mutations, deterministic.
 export function buildStatusReport(input: StatusReportInput): string {
-  const { boardItems, laneLocks, lastReport, clock } = input;
+  const { laneLocks, lastReport, clock } = input;
   const nowMs = clock();
+
+  // Belt-and-braces vs snapshot races (F11): the SKILL pipeline takes ONE
+  // atomic z-board snapshot, but if a future caller ever feeds overlapping
+  // per-status snapshots again, a ticket moving mid-scan appears twice. Keep
+  // the first occurrence per issue number, count the rest, and say so below --
+  // silently double-counted totals are worse than a flagged degraded report.
+  const seenNumbers = new Set<number>();
+  const boardItems: BoardItem[] = [];
+  let dupesDropped = 0;
+  for (const item of input.boardItems) {
+    if (seenNumbers.has(item.number)) {
+      dupesDropped++;
+      continue;
+    }
+    seenNumbers.add(item.number);
+    boardItems.push(item);
+  }
 
   // Questions and Blocked tickets with their numbers and titles
   const questionTickets = boardItems
@@ -52,18 +70,26 @@ export function buildStatusReport(input: StatusReportInput): string {
     if (typeof act === "number") totalActual += act;
   }
 
-  // Last loop report summary: read the file and extract the verdict line
+  // Last loop report summary: read the file and extract the verdict line.
+  // Only a MISSING file means "no prior loops" (fresh board); any other read
+  // failure (EISDIR, EACCES, ...) must not render a plausible-but-false
+  // history-less dashboard -- fail loud, naming the path (F13).
   let reportLine = "";
   if (lastReport) {
+    let content: string | null = null;
     try {
-      const content = readFileSync(lastReport, "utf8");
+      content = readFileSync(lastReport, "utf8");
+    } catch (e: any) {
+      if (e?.code !== "ENOENT") {
+        throw new ZError(`Cannot read last report ${lastReport}: ${e?.message ?? e}`);
+      }
+    }
+    if (content !== null) {
       const match = content.match(/^\*\*Verdict:\*\*\s+(.+)$/m);
       if (match) {
         const verdictPath = lastReport.split(/[\\/]/).pop() || lastReport;
         reportLine = `${verdictPath}: ${match[1]}`;
       }
-    } catch {
-      // If the report can't be read, skip the summary line
     }
   }
 
@@ -78,9 +104,12 @@ export function buildStatusReport(input: StatusReportInput): string {
   const blockedSection = blockedTickets.length ? blockedTickets.join("\n") : "- None.";
   const lanesSection = laneLines.length ? laneLines.join("\n") : "- None (board is idle).";
   const reportSection = reportLine ? reportLine : "(no prior loops)";
+  const dupeWarning = dupesDropped
+    ? `\n> Warning: dropped ${dupesDropped} duplicate board item(s) (same issue number seen more than once in the snapshot); counts and totals use the first occurrence.\n`
+    : "";
 
   return `# z-status — Board Dashboard
-
+${dupeWarning}
 ## Ticket Counts
 
 ${statusCounts}
@@ -131,8 +160,9 @@ export function main(argv: string[]): number {
       const locksDir = requireFlag(flags, "locks-dir");
       const lastReportFile = str(flags, "last-report");
 
-      // Load board items from JSON file
-      const boardItemsJson = JSON.parse(readFileSync(boardItemsFile, "utf8")) as BoardItem[];
+      // readJson wraps parse failures in ZError (F15): a corrupt snapshot file
+      // exits 1 with an actionable message, never a raw stack trace.
+      const boardItemsJson = readJson(boardItemsFile) as BoardItem[];
 
       // Load lane locks from directory
       const laneLocks = listLaneLocks(locksDir);

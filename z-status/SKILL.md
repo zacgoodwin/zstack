@@ -42,12 +42,12 @@ SLUG=$(gh repo view --json name -q .name)
 export ZSTACK_SLUG="$SLUG"
 DIR="$HOME/.zstack/projects/$SLUG"
 TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
 
-# Snapshot: all nine statuses -> one BoardItem[] file (same shape z-loop ingests)
-for S in Backlog Ready Questions Building QA Review Blocked Skipped Done; do
-  "$Z_BOARD" list --status "$S" --json --slug "$SLUG" > "$TMP/items-$S.json"
-done
-jq -s 'add' "$TMP"/items-*.json > "$TMP/items.json"
+# Snapshot: ONE atomic z-board call returns ALL items (every status) as a
+# single BoardItem[] (same shape z-loop ingests). Never snapshot per-status:
+# a ticket moving between statuses mid-scan is double-counted or vanishes.
+"$Z_BOARD" list --json --slug "$SLUG" > "$TMP/items.json"
 
 # Newest loop report, if any prior loop has run
 LAST=$(ls -t "$DIR/reports"/loop-*.md 2>/dev/null | head -1)

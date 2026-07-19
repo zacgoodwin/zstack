@@ -14,6 +14,15 @@ import {
 
 const DATA_TYPES: FieldDataType[] = ["SINGLE_SELECT", "NUMBER", "TEXT"];
 
+// Positive-finite guard, exported so z-setup's pre-flight (F9, issue #14) can
+// reject user-supplied numerics BEFORE any board mutation runs, with the exact
+// same rule and error text as the config those numbers would become.
+export function requirePositiveNumber(key: string, v: unknown): void {
+  if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v) || v <= 0)) {
+    throw new ZError(`Config "${key}" must be a positive number, got ${JSON.stringify(v)}.`);
+  }
+}
+
 function requireString(obj: any, key: string): void {
   if (typeof obj[key] !== "string" || !obj[key]) {
     throw new ZError(`Config "${key}" must be a non-empty string.`);
@@ -94,17 +103,12 @@ export function validateConfig(cfg: unknown): BoardConfig {
     throw new ZError(`Config "epicStyle" must be "milestones", got ${JSON.stringify(c.epicStyle)}.`);
   }
   for (const k of ["maxLanes", "watchdogMinutes", "lockStalenessMinutes"]) {
-    if (c[k] !== undefined && (typeof c[k] !== "number" || !Number.isFinite(c[k]) || c[k] <= 0)) {
-      throw new ZError(`Config "${k}" must be a positive number, got ${JSON.stringify(c[k])}.`);
-    }
+    requirePositiveNumber(k, c[k]);
   }
   if (c.quota !== undefined) {
     if (typeof c.quota !== "object" || c.quota === null) {
       throw new ZError(`Config "quota" must be an object.`);
     }
-    // Number.isFinite matters (issue #14 item 18): a NaN threshold passed the
-    // old typeof/negative checks, and `remaining >= NaN` is always false -- the
-    // quota guard would trip on EVERY call, sleeping or aborting forever.
     // Number.isFinite matters (issue #14 item 18): a NaN threshold passed the
     // old typeof/negative checks, and `remaining >= NaN` is always false -- the
     // quota guard would trip on EVERY call, sleeping or aborting forever.

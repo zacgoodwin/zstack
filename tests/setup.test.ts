@@ -46,12 +46,15 @@ interface BackendField {
   dataType: "SINGLE_SELECT" | "NUMBER" | "TEXT";
   options?: string[];
 }
+// An item is either a Status option name (shorthand, null = no Status) or a
+// {fieldName: optionName} record for multi-field usage tests (F7).
+type BackendItem = string | null | Record<string, string | null>;
 interface BackendProject {
   id: string;
   number: number;
   title: string;
   fields: BackendField[];
-  items?: (string | null)[]; // one Status option name per item; null = no Status
+  items?: BackendItem[];
 }
 
 function fullProjectSpec(title = "zstack"): BackendProject {
@@ -93,7 +96,7 @@ function nodeFrom(p: BackendProject): GraphQLData {
 // GitHub's default Status, and every field mutation updates the store, so a read
 // after a write reflects it -- which is what makes the end-to-end idempotence
 // assertion (second apply plans zero mutations) meaningful.
-function setupBackend(existing?: BackendProject) {
+function setupBackend(existing?: BackendProject, opts?: { usagePageSize?: number }) {
   let project: BackendProject | null = existing ? structuredClone(existing) : null;
   let seq = 0;
   const calls: { op: string; query: string; vars: any }[] = [];
@@ -126,16 +129,26 @@ function setupBackend(existing?: BackendProject) {
       case "ProjectFields":
         if (!project) throw new Error("ProjectFields called with no project");
         return nodeFrom(project);
-      case "StatusUsage":
-        if (!project) throw new Error("StatusUsage called with no project");
+      case "FieldUsage": {
+        if (!project) throw new Error("FieldUsage called with no project");
+        // Real cursor pagination (offset cursors) so tests can pin that the
+        // production loop actually follows pages (F6).
+        const all = (project.items ?? []).map((it) => {
+          const v = it === null || typeof it === "string" ? (vars.field === "Status" ? it : null) : (it[vars.field] ?? null);
+          return { fieldValueByName: v ? { name: v } : null };
+        });
+        const size = opts?.usagePageSize ?? Math.max(all.length, 1);
+        const start = vars.after ? Number(vars.after) : 0;
+        const end = start + size;
         return {
           node: {
             items: {
-              pageInfo: { hasNextPage: false, endCursor: null },
-              nodes: (project.items ?? []).map((s) => ({ fieldValueByName: s ? { name: s } : null })),
+              pageInfo: { hasNextPage: end < all.length, endCursor: end < all.length ? String(end) : null },
+              nodes: all.slice(start, end),
             },
           },
         };
+      }
       case "CreateProject":
         project = {
           id: "PVT_new",
@@ -377,22 +390,24 @@ describe("SetupBoard.apply — adoption path", () => {
   });
 });
 
+// GitHub's default board: Todo / In Progress are non-canonical and would be
+// deleted by set-status-options; Done is canonical and survives. Shared by the
+// adopt-guard, pagination (F6), and TOCTOU-recheck (F10) suites.
+function legacyProject(items: BackendItem[]): BackendProject {
+  return {
+    id: "PVT_legacy",
+    number: 4,
+    title: "zstack",
+    fields: [
+      { id: "F_title", name: "Title", dataType: "TEXT" },
+      { id: "F_status", name: "Status", dataType: "SINGLE_SELECT", options: ["Todo", "In Progress", "Done"] },
+    ],
+    items,
+  };
+}
+
 // -- destructive adopt guard (issue #14 item 5) -------------------------------
 describe("SetupBoard.apply — destructive adopt guard", () => {
-  // GitHub's default board: Todo / In Progress are non-canonical and would be
-  // deleted by set-status-options; Done is canonical and survives.
-  function legacyProject(items: (string | null)[]): BackendProject {
-    return {
-      id: "PVT_legacy",
-      number: 4,
-      title: "zstack",
-      fields: [
-        { id: "F_title", name: "Title", dataType: "TEXT" },
-        { id: "F_status", name: "Status", dataType: "SINGLE_SELECT", options: ["Todo", "In Progress", "Done"] },
-      ],
-      items,
-    };
-  }
 
   test("adopt with live items in non-canonical options refuses without --force, naming options + counts, issuing no mutation", async () => {
     const backend = setupBackend(legacyProject(["Todo", "Todo", "In Progress", "Done", null]));
@@ -416,8 +431,8 @@ describe("SetupBoard.apply — destructive adopt guard", () => {
     const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", force: true });
     expect(result.created).toBe(false);
     expect(result.dropped).toEqual([
-      { name: "Todo", count: 1 },
-      { name: "In Progress", count: 1 },
+      { field: "Status", name: "Todo", count: 1 },
+      { field: "Status", name: "In Progress", count: 1 },
     ]);
     expect(backend.calls.some((c) => c.op === "UpdateFieldOptions")).toBe(true);
     expect(backend.project!.fields.find((f) => f.name === "Status")!.options).toEqual([...STATUS_OPTIONS]);
@@ -431,6 +446,204 @@ describe("SetupBoard.apply — destructive adopt guard", () => {
     expect(result.created).toBe(false);
     expect(result.dropped).toEqual([]);
     expect(backend.calls.some((c) => c.op === "UpdateFieldOptions")).toBe(true);
+  });
+});
+
+// -- F6: usage scan pagination is real and loud ------------------------------
+describe("SetupBoard.apply — usage scan pagination (F6)", () => {
+  test("counts populated options across BOTH pages (refusal names the full count)", async () => {
+    // 3 "Todo" items with a page size of 2: page one alone sees only 2. An
+    // implementation with the cursor loop deleted undercounts and this regex
+    // (pinned to the total) fails.
+    const backend = setupBackend(legacyProject(["Todo", "Todo", "Todo"]), { usagePageSize: 2 });
+    const setup = new SetupBoard(backend.exec);
+    await expect(
+      setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" })
+    ).rejects.toThrow(/"Todo": 3 item\(s\)/);
+    expect(backend.calls.some((c) => c.op.startsWith("Create") || c.op.startsWith("Update"))).toBe(false);
+  });
+
+  test("hasNextPage with a null or empty endCursor throws loudly instead of undercounting", async () => {
+    for (const badCursor of [null, ""]) {
+      const backend = setupBackend(legacyProject(["Todo"]));
+      const exec: GraphQLExecutor = async (q, v) => {
+        const data = await backend.exec(q, v);
+        if (opName(q) === "FieldUsage") {
+          (data as any).node.items.pageInfo = { hasNextPage: true, endCursor: badCursor };
+        }
+        return data;
+      };
+      await expect(
+        new SetupBoard(exec).apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" })
+      ).rejects.toThrow(/endCursor/);
+    }
+  });
+
+  test("a repeated endCursor throws instead of looping forever", async () => {
+    const backend = setupBackend(legacyProject(["Todo"]));
+    const exec: GraphQLExecutor = async (q, v) => {
+      const data = await backend.exec(q, v);
+      if (opName(q) === "FieldUsage") {
+        (data as any).node.items.pageInfo = { hasNextPage: true, endCursor: "STUCK" };
+      }
+      return data;
+    };
+    await expect(
+      new SetupBoard(exec).apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" })
+    ).rejects.toThrow(/twice in a row/);
+  });
+});
+
+// -- F7: the guard covers every single-select replace, not just Status --------
+describe("SetupBoard.apply — guard covers Model / Model Effort (F7)", () => {
+  // A board whose Model field carries an extra non-canonical option; Status is
+  // already canonical so ONLY the Model replace is destructive.
+  function modelDriftProject(items: BackendItem[]): BackendProject {
+    const p = fullProjectSpec();
+    p.fields.find((f) => f.name === "Model")!.options = ["haiku", "sonnet", "opus", "fable", "gpt4"];
+    p.items = items;
+    return p;
+  }
+
+  test("a populated non-canonical Model option refuses without --force, naming Model and the option", async () => {
+    const backend = setupBackend(modelDriftProject([{ Model: "gpt4" }, { Model: "opus" }, {}]));
+    const setup = new SetupBoard(backend.exec);
+    await expect(
+      setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" })
+    ).rejects.toThrow(/Model "gpt4": 1 item\(s\)[\s\S]*--force/);
+    expect(backend.calls.some((c) => c.op.startsWith("Create") || c.op.startsWith("Update"))).toBe(false);
+  });
+
+  test("--force proceeds, reports the dropped Model option per field, and replaces the options", async () => {
+    const backend = setupBackend(modelDriftProject([{ Model: "gpt4" }]));
+    const setup = new SetupBoard(backend.exec);
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", force: true });
+    expect(result.dropped).toEqual([{ field: "Model", name: "gpt4", count: 1 }]);
+    expect(backend.project!.fields.find((f) => f.name === "Model")!.options).toEqual([
+      "haiku",
+      "sonnet",
+      "opus",
+      "fable",
+    ]);
+  });
+
+  test("an unpopulated non-canonical Model option proceeds without --force", async () => {
+    const backend = setupBackend(modelDriftProject([{ Model: "opus" }]));
+    const setup = new SetupBoard(backend.exec);
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    expect(result.dropped).toEqual([]);
+    expect(backend.calls.some((c) => c.op === "UpdateFieldOptions")).toBe(true);
+  });
+});
+
+// -- F8: lookup pagination (a page-2 project/field must be FOUND) -------------
+describe("SetupBoard pagination of lookups (F8)", () => {
+  test("a title match on page 2 of projectsV2 is adopted, not duplicated", async () => {
+    const backend = setupBackend(fullProjectSpec());
+    const exec: GraphQLExecutor = async (q, v: any) => {
+      if (opName(q) === "Projects") {
+        // Page one: only a decoy, more pages advertised. Page two: the match.
+        if (!v.after) {
+          return {
+            repository: {
+              projectsV2: {
+                pageInfo: { hasNextPage: true, endCursor: "P1" },
+                nodes: [{ id: "PVT_other", number: 1, title: "decoy" }],
+              },
+            },
+          };
+        }
+        return {
+          repository: {
+            projectsV2: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [{ id: "PVT_full", number: 3, title: "zstack" }],
+            },
+          },
+        };
+      }
+      return backend.exec(q, v);
+    };
+    const setup = new SetupBoard(exec);
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    expect(result.created).toBe(false); // found on page 2 -> adopted
+    expect(result.config.projectId).toBe("PVT_full");
+    expect(backend.calls.some((c) => c.op === "CreateProject")).toBe(false);
+  });
+
+  test("field discovery sees fields split across two pages (no duplicate create planned)", async () => {
+    const backend = setupBackend(fullProjectSpec());
+    const exec: GraphQLExecutor = async (q, v: any) => {
+      if (opName(q) === "ProjectFields") {
+        const node = (nodeFrom(backend.project!) as any).node;
+        const nodes = node.fields.nodes;
+        const page = v.after
+          ? { pageInfo: { hasNextPage: false, endCursor: null }, nodes: nodes.slice(3) }
+          : { pageInfo: { hasNextPage: true, endCursor: "F1" }, nodes: nodes.slice(0, 3) };
+        return { node: { ...node, fields: page } };
+      }
+      return backend.exec(q, v);
+    };
+    const setup = new SetupBoard(exec);
+    // Every field lives on one of the two pages; if page 2 were dropped, the
+    // plan would contain create-field actions for the "missing" fields.
+    const actions = await setup.plan("zacgoodwin", "zstack", { title: "zstack" });
+    expect(actions).toEqual([]);
+  });
+});
+
+// -- F9: inputs are validated BEFORE the first GraphQL op ---------------------
+describe("SetupBoard.apply — pre-flight input validation (F9)", () => {
+  test("an invalid maxLanes / watchdogMinutes refuses with ZERO GraphQL ops issued", async () => {
+    const backend = setupBackend(fullProjectSpec());
+    const setup = new SetupBoard(backend.exec);
+    for (const bad of [NaN, 0, -1]) {
+      await expect(
+        setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", maxLanes: bad })
+      ).rejects.toThrow(/"maxLanes" must be a positive number/);
+    }
+    await expect(
+      setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", watchdogMinutes: -5 })
+    ).rejects.toThrow(/"watchdogMinutes" must be a positive number/);
+    expect(backend.calls).toEqual([]); // nothing reached the backend, mutation or read
+  });
+
+  test('apply({epicStyle: "issue-type"} as any) throws before any op (JS-caller defense)', async () => {
+    const backend = setupBackend(fullProjectSpec());
+    const setup = new SetupBoard(backend.exec);
+    await expect(
+      setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", epicStyle: "issue-type" } as any)
+    ).rejects.toThrow(/not yet supported[\s\S]*milestones/);
+    expect(backend.calls).toEqual([]);
+  });
+});
+
+// -- F10: TOCTOU recheck right before the destructive mutation ----------------
+describe("SetupBoard.apply — usage recheck before replace (F10)", () => {
+  test("an option populated between the scan and the mutation refuses even with --force", async () => {
+    // First scan: nothing populated (guard would proceed). Second scan: an item
+    // landed in "Todo" during the window -> refuse, naming it, despite --force.
+    const backend = setupBackend(legacyProject(["Done", null]));
+    let usageReads = 0;
+    const exec: GraphQLExecutor = async (q, v) => {
+      if (opName(q) === "FieldUsage" && ++usageReads === 2) {
+        return {
+          node: {
+            items: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [{ fieldValueByName: { name: "Todo" } }],
+            },
+          },
+        };
+      }
+      return backend.exec(q, v);
+    };
+    const setup = new SetupBoard(exec);
+    await expect(
+      setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", force: true })
+    ).rejects.toThrow(/"Todo": 1 item\(s\)[\s\S]*not quiescent/);
+    expect(usageReads).toBe(2); // the recheck actually ran
+    expect(backend.calls.some((c) => c.op === "UpdateFieldOptions")).toBe(false);
   });
 });
 

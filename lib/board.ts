@@ -7,7 +7,7 @@
 // (GraphQLExecutor) so gate tests run against recorded fixtures with zero
 // network; production wires ghExecutor().
 import { readFileSync } from "node:fs";
-import { handleCliError, parseFlags, requireFlag } from "./cli.ts";
+import { handleCliError, parseFlags, requireFlag, str } from "./cli.ts";
 import {
   BoardConfig,
   DEFAULT_QUOTA,
@@ -239,8 +239,10 @@ export class Board {
     return data.rateLimit as QuotaStatus;
   }
 
-  async list(status: string): Promise<BoardItem[]> {
-    this.assertStatus(status);
+  // status omitted = every item on the board (F0): the one-call atomic
+  // snapshot contract z-status consumes via `z-board list --json`.
+  async list(status?: string): Promise<BoardItem[]> {
+    if (status !== undefined) this.assertStatus(status);
     // Cursor pagination (issue #14 item 1): the board WILL exceed 100 items
     // (auto-archive is forced off and Done issues stay open), and list()
     // filters client-side, so truncation here silently drops tickets.
@@ -253,16 +255,38 @@ export class Board {
       const items = data.node?.items;
       nodes.push(...(items?.nodes ?? []));
       const page = items?.pageInfo;
-      if (page?.hasNextPage && typeof page.endCursor !== "string") {
+      // F3c: items with no pageInfo is a malformed response, NOT "board
+      // drained" -- callers treat completion as authoritative, so guessing
+      // termination here would silently drop tickets.
+      if (!page && (items?.nodes?.length ?? 0) > 0) {
         throw new ZError(
-          `ProjectItems advertises another page but returned no endCursor -- refusing to silently drop board items.`
+          `ProjectItems returned ${items.nodes.length} item(s) but no pageInfo -- malformed response, refusing to treat the board as fully listed.`
         );
       }
-      cursor = page?.hasNextPage ? page.endCursor : undefined;
+      if (page?.hasNextPage) {
+        // F3a: an absent OR empty endCursor cannot be followed.
+        if (typeof page.endCursor !== "string" || page.endCursor === "") {
+          throw new ZError(
+            `ProjectItems advertises another page but returned no endCursor -- refusing to silently drop board items.`
+          );
+        }
+        // F3b: a cursor that does not advance would refetch this page forever.
+        if (page.endCursor === cursor) {
+          throw new ZError(
+            `ProjectItems returned the same endCursor twice (${JSON.stringify(cursor)}) -- refusing to loop forever on one page.`
+          );
+        }
+        cursor = page.endCursor;
+      } else {
+        cursor = undefined;
+      }
     } while (cursor !== undefined);
     return nodes
       .map((n) => toItem(n))
-      .filter((it): it is BoardItem => it !== null && it.fields["Status"] === status);
+      .filter(
+        (it): it is BoardItem =>
+          it !== null && (status === undefined || it.fields["Status"] === status)
+      );
   }
 
   async move(n: number, status: string): Promise<void> {
@@ -320,8 +344,11 @@ export class Board {
       }
       await this.gql(M_SET_SINGLE_SELECT, { ...base, option });
     } else if (fc.dataType === "NUMBER") {
-      const num = Number(value);
-      if (Number.isNaN(num)) throw new ZError(`${field} expects a number, got "${value}".`);
+      // F4: Number("") and Number("  ") are 0, so a failed upstream pipeline
+      // emitting a blank would silently zero a board field (e.g. Actual). Only
+      // a non-blank string parsing to a FINITE number may reach the mutation.
+      const num = value.trim() === "" ? NaN : Number(value);
+      if (!Number.isFinite(num)) throw new ZError(`${field} expects a number, got "${value}".`);
       await this.gql(M_SET_NUMBER, { ...base, number: num });
     } else {
       await this.gql(M_SET_TEXT, { ...base, text: value });
@@ -387,29 +414,62 @@ export class Board {
     await this.addRelation(b, `Blocks #${n}`);
   }
 
+  // In-process serialization for addRelation (F2): one promise chain per
+  // issue, so concurrent link() calls in this process never interleave their
+  // read-modify-write phases at all. Static because two Board instances in one
+  // process still share the same GitHub issue. Entries self-remove once the
+  // chain drains. KNOWN CEILING: a writer in ANOTHER process can still clobber
+  // us after our verification passes -- GitHub's updateIssue has no
+  // compare-and-swap, so the verify-retry loop plus the loud bounded failure
+  // below is the best available cross-process defense.
+  private static relationLocks = new Map<string, Promise<void>>();
+
+  private async withRelationLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = Board.relationLocks.get(key) ?? Promise.resolve();
+    const run = prev.then(fn, fn); // run even when the predecessor failed
+    const tail = run.then(
+      () => undefined,
+      () => undefined // a rejection must not poison the chain for the next waiter
+    );
+    Board.relationLocks.set(key, tail);
+    void tail.then(() => {
+      if (Board.relationLocks.get(key) === tail) Board.relationLocks.delete(key);
+    });
+    return run;
+  }
+
   // Body appends are read-modify-write with no server-side CAS, so a concurrent
   // link() that read the same base body can clobber our line (issue #14 item
   // 10). Mirror setup-permissions.verifyWrite: after writing, re-read and
   // confirm the line survived; on a lost update, re-append against the fresh
   // body and retry (bounded), then fail loudly instead of reporting success on
-  // a write that didn't stick.
+  // a write that didn't stick. Presence checks are line-exact (hasLine, F1):
+  // substring includes() let "Depends on #12" satisfy a check for
+  // "Depends on #1", so a clobbered write false-verified and the pre-check
+  // silently no-opped a needed append.
   private async addRelation(issue: IssueNode, line: string): Promise<void> {
-    if ((issue.body ?? "").includes(line)) return; // pre-existing: skip body write AND comment
-    const RETRIES = 3;
-    let current = issue;
-    for (let attempt = 1; ; attempt++) {
-      const body = current.body && current.body.length ? `${current.body}\n\n${line}` : line;
-      await this.gql(M_UPDATE_BODY, { id: current.id, body });
-      current = await this.lookup(current.number);
-      if ((current.body ?? "").includes(line)) break;
-      if (attempt >= RETRIES) {
-        throw new ZError(
-          `Issue #${current.number}: relation line "${line}" did not survive ${RETRIES} body writes -- ` +
-            `a concurrent writer keeps clobbering it. Re-run z-board link once the other writer settles.`
-        );
+    if (hasLine(issue.body, line)) return; // pre-existing: skip body write AND comment
+    const key = `${this.cfg.owner}/${this.cfg.repo}#${issue.number}`;
+    await this.withRelationLock(key, async () => {
+      // Re-read inside the lock: the caller's snapshot may predate the append
+      // of a writer we queued behind -- writing from it would drop that line.
+      let current = await this.lookup(issue.number);
+      if (hasLine(current.body, line)) return; // appended while we queued
+      const RETRIES = 3;
+      for (let attempt = 1; ; attempt++) {
+        const body = current.body && current.body.length ? `${current.body}\n\n${line}` : line;
+        await this.gql(M_UPDATE_BODY, { id: current.id, body });
+        current = await this.lookup(current.number);
+        if (hasLine(current.body, line)) break;
+        if (attempt >= RETRIES) {
+          throw new ZError(
+            `Issue #${current.number}: relation line "${line}" did not survive ${RETRIES} body writes -- ` +
+              `a concurrent writer keeps clobbering it. Re-run z-board link once the other writer settles.`
+          );
+        }
       }
-    }
-    await this.gql(M_ADD_COMMENT, { subject: issue.id, body: line });
+      await this.gql(M_ADD_COMMENT, { subject: issue.id, body: line });
+    });
   }
 
   // Atomic claim. Assignee sets are not compare-and-swap, so: refuse if already
@@ -519,6 +579,13 @@ export class Board {
   }
 }
 
+// Line-exact relation-line presence check (F1). Trailing whitespace/CR is
+// trimmed (CRLF bodies), then whole lines must match exactly -- substring
+// matching made "Depends on #12" satisfy a check for "Depends on #1".
+function hasLine(body: string | null | undefined, line: string): boolean {
+  return (body ?? "").split("\n").some((l) => l.trimEnd() === line);
+}
+
 interface IssueNode {
   id: string;
   number: number;
@@ -608,7 +675,7 @@ export function ghExecutor(): GraphQLExecutor {
 // -- CLI -------------------------------------------------------------------
 const USAGE = `z-board <command> [args]
 
-  list --status <S> [--json]        items in a status, with fields
+  list [--status <S>] [--json]      board items with fields (all statuses unless --status)
   move <N> <S>                      set an issue's Status
   comment <N> --body-file <F>       add a comment
   field-get <N> <Field>             read a custom field (${FIELD_HINT()})
@@ -667,8 +734,13 @@ export async function main(argv: string[]): Promise<number> {
 
     switch (cmd) {
       case "list": {
-        const status = requireFlag(flags, "status");
-        const items = await board.list(status);
+        // --status is optional (F0): omitted lists the whole board -- the
+        // atomic snapshot z-status consumes as `z-board list --json`. A bare
+        // --status with no value is a typo, not a request for everything.
+        if ("status" in flags && typeof flags.status !== "string") {
+          throw new ZError(`--status requires a value (omit the flag to list all items).`);
+        }
+        const items = await board.list(str(flags, "status"));
         if (flags.json) {
           console.log(JSON.stringify(items, null, 2));
         } else {

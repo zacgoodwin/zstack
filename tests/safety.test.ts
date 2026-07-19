@@ -432,6 +432,9 @@ describe("control 2: orphan scan (crash recovery)", () => {
         return {
           node: {
             items: {
+              // Real responses always carry pageInfo (selected in the query);
+              // the F3c malformed-response guard refuses a page without it.
+              pageInfo: { hasNextPage: false, endCursor: null },
               nodes: [
                 {
                   content: { number: 5, title: "t5", url: "u5" },
@@ -797,6 +800,26 @@ describe("item 18: corrupt locks fail with ZErrors on the recovery path", () => 
       JSON.stringify({ ticket: "4", stage: "builder", session: "s", claimedAt: "now" }) // strings where numbers belong
     );
     expect(() => readLaneLock(d, 4)).toThrow(/must be \{ticket, stage, session, claimedAt\}/);
+  });
+
+  // -- F13: only a MISSING locks dir reads as "no lanes" ----------------------
+  test("a missing locks dir still reads as no lanes (fresh project)", () => {
+    expect(listLaneLocks(join(tmp(), "never-created"))).toEqual([]);
+  });
+
+  test("a locks 'dir' that is actually a FILE raises ZError naming the path, not []", () => {
+    // readdir on a file fails ENOTDIR (not ENOENT) -- swallowing that into []
+    // rendered a plausible-but-false idle dashboard. Same for EACCES/EPERM.
+    const notADir = join(tmp(), "locks");
+    writeFileSync(notADir, "i am a file");
+    let caught: unknown;
+    try {
+      listLaneLocks(notADir);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ZError);
+    expect((caught as ZError).message).toContain(notADir);
   });
 
   test("the crash-recovery sweep (listLaneLocks) surfaces a corrupt lock loudly", () => {

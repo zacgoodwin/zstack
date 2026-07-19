@@ -200,6 +200,71 @@ describe("dedup fallback when requestId is absent (item 16a)", () => {
   });
 });
 
+// -- mixed-id dedup (F14) -----------------------------------------------------
+//
+// One response's content-block lines don't all carry the same id fields: a line
+// can have requestId+message.id while a sibling has only message.id (or only
+// requestId). Keying each line by a SINGLE id gives the two halves different
+// dedup keys ("req_R" vs "msgid:msg_M") and prices the one response twice. The
+// fix registers BOTH ids as seen and treats a line as duplicate if EITHER key
+// was seen -- including registering the keys of already-duplicate lines, so a
+// later line carrying only the "other" id of a linked pair still dedups.
+describe("mixed-id responses dedup by BOTH keys (F14)", () => {
+  const USAGE = {
+    input_tokens: 100,
+    output_tokens: 100,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+  };
+  const line = (ids: { requestId?: string; msgId?: string }) =>
+    JSON.stringify({
+      type: "assistant",
+      ...(ids.requestId !== undefined ? { requestId: ids.requestId } : {}),
+      message: {
+        ...(ids.msgId !== undefined ? { id: ids.msgId } : {}),
+        model: "claude-haiku-4-5",
+        usage: USAGE,
+      },
+    });
+
+  test("line with both ids + line with only message.id: priced once", () => {
+    const file = tmpFile(line({ requestId: "req_R", msgId: "msg_M" }) + "\n" + line({ msgId: "msg_M" }) + "\n");
+    const result = costOfFiles([file], RATES);
+    expect(result.lines_parsed).toBe(2);
+    expect(result.requests).toBe(1); // NOT 2: both lines are one API response
+    const haiku = result.by_model.find((m) => m.model === "haiku")!;
+    expect(haiku.tokens.output_tokens).toBe(100); // priced once, not twice
+  });
+
+  test("line with only requestId + line with both ids: priced once", () => {
+    const file = tmpFile(line({ requestId: "req_R" }) + "\n" + line({ requestId: "req_R", msgId: "msg_M" }) + "\n");
+    const result = costOfFiles([file], RATES);
+    expect(result.requests).toBe(1);
+    expect(result.by_model.find((m) => m.model === "haiku")!.tokens.output_tokens).toBe(100);
+  });
+
+  test("chain: requestId-only, both, message.id-only -- one response, priced once", () => {
+    // The middle line links req_R to msg_M; the third carries only msg_M. This
+    // only dedups if duplicate lines still register their unseen keys.
+    const file = tmpFile(
+      line({ requestId: "req_R" }) + "\n" + line({ requestId: "req_R", msgId: "msg_M" }) + "\n" + line({ msgId: "msg_M" }) + "\n"
+    );
+    const result = costOfFiles([file], RATES);
+    expect(result.lines_parsed).toBe(3);
+    expect(result.requests).toBe(1);
+    expect(result.by_model.find((m) => m.model === "haiku")!.tokens.output_tokens).toBe(100);
+  });
+
+  test("distinct responses with distinct id pairs stay distinct", () => {
+    const file = tmpFile(
+      line({ requestId: "req_A", msgId: "msg_A" }) + "\n" + line({ requestId: "req_B", msgId: "msg_B" }) + "\n"
+    );
+    const result = costOfFiles([file], RATES);
+    expect(result.requests).toBe(2);
+    expect(result.by_model.find((m) => m.model === "haiku")!.tokens.output_tokens).toBe(200);
+  });
+});
+
 // -- z-cost --json (issue #14 item 16b) ---------------------------------------
 //
 // z-loop's Actual field-set consumes `z-cost --json | jq -r .total`; this pins

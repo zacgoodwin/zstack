@@ -30,7 +30,7 @@ import {
   configPath,
   ZError,
 } from "./config.ts";
-import { validateConfig } from "./config-schema.ts";
+import { requirePositiveNumber, validateConfig } from "./config-schema.ts";
 import { ghExecutor, type GraphQLData, type GraphQLExecutor } from "./board.ts";
 
 export { ZError } from "./config.ts";
@@ -199,9 +199,15 @@ const Q_REPO_ID = `query RepoId($owner: String!, $repo: String!) {
   repository(owner: $owner, name: $repo) { id }
 }`;
 
-const Q_PROJECTS = `query Projects($owner: String!, $repo: String!) {
+// Paginated (issue F8): a title match past page one would read as "absent" and
+// apply() would create a DUPLICATE project, so a loud throw is not enough here
+// -- the lookup must actually walk every page.
+const Q_PROJECTS = `query Projects($owner: String!, $repo: String!, $after: String) {
   repository(owner: $owner, name: $repo) {
-    projectsV2(first: 50) { nodes { id number title } }
+    projectsV2(first: 50, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      nodes { id number title }
+    }
   }
 }`;
 
@@ -211,17 +217,18 @@ const Q_PROJECT_BY_NUMBER = `query ProjectByNumber($owner: String!, $repo: Strin
   }
 }`;
 
-// Counts live items per Status option so the adopt guard can see which
-// non-canonical options still hold items before they are wholesale-replaced.
+// Counts live items per option of ONE single-select field ($field), so the
+// adopt guard can see which non-canonical options still hold items before they
+// are wholesale-replaced (Status, Model, and Model Effort all get this check).
 // Paginated: undercounting past 100 items would let the guard wave through a
 // destructive adopt on a big board.
-const Q_STATUS_USAGE = `query StatusUsage($project: ID!, $after: String) {
+const Q_FIELD_USAGE = `query FieldUsage($project: ID!, $field: String!, $after: String) {
   node(id: $project) {
     ... on ProjectV2 {
       items(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
-          fieldValueByName(name: "Status") {
+          fieldValueByName(name: $field) {
             ... on ProjectV2ItemFieldSingleSelectValue { name }
           }
         }
@@ -230,11 +237,14 @@ const Q_STATUS_USAGE = `query StatusUsage($project: ID!, $after: String) {
   }
 }`;
 
-const Q_PROJECT_FIELDS = `query ProjectFields($project: ID!) {
+// Paginated (issue F8): a field past page one would read as missing, and apply()
+// would try to create a DUPLICATE custom field.
+const Q_PROJECT_FIELDS = `query ProjectFields($project: ID!, $after: String) {
   node(id: $project) {
     ... on ProjectV2 {
       id number title
-      fields(first: 50) {
+      fields(first: 50, after: $after) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           __typename
           ... on ProjectV2FieldCommon { id name dataType }
@@ -284,14 +294,18 @@ export interface ApplyOptions {
   slug: string;
   title: string;
   projectNumber?: number; // adopt this exact project instead of searching by title
-  epicStyle?: EpicStyle;
+  // Only "milestones" is supported (issue #14 item 6): the literal type pins TS
+  // callers, and apply() re-checks at runtime for plain-JS callers (F9).
+  epicStyle?: "milestones";
   maxLanes?: number;
   watchdogMinutes?: number;
-  force?: boolean; // adopt even when non-canonical Status options still hold items
+  force?: boolean; // adopt even when non-canonical single-select options still hold items
 }
 
-// A non-canonical Status option that had items when it was replaced (--force).
+// A non-canonical single-select option that had items when it was replaced
+// (--force). `field` names which field lost it (Status, Model, Model Effort).
 export interface DroppedOption {
+  field: string;
   name: string;
   count: number;
 }
@@ -324,6 +338,41 @@ export class SetupBoard {
     return id;
   }
 
+  // Cursor-follows a GraphQL connection to exhaustion, with lib/board.ts's
+  // loud-throw contract (F6): hasNextPage with a missing/empty endCursor, or a
+  // cursor that repeats, throws instead of silently truncating or spinning.
+  // Truncation here is never cosmetic: an undercounted FieldUsage waves a
+  // destructive adopt through, and a missed Projects page creates a duplicate.
+  // The page callback receives undefined on page one so callers can omit the
+  // $after variable entirely (ghExecutor encodes every variable it is given).
+  private async paginate<T>(
+    what: string,
+    page: (
+      after: string | undefined
+    ) => Promise<{ pageInfo?: { hasNextPage?: boolean; endCursor?: string | null }; nodes?: (T | null)[] } | null | undefined>
+  ): Promise<T[]> {
+    const out: T[] = [];
+    let after: string | undefined;
+    for (;;) {
+      const conn = await page(after);
+      for (const n of conn?.nodes ?? []) if (n != null) out.push(n);
+      const info = conn?.pageInfo;
+      if (!info?.hasNextPage) return out;
+      const next = info.endCursor;
+      if (typeof next !== "string" || next === "") {
+        throw new ZError(
+          `${what} advertises another page but returned no endCursor -- refusing to silently truncate.`
+        );
+      }
+      if (next === after) {
+        throw new ZError(
+          `${what} pagination returned endCursor "${next}" twice in a row -- aborting instead of looping forever.`
+        );
+      }
+      after = next;
+    }
+  }
+
   // Which project to work on. By explicit number (adopt), else by title match
   // among the repo's linked projects. null means "does not exist yet".
   async resolveHeader(
@@ -336,33 +385,59 @@ export class SetupBoard {
       const p = data.repository?.projectV2;
       return p ? { id: p.id, number: p.number, title: p.title } : null;
     }
-    const data = await this.exec(Q_PROJECTS, { owner, repo });
-    const nodes: any[] = data.repository?.projectsV2?.nodes ?? [];
+    const nodes = await this.paginate<any>("Projects", async (after) => {
+      const data = await this.exec(Q_PROJECTS, after ? { owner, repo, after } : { owner, repo });
+      return data.repository?.projectsV2;
+    });
     const match = nodes.find((n) => n.title === opts.title);
     return match ? { id: match.id, number: match.number, title: match.title } : null;
   }
 
   async readFields(projectId: string): Promise<ProjectState> {
-    const data = await this.exec(Q_PROJECT_FIELDS, { project: projectId });
-    return stateFromNode(data.node);
+    // The header (id/number/title) rides along on page one; only the fields
+    // connection is followed across pages.
+    let header: any;
+    const fieldNodes = await this.paginate<any>("ProjectFields", async (after) => {
+      const data = await this.exec(Q_PROJECT_FIELDS, after ? { project: projectId, after } : { project: projectId });
+      if (header === undefined) header = data.node;
+      return data.node?.fields;
+    });
+    return stateFromNode(header, fieldNodes);
   }
 
-  // Item count per Status option name, across every page.
-  private async statusUsage(projectId: string): Promise<Record<string, number>> {
+  // Item count per option name of one single-select field, across every page.
+  private async fieldUsage(projectId: string, field: string): Promise<Record<string, number>> {
+    const nodes = await this.paginate<any>(`FieldUsage("${field}")`, async (after) => {
+      const data = await this.exec(
+        Q_FIELD_USAGE,
+        after ? { project: projectId, field, after } : { project: projectId, field }
+      );
+      return data.node?.items;
+    });
     const counts: Record<string, number> = {};
-    let after: string | undefined;
-    do {
-      // The cursor is only sent when present: ghExecutor encodes every variable
-      // it is given, and "$after: String" may simply be omitted on page one.
-      const data = await this.exec(Q_STATUS_USAGE, after ? { project: projectId, after } : { project: projectId });
-      const items = data.node?.items;
-      for (const n of items?.nodes ?? []) {
-        const name = n?.fieldValueByName?.name;
-        if (name) counts[name] = (counts[name] ?? 0) + 1;
-      }
-      after = items?.pageInfo?.hasNextPage ? items.pageInfo.endCursor : undefined;
-    } while (after);
+    for (const n of nodes) {
+      const name = n?.fieldValueByName?.name;
+      if (name) counts[name] = (counts[name] ?? 0) + 1;
+    }
     return counts;
+  }
+
+  // For each field whose options are about to be replaced, count the items
+  // still assigned to each to-be-deleted option. One FieldUsage sweep per field
+  // (fieldValueByName takes exactly one name per query).
+  private async populatedDrops(
+    projectId: string,
+    atRisk: { field: string; options: string[] }[]
+  ): Promise<DroppedOption[]> {
+    const dropped: DroppedOption[] = [];
+    for (const r of atRisk) {
+      const usage = await this.fieldUsage(projectId, r.field);
+      for (const name of r.options) {
+        const count = usage[name] ?? 0;
+        if (count > 0) dropped.push({ field: r.field, name, count });
+      }
+    }
+    return dropped;
   }
 
   // Reads the full state, or null when the project does not exist.
@@ -388,6 +463,10 @@ export class SetupBoard {
   // re-reads and builds the validated BoardConfig. Does not touch the filesystem
   // (see writeConfig) so it stays unit-testable.
   async apply(owner: string, repo: string, opts: ApplyOptions): Promise<ApplyResult> {
+    // F9: every user-supplied input is checked before the FIRST GraphQL call.
+    // Validation used to live only in validateConfig AFTER the mutations, so a
+    // bad --max-lanes mutated the board and then failed without writing config.
+    validateApplyOptions(opts);
     const repositoryId = await this.repoId(owner, repo);
 
     let header = await this.resolveHeader(owner, repo, { number: opts.projectNumber, title: opts.title });
@@ -405,32 +484,64 @@ export class SetupBoard {
     // field ids from `state`.
     const actions = diffState(state, opts.title).filter((a) => a.kind !== "create-project");
 
-    // Destructive-adopt guard (issue #14 item 5). Replacing the Status options
-    // deletes every non-canonical option, and items assigned to a deleted
-    // option silently lose their Status. On an adopted board (never one we just
-    // created: its default options hold zero items) refuse before ANY mutation
-    // runs, unless --force; --force still surfaces what is dropped.
-    let dropped: DroppedOption[] = [];
-    if (!created && actions.some((a) => a.kind === "set-status-options")) {
-      const status = state.fields.find((f) => f.name === STATUS_FIELD_NAME);
-      const nonCanonical = (status?.options ?? [])
-        .map((o) => o.name)
-        .filter((n) => !(STATUS_OPTIONS as readonly string[]).includes(n));
-      if (nonCanonical.length) {
-        const usage = await this.statusUsage(header.id);
-        dropped = nonCanonical
-          .map((name) => ({ name, count: usage[name] ?? 0 }))
-          .filter((d) => d.count > 0);
-        if (dropped.length && !opts.force) {
-          const detail = dropped.map((d) => `  "${d.name}": ${d.count} item(s)`).join("\n");
-          throw new ZError(
-            `Refusing to adopt project #${header.number} "${header.title}": replacing the Status ` +
-              `options would delete non-canonical options that still have items assigned ` +
-              `(those items silently lose their Status):\n${detail}\n` +
-              `Re-run with --force to drop them anyway.`
-          );
-        }
+    // Destructive-adopt guard (issue #14 item 5, generalized by F7 to EVERY
+    // single-select replace: Status, Model, Model Effort). Replacing a field's
+    // options deletes every non-canonical option, and items assigned to a
+    // deleted option silently lose that field's value. On an adopted board
+    // (never one we just created: its default options hold zero items) refuse
+    // before ANY mutation runs, unless --force; --force still surfaces what is
+    // dropped, per field.
+    const replaces: { field: string; desired: string[] }[] = [];
+    if (!created) {
+      for (const a of actions) {
+        if (a.kind === "set-status-options") replaces.push({ field: STATUS_FIELD_NAME, desired: a.options });
+        else if (a.kind === "set-field-options") replaces.push({ field: a.name, desired: a.options });
       }
+    }
+    // Per replaced field: the existing options the replace would delete.
+    const atRisk = replaces
+      .map((r) => ({
+        field: r.field,
+        options: (state.fields.find((f) => f.name === r.field)?.options ?? [])
+          .map((o) => o.name)
+          .filter((n) => !r.desired.includes(n)),
+      }))
+      .filter((r) => r.options.length > 0);
+
+    let dropped: DroppedOption[] = [];
+    if (atRisk.length) {
+      dropped = await this.populatedDrops(header.id, atRisk);
+      if (dropped.length && !opts.force) {
+        const detail = dropped.map((d) => `  ${d.field} "${d.name}": ${d.count} item(s)`).join("\n");
+        throw new ZError(
+          `Refusing to adopt project #${header.number} "${header.title}": replacing single-select ` +
+            `options would delete non-canonical options that still have items assigned ` +
+            `(those items silently lose that field's value):\n${detail}\n` +
+            `Re-run with --force to drop them anyway.`
+        );
+      }
+
+      // TOCTOU mitigation (F10). The Projects API has no conditional mutation,
+      // so check-then-replace can never be atomic client-side. Re-scanning here
+      // shrinks the unguarded window from "scan -> human --force confirmation
+      // -> mutation" (minutes) to the gap between this read and the
+      // UpdateFieldOptions calls below (milliseconds). That residual window is
+      // the known ceiling: an item assigned inside it still loses its value
+      // silently -- SKILL.md tells the operator to run adopt on a quiescent
+      // board. Any option populated since the report above was produced is NOT
+      // covered by what the user consented to, so it refuses even under --force.
+      const recheck = await this.populatedDrops(header.id, atRisk);
+      const reported = new Set(dropped.map((d) => JSON.stringify([d.field, d.name])));
+      const fresh = recheck.filter((d) => !reported.has(JSON.stringify([d.field, d.name])));
+      if (fresh.length) {
+        const detail = fresh.map((d) => `  ${d.field} "${d.name}": ${d.count} item(s)`).join("\n");
+        throw new ZError(
+          `Refusing to adopt project #${header.number} "${header.title}": items were assigned to ` +
+            `non-canonical options while setup was running -- these were NOT in the report above:\n` +
+            `${detail}\nThe board is not quiescent; stop other writers and re-run.`
+        );
+      }
+      dropped = recheck; // report the counts that are actually destroyed
     }
 
     for (const a of actions) {
@@ -462,9 +573,11 @@ export class SetupBoard {
   }
 }
 
-function stateFromNode(node: any): ProjectState {
+// fieldNodes arrive separately from the header node because readFields
+// accumulates them across pages (F8).
+function stateFromNode(node: any, fieldNodes: any[]): ProjectState {
   if (!node || node.id === undefined) throw new ZError("Project not found (node returned null).");
-  const fields: FieldState[] = (node.fields?.nodes ?? [])
+  const fields: FieldState[] = fieldNodes
     .filter((f: any) => f && f.name && f.dataType)
     .map((f: any) => ({
       id: f.id,
@@ -473,6 +586,22 @@ function stateFromNode(node: any): ProjectState {
       options: f.options ? f.options.map((o: any) => ({ id: o.id, name: o.name })) : undefined,
     }));
   return { id: node.id, number: node.number, title: node.title, fields };
+}
+
+// F9 pre-flight: apply()'s defense against plain-JS callers (the ApplyOptions
+// literal types cover TS only). Same guards -- and error text -- as the config
+// these values become, but run BEFORE the first GraphQL op so a bad input can
+// never leave the board half-mutated with no config written.
+function validateApplyOptions(opts: ApplyOptions): void {
+  if (typeof opts.slug !== "string" || !opts.slug) {
+    throw new ZError(`Config "slug" must be a non-empty string.`);
+  }
+  toEpicStyle(opts.epicStyle); // rejects "issue-type" and any other non-"milestones" value
+  requirePositiveNumber("maxLanes", opts.maxLanes);
+  requirePositiveNumber("watchdogMinutes", opts.watchdogMinutes);
+  if (opts.projectNumber !== undefined && !Number.isInteger(opts.projectNumber)) {
+    throw new ZError(`"projectNumber" must be an integer, got ${JSON.stringify(opts.projectNumber)}.`);
+  }
 }
 
 function requireFieldId(state: ProjectState, name: string): string {
@@ -542,7 +671,8 @@ Fields:   ${CUSTOM_FIELDS.map((f) => f.name).join(", ")}`;
 
 // Exported for the gate test: rejecting "issue-type" here keeps the CLI from
 // ever calling GraphQL with a config the loop cannot act on (issue #14 item 6).
-export function toEpicStyle(v: string | undefined): EpicStyle | undefined {
+// Returns the supported literal, matching ApplyOptions.epicStyle (F9).
+export function toEpicStyle(v: string | undefined): "milestones" | undefined {
   if (v === undefined) return undefined;
   if (v === "issue-type") {
     throw new ZError(
@@ -610,8 +740,8 @@ export async function main(argv: string[]): Promise<number> {
         );
         if (result.dropped.length) {
           console.log(
-            "--force dropped non-canonical Status options that had items: " +
-              result.dropped.map((d) => `"${d.name}" (${d.count} item(s))`).join(", ")
+            "--force dropped non-canonical options that had items: " +
+              result.dropped.map((d) => `${d.field} "${d.name}" (${d.count} item(s))`).join(", ")
           );
         }
         console.log(`Wrote ${path}`);

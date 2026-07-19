@@ -93,13 +93,17 @@ export function removeLaneLock(locksDir: string, ticket: number): void {
 }
 
 // Every lane lock currently on disk, with its path, sorted by ticket. Tolerates
-// a missing locks dir (returns []) -- a fresh project has none.
+// a missing locks dir (returns []) -- a fresh project has none. Only ENOENT
+// means "no lanes": any other readdir failure (ENOTDIR: the path is a file;
+// EACCES/EPERM: unreadable) must not render a plausible-but-false idle
+// dashboard -- fail loud, naming the path (F13).
 export function listLaneLocks(locksDir: string): { path: string; lock: LaneLock }[] {
   let names: string[];
   try {
     names = readdirSync(locksDir);
-  } catch {
-    return [];
+  } catch (e: any) {
+    if (e?.code === "ENOENT") return [];
+    throw new ZError(`Cannot read locks dir ${locksDir}: ${e?.message ?? e}`);
   }
   const out: { path: string; lock: LaneLock }[] = [];
   for (const name of names) {

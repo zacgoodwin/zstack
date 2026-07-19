@@ -5,7 +5,7 @@
 // passes a path derived from homedir(): acceptance criterion 4 (no test
 // touches the real ~/.claude/settings.json) is structural, not a convention.
 import { test, expect, describe, afterEach } from "bun:test";
-import { copyFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -21,6 +21,7 @@ import {
   verifyWrite,
   type PermissionsMode,
 } from "../lib/setup-permissions.ts";
+import { atomicWrite } from "../lib/cli.ts";
 
 const FIXTURES = join(import.meta.dir, "fixtures", "settings");
 
@@ -336,6 +337,65 @@ describe("atomicWrite file mode", () => {
     // so the gate stays green cross-platform (the mode arg is a harmless no-op).
     if (process.platform === "win32") return;
     expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+});
+
+// -- atomicWrite failure handling (F16): cleanup + bounded Windows retry ---
+// A tiny error factory: the seam only inspects .code, matching how fs errors
+// carry it.
+function errnoErr(code: string): Error {
+  return Object.assign(new Error(`${code}: simulated`), { code });
+}
+
+describe("atomicWrite failure handling", () => {
+  test("rename failure unlinks the tmp file and propagates the error", () => {
+    const dir = makeDir();
+    const target = join(dir, "target");
+    // renameSync cannot replace an existing directory on Windows or POSIX, so
+    // this fails deterministically through the real fs (EPERM/EISDIR).
+    mkdirSync(target);
+    expect(() => atomicWrite(target, "x")).toThrow();
+    expect(statSync(target).isDirectory()).toBe(true); // target untouched
+    expect(readdirSync(dir).some((f) => f.includes(".tmp-"))).toBe(false);
+  });
+
+  test("transient EPERM is retried: two failures then success writes the file", () => {
+    const dir = makeDir();
+    const target = join(dir, "out.json");
+    let calls = 0;
+    atomicWrite(target, "hello", (from, to) => {
+      if (++calls <= 2) throw errnoErr("EPERM");
+      renameSync(from, to);
+    });
+    expect(calls).toBe(3);
+    expect(readFileSync(target, "utf8")).toBe("hello");
+    expect(readdirSync(dir).some((f) => f.includes(".tmp-"))).toBe(false);
+  });
+
+  test("a non-retryable rename error (ENOENT) fails on attempt 1, no retries, tmp cleaned", () => {
+    const dir = makeDir();
+    let calls = 0;
+    expect(() =>
+      atomicWrite(join(dir, "out.json"), "x", () => {
+        calls++;
+        throw errnoErr("ENOENT");
+      }),
+    ).toThrow("ENOENT");
+    expect(calls).toBe(1);
+    expect(readdirSync(dir).some((f) => f.includes(".tmp-"))).toBe(false);
+  });
+
+  test("persistent EPERM gives up after exactly 3 attempts, tmp cleaned", () => {
+    const dir = makeDir();
+    let calls = 0;
+    expect(() =>
+      atomicWrite(join(dir, "out.json"), "x", () => {
+        calls++;
+        throw errnoErr("EPERM");
+      }),
+    ).toThrow("EPERM");
+    expect(calls).toBe(3);
+    expect(readdirSync(dir).some((f) => f.includes(".tmp-"))).toBe(false);
   });
 });
 
