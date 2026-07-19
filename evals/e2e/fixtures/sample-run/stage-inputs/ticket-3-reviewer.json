@@ -1,0 +1,6 @@
+{
+  "ticketBody": "## Context\nNo visibility into route usage. Count requests per route.\n\n## Plan\nAdd src/metrics.ts counter; wrap handle(); add route('/metrics').\n\n### Acceptance Criteria\n- two /health hits then /metrics -> counts['/health'] === 2.\n- GET /metrics -> 200 with a per-route count object.\n\n## Tests + evals\ntest/metrics.test.ts.\n\n## Docs pages touched\ndocs/user-guide/index.md.\n\n## Out of scope\nPersistent metrics.\n\nDepends on: #2",
+  "acceptanceCriteria": "- two /health hits then /metrics -> counts['/health'] === 2.\n- GET /metrics -> 200 with a per-route count object.",
+  "diff": "diff --git a/src/metrics.ts b/src/metrics.ts\nnew file mode 100644\n+++ b/src/metrics.ts\n@@\n+const counts: Record<string, number> = {};\n+export const bump = (p: string) => { counts[p] = (counts[p] ?? 0) + 1; };\n+export const snapshot = () => ({ ...counts });",
+  "worktreePath": "/tmp/z-review-3"
+}

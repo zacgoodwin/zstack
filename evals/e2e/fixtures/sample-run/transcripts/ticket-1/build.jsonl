@@ -1,0 +1,3 @@
+{"type":"user","message":{"role":"user","content":"Build ticket #1"}}
+{"type":"assistant","requestId":"req-t1-a","message":{"model":"claude-sonnet-4-5-20260101","usage":{"input_tokens":200000,"output_tokens":40000,"cache_read_input_tokens":500000,"cache_creation_input_tokens":0}}}
+{"type":"assistant","requestId":"req-t1-a","message":{"model":"claude-sonnet-4-5-20260101","usage":{"input_tokens":200000,"output_tokens":40000,"cache_read_input_tokens":500000,"cache_creation_input_tokens":0}}}
