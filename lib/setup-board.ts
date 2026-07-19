@@ -182,9 +182,8 @@ export function verifyReport(project: ProjectState | null): VerifyReport {
 // -- GraphQL operations ------------------------------------------------------
 // Single-select option lists are our own fixed constants, so they are inlined as
 // GraphQL literals rather than passed as variables: that keeps every runtime
-// variable scalar, which is exactly what board.ts's ghExecutor (-f/-F only) can
-// encode. JSON.stringify escapes the (controlled) name safely; color/description
-// are literal enum/string tokens.
+// variable scalar. JSON.stringify escapes the (controlled) name safely;
+// color/description are literal enum/string tokens.
 const COLORS = ["GRAY", "BLUE", "GREEN", "YELLOW", "ORANGE", "RED", "PURPLE", "PINK"];
 
 function optionLiterals(options: string[]): string {
