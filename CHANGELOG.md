@@ -2,6 +2,31 @@
 
 All notable changes to zstack are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/); versions use `MAJOR.MINOR.PATCH.MICRO`.
 
+## [Unreleased]
+
+Remediation of issue #14 (all 22 items now closed) plus an adversarial hardening pass (OpenAI Codex challenge + independent refute review, every fix mutation-tested).
+
+### Fixed
+
+- `Board.list()` paginates past 100 items with cursor-loop hardening (empty/repeated cursor and missing `pageInfo` throw loudly); single-page ceilings (fieldValues, projectItems, milestones, labels) guard with loud throws.
+- Destructive board adopt now refuses without `--force` when non-canonical options on ANY single-select field (Status, Model, Model Effort) still hold items, names each option and count before any mutation, and rechecks immediately before mutating (refuses even under `--force` if the board moved).
+- Setup's project/field lookups paginate — a project past page one is adopted, not duplicated.
+- `link` (Depends-on) survives lost updates: line-exact verification (no more `#12` false-verifying `#1`), bounded re-append retries, per-issue in-process serialization; comment posts only after a verified write.
+- Cost accounting prices a response exactly once even when its transcript lines mix requestId and message.id presence; blank or non-finite values are rejected before any NUMBER field write (a failed pipeline can no longer zero `Actual`).
+- z-status reads ONE atomic board snapshot (no more mid-scan double-count/vanish), cleans up its temp dir, and dedupes by issue number with a visible warning.
+- Lock/report reads distinguish "missing" from "unreadable": I/O failures raise errors instead of rendering a false idle dashboard.
+- `atomicWrite` hardened for Windows: exclusive tmp create, bounded retry on transient rename errors, tmp cleanup on failure.
+- The two skill-file grep gates scan the real `*/SKILL.md` targets with canary assertions and an exact allowlist; the scanner joins backslash continuations and covers all `gh` invocations (both proven evasions now self-tested).
+
+### Changed
+
+- `z-board list --status` is now optional: omitted lists the whole board in one paginated call (the atomic snapshot z-status consumes).
+- `z-cost --json` emits machine-readable totals; z-loop's Actual write consumes it instead of parsing prose.
+- `epicStyle "issue-type"` is rejected at config validation and z-setup until a sub-issue create path exists; epic style is always `milestones`.
+- `field-get` on a nonexistent issue throws the same not-found error as other subcommands (was a silent empty value), and never falls back to another project's same-named field.
+- Root strict `tsconfig` + `bun run typecheck` wired into the gate suite; shared CLI plumbing consolidated into `lib/cli.ts`; board statuses single-sourced in `lib/config.ts`.
+- 100+ new gate tests (456 total), each proven to bite via mutation testing.
+
 ## [0.1.0.0] - 2026-07-19
 
 First release of the zstack dev-loop skill pack. Installs at `~/.claude/skills/zstack` alongside gstack (required) and runs the [PROCESS.md](references/PROCESS.md) development loop after planning, deploying at end of loop. GitHub Projects backed; solo-dev, any repo.
@@ -20,5 +45,5 @@ First release of the zstack dev-loop skill pack. Installs at `~/.claude/skills/z
 
 ### Known limitations
 
-- Not yet merge-ready to a production main: the pre-landing review filed remediation issue #14 (pagination beyond 100 board items, epicStyle `issue-type` create path, cross-session claim identity, and others). See #14 before running against a real board at scale.
+- The pre-landing review filed remediation issue #14 (pagination beyond 100 board items, epicStyle `issue-type` create path, cross-session claim identity, and others); all 22 items are closed in [Unreleased] above.
 - Board creation, real multi-session lock concurrency, and issue-stays-open-on-Done are validated by design and gate tests but need one live run (`gh auth refresh -s project`, then `/z-setup`) to confirm end to end.
