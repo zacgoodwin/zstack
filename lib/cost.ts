@@ -30,7 +30,7 @@
 // loudly instead of silently under/over-billing (tests/cost.test.ts pins this
 // with a mutated-fixture canary).
 import { readFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { handleCliError } from "./cli.ts";
 import { ZError } from "./config.ts";
 import { loadRates, priceTokens, ratesPath, resolveRate, roundCents, type RatesFile } from "./estimate.ts";
@@ -177,9 +177,53 @@ export function costOfFiles(paths: string[], rates: RatesFile): CostResult {
 // Handles both cwd-relative patterns ("transcripts/*.jsonl") and absolute
 // ones (a real "~/.claude/projects/.../*.jsonl" expansion) by re-joining any
 // relative match against cwd; absolute matches pass through unchanged.
+//
+// Bun.Glob.scanSync cannot match a pattern that IS itself an absolute path --
+// confirmed empirically (ticket #22): an absolute pattern with no glob
+// metacharacter anywhere (e.g. a transcript file named directly, the exact
+// shape z-cost hit live) returns zero matches no matter what `cwd` is passed,
+// even though the identical tail matches fine once it's relative to its own
+// directory. So an absolute pattern is split into its deepest directory
+// prefix that contains no glob metacharacter, and Bun.Glob scans FROM that
+// prefix with only the remaining (now-relative) tail as the pattern; matches
+// are re-joined onto the prefix to stay absolute. Relative patterns are
+// untouched -- they already scan correctly from the caller's cwd.
+const ABSOLUTE_PATTERN = /^(?:[a-zA-Z]:[\\/]|[\\/])/; // POSIX "/..." or Windows "X:/..." / "X:\..."
+const GLOB_META = /[*?[\]{}]/;
+
+// Splits an absolute pattern into { prefix, rest } where `prefix` has no glob
+// metacharacter in any segment and `rest` is the (relative) remainder handed
+// to Bun.Glob. If the whole pattern is literal (no metachar at all -- the
+// exact failure this fixes), `rest` falls back to just the final segment so
+// Bun.Glob always receives a relative tail.
+function splitAbsoluteGlob(pattern: string): { prefix: string; rest: string } {
+  const segments = pattern.split(/[\\/]+/); // segments[0] is "" (POSIX root) or "C:" (drive)
+  let i = 1;
+  for (; i < segments.length; i++) {
+    if (GLOB_META.test(segments[i])) break;
+  }
+  if (i >= segments.length) i = segments.length - 1; // no metachar anywhere: keep the last segment relative
+  let prefix = segments.slice(0, i).join("/") || "/";
+  if (/^[a-zA-Z]:$/.test(prefix)) prefix += "/"; // bare drive letter ("C:") means drive-relative, not root
+  const rest = segments.slice(i).join("/");
+  return { prefix, rest };
+}
+
 export function expandGlob(pattern: string, cwd: string = process.cwd()): string[] {
-  const matches = [...new Bun.Glob(pattern).scanSync({ cwd })];
-  return matches.map((m) => (isAbsolute(m) ? m : join(cwd, m))).sort();
+  let scanCwd = cwd;
+  let scanPattern = pattern;
+  if (ABSOLUTE_PATTERN.test(pattern)) {
+    const split = splitAbsoluteGlob(pattern);
+    // resolve(): a driveless POSIX-style prefix ("/Users/...") is a real,
+    // existing directory to node:fs (Windows maps it onto the current
+    // drive) but Bun.Glob's own `cwd` option fails to open it as given
+    // (confirmed empirically) -- resolve() fully-qualifies it onto the
+    // current drive first, which Bun.Glob always handles correctly.
+    scanCwd = resolve(split.prefix);
+    scanPattern = split.rest;
+  }
+  const matches = [...new Bun.Glob(scanPattern).scanSync({ cwd: scanCwd })];
+  return matches.map((m) => (isAbsolute(m) ? m : join(scanCwd, m))).sort();
 }
 
 // -- CLI ---------------------------------------------------------------------

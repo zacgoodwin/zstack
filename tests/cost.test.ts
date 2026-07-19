@@ -143,6 +143,99 @@ describe("expandGlob", () => {
   });
 });
 
+// -- absolute patterns (ticket #22: Bun.Glob drive-letter fix) ---------------
+//
+// Confirmed empirically (Windows, Bun 1.3.14): Bun.Glob.scanSync never
+// matches a pattern that is ITSELF a fully literal absolute path (no glob
+// metacharacter anywhere) regardless of `cwd` -- e.g. the exact live repro
+// `z-cost --json "C:/.../transcripts/ticket-17/builder.jsonl"` returned "No
+// files matched" even though the file existed, while the identical filename
+// used as a relative pattern from its own directory matched fine. The fix
+// splits an absolute pattern into its deepest glob-metacharacter-free
+// directory prefix and scans from there with only the (now relative) tail.
+describe("expandGlob: absolute patterns (ticket #22)", () => {
+  test("AC1: absolute Windows drive-letter pattern (forward slashes) matches", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-abs-win-fwd-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "transcript.jsonl"), readFileSync(FIXTURE, "utf8"));
+    const pattern = join(dir, "*.jsonl").replaceAll("\\", "/"); // "C:/.../*.jsonl"
+    const files = expandGlob(pattern);
+    expect(files.length).toBe(1);
+    expect(costOfFiles(files, RATES).total).toBe(0.09);
+  });
+
+  test("AC1: absolute Windows drive-letter pattern (native backslashes) matches", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-abs-win-back-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "transcript.jsonl"), readFileSync(FIXTURE, "utf8"));
+    const pattern = join(dir, "*.jsonl"); // native Windows join uses "\"
+    const files = expandGlob(pattern);
+    expect(files.length).toBe(1);
+    expect(costOfFiles(files, RATES).total).toBe(0.09);
+  });
+
+  test("absolute POSIX-style pattern (leading single slash, no drive letter) matches", () => {
+    // A driveless leading-slash path is drive-RELATIVE on Windows (it
+    // resolves onto whatever the current process's drive is), so the fixture
+    // has to live on that same drive -- os.tmpdir() is a different drive on
+    // this machine, so build under process.cwd() (the worktree) instead.
+    const dir = mkdtempSync(join(process.cwd(), ".zcost-abs-posix-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "transcript.jsonl"), readFileSync(FIXTURE, "utf8"));
+    // Strip the drive letter to simulate a POSIX-style absolute pattern
+    // ("/Users/.../*.jsonl") -- the leading-slash branch of ABSOLUTE_PATTERN.
+    const posixDir = "/" + dir.replace(/^[a-zA-Z]:[\\/]/, "").replaceAll("\\", "/");
+    const pattern = `${posixDir}/*.jsonl`;
+    const files = expandGlob(pattern);
+    expect(files.length).toBe(1);
+    expect(costOfFiles(files, RATES).total).toBe(0.09);
+  });
+
+  test("literal absolute path with NO glob metacharacter still matches (the exact live repro)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-abs-literal-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "builder.jsonl"), readFileSync(FIXTURE, "utf8"));
+    const pattern = join(dir, "builder.jsonl").replaceAll("\\", "/"); // no "*" anywhere
+    const files = expandGlob(pattern);
+    expect(files.length).toBe(1);
+    expect(costOfFiles(files, RATES).total).toBe(0.09);
+  });
+
+  test("AC2: relative pattern (cd T && z-cost \"*.jsonl\") gives the same total as AC1", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-rel-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "transcript.jsonl"), readFileSync(FIXTURE, "utf8"));
+    const files = expandGlob("*.jsonl", dir); // cwd = T, pattern relative -- unchanged behavior
+    expect(files.length).toBe(1);
+    expect(costOfFiles(files, RATES).total).toBe(0.09);
+  });
+
+  test("AC3: absolute pattern over an empty directory still yields no matches", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-abs-empty-"));
+    tmpPaths.push(dir);
+    const pattern = join(dir, "*.jsonl").replaceAll("\\", "/");
+    expect(expandGlob(pattern)).toEqual([]);
+  });
+
+  test("AC3: main() raises the existing ZError naming the pattern for an absolute no-match glob", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-abs-empty-cli-"));
+    tmpPaths.push(dir);
+    const pattern = join(dir, "*.jsonl").replaceAll("\\", "/");
+    const logs: string[] = [];
+    const origError = console.error;
+    console.error = (...a: unknown[]) => void logs.push(a.join(" "));
+    let code: number;
+    try {
+      code = await main(["--json", pattern]);
+    } finally {
+      console.error = origError;
+    }
+    expect(code).not.toBe(0);
+    expect(logs.join("\n")).toContain(pattern);
+    expect(logs.join("\n")).toMatch(/No files matched/);
+  });
+});
+
 // -- requestId-absent dedup fallback (issue #14 item 16a) ---------------------
 //
 // Real transcripts split one API response across multiple jsonl lines (one per
