@@ -421,3 +421,66 @@ describe("z-plan/SKILL.md: Step 1 multi-document input contract (issue #16)", ()
     expect(step1).toMatch(/Stop with no board writes on\s*\n?\s*this path either/);
   });
 });
+
+// -- Step 1 multiple explicit path arguments (issue #19) ---------------------
+// #16 covers the no-argument case only; `/z-plan a.md b.md c.md` was
+// previously undefined -- Step 1's flag-parsing loop assigned every non-flag
+// argument to a single SPEC variable, so only the LAST path survived and the
+// rest were silently dropped. These are doc canaries on z-plan/SKILL.md's
+// Step 1 (the skill is executed by an agent, not this suite) pinning the
+// contract strings that make AC1-AC3 true: one explicit path is unchanged
+// (AC2), the first of several is the primary spec and every other is
+// mandatory grounding context, nothing named is silently dropped (AC1), and a
+// missing named file fails loud naming it with no partial planning (AC3).
+describe("z-plan/SKILL.md: Step 1 multiple explicit path arguments (issue #19)", () => {
+  const zPlan = () => readFileSync(join(import.meta.dir, "..", "z-plan", "SKILL.md"), "utf8");
+
+  function section(md: string, heading: string): string {
+    const start = md.indexOf(heading);
+    if (start < 0) return "";
+    const rest = md.slice(start + heading.length);
+    const next = rest.indexOf("\n## ");
+    return next < 0 ? rest : rest.slice(0, next);
+  }
+
+  test("a single explicit path argument is unchanged from before this ticket (AC2)", () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    // Same literal contract sentence #16 already pinned -- this ticket must
+    // not weaken it while adding multi-path support.
+    expect(step1).toContain("An explicit path argument wins unchanged");
+    expect(step1).toContain("no discovery run");
+    expect(step1).toContain("Identical to the behavior before this ticket (issue #19)");
+  });
+
+  test("more than one explicit path: the FIRST is primary, every other is mandatory grounding (AC1)", () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toContain("More than one explicit path argument is also supported");
+    expect(step1).toMatch(/`\$\{SPECS\[0\]\}`\s*—\s*the FIRST path\s*—\s*is the\s*\n?\s*\*\*primary spec\*\*/);
+    expect(step1).toMatch(/Every subsequent path is \*\*mandatory grounding\s*\n?\s*context\*\*/);
+    expect(step1).toMatch(/scope named ONLY in one of\s*\n?\s*these other files still belongs in the plan/);
+    expect(step1).toMatch(/nothing (named on the command\s*\n?\s*line is optional background reading, and )?nothing is silently dropped/);
+    // Guards the exact regression this ticket fixes: a naive port that still
+    // overwrites a single SPEC variable per argument.
+    expect(step1).toMatch(/only the LAST path survived and the rest were\s*\n?\s*silently dropped/);
+    // Explicit paths (one or many) never fall through to spec-sources discovery.
+    expect(step1).toMatch(/still bypass `lib\/spec-sources\.ts` discovery entirely/);
+  });
+
+  test("every named path must exist before any is read; a missing one fails loud, naming it, with no partial plan (AC3)", () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toContain('Every named path must exist before any of them is read');
+    expect(step1).toContain('[ -f "$p" ]');
+    expect(step1).toMatch(/A missing file fails loud, naming exactly which path does not\s*\n?\s*exist/);
+    expect(step1).toMatch(/exits 1 with no board writes/);
+    expect(step1).toMatch(/does NOT fall back to planning from the\s*\n?\s*paths that do exist/);
+    // The concrete AC3 example: a.md + missing.md never plans from a.md alone.
+    expect(step1).toContain("/z-plan a.md missing.md` never plans from `a.md` alone");
+  });
+
+  test("Step 1 collects arguments into an ordered SPECS list, not a single overwritten SPEC variable", () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toContain("SPECS=()");
+    expect(step1).toContain('SPECS+=("$arg")');
+    expect(step1).not.toContain('SPEC="$arg"');
+  });
+});
