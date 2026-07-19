@@ -428,8 +428,8 @@ describe("AC4: final report -- verdict, dollars, tickets by status, edges rollup
     expect(report).toContain("to check empty-list export, do export with zero rows, expect a header-only CSV, not an error.");
     // bugs filed
     expect(report).toContain("#20 [cso] hardcoded secret in lib/x.ts");
-    // 5th-loop audits called out
-    expect(report).toContain("5th-loop audits");
+    // audits called out (cadence-neutral: no hardcoded "5th-loop" wording, since the cadence is configurable)
+    expect(report).toContain("audits (cso + health) also ran this loop");
   });
 
   test("red report states plainly that no deploy happened, and lists the filed bugs", () => {

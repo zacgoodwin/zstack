@@ -197,7 +197,7 @@ export function buildEndLoopReport(input: EndLoopReportInput): string {
   const deployLine =
     regression.verdict === "red"
       ? "NO deploy -- regression is red. Every finding below is filed to Backlog with repro + first-suspect file; fix and re-run before shipping."
-      : `land-and-deploy -> canary -> document-release completed, in that order.${auditsRan ? " 5th-loop audits (cso + health) also ran; findings below." : ""}`;
+      : `land-and-deploy -> canary -> document-release completed, in that order.${auditsRan ? " audits (cso + health) also ran this loop; findings below." : ""}`;
 
   const statusCounts = TERMINAL_STATUSES.map((s) => `- ${s}: ${tickets.filter((t) => t.status === s).length}`).join("\n");
 
