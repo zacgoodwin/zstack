@@ -295,14 +295,20 @@ describe("z-plan/SKILL.md: Step 10 Backlog scan contract (issue #13)", () => {
     expect(step10).toContain('"$Z_BOARD" field-get <N> <Field>');
   });
 
-  test("Step 10 stays in Backlog: no move to Ready, exception named as Step 7.4's pull only", () => {
+  test("Step 10 never promotes to Ready; Step 7.4's pull remains the only path to Ready", () => {
     const step10 = section(zPlan(), "## Step 10 — Backlog scan");
     expect(step10).toContain("Step 10 never calls");
     expect(step10).toContain('"$Z_BOARD" move <N> Ready');
     expect(step10).toMatch(/Step 7\.4's\s+dependency pull/); // tolerant of source line-wrap
-    // The only ticket-movement call anywhere in Step 10 is to Questions (the
-    // ambiguity path) -- Ready never appears as a `z-board move` target.
+    // Ready never appears as a `z-board move` target anywhere in Step 10.
     expect(step10).not.toMatch(/"\$Z_BOARD" move <N> Ready --slug/);
+    // The claim is scoped to Ready specifically -- Step 10 also moves tickets
+    // to Questions (item 3's ambiguity path) and must say so is a *different*,
+    // allowed movement, not a second Ready exception (this is the reworded
+    // contract; a version that still claims Step 7.4 is the only ticket
+    // movement anywhere in the skill is the bug this test guards against).
+    expect(step10).toMatch(/different, allowed movement/);
+    expect(step10).not.toMatch(/only ticket-movement exception anywhere in this skill/);
   });
 
   test("Step 10 idempotent re-run: a passing, fully-fielded ticket gets zero writes", () => {
@@ -316,8 +322,20 @@ describe("z-plan/SKILL.md: Step 10 Backlog scan contract (issue #13)", () => {
     expect(dryRun).toMatch(/No board writes,\s+no GitHub writes/); // tolerant of source line-wrap
   });
 
-  test("Done criteria names the Step 10 gate", () => {
+  test("Done criteria names the Step 10 gate, scoped to tickets still in Backlog", () => {
     const done = section(zPlan(), "## Done criteria");
-    expect(done).toMatch(/Backlog at scan time passes `z-ticket-lint`/);
+    // The lint-pass claim must carve out item 3's ambiguity path (a ticket
+    // moved to Questions never gets a drafted body, so it can't be linted) --
+    // a version that claims literally "every ticket in Backlog at scan time"
+    // passes lint is the bug this test guards against.
+    expect(done).toMatch(/still in Backlog after the scan/);
+    expect(done).toMatch(/not moved to Questions/);
+    expect(done).toMatch(/passes `z-ticket-lint`/);
+    expect(done).not.toMatch(/Every ticket in Backlog at scan time passes `z-ticket-lint`/);
+    // The Ready-promotion claim must be scoped to Ready, not asserted as the
+    // only ticket movement anywhere in the skill (Questions is another).
+    expect(done).toMatch(/never promotes a ticket to Ready/);
+    expect(done).toMatch(/Step 7\.4's\s+dependency pull/);
+    expect(done).not.toMatch(/only ticket-movement exception anywhere in this skill/);
   });
 });

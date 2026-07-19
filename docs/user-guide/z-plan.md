@@ -80,5 +80,6 @@ needed a change, emitted to stdout as one markdown block.
 Every filed ticket passes the lint gate, carries Model/Effort/Estimate via
 `z-board`, links its dependencies both ways, splits anything over the context
 gate, parks open questions, and a re-run creates zero duplicates. Every ticket
-already in Backlog at scan time passes the same lint gate and carries the same
-three fields, without being promoted.
+still in Backlog after the scan — i.e., not moved to Questions by a genuine
+ambiguity — passes the same lint gate and carries the same three fields; this
+step never promotes a ticket to Ready.

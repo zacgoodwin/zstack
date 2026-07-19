@@ -347,12 +347,16 @@ For each ticket number `<N>` in that list:
    passes lint AND already carries all three fields gets zero body edits, zero
    field writes, and zero comments this run — the same idempotent-rerun
    guarantee Step 9 gives spec-derived tickets.
-6. **Stay in Backlog.** Every ticket this step plans (step 3's draft path, step
-   4's fields) stays exactly where it was found. Step 10 never calls
-   `"$Z_BOARD" move <N> Ready`; promotion is a human decision. The only
-   ticket-movement exception anywhere in this skill remains Step 7.4's
-   dependency pull (a dependency discovered while planning OTHER work that must
-   be analyzed next) — Step 10 does not add a second one.
+6. **Never promotes to Ready.** Every ticket this step plans (step 3's draft
+   path, step 4's fields) stays exactly where it was found, unless step 3's
+   ambiguity path moved it to Questions. Step 10 never calls
+   `"$Z_BOARD" move <N> Ready`; promotion is a human decision, and the only
+   path anywhere in this skill that ever moves a Backlog ticket to Ready
+   remains Step 7.4's dependency pull (a dependency discovered while planning
+   OTHER work that must be analyzed next) — Step 10 does not add a second one.
+   Moving a ticket to Questions (this step's item 3, and the pre-existing
+   Step 8) is a different, allowed movement; Step 10 does not claim
+   exclusivity over that one, only over Ready.
 
 ---
 
@@ -391,7 +395,8 @@ Report DONE only when all hold:
   order recorded in the parent (Step 5).
 - Open questions are commented and their tickets are in Questions (Step 8).
 - A re-run on the same spec updates in place and creates zero duplicates (Step 9).
-- Every ticket in Backlog at scan time passes `z-ticket-lint` and carries
-  Model, Model Effort, and Estimate (Step 10); none were promoted to Ready by
-  this step — the only ticket-movement exception anywhere in this skill remains
-  Step 7.4's dependency pull.
+- Every ticket still in Backlog after the scan — i.e., not moved to Questions
+  by item 3's ambiguity path — passes `z-ticket-lint` and carries Model, Model
+  Effort, and Estimate (Step 10). This step never promotes a ticket to Ready —
+  the only path anywhere in this skill that ever moves a Backlog ticket to
+  Ready remains Step 7.4's dependency pull.
