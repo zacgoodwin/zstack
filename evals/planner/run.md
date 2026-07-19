@@ -199,3 +199,62 @@ echo "multi-document scores in $OUT"
 - The dry-run output splitter feeding `bin/z-ticket-lint`.
 - Aggregation of `multidoc-score-*.json` totals against the same ≥8/10
   threshold, and nightly scheduling alongside the other two passes.
+
+### Explicit two-path variant (issue #19)
+
+The pass above exercises the no-argument discovery route into the same
+cross-document-coverage check. Issue #19 adds a second, independent route to
+that identical rubric dimension: two explicit path arguments
+(`/z-plan a.md b.md`), where the FIRST path is the primary spec and the
+second is mandatory grounding context (z-plan/SKILL.md Step 1) -- no
+`lib/spec-sources.ts` discovery involved at all, so this variant needs no
+project-dir double, just the two fixtures already on disk. Same paid lane,
+same `claude -p` rule, same `bin/z-ticket-lint` deterministic half, scored
+against the SAME "Multi-document coverage pass" rubric section (dimension 5,
+cross-document coverage) as the no-arg variant above -- the check is "did
+both documents' scope reach the plan", regardless of which Step 1 route
+resolved them.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+REPO="$(cd "$HERE/../.." && pwd -P)"
+RUNS="${1:-3}"
+OUT="$(mktemp -d)"
+
+for i in $(seq 1 "$RUNS"); do
+  # PLAN: run /z-plan with TWO explicit paths -- fixture-spec.md first (the
+  # primary spec) and fixture-spec-2.md second (mandatory grounding context,
+  # Step 1's issue #19 contract). No project-dir double needed: explicit
+  # paths bypass spec-sources discovery entirely.
+  claude -p "/z-plan --dry-run $HERE/fixture-spec.md $HERE/fixture-spec-2.md" \
+    --add-dir "$HERE/fixture-app" \
+    --add-dir "$HERE" \
+    > "$OUT/multidoc-explicit-plan-$i.md"
+
+  # SCHEMA GATE (deterministic, dimension 1): every emitted body must exit 0.
+  # "$REPO/bin/z-ticket-lint" "$OUT/multidoc-explicit-ticket-<n>.md"
+
+  # GRADE: same rubric section as the no-arg variant -- the expiration scope
+  # from the SECOND path (fixture-spec-2.md) must reach the plan alongside
+  # the persistence/shorten/resolve/CLI scope from the first, proving the
+  # explicit-path route reads past the primary spec too, not just the no-arg
+  # discovery route above.
+  claude -p "Score the plan in $OUT/multidoc-explicit-plan-$i.md against the
+    'Multi-document coverage pass' section of the rubric in $HERE/rubric.md,
+    grounded on the app in $HERE/fixture-app and BOTH fixture-spec.md and
+    fixture-spec-2.md. Return only the JSON object the rubric specifies." \
+    --add-dir "$OUT" --add-dir "$HERE" \
+    > "$OUT/multidoc-explicit-score-$i.json"
+done
+
+echo "explicit two-path multi-document scores in $OUT"
+```
+
+#### What's left to wire for the explicit two-path variant
+
+- The dry-run output splitter feeding `bin/z-ticket-lint` (same splitter the
+  other passes need -- no new one).
+- Aggregation of `multidoc-explicit-score-*.json` totals against the same
+  ≥8/10 threshold, and nightly scheduling alongside the other passes.

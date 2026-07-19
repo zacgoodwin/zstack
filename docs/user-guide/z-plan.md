@@ -20,6 +20,24 @@ After `/z-setup`, whenever you have a spec to turn into tickets:
 An explicit path always wins unchanged (back-compat) -- exactly that file is
 used, no discovery run.
 
+**More than one explicit path is also supported**:
+
+```bash
+/z-plan path/to/a.md path/to/b.md path/to/c.md
+```
+
+The FIRST path given is the primary spec -- the source of the milestones and
+tickets, same as passing one path. Every path after it is mandatory grounding
+context: read in full, and scope named only in one of those other files still
+makes it into the plan, exactly like the no-argument discovery case below --
+nothing named on the command line is ever silently dropped. (Passing several
+paths used to silently keep only the last one; every named path now
+contributes.) Explicit paths, one or several, always bypass discovery -- it
+only runs with zero path arguments. Every named path must exist: if any one
+doesn't, `/z-plan` fails loud naming exactly which path is missing and makes
+no board writes -- it never falls back to planning from just the paths that
+do exist.
+
 With no argument it discovers and reads **every** gstack planning document for
 the repo, not just the newest one: `specs/*.md`, `ceo-plans/*.md`, loose
 `*-test-plan-*.md` files, and `checkpoints/*.md` under
