@@ -115,6 +115,17 @@ captures stdout, so its stderr message, already naming every directory it
 searched (AC3), has printed directly; just `exit 1`. No board writes happen on
 this path.
 
+**A second, distinct failure**: `lib/spec-sources.ts` also exits non-zero when
+it found documents but ZERO of them are `specs`/`ceo-plans` (only `test-plan`
+and/or `checkpoints` entries exist) — there is no primary-spec candidate,
+since the primary spec is picked from `specs`/`ceo-plans` only. Its stderr
+message is DISTINCT from the empty-result one above: it names every kind and
+path it did find and states plainly that no specs/ceo-plans primary-spec
+candidate exists. Echo that message and `exit 1` — do NOT auto-plan from
+checkpoints or test plans alone; those two kinds are mandatory grounding
+context only, never a substitute primary spec. Stop with no board writes on
+this path either; the caller must re-run with an explicit spec path instead.
+
 Run Steps 2–9 on the primary spec (grounded with the other documents' scope
 folded in), then Step 10 — the
 Backlog scan runs as the final step of every normal spec run too, not only via

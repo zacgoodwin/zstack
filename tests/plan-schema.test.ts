@@ -399,4 +399,25 @@ describe("z-plan/SKILL.md: Step 1 multi-document input contract (issue #16)", ()
     expect(step1).toMatch(/already naming every directory it\s*\n?\s*searched/);
     expect(step1).toMatch(/No board writes happen on\s*\n?\s*this path/);
   });
+
+  // Reviewer finding 2 (issue #16 rework): a non-empty discovery result with
+  // zero specs/ceo-plans entries (only test-plan/checkpoints found) left
+  // "primary spec" undefined -- discoverSpecSources only threw on a TOTAL
+  // empty result, but the primary-spec rule above draws from specs/ceo-plans
+  // only. Decided contract (conservative-deterministic, do not re-litigate):
+  // this doc canary pins the never-auto-plan-from-non-spec-kinds sentence so
+  // a future edit that quietly falls back to a test-plan/checkpoint as the
+  // primary spec fails loudly here instead of shipping silently.
+  test("a second, distinct failure covers zero specs/ceo-plans found (only test-plan/checkpoints): never auto-plan from those kinds (finding 2)", () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toMatch(/second, distinct failure/i);
+    // (a) names what was found.
+    expect(step1).toMatch(/names every kind and\s*\n?\s*path it did find/);
+    // (b) states no specs/ceo-plans primary candidate exists.
+    expect(step1).toMatch(/no specs\/ceo-plans primary-spec\s*\n?\s*candidate exists/);
+    // (c) echoes the CLI error and stops -- no board writes, ever.
+    expect(step1).toMatch(/Echo that message and `exit 1`/);
+    expect(step1).toMatch(/do NOT auto-plan from\s*\n?\s*checkpoints or test plans alone/);
+    expect(step1).toMatch(/Stop with no board writes on\s*\n?\s*this path either/);
+  });
 });

@@ -39,10 +39,23 @@ const CATEGORIES: {
   subdir: string | null;
   matches: (name: string) => boolean;
 }[] = [
-  { kind: "specs", subdir: "specs", matches: (n) => n.endsWith(".md") },
-  { kind: "ceo-plans", subdir: "ceo-plans", matches: (n) => n.endsWith(".md") },
-  { kind: "test-plan", subdir: null, matches: (n) => n.endsWith(".md") && n.includes("-test-plan-") },
-  { kind: "checkpoints", subdir: "checkpoints", matches: (n) => n.endsWith(".md") },
+  // Case-insensitive on both the extension and the test-plan infix (issue #16
+  // rework, finding 1): a project whose only planning doc is `specs/PLAN.MD`
+  // relocated the exact dead-end this ticket exists to eliminate -- readdirSync
+  // returns names verbatim from the filesystem and gstack does not guarantee
+  // lowercase, so `.toLowerCase()` before every comparison, not `endsWith`/
+  // `includes` directly.
+  { kind: "specs", subdir: "specs", matches: (n) => n.toLowerCase().endsWith(".md") },
+  { kind: "ceo-plans", subdir: "ceo-plans", matches: (n) => n.toLowerCase().endsWith(".md") },
+  {
+    kind: "test-plan",
+    subdir: null,
+    matches: (n) => {
+      const lower = n.toLowerCase();
+      return lower.endsWith(".md") && lower.includes("-test-plan-");
+    },
+  },
+  { kind: "checkpoints", subdir: "checkpoints", matches: (n) => n.toLowerCase().endsWith(".md") },
 ];
 
 function categoryDir(projectDir: string, subdir: string | null): string {
@@ -87,13 +100,27 @@ function listCategory(dir: string, matches: (name: string) => boolean): { path: 
   return out;
 }
 
+// The two kinds z-plan/SKILL.md's Step 1 no-arg branch draws the *primary*
+// spec from (the newest entry across just these two kinds). `test-plan` and
+// `checkpoints` are mandatory grounding context only -- never a substitute
+// primary spec (issue #16 rework, finding 2).
+const PRIMARY_KINDS: readonly SpecSourceKind[] = ["specs", "ceo-plans"];
+
 // Discovers every planning document under a gstack project dir. Ordering
 // (issue #16 contract): newest-first WITHIN a kind (mtimeMs descending, path
 // ascending tiebreak for equal mtimes -- some filesystems' mtime resolution is
 // coarse enough that two files written in the same batch tie), kinds
 // concatenated in CATEGORIES order so specs/ceo-plans sort before
 // test-plan/checkpoints. Throws ZError naming every searched directory (AC3)
-// when nothing is found anywhere.
+// when nothing is found anywhere, and a second, distinct ZError when
+// something is found but none of it is a `specs`/`ceo-plans` entry (issue #16
+// rework, finding 2) -- a project with only checkpoints/ and test-plan files
+// has no candidate for the primary spec, and z-plan must never auto-plan from
+// grounding-only documents. That message names every kind+path actually
+// found, states plainly that no primary-spec candidate exists, and tells the
+// caller to pass an explicit spec path -- the orchestrator's decided,
+// conservative-deterministic contract; do not relax it to "fall back to the
+// newest test-plan/checkpoint" without a spec change.
 export function discoverSpecSources(projectDir: string): SpecSource[] {
   const out: SpecSource[] = [];
   for (const cat of CATEGORIES) {
@@ -107,6 +134,14 @@ export function discoverSpecSources(projectDir: string): SpecSource[] {
       `No planning documents found under ${projectDir}. Searched: ${searchedDirs(projectDir).join(", ")}.`
     );
   }
+  if (!out.some((s) => PRIMARY_KINDS.includes(s.kind))) {
+    const found = out.map((s) => `${s.kind}: ${s.path}`).join(", ");
+    throw new ZError(
+      `Found planning documents under ${projectDir} (${found}), but none are a specs/ceo-plans entry -- ` +
+        `no primary-spec candidate exists (test-plan and checkpoints are grounding context only, never a ` +
+        `substitute primary spec). Pass an explicit spec path to /z-plan instead.`
+    );
+  }
   return out;
 }
 
@@ -118,7 +153,9 @@ const USAGE = `spec-sources <gstack-project-dir>
   ({path, kind, mtimeMs}[]) to stdout, newest-first within each kind, with
   specs/ceo-plans ordered before test-plan/checkpoints. Exit 0 on success;
   exit 1 (message on stderr naming every directory searched) when nothing is
-  found, or on a usage/read error.`;
+  found; exit 1 (message naming what WAS found) when only test-plan/checkpoints
+  entries exist and no specs/ceo-plans primary-spec candidate does; or on a
+  usage/read error.`;
 
 export function main(argv: string[]): number {
   const dir = argv[0];

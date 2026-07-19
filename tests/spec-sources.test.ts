@@ -87,6 +87,32 @@ describe("discoverSpecSources: kind filtering", () => {
     expect(sources).toHaveLength(1);
     expect(sources[0].kind).toBe("specs");
   });
+
+  // Reviewer finding 1 (issue #16 rework): matching was case-sensitive, so a
+  // project whose only planning doc used an uppercase extension (e.g.
+  // `specs/PLAN.MD`, observed live) fell through to the empty-result "No
+  // planning documents found" exit 1 -- the exact dead-end this ticket exists
+  // to eliminate.
+  test("an uppercase .MD extension is matched, not silently skipped", () => {
+    const dir = projectDir();
+    fileAt(join(dir, "specs", "PLAN.MD"), T0);
+    const sources = discoverSpecSources(dir);
+    expect(sources).toHaveLength(1);
+    expect(sources[0].kind).toBe("specs");
+    expect(sources[0].path).toBe(join(dir, "specs", "PLAN.MD"));
+  });
+
+  test("a mixed-case -Test-Plan- infix is matched", () => {
+    const dir = projectDir();
+    // A specs/ entry too, so this test isolates the case-insensitive infix
+    // match from the separate no-primary-candidate check (a lone test-plan
+    // file is covered by its own describe block below).
+    fileAt(join(dir, "specs", "a.md"), T0);
+    fileAt(join(dir, "app-Test-Plan-v1.MD"), T0);
+    const sources = discoverSpecSources(dir);
+    const testPlan = sources.find((s) => s.kind === "test-plan");
+    expect(testPlan?.path).toBe(join(dir, "app-Test-Plan-v1.MD"));
+  });
 });
 
 describe("discoverSpecSources: newest-first ordering within a kind", () => {
@@ -165,6 +191,72 @@ describe("discoverSpecSources: empty result (AC3)", () => {
   });
 });
 
+// Reviewer finding 2 (issue #16 rework): a non-empty discovery result with
+// ZERO specs/ceo-plans entries (only checkpoints and/or test-plan files) must
+// NOT silently succeed -- z-plan/SKILL.md's primary-spec rule only ever
+// selects from specs/ceo-plans, so returning those non-empty results back to
+// the caller would leave "primary spec" undefined. Decided contract
+// (conservative-deterministic): throw a DISTINCT ZError naming (a) every
+// kind+path actually found, (b) that no specs/ceo-plans primary-spec
+// candidate exists, and (c) that the caller should pass an explicit spec path.
+describe("discoverSpecSources: no specs/ceo-plans primary candidate", () => {
+  test("only checkpoints -> throws a distinct ZError naming what was found", () => {
+    const dir = projectDir();
+    fileAt(join(dir, "checkpoints", "c1.md"), T0);
+    expect(() => discoverSpecSources(dir)).toThrow(ZError);
+    try {
+      discoverSpecSources(dir);
+      throw new Error("expected discoverSpecSources to throw");
+    } catch (e) {
+      const msg = (e as ZError).message;
+      // (a) names what was found: kind + path.
+      expect(msg).toContain("checkpoints");
+      expect(msg).toContain(join(dir, "checkpoints", "c1.md"));
+      // (b) states plainly that no specs/ceo-plans primary candidate exists.
+      expect(msg).toMatch(/no primary-spec candidate exists/i);
+      expect(msg).toMatch(/specs\/ceo-plans/);
+      // (c) tells the caller to pass an explicit spec path.
+      expect(msg).toMatch(/explicit spec path/i);
+    }
+  });
+
+  test("only test-plan files (no checkpoints, no specs, no ceo-plans) also throws", () => {
+    const dir = projectDir();
+    fileAt(join(dir, "app-test-plan-v1.md"), T0);
+    try {
+      discoverSpecSources(dir);
+      throw new Error("expected discoverSpecSources to throw");
+    } catch (e) {
+      const msg = (e as ZError).message;
+      expect(msg).toContain("test-plan");
+      expect(msg).toContain(join(dir, "app-test-plan-v1.md"));
+      expect(msg).toMatch(/no primary-spec candidate exists/i);
+    }
+  });
+
+  test("test-plan AND checkpoints together, still zero specs/ceo-plans -> throws naming both", () => {
+    const dir = projectDir();
+    fileAt(join(dir, "app-test-plan-v1.md"), T0);
+    fileAt(join(dir, "checkpoints", "c1.md"), T0 + DAY);
+    try {
+      discoverSpecSources(dir);
+      throw new Error("expected discoverSpecSources to throw");
+    } catch (e) {
+      const msg = (e as ZError).message;
+      expect(msg).toContain(join(dir, "app-test-plan-v1.md"));
+      expect(msg).toContain(join(dir, "checkpoints", "c1.md"));
+    }
+  });
+
+  test("a single specs/ entry alongside checkpoints does NOT throw -- one primary candidate is enough", () => {
+    const dir = projectDir();
+    fileAt(join(dir, "checkpoints", "c1.md"), T0);
+    fileAt(join(dir, "specs", "a.md"), T0);
+    const sources = discoverSpecSources(dir);
+    expect(sources.map((s) => s.kind).sort()).toEqual(["checkpoints", "specs"]);
+  });
+});
+
 describe("discoverSpecSources: determinism (AC4/AC5)", () => {
   test("two runs over the same dir produce byte-identical JSON", () => {
     const dir = projectDir();
@@ -221,5 +313,21 @@ describe("spec-sources CLI (main)", () => {
 
   test("--help prints usage and exits 0", () => {
     expect(main(["--help"])).toBe(0);
+  });
+
+  // Reviewer finding 2 (issue #16 rework): only-checkpoints/test-plan input
+  // exits 1 with a DISTINCT message from the plain-empty case, naming what
+  // was found and directing the caller to an explicit spec path.
+  test("only checkpoints found exits 1 with the distinct no-primary-candidate message", () => {
+    const dir = projectDir();
+    fileAt(join(dir, "checkpoints", "c1.md"), T0);
+    expect(main([dir])).toBe(1);
+    expect(errs).toHaveBeenCalled();
+    const printed = errs.mock.calls[0][0] as string;
+    expect(printed).toContain(join(dir, "checkpoints", "c1.md"));
+    expect(printed).toMatch(/no primary-spec candidate exists/i);
+    expect(printed).toMatch(/explicit spec path/i);
+    // Distinct from the plain-empty message (which never mentions "found").
+    expect(printed).not.toContain("No planning documents found");
   });
 });
