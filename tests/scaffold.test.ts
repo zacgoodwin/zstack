@@ -107,6 +107,14 @@ describe("setup preconditions", () => {
     expect(readFileSync(join(registered, "VERSION"), "utf8").trim()).toBe(
       readFileSync(join(REPO_ROOT, "VERSION"), "utf8").trim()
     ); // the registered copy matches the repo VERSION (whatever the parent bumped it to)
+    // The Windows copy filters repo baggage — without this the copy hauls
+    // ~75MB of node_modules/.git/.worktrees and this test blows its timeout.
+    // (On macOS/Linux registration is a symlink to the repo, so the paths
+    // exist through it by design — the filter only applies to copies.)
+    if (process.platform === "win32") {
+      expect(existsSync(join(registered, "node_modules"))).toBe(false);
+      expect(existsSync(join(registered, ".git"))).toBe(false);
+    }
   });
 
   test.skipIf(!GH_DIR)("--team flag is accepted", () => {

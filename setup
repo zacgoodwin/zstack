@@ -48,15 +48,29 @@ _link_or_copy() {
   local src="$1" dst="$2"
   if [ "$IS_WINDOWS" -eq 1 ]; then
     rm -rf "$dst"
-    cp -R "$src" "$dst"
+    mkdir -p "$dst"
+    # A repo-shaped pack drags .git / node_modules / .worktrees (tens of MB
+    # the skills never read) into every copy; filter them at the top level.
+    local entry name
+    for entry in "$src"/* "$src"/.[!.]*; do
+      [ -e "$entry" ] || continue
+      name="$(basename "$entry")"
+      case "$name" in .git|node_modules|.worktrees|.gstack) continue ;; esac
+      cp -R "$entry" "$dst/$name"
+    done
   else
+    # `ln -snf src dir` on an existing REAL dir nests the link inside it;
+    # callers verify ownership before we get here, so replace outright.
+    [ -d "$dst" ] && [ ! -L "$dst" ] && rm -rf "$dst"
     ln -snf "$src" "$dst"
   fi
 }
 
-# Register PACK_DIR under a host's skills directory as "zstack".
-# The pack ships four skills (z-setup, z-plan, z-loop, z-status); registering the
-# pack dir makes all of them discoverable to the host at once.
+# Register PACK_DIR under a host's skills directory. Hosts build their skill
+# list from skills_dir/<name>/SKILL.md ONE level deep (Claude Code skips
+# repo-shaped pack dirs entirely — see gstack's setup), so the pack entry only
+# carries runtime assets (bin/, lib/); each z-* skill must ALSO be registered
+# as its own top-level entry or none of them appear.
 register() {
   local skills_dir="$1" label="$2"
   mkdir -p "$skills_dir"
@@ -65,28 +79,47 @@ register() {
   # Already installed directly inside a skills/ dir (e.g. cloned straight to
   # ~/.claude/skills/zstack)? Then target == PACK_DIR: symlinking or copying
   # it onto itself would corrupt it (Windows copy path does `rm -rf "$dst"`
-  # first). Detect via parent-dir match and skip.
+  # first). Detect via parent-dir match and skip the pack link only — the
+  # per-skill registration below must still run.
   local skills_real pack_parent_real
   skills_real="$(cd "$skills_dir" && pwd -P)"
   pack_parent_real="$(cd "$(dirname "$PACK_DIR")" && pwd -P)"
   if [ "$skills_real" = "$pack_parent_real" ]; then
-    echo "  $label: already installed at $PACK_DIR"
-    return 0
-  fi
-
-  # Target exists as a real (non-symlink) dir pointing somewhere else? Don't
-  # clobber a separate install.
-  if [ -e "$target" ] && [ ! -L "$target" ]; then
-    local existing_real
-    existing_real="$(cd "$target" 2>/dev/null && pwd -P || echo "")"
-    if [ -n "$existing_real" ] && [ "$existing_real" != "$PACK_DIR" ]; then
-      echo "  $target already exists as a separate install; skipping $label registration." >&2
-      return 0
+    echo "  $label: pack already at $PACK_DIR"
+  else
+    # Target exists as a real (non-symlink) dir pointing somewhere else? Don't
+    # clobber a separate install.
+    if [ -e "$target" ] && [ ! -L "$target" ]; then
+      local existing_real
+      existing_real="$(cd "$target" 2>/dev/null && pwd -P || echo "")"
+      if [ -n "$existing_real" ] && [ "$existing_real" != "$PACK_DIR" ]; then
+        echo "  $target already exists as a separate install; skipping $label registration." >&2
+        return 0
+      fi
     fi
+    _link_or_copy "$PACK_DIR" "$target"
+    echo "  registered pack for $label: $target"
   fi
 
-  _link_or_copy "$PACK_DIR" "$target"
-  echo "  registered for $label: $target"
+  # Per-skill top-level entries: skills_dir/z-loop -> PACK_DIR/z-loop etc.
+  local skill_dir skill_name dst
+  local registered=""
+  for skill_dir in "$PACK_DIR"/z-*/; do
+    [ -f "$skill_dir/SKILL.md" ] || continue
+    skill_name="$(basename "$skill_dir")"
+    dst="$skills_dir/$skill_name"
+    # A real dir whose SKILL.md doesn't declare our skill name is someone
+    # else's skill that happens to collide — leave it alone. Symlinks and
+    # zstack-named entries are ours to refresh (same call gstack makes).
+    if [ -e "$dst" ] && [ ! -L "$dst" ] && \
+       ! head -3 "$dst/SKILL.md" 2>/dev/null | grep -q "^name: $skill_name"; then
+      echo "  $dst exists and is not a zstack skill; skipping." >&2
+      continue
+    fi
+    _link_or_copy "${skill_dir%/}" "$dst"
+    registered="$registered $skill_name"
+  done
+  [ -n "$registered" ] && echo "  registered $label skills:$registered"
 }
 
 register "$HOME/.claude/skills" "Claude Code"
