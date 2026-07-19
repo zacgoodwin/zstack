@@ -110,8 +110,9 @@ Restart Claude Code afterwards — the skill list is scanned at session start,
 so `/z-setup` and friends appear in the next session, not the current one.
 
 **Updating:** `git pull` in the pack directory. On macOS/Linux that's the whole
-update (symlinks). On Windows the registrations are copies, so re-run
-`./setup` after pulling.
+update for existing skills (symlinks). On Windows the registrations are copies,
+so re-run `./setup` after pulling. Either way, a pull that adds a NEW skill
+needs one `./setup` re-run to register it.
 
 **Uninstalling:** remove the pack and the four per-skill entries for every
 host setup registered (Codex/Factory only if their binaries were on PATH):
@@ -121,6 +122,10 @@ rm -rf ~/.claude/skills/zstack ~/.claude/skills/z-{setup,plan,loop,status}
 rm -rf ~/.codex/skills/zstack ~/.codex/skills/z-{setup,plan,loop,status}
 rm -rf ~/.factory/skills/zstack ~/.factory/skills/z-{setup,plan,loop,status}
 ```
+
+Only delete entries zstack created: symlinks into the pack, or copies carrying
+a `.zstack-registered` file. If setup warned about a colliding non-zstack
+`z-*` skill it left in place, that one is not yours to remove.
 
 The board keeps all recoverable state; `~/.zstack` holds only per-repo config
 and disposable run state you can also delete.

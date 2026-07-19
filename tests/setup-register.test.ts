@@ -8,7 +8,7 @@
 // Scenarios launch concurrently at module load (Windows bash spawns cost ~1s
 // each) and each test just awaits its result. Harness: tests/helpers/setup-harness.ts.
 import { test, expect, describe, afterAll } from "bun:test";
-import { rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, lstatSync } from "node:fs";
+import { rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, lstatSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -82,6 +82,17 @@ const scenarioF = (async () => {
   return { env, run };
 })();
 
+// Scenario G: a pack with NO z-*/SKILL.md at all (partial download, renamed
+// dirs). Registering zero skills with a success banner is the invisible-skills
+// bug all over again — setup must fail loudly.
+const scenarioG = (async () => {
+  const env = makeEnv(roots);
+  const packDir = join(env.skills, "zstack");
+  makePack(packDir, []); // setup script only, no skills
+  const run = await runSetup(packDir, env);
+  return { env, run };
+})();
+
 describe("setup registers each skill one level deep", () => {
   test("cloned straight into ~/.claude/skills/zstack: z-* entries appear (the reported bug), re-run idempotent", async () => {
     const { env, packDir, first, second } = await scenarioA;
@@ -115,7 +126,7 @@ describe("setup registers each skill one level deep", () => {
     expect(run.code).toBe(0);
     expect(readFileSync(join(foreign, "SKILL.md"), "utf8")).toContain("keep me");
     expect(readFileSync(join(nearMiss, "SKILL.md"), "utf8")).toContain("keep me too");
-    expect(run.stderr).toContain("not a zstack skill");
+    expect(run.stderr).toContain("not registered by zstack setup");
     // The non-colliding sibling still registered.
     expect(existsSync(join(env.skills, "z-beta", "SKILL.md"))).toBe(true);
   });
@@ -124,39 +135,33 @@ describe("setup registers each skill one level deep", () => {
     const { run } = await scenarioF;
     expect(run.code).toBe(0);
     expect(run.stdout).toContain("zstack setup complete.");
-    expect(run.stderr).toContain("not a zstack skill");
+    expect(run.stderr).toContain("not registered by zstack setup");
+  });
+
+  test("a pack with no z-*/SKILL.md skills fails loudly instead of registering nothing", async () => {
+    const { run } = await scenarioG;
+    expect(run.code).toBe(1);
+    expect(run.stderr).toContain("no z-*/SKILL.md skills found");
+    expect(run.stdout).not.toContain("zstack setup complete.");
   });
 
   test.skipIf(process.platform === "win32")(
     "POSIX: an owned real dir at the destination is replaced by a symlink, not nested into",
     async () => {
       // ln -snf into an existing real dir would nest the link INSIDE it,
-      // leaving stale skill content live. _link_or_copy must replace it.
+      // leaving stale skill content live. A sentinel-carrying real dir (a
+      // prior copy-mode registration) is ours: _link_or_copy must replace it.
       const env = makeEnv(roots);
       const packDir = join(env.skills, "zstack");
       makePack(packDir, ["z-alpha"]);
       const stale = join(env.skills, "z-alpha");
       mkdirSync(stale, { recursive: true });
       writeFileSync(join(stale, "SKILL.md"), "---\nname: z-alpha\n---\nold copy\n");
+      writeFileSync(join(stale, ".zstack-registered"), "");
       const run = await runSetup(packDir, env);
       expect(run.code).toBe(0);
       expect(lstatSync(stale).isSymbolicLink()).toBe(true);
       expect(readFileSync(join(stale, "SKILL.md"), "utf8")).toContain("test skill");
     }
   );
-
-  test("real z-*/SKILL.md files keep `name:` inside the head -3 window setup parses", () => {
-    // The Windows refresh path greps the first 3 lines for `name: <dir>`;
-    // reordering frontmatter would silently demote every re-run to "not a
-    // zstack skill". Pin the contract against the real skill files.
-    const repoRoot = join(import.meta.dir, "..");
-    const skillDirs = readdirSync(repoRoot).filter((d) => d.startsWith("z-"));
-    expect(skillDirs.length).toBeGreaterThanOrEqual(4);
-    for (const dir of skillDirs) {
-      const head = readFileSync(join(repoRoot, dir, "SKILL.md"), "utf8")
-        .split("\n")
-        .slice(0, 3);
-      expect(head.some((l) => l.trimEnd() === `name: ${dir}`)).toBe(true);
-    }
-  });
 });

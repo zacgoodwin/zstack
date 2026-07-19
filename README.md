@@ -54,9 +54,10 @@ one level deep, so the pack directory alone is never enough:
 
 Restart Claude Code after install — the skill list is scanned at session start.
 
-On macOS/Linux registration is a symlink, so `git pull` is the whole update. On
-Windows it is a copy (symlinks need Developer Mode), so re-run `./setup` after
-each pull to refresh the copies.
+On macOS/Linux registration is a symlink, so `git pull` is the whole update for
+existing skills. On Windows it is a copy (symlinks need Developer Mode), so
+re-run `./setup` after each pull to refresh the copies. Either way, a pull that
+adds a NEW skill needs one `./setup` re-run to register it.
 
 Installing the pack changes nothing else — no repo is touched until you run
 `/z-setup` inside one.
@@ -234,6 +235,10 @@ rm -rf ~/.claude/skills/zstack ~/.claude/skills/z-{setup,plan,loop,status}
 rm -rf ~/.codex/skills/zstack ~/.codex/skills/z-{setup,plan,loop,status}       # if codex was on PATH
 rm -rf ~/.factory/skills/zstack ~/.factory/skills/z-{setup,plan,loop,status}   # if droid was on PATH
 ```
+
+Only delete entries zstack created: symlinks into the pack, or copies carrying
+a `.zstack-registered` file. If setup warned about a colliding non-zstack
+`z-*` skill it left in place, that one is not yours to remove.
 
 Board statuses are the recoverable state; worktrees are disposable; locks
 clear via `/z-loop --reconcile`.
