@@ -1,0 +1,237 @@
+// Gate tests for C6's pure prompt constructors: reviewer blindness (issue #8
+// AC3 -- the input type has exactly four keys, enforced at compile time and at
+// runtime), the fresh-context purity guarantee (AC4 -- constructors are pure
+// functions of their typed input, so every spawn's context is rebuilt from
+// data), and the completion-note builder (AC7 -- edges + Actual present).
+import { test, expect, describe, afterAll } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  builderPrompt,
+  completionNote,
+  mergePrompt,
+  qaPrompt,
+  reviewerPrompt,
+  REVIEWER_INPUT_KEYS,
+  ZError,
+  type BuilderPromptInput,
+  type CompletionNoteInput,
+  type MergePromptInput,
+  type QaPromptInput,
+  type ReviewerPromptInput,
+} from "../lib/stage-prompts.ts";
+
+const REPO_ROOT = join(import.meta.dir, "..");
+
+const BUILDER_INPUT: BuilderPromptInput = {
+  ticketNumber: 42,
+  ticketTitle: "Add CSV export",
+  ticketBody: "## Context\n\nUsers need CSV.\n\n### Acceptance Criteria\n\n- exporting an empty list yields a header-only file",
+  worktreePath: ".worktrees/ticket-42",
+  branch: "z/ticket-42-add-csv-export",
+  baseBranch: "main",
+};
+
+const QA_INPUT: QaPromptInput = {
+  ticketNumber: 42,
+  ticketBody: BUILDER_INPUT.ticketBody,
+  worktreePath: ".worktrees/ticket-42",
+  branch: "z/ticket-42-add-csv-export",
+  qaPass: 1,
+  webTarget: false,
+};
+
+const REVIEWER_INPUT: ReviewerPromptInput = {
+  ticketBody: BUILDER_INPUT.ticketBody,
+  acceptanceCriteria: "- exporting an empty list yields a header-only file",
+  diff: "diff --git a/export.ts b/export.ts\n+export function toCsv() {}",
+  worktreePath: "/tmp/review-throwaway-42",
+};
+
+const MERGE_INPUT: MergePromptInput = {
+  ticketNumber: 42,
+  prTitle: "Add CSV export",
+  branch: "z/ticket-42-add-csv-export",
+  baseBranch: "main",
+  worktreePath: ".worktrees/ticket-42",
+  stackedOn: [],
+};
+
+// -- reviewer blindness (AC3) -------------------------------------------------
+
+describe("reviewer blindness", () => {
+  test("the input type has exactly {ticketBody, acceptanceCriteria, diff, worktreePath}", () => {
+    // Compile-time half: Exact<> collapses to never if ReviewerPromptInput ever
+    // gains or loses a key, so this assignment stops typechecking.
+    type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
+    const _exact: Exact<keyof ReviewerPromptInput, (typeof REVIEWER_INPUT_KEYS)[number]> = true;
+    void _exact;
+    // Runtime half: a constructed input exposes exactly the four keys.
+    expect(Object.keys(REVIEWER_INPUT).sort()).toEqual(["acceptanceCriteria", "diff", "ticketBody", "worktreePath"]);
+    expect([...REVIEWER_INPUT_KEYS].sort()).toEqual(["acceptanceCriteria", "diff", "ticketBody", "worktreePath"]);
+  });
+
+  test("a smuggled extra field is rejected at runtime", () => {
+    const leaky = { ...REVIEWER_INPUT, prDescription: "trust me, it works" };
+    expect(() => reviewerPrompt(leaky as ReviewerPromptInput)).toThrow(ZError);
+    const rationale = { ...REVIEWER_INPUT, planRationale: "we chose X because..." };
+    expect(() => reviewerPrompt(rationale as ReviewerPromptInput)).toThrow(ZError);
+  });
+
+  test("a missing or empty input is rejected -- a blinded reviewer with no diff is no reviewer", () => {
+    const { diff: _dropped, ...missing } = REVIEWER_INPUT;
+    expect(() => reviewerPrompt(missing as ReviewerPromptInput)).toThrow(ZError);
+    expect(() => reviewerPrompt({ ...REVIEWER_INPUT, diff: "" })).toThrow(ZError);
+  });
+
+  test("the prompt embeds all four inputs and states the blindness contract", () => {
+    const p = reviewerPrompt(REVIEWER_INPUT);
+    expect(p).toContain(REVIEWER_INPUT.ticketBody);
+    expect(p).toContain(REVIEWER_INPUT.acceptanceCriteria);
+    expect(p).toContain(REVIEWER_INPUT.diff);
+    expect(p).toContain(REVIEWER_INPUT.worktreePath);
+    expect(p).toContain("no PR description, no plan rationale, no builder or QA transcript");
+    expect(p).toContain("REVIEW-APPROVE:");
+    expect(p).toContain("REVIEW-FINDINGS:");
+  });
+});
+
+// -- fresh-context purity (AC4) -----------------------------------------------
+
+describe("prompt constructor purity", () => {
+  test("every constructor is a pure function of its input: identical input, identical prompt, no carried state", () => {
+    // Interleave calls with different inputs; the repeats must be byte-identical,
+    // proving no hidden state leaks between spawns.
+    const b1 = builderPrompt(BUILDER_INPUT);
+    const q1 = qaPrompt(QA_INPUT);
+    const r1 = reviewerPrompt(REVIEWER_INPUT);
+    const m1 = mergePrompt(MERGE_INPUT);
+    builderPrompt({ ...BUILDER_INPUT, ticketNumber: 99, qaNotes: "1) broken" });
+    reviewerPrompt({ ...REVIEWER_INPUT, diff: "other diff" });
+    expect(builderPrompt(BUILDER_INPUT)).toBe(b1);
+    expect(qaPrompt(QA_INPUT)).toBe(q1);
+    expect(reviewerPrompt(REVIEWER_INPUT)).toBe(r1);
+    expect(mergePrompt(MERGE_INPUT)).toBe(m1);
+  });
+});
+
+// -- builder prompt -----------------------------------------------------------
+
+describe("builder prompt", () => {
+  test("carries the ticket, worktree discipline, ponytail, and the exit contract", () => {
+    const p = builderPrompt(BUILDER_INPUT);
+    expect(p).toContain('#42: "Add CSV export"');
+    expect(p).toContain(BUILDER_INPUT.ticketBody);
+    expect(p).toContain(".worktrees/ticket-42");
+    expect(p).toContain("z/ticket-42-add-csv-export");
+    expect(p).toContain("Ponytail ladder");
+    expect(p).toContain("implementation + gate tests + evals");
+    expect(p).toContain("BUILT:");
+    expect(p).toContain("NEEDS-INPUT:");
+    expect(p).toContain("never ask a question");
+  });
+
+  test("QA bounce includes the notes; second bounce demands /investigate first", () => {
+    const p1 = builderPrompt({ ...BUILDER_INPUT, qaNotes: "1) header row missing" });
+    expect(p1).toContain("1) header row missing");
+    expect(p1).not.toContain("/investigate");
+    const p2 = builderPrompt({ ...BUILDER_INPUT, qaNotes: "1) header row missing", investigateFirst: true });
+    expect(p2).toContain("/investigate");
+    const pr = builderPrompt({ ...BUILDER_INPUT, reviewNotes: "1) AC weakened" });
+    expect(pr).toContain("Reviewer findings");
+    expect(pr).toContain("1) AC weakened");
+  });
+});
+
+// -- QA prompt ----------------------------------------------------------------
+
+describe("qa prompt", () => {
+  test("functional + technical checks, pass number, exit contract", () => {
+    const p = qaPrompt(QA_INPUT);
+    expect(p).toContain("QA pass 1");
+    expect(p).toContain("Functional");
+    expect(p).toContain("Technical");
+    expect(p).toContain("QA-PASS:");
+    expect(p).toContain("QA-BUGS:");
+    expect(p).not.toContain("/qa");
+  });
+
+  test("web targets are told to drive gstack /qa", () => {
+    expect(qaPrompt({ ...QA_INPUT, webTarget: true })).toContain("gstack /qa");
+  });
+});
+
+// -- merge prompt -------------------------------------------------------------
+
+describe("merge prompt", () => {
+  test("plain merge: PR steps, conflict gauntlet, no branch deletion mid-batch", () => {
+    const p = mergePrompt(MERGE_INPUT);
+    expect(p).toContain("gh pr create --base main");
+    expect(p).toContain("full gauntlet");
+    expect(p).toContain("Never pass --delete-branch");
+    expect(p).toContain("MERGED:");
+    expect(p).not.toContain("Stacked chain");
+  });
+
+  test("stacked chain: parent first, no deletion, retarget, delete last", () => {
+    const p = mergePrompt({ ...MERGE_INPUT, stackedOn: [40, 41] });
+    expect(p).toContain("Stacked chain");
+    expect(p).toContain("#40, #41");
+    expect(p).toContain("WITHOUT deleting its branch");
+    expect(p).toContain("retarget this PR");
+    expect(p).toContain("gh pr edit --base main");
+    expect(p).toContain("Delete branches only after the whole batch");
+  });
+});
+
+// -- completion note (AC7) ----------------------------------------------------
+
+describe("completion note", () => {
+  const NOTE_INPUT: CompletionNoteInput = {
+    shipped: "CSV export behind the reports menu (lib/export.ts, tests/export.test.ts)",
+    prUrl: "https://github.com/x/y/pull/12",
+    acceptancePassed: ["exporting an empty list yields a header-only file"],
+    edges: [{ check: "the empty-list default", doStep: "export with zero rows", expect: "a file with only the header row" }],
+    filedTickets: [{ number: 77, title: "Excel export variant surfaced during QA" }],
+    actualDollars: 6.5,
+  };
+
+  test("includes shipped, criteria, to-check-do-expect edges, filed tickets, and Actual", () => {
+    const n = completionNote(NOTE_INPUT);
+    expect(n).toContain("CSV export behind the reports menu");
+    expect(n).toContain("https://github.com/x/y/pull/12");
+    expect(n).toContain("- exporting an empty list yields a header-only file");
+    expect(n).toContain("To check the empty-list default, do export with zero rows, expect a file with only the header row.");
+    expect(n).toContain("#77 Excel export variant surfaced during QA");
+    expect(n).toContain("**Actual:** $6.50");
+    expect(n).toContain("stays OPEN");
+  });
+
+  test("empty edges and filings say so explicitly instead of vanishing", () => {
+    const n = completionNote({ ...NOTE_INPUT, edges: [], filedTickets: [] });
+    expect(n).toContain("**Edges a human must validate:**\n- None surfaced.");
+    expect(n).toContain("**Use cases filed to Backlog:**\n- None surfaced.");
+  });
+});
+
+// -- CLI smoke ----------------------------------------------------------------
+
+describe("stage-prompts CLI", () => {
+  const dir = mkdtempSync(join(tmpdir(), "zstack-prompts-test-"));
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("prompt reviewer builds from an input file; a leaky input file fails loudly", () => {
+    const ok = join(dir, "reviewer.json");
+    writeFileSync(ok, JSON.stringify(REVIEWER_INPUT));
+    const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "stage-prompts.ts"), "prompt", "reviewer", ok], { stdout: "pipe", stderr: "pipe" });
+    expect(proc.exitCode).toBe(0);
+    expect(proc.stdout.toString()).toContain("ADVERSARIAL REVIEWER");
+
+    const leaky = join(dir, "leaky.json");
+    writeFileSync(leaky, JSON.stringify({ ...REVIEWER_INPUT, builderTranscript: "..." }));
+    const bad = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "stage-prompts.ts"), "prompt", "reviewer", leaky], { stdout: "pipe", stderr: "pipe" });
+    expect(bad.exitCode).toBe(1);
+    expect(bad.stderr.toString()).toContain("blinded by design");
+  });
+});
