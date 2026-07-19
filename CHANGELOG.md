@@ -2,12 +2,15 @@
 
 All notable changes to zstack are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/); versions use `MAJOR.MINOR.PATCH.MICRO`.
 
-## [Unreleased]
+## [0.1.1.0] - 2026-07-19
 
-Remediation of issue #14 (all 22 items now closed) plus an adversarial hardening pass (OpenAI Codex challenge + independent refute review, every fix mutation-tested).
+Installing zstack now actually surfaces the four skills. Also releases the issue #14 remediation (all 22 items closed) plus an adversarial hardening pass (OpenAI Codex challenge + independent refute review, every fix mutation-tested).
 
 ### Fixed
 
+- `./setup` now registers each skill (`z-setup`, `z-plan`, `z-loop`, `z-status`) as its own top-level entry in the host's skills directory. Hosts discover `skills/<name>/SKILL.md` one level deep only, so registering just the pack directory left all four skills invisible — worst on the documented clone-straight-into-`~/.claude/skills/zstack` path, which early-returned before registering anything. Run `./setup` after every install or update, then restart Claude Code; on Windows run it from Git Bash (`cmd.exe` leaves a literal `~` folder).
+- Registration is now safe around things setup didn't create. Every copy carries a `.zstack-registered` sentinel and only sentinel-carrying dirs (or symlinks) are refreshed: a separate zstack checkout at `~/.claude/skills/zstack` (including git worktrees, where `.git` is a file), a ZIP/manual install, or a third-party skill that happens to be named `z-*` is left untouched with the resolution printed, instead of being deleted or mixed with a different runtime pack. Refusing the Claude Code host also skips Codex/Factory so no host ends up driving another install's `bin/lib`.
+- Windows registration copies are staged and swapped by rename, so a locked file or mid-copy failure can't leave a half-registered skill, and they filter `.git` / `node_modules` / `.worktrees` / `.gstack` (~75MB of repo baggage the skills never read). A pack with no skills in it now fails setup loudly instead of printing the success banner over an empty registration.
 - `Board.list()` paginates past 100 items with cursor-loop hardening (empty/repeated cursor and missing `pageInfo` throw loudly); single-page ceilings (fieldValues, projectItems, milestones, labels) guard with loud throws.
 - Destructive board adopt now refuses without `--force` when non-canonical options on ANY single-select field (Status, Model, Model Effort) still hold items, names each option and count before any mutation, and rechecks immediately before mutating (refuses even under `--force` if the board moved).
 - Setup's project/field lookups paginate — a project past page one is adopted, not duplicated.
