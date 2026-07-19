@@ -12,16 +12,12 @@ Solo dev, any repo with a GitHub Projects board. Laid out like gstack: one
 directory per skill (`SKILL.md`, `bin/`, `lib/`), a `setup` script, a `VERSION`.
 
 ## Install
-Linux
+Linux/MacOS
 ```bash
 git clone https://github.com/zacgoodwin/zstack/ ~/.claude/skills/zstack
 cd ~/.claude/skills/zstack && ./setup          # add --team to also register Codex/Factory
 ```
-Windows
-```bash
-git clone https://github.com/zacgoodwin/zstack/ ~/.claude/skills/zstack
-cd ~/.claude/skills/zstack && bash ./setup          # add --team to also register Codex/Factory
-```
+
 
 Requires:
 
