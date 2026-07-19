@@ -11,24 +11,122 @@ Estimate/Actual dollar fields. Nothing burns tokens while stuck.
 Solo dev, any repo with a GitHub Projects board. Laid out like gstack: one
 directory per skill (`SKILL.md`, `bin/`, `lib/`), a `setup` script, a `VERSION`.
 
-## Install
+New here? Read the [user guide](docs/user-guide/README.md) — it walks the whole
+lifecycle from install to your first green loop.
 
-```bash
-git clone <this-repo> ~/.claude/skills/zstack
-cd ~/.claude/skills/zstack && ./setup          # add --team to also register Codex/Factory
-```
-
-Requires:
+## Requirements
 
 - **[gstack](https://github.com/garrytan/gstack)** at `~/.claude/skills/gstack`
   (zstack invokes its `/setup-deploy`, `/land-and-deploy`, `/canary`,
-  `/document-release`, `/qa-only`, `/cso`, `/health`)
-- **[bun](https://bun.sh)** — the deterministic core is bun TypeScript
-- **[gh](https://cli.github.com)** — all board access is GitHub-only, and the
-  token needs the `project` scope (`/z-setup` refreshes it for you)
+  `/document-release`, `/qa-only`, `/cso`, `/health`):
 
-`./setup` checks every precondition and refuses with the exact fix command if one
-is missing.
+  ```bash
+  git clone --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack
+  cd ~/.claude/skills/gstack && ./setup --team
+  ```
+
+- **[bun](https://bun.sh)** — the deterministic core is bun TypeScript.
+- **[gh](https://cli.github.com)** — all board access is GitHub-only, and the
+  token needs the `project` scope (`/z-setup` refreshes it for you).
+
+## Install (once per machine)
+
+```bash
+git clone https://github.com/zacgoodwin/zstack.git ~/.claude/skills/zstack
+cd ~/.claude/skills/zstack && ./setup
+```
+
+On Windows, run both commands from **Git Bash** — `cmd.exe` doesn't expand `~`,
+so the clone lands in a literal `~` folder instead of your home directory.
+
+`./setup` checks every precondition (bun, gstack, gh) and refuses with the exact
+fix command if one is missing. It then registers each of the four skills
+(`/z-setup`, `/z-plan`, `/z-loop`, `/z-status`) as its own top-level entry in
+the host's skills directory — hosts discover `skills/<name>/SKILL.md` exactly
+one level deep, so the pack directory alone is never enough:
+
+- **Claude Code** — the pack at `~/.claude/skills/zstack` (runtime assets)
+  plus `~/.claude/skills/z-setup`, `z-plan`, `z-loop`, `z-status`. Running
+  `./setup` is mandatory even when you cloned straight into place.
+- **Codex / Factory** — auto-detected by binary on PATH (`codex` / `droid`) and
+  registered the same way under `~/.codex/skills` / `~/.factory/skills`.
+  `--team` prints the team-mode note; the four skills need no session hooks.
+
+Restart Claude Code after install — the skill list is scanned at session start.
+
+On macOS/Linux registration is a symlink, so `git pull` is the whole update. On
+Windows it is a copy (symlinks need Developer Mode), so re-run `./setup` after
+each pull to refresh the copies.
+
+Installing the pack changes nothing else — no repo is touched until you run
+`/z-setup` inside one.
+
+## Set up a project (once per repo): what `/z-setup` does and asks
+
+Run `/z-setup` from the repo you want the loop to work on. It is idempotent —
+re-running on a configured repo makes zero changes.
+
+What it **does**, in order:
+
+1. **Checks preconditions** — gstack, bun, gh auth, and that your gh token has
+   the `project` scope (runs `gh auth refresh -s project` for you if not).
+2. **Records the epic style** — fixed to `milestones` today (one GitHub
+   milestone per epic); the sub-issue style is not yet supported.
+3. **Creates or adopts the board** — a ProjectV2 titled after the repo, driven
+   to nine statuses (Backlog, Ready, Questions, Building, QA, Review, Blocked,
+   Skipped, Done) and four custom fields (Model, Model Effort, Estimate,
+   Actual). Previews every change first; `apply` executes zero mutations when
+   the board already matches.
+4. **Walks you through the manual workflow toggles** — GitHub has no API for
+   built-in project workflows, so you flip two off in the web UI (see the
+   question below).
+5. **Verifies by script** — `z-setup-board verify` walks the live board and
+   exits non-zero on any drift. No eyeballing.
+6. **Wires deploy** — invokes gstack `/setup-deploy` so the loop can ship at
+   end of run.
+7. **Offers auto-approvals** — optional, machine-wide permission changes so the
+   loop can run unattended (the second question below).
+
+It writes one file: `~/.zstack/projects/<slug>/config.json`. Every other z-tool
+only reads it.
+
+What it **asks** — exactly two questions:
+
+- **"Are both workflows off?"** After printing the exact clicks (project → ⋯ →
+  Workflows), it asks you to confirm **Auto-archive items** and any
+  **close-issue-on-Done** workflow are disabled. Both fight the loop: archived
+  items vanish from its view, and the loop deliberately leaves Done tickets
+  open for you to review and close. Setup will not report done until you
+  confirm.
+- **"How permissive should Claude Code be on this machine?"** Running the loop
+  with default permissions turns you into a click-through machine — every novel
+  command re-prompts. Three options, applied via `bin/z-setup-permissions`
+  (atomic, JSON-validated, never clobbers existing settings):
+
+  | Option | What it configures | Trade-off |
+  | --- | --- | --- |
+  | **A) Full auto-approvals** | Permission-allow hook + `bypassPermissions` default mode + the allowlist from B | Zero prompts, fully unattended — but **machine-wide**: every project on this machine runs unprompted until you undo it |
+  | **B) Loop allowlist** | Allow rules for `git`/`gh`/`bun`/`bunx` commands only; no hook, no mode change | Smallest blast radius; Edit, Write, and novel commands still prompt, so not fully unattended |
+  | **C) Skip** | Nothing | Today's behavior; one-off approvals keep piling up |
+
+  This edits `~/.claude/settings.json`, which affects **every project on the
+  machine**, not just this repo. Undo is a documented hand-edit;
+  `z-setup-permissions --check` reports which layers are active. Details in the
+  [z-setup guide](docs/user-guide/z-setup.md).
+
+## Commands and options
+
+| Command | What it does | Options |
+| ------- | ------------ | ------- |
+| **`/z-setup`** | One-time per repo: board + statuses + fields, workflows off, deploy wired, config written. Idempotent. | `--project-number <N>` adopt a specific existing project instead of matching by title. `--force` proceed past the destructive-adopt guard (deletes non-canonical field options that still have items — only after you've read the printed list). |
+| **`/z-plan [spec]`** | Turn a spec into milestones + board-ready tickets: grounded plans, `### Acceptance Criteria`, Model/Effort, a reproducible dollar Estimate, dependencies linked both ways. Idempotent by title slug. No arg → newest gstack CEO plan for the repo. | `--dry-run` emits tickets to stdout with zero board writes (what `evals/planner/` grades). |
+| **`/z-loop`** | Drain the Ready batch: plan → build → QA → adversarial review → merge in dependency order, then end-of-loop regression + deploy (green) or bug-filing (red), report, exit. No daemon. | `--reconcile` clears a crashed run's locks/worktrees, parks its tickets back to Ready, then starts. Never clears a live loop's lock. |
+| **`/z-status`** | Read-only dashboard: status counts, Questions/Blocked waiting on you, in-flight lanes with age, last loop's verdict, Estimate vs Actual totals. | — |
+
+Tunables live in `~/.zstack/projects/<slug>/config.json`: `maxLanes` (default 3
+concurrent lanes), `watchdogMinutes` (default 10, stuck-worker timeout),
+`lockStalenessMinutes` (when a crashed loop's lock counts as stale). See the
+[configuration reference](docs/user-guide/README.md#configuration-reference).
 
 ## The loop in one diagram
 
@@ -62,27 +160,11 @@ The stage diagrams the loop implements are in `references/` (`develop stage.png`
 (a genuine ambiguity, a dead worker, a third QA failure) parks in
 Questions / Blocked / Skipped with a comment — never a silent guess, never a stall.
 
-## Command reference
-
-| Command | What it does | Key options |
-|---------|--------------|-------------|
-| **`/z-setup`** | One-time per repo: create/adopt the board (9 statuses, 4 fields Model/Model Effort/Estimate/Actual), turn off the auto-archive + auto-close workflows, wire deploy, write `~/.zstack/projects/<slug>/config.json`. Idempotent. | Step 7 **auto-approvals**: optionally reduce Claude Code permission prompts so the loop runs unattended (A full / B loop-allowlist / C skip). Machine-wide — see [z-setup docs](docs/user-guide/z-setup.md). |
-| **`/z-plan [spec]`** | Turn a spec into milestones + board-ready tickets: grounded plans, `### Acceptance Criteria`, Model/Effort, a reproducible dollar Estimate, dependencies linked both ways. Idempotent by title slug. | `--dry-run` emits tickets to stdout with no board writes (used by `evals/planner/`). |
-| **`/z-loop`** | Drain the Ready batch: plan → build → QA → adversarial review → merge in dependency order, then end-of-loop regression + deploy (green) or bug-filing (red), report, exit. No daemon. | `--reconcile` clears a crashed run's locks/worktrees and parks its tickets back to Ready, then starts (C7). |
-| **`/z-status`** | Read-only dashboard: status counts, Questions/Blocked waiting on you, in-flight lanes with age, last loop's verdict, Estimate vs Actual totals. | — |
-
-Per-skill detail: [`docs/user-guide/`](docs/user-guide/) — one page each for
-[z-setup](docs/user-guide/z-setup.md), [z-plan](docs/user-guide/z-plan.md),
-[z-loop](docs/user-guide/z-loop.md), [z-status](docs/user-guide/z-status.md), and
-[troubleshooting](docs/user-guide/troubleshooting.md).
-
 ## Quickstart
 
-From a repo with a GitHub Projects board you can write to:
-
 ```bash
-# 0. Install the pack (once)
-git clone <this-repo> ~/.claude/skills/zstack
+# 0. Install the pack (once per machine)
+git clone https://github.com/zacgoodwin/zstack.git ~/.claude/skills/zstack
 cd ~/.claude/skills/zstack && ./setup
 
 # 1. Make sure your gh token can see projects
@@ -91,8 +173,7 @@ gh auth refresh -s project
 # 2. In the target repo, set up the board (creates statuses + fields, wires deploy)
 cd /path/to/your/repo
 /z-setup
-#   → toggle the two workflows OFF in the web UI and choose an auto-approvals
-#     level so the loop can run unattended (epic style is always milestones).
+#   → answers the two questions above: workflows off, auto-approvals level.
 
 # 3. Turn a spec into tickets
 /z-plan docs/specs/my-feature.md
@@ -109,6 +190,16 @@ cd /path/to/your/repo
 
 If a run wedges (a crash left locks or stray worktrees), `/z-loop --reconcile`
 clears it and restarts. See [troubleshooting](docs/user-guide/troubleshooting.md).
+
+## Documentation
+
+- [**User guide**](docs/user-guide/README.md) — the detailed walkthrough:
+  concepts, install, board setup, planning, running the loop, recovery, and the
+  configuration reference.
+- Per-skill pages: [z-setup](docs/user-guide/z-setup.md) ·
+  [z-plan](docs/user-guide/z-plan.md) · [z-loop](docs/user-guide/z-loop.md) ·
+  [z-status](docs/user-guide/z-status.md) ·
+  [troubleshooting](docs/user-guide/troubleshooting.md)
 
 ## Layout
 
@@ -135,5 +226,7 @@ Two lanes, per `references/PRINCIPLES.md`:
 
 ## Uninstall
 
-Local tooling only: `rm -rf ~/.claude/skills/zstack`. Board statuses are the
-recoverable state; worktrees are disposable; locks clear via `/z-loop --reconcile`.
+Local tooling only: `rm -rf ~/.claude/skills/zstack ~/.claude/skills/z-{setup,plan,loop,status}`
+(the pack plus the four per-skill entries `./setup` registered). Board statuses
+are the recoverable state; worktrees are disposable; locks clear via
+`/z-loop --reconcile`.

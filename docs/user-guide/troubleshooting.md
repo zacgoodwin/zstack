@@ -4,6 +4,23 @@ The failure modes zstack surfaces on purpose, and what to do about each. All of
 these are deliberate stops — the loop refuses to guess or to burn tokens while
 wedged.
 
+## Installed the pack but /z-setup, /z-plan, /z-loop, /z-status don't appear
+
+Claude Code builds its skill list from `~/.claude/skills/<name>/SKILL.md`,
+exactly one level deep — SKILL.md files nested inside the pack directory are
+invisible. `./setup` registers each skill as its own top-level entry
+(`~/.claude/skills/z-setup` etc.), so:
+
+1. Run `./setup` from the pack directory (mandatory even if you cloned straight
+   into `~/.claude/skills/zstack` — early versions skipped registration
+   entirely on that path; `git pull` first if yours does).
+2. Restart Claude Code: the skill list is scanned at session start.
+3. On Windows, check for a literal `~` folder in `~/.claude/skills` — it means
+   the install commands ran in `cmd.exe`, which doesn't expand `~`. Delete it
+   and re-run the install from Git Bash.
+
+Verify: `ls ~/.claude/skills/z-*/SKILL.md` should list four files.
+
 ## gh: "missing required scopes [read:project]"
 
 The board lives in GitHub ProjectV2, which needs the `project` scope on your gh
