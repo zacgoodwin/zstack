@@ -23,8 +23,9 @@ With no argument it defaults to the newest gstack CEO plan for the repo.
 
 1. **Grounds in the codebase first.** Reads the files the spec touches; every
    ticket's `## Plan` cites real paths and line refs, not guesses.
-2. **Milestones per `epicStyle`.** Groups work into epics (milestones or an epic
-   issue with sub-issues, whichever `/z-setup` recorded).
+2. **Milestones per `epicStyle`.** Groups work into epics. Only `milestones` is
+   supported today; the `issue-type` style (epic issue + sub-issues) is not yet
+   supported (issue #14).
 3. **Drafts each ticket to the schema and gates it.** Mandatory sections:
    `## Context`, `## Plan`, `### Acceptance Criteria` (setup → action → expected,
    authored before any code), `## Tests + evals`, `## Docs pages touched`,

@@ -9,7 +9,7 @@ import { test, expect, describe, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { costOfFiles, expandGlob, parseLine, ZError } from "../lib/cost.ts";
+import { costOfFiles, expandGlob, main, parseLine, ZError } from "../lib/cost.ts";
 import type { RatesFile } from "../lib/estimate.ts";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "transcript.jsonl");
@@ -140,6 +140,94 @@ describe("expandGlob", () => {
     const dir = mkdtempSync(join(tmpdir(), "zcost-glob-empty-"));
     tmpPaths.push(dir);
     expect(expandGlob("*.jsonl", dir)).toEqual([]);
+  });
+});
+
+// -- requestId-absent dedup fallback (issue #14 item 16a) ---------------------
+//
+// Real transcripts split one API response across multiple jsonl lines (one per
+// content block), each repeating the identical `message` object -- including
+// its API message id (`message.id`). requestId and message.id are 1:1 per
+// response (verified: 0 mismatches across 8 requestIds / 27 lines in a real
+// session). So when requestId is absent, message.id is the stable per-response
+// key; without it, the old file:line fallback priced an N-block response N
+// times -- the exact overcount the dedup exists to prevent.
+describe("dedup fallback when requestId is absent (item 16a)", () => {
+  const HAIKU_USAGE = {
+    input_tokens: 100,
+    output_tokens: 100,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+  };
+  // One content-block line of a response identified only by message.id.
+  const blockLine = (msgId: string | undefined, text: string) =>
+    JSON.stringify({
+      type: "assistant",
+      message: {
+        ...(msgId !== undefined ? { id: msgId } : {}),
+        model: "claude-haiku-4-5",
+        role: "assistant",
+        content: [{ type: "text", text }],
+        usage: HAIKU_USAGE,
+      },
+    });
+
+  test("multi-block response without requestId is priced exactly once", () => {
+    const file = tmpFile(blockLine("msg_ONE", "block a") + "\n" + blockLine("msg_ONE", "block b") + "\n");
+    const result = costOfFiles([file], RATES);
+    expect(result.lines_parsed).toBe(2);
+    expect(result.requests).toBe(1); // NOT 2: both lines are one API response
+    const haiku = result.by_model.find((m) => m.model === "haiku")!;
+    expect(haiku.tokens).toEqual({ fresh_input_tokens: 100, cached_input_tokens: 0, output_tokens: 100 });
+  });
+
+  test("distinct responses without requestId stay distinct (different message.id)", () => {
+    const file = tmpFile(blockLine("msg_ONE", "a") + "\n" + blockLine("msg_TWO", "b") + "\n");
+    const result = costOfFiles([file], RATES);
+    expect(result.requests).toBe(2);
+    const haiku = result.by_model.find((m) => m.model === "haiku")!;
+    expect(haiku.tokens.output_tokens).toBe(200);
+  });
+
+  test("neither requestId nor message.id: last-resort file:line, never dropped", () => {
+    const file = tmpFile(blockLine(undefined, "a") + "\n" + blockLine(undefined, "b") + "\n");
+    const result = costOfFiles([file], RATES);
+    expect(result.requests).toBe(2); // priced once per line, uniquely -- worst case, not silently dropped
+  });
+
+  test("requestId still wins when present (fixture behavior unchanged)", () => {
+    expect(costOfFiles([FIXTURE], RATES).requests).toBe(3);
+  });
+});
+
+// -- z-cost --json (issue #14 item 16b) ---------------------------------------
+//
+// z-loop's Actual field-set consumes `z-cost --json | jq -r .total`; this pins
+// the machine-readable shape so that pipeline can't silently rot.
+describe("z-cost --json output (item 16b)", () => {
+  test("emits one parseable object: total, per-model breakdown with tokens, requests", async () => {
+    // Same data as the AC3 fixture, via a glob pattern like z-loop passes.
+    const file = tmpFile(readFileSync(FIXTURE, "utf8"));
+    const pattern = join(file, "..", "*.jsonl").replaceAll("\\", "/");
+    const ratesFile = tmpFile(JSON.stringify(RATES), "rates.json");
+
+    const logs: string[] = [];
+    const orig = console.log;
+    console.log = (...a: unknown[]) => void logs.push(a.join(" "));
+    let code: number;
+    try {
+      code = await main(["--json", pattern, "--rates", ratesFile]);
+    } finally {
+      console.log = orig;
+    }
+    expect(code).toBe(0);
+
+    const obj = JSON.parse(logs.join("\n"));
+    expect(obj.total).toBe(0.09); // jq -r .total -> what z-loop field-sets as Actual
+    expect(obj.requests).toBe(3);
+    const sonnet = obj.by_model.find((m: any) => m.model === "sonnet");
+    expect(sonnet.dollars).toBe(0.06);
+    expect(sonnet.tokens).toEqual({ fresh_input_tokens: 3000, cached_input_tokens: 150000, output_tokens: 550 });
   });
 });
 

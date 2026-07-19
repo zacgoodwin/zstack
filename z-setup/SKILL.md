@@ -67,37 +67,20 @@ Run each check. Do not continue past a failure; fix it and re-run.
 
 ## Step 2 — Epic style (D1)
 
-Ask the user how epics should be modeled, using AskUserQuestion in the
-decision-brief format. This is written to `epicStyle` in config.json.
+Epic style is currently fixed to `milestones`: one GitHub milestone per epic —
+a built-in bucket you drop issues into, with a free progress bar, and the
+grouping `z-board create --milestone` already targets. Do not ask the user;
+set it directly:
 
-```
-D1 — How should epics be modeled on this board?
-Project/branch/task: First-time zstack setup for <OWNER>/<REPO>.
-ELI10: An "epic" is a big piece of work that breaks into many small tickets. We
-  can group those tickets two ways. Option A: a GitHub "milestone" per epic — a
-  built-in bucket you drop issues into, with a progress bar. Option B: a special
-  "epic" issue that lists its children as sub-issues. Both work; they change how
-  you'll file and track the children later.
-Stakes if we pick wrong: switching later means re-tagging every existing ticket,
-  so pick the one that matches how you already think about the work.
-Recommendation: A (milestones-as-epics) because it's the original zstack
-  preference, needs no issue-type config, and the milestone progress bar is a
-  free burn-down.
-Completeness: A=9/10, B=8/10
-Pros / cons:
-A) Milestones as epics (recommended)
-  ✅ Built-in progress bar and filter (`milestone:"zstack-v1"`) with zero setup
-  ✅ z-board create already targets a milestone, so no new plumbing is needed
-  ❌ A ticket belongs to exactly one milestone, so an epic can't overlap another
-B) Epic issue with sub-issue relations
-  ✅ Nested hierarchy shows parent/child directly in the issue UI
-  ✅ A child can be linked under more than one parent if scopes overlap
-  ❌ Needs the sub-issues feature and more manual linking per ticket
-Net: milestones are the lower-effort default that matches existing tooling;
-  sub-issues buy hierarchy you probably don't need yet.
+```bash
+EPIC_STYLE=milestones
 ```
 
-Record the answer as `milestones` (A) or `issue-type` (B) — call it `$EPIC_STYLE`.
+The alternative — an "epic" issue whose children are linked as sub-issues
+(`issue-type`) — is **not yet supported**: no sub-issue create path exists in
+the loop, so `z-setup-board` rejects `--epic-style issue-type` and config
+validation rejects `epicStyle: "issue-type"` until one is implemented
+(issue #14). When that lands, this step becomes a real D1 decision again.
 
 ---
 
@@ -125,6 +108,14 @@ Preview exactly what will change (zero writes):
 To adopt a specific existing project instead of matching by title, add
 `--project-number <N>`. `apply` is idempotent: re-running plans and executes zero
 mutations once the board is correct.
+
+**Destructive adopt guard.** Replacing the Status options on an adopted board
+deletes every non-canonical option (e.g. GitHub's default Todo / In Progress),
+and items assigned to a deleted option silently lose their Status. When such
+options still have items, `apply` refuses before running any mutation and lists
+each option with its item count. Show that list to the user and only re-run with
+`--force` after they explicitly confirm the loss; `--force` proceeds and prints
+what was dropped.
 
 ---
 

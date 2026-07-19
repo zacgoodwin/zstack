@@ -87,8 +87,12 @@ refs you did not read is not grounded and does not ship.
 Read `epicStyle` from config.json and model each epic from the spec accordingly:
 
 - `milestones` — one GitHub milestone per epic; `z-board create --milestone <M>`
-  files each child under it. This is the /z-setup default.
-- `issue-type` — an epic issue whose children are linked as sub-issues.
+  files each child under it. This is the /z-setup default and the only style
+  supported today.
+- `issue-type` — an epic issue whose children are linked as sub-issues. **Not
+  yet supported**: no sub-issue create path exists, and config validation
+  rejects `epicStyle: "issue-type"` until one is implemented (issue #14), so a
+  config read here always says `milestones`.
 
 Group the spec's work into these epics before drafting individual tickets.
 

@@ -91,8 +91,8 @@ gh auth refresh -s project
 # 2. In the target repo, set up the board (creates statuses + fields, wires deploy)
 cd /path/to/your/repo
 /z-setup
-#   → answer the epic-style question, toggle the two workflows OFF in the web UI,
-#     and choose an auto-approvals level so the loop can run unattended.
+#   → toggle the two workflows OFF in the web UI and choose an auto-approvals
+#     level so the loop can run unattended (epic style is always milestones).
 
 # 3. Turn a spec into tickets
 /z-plan docs/specs/my-feature.md

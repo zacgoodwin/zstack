@@ -283,9 +283,14 @@ describe("AC2: contract enforcement — no z-board mutating commands", () => {
   }
 
   test("z-status skill and status-report code contain zero z-board mutating subcommands", () => {
+    // Issue #14 item 2: the old filter excluded *.md, so z-status/SKILL.md --
+    // the file this gate exists to guard -- was never scanned. Scan it.
     const files = trackedFiles()
       .filter((f) => (f.startsWith("z-status/") || f.includes("status-report")) && !f.startsWith("tests/"))
-      .filter((f) => !f.endsWith(".md") && !f.endsWith(".png"));
+      .filter((f) => !f.endsWith(".png"));
+    // Canary: fail loudly if the skill file ever drops out of the scanned set,
+    // instead of passing vacuously again.
+    expect(files).toContain("z-status/SKILL.md");
 
     const mutatingCommands = ["move", "field-set", "create", "comment", "claim", "release"];
     const offenders: string[] = [];

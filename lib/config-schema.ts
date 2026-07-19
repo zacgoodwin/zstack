@@ -81,8 +81,17 @@ export function validateConfig(cfg: unknown): BoardConfig {
 
   // Optional fields: validated only when present so hand-written configs that
   // omit them (loadConfig fills defaults) still pass.
-  if (c.epicStyle !== undefined && c.epicStyle !== "milestones" && c.epicStyle !== "issue-type") {
-    throw new ZError(`Config "epicStyle" must be "milestones" or "issue-type", got ${JSON.stringify(c.epicStyle)}.`);
+  // "issue-type" is deliberately rejected until a sub-issue create path exists
+  // (issue #14 item 6): a config carrying it advertises an epic style the loop
+  // cannot act on. This check is the single enforcement point -- z-setup writes
+  // through it and loadConfig reads through it, so board.ts never sees one.
+  if (c.epicStyle === "issue-type") {
+    throw new ZError(
+      `Config "epicStyle" "issue-type" is not yet supported (no sub-issue create path exists yet; issue #14). Use "milestones".`
+    );
+  }
+  if (c.epicStyle !== undefined && c.epicStyle !== "milestones") {
+    throw new ZError(`Config "epicStyle" must be "milestones", got ${JSON.stringify(c.epicStyle)}.`);
   }
   for (const k of ["maxLanes", "watchdogMinutes", "lockStalenessMinutes"]) {
     if (c[k] !== undefined && (typeof c[k] !== "number" || !Number.isFinite(c[k]) || c[k] <= 0)) {

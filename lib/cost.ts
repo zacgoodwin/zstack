@@ -110,11 +110,21 @@ export function parseLine(line: string, where: string): ParsedUsageLine | null {
   if (typeof model !== "string" || !model) {
     throw new ZError(`${where}: assistant message missing "model".`);
   }
-  // requestId is what dedupes split-content-block lines back to one API call
-  // (fact 1 above). Falling back to `where` (file:line) if it's ever absent
-  // means a line is never silently dropped -- worst case it's priced once,
-  // uniquely, same as today's behavior without this fallback.
-  const requestId = typeof obj.requestId === "string" && obj.requestId ? obj.requestId : where;
+  // Dedup key for split-content-block lines (fact 1 above): requestId when
+  // present; else the API message id -- every block line of one response
+  // repeats the identical `message` object including its `id`, and message.id
+  // is 1:1 with requestId (verified: 0 mismatches across 8 requestIds / 27
+  // lines in a real session). A file:line fallback here would price an N-block
+  // response N times, the exact overcount the dedup exists to prevent; it
+  // remains only as the last resort when BOTH ids are absent, so a line is
+  // never silently dropped -- worst case it's priced once, uniquely. The
+  // "msgid:" prefix keeps the two id namespaces from ever colliding.
+  const requestId =
+    typeof obj.requestId === "string" && obj.requestId
+      ? obj.requestId
+      : typeof obj.message.id === "string" && obj.message.id
+        ? `msgid:${obj.message.id}`
+        : where;
   return { requestId, model, usage };
 }
 
@@ -165,10 +175,13 @@ export function expandGlob(pattern: string, cwd: string = process.cwd()): string
 }
 
 // -- CLI ---------------------------------------------------------------------
-const USAGE = `z-cost <glob-pattern> [--rates <path>]
+const USAGE = `z-cost <glob-pattern> [--rates <path>] [--json]
 
   glob-pattern: Claude Code transcript jsonl files for a ticket's agents,
-                e.g. "$HOME/.claude/projects/*/*.jsonl"`;
+                e.g. "$HOME/.claude/projects/*/*.jsonl"
+  --json:       emit the CostResult object (total, by_model with tokens and
+                dollars, requests, lines_parsed) so consumers like z-loop's
+                Actual field-set parse JSON, never prose`;
 
 export async function main(argv: string[]): Promise<number> {
   if (!argv[0]) {
@@ -183,8 +196,10 @@ export async function main(argv: string[]): Promise<number> {
   try {
     let pattern: string | undefined;
     let ratesFilePath = ratesPath();
+    let jsonOut = false;
     for (let i = 0; i < argv.length; i++) {
       if (argv[i] === "--rates") ratesFilePath = argv[++i];
+      else if (argv[i] === "--json") jsonOut = true;
       else pattern = argv[i];
     }
     if (!pattern) throw new ZError(`Usage: ${USAGE}`);
@@ -195,6 +210,10 @@ export async function main(argv: string[]): Promise<number> {
     const rates = loadRates(ratesFilePath);
     const result = costOfFiles(files, rates);
 
+    if (jsonOut) {
+      console.log(JSON.stringify(result));
+      return 0;
+    }
     console.log(`$${result.total.toFixed(2)} total across ${result.requests} request(s), ${files.length} file(s)`);
     for (const m of result.by_model) {
       console.log(

@@ -18,8 +18,9 @@ does not exist yet, you need `/z-setup`.
 1. **Preconditions.** Checks gstack, bun, gh, and — the one that actually bit us
    live — that your gh token has the `project` scope. If not, it prints and runs
    `gh auth refresh -s project` and re-probes before continuing.
-2. **Epic style (D1).** Asks how epics are modeled: a GitHub milestone per epic
-   (recommended) or an epic issue with sub-issues. Written to `epicStyle`.
+2. **Epic style (D1).** Records `epicStyle: "milestones"` (one GitHub milestone
+   per epic). The sub-issue alternative (`issue-type`) is not yet supported —
+   setup and config validation reject it until a create path exists (issue #14).
 3. **Create/adopt the board.** Previews the exact changes (`z-setup-board plan`,
    zero writes), then applies: nine statuses (Backlog, Ready, Questions, Building,
    QA, Review, Blocked, Skipped, Done) and four fields (Model, Model Effort,

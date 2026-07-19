@@ -28,16 +28,35 @@ can touch a ticket.
 
 ## How to run
 
+Invoked as `/z-status`. Run the pipeline below and present its stdout as the
+dashboard, verbatim. Every number on the dashboard — counts, sums, ages — is
+computed by `lib/status-report.ts`, never in prose: do not count tickets, add
+dollars, or re-derive any figure yourself. Your only latent work is optional
+commentary AFTER the rendered report (e.g. flagging a long-running lane).
+
 ```bash
-/z-status
+PACK="$HOME/.claude/skills/zstack"
+[ -d "$PACK" ] || PACK="$(cd "$(dirname "${BASH_SOURCE:-$0}")/.." && pwd -P)"
+Z_BOARD="$PACK/bin/z-board"
+SLUG=$(gh repo view --json name -q .name)
+export ZSTACK_SLUG="$SLUG"
+DIR="$HOME/.zstack/projects/$SLUG"
+TMP=$(mktemp -d)
+
+# Snapshot: all nine statuses -> one BoardItem[] file (same shape z-loop ingests)
+for S in Backlog Ready Questions Building QA Review Blocked Skipped Done; do
+  "$Z_BOARD" list --status "$S" --json --slug "$SLUG" > "$TMP/items-$S.json"
+done
+jq -s 'add' "$TMP"/items-*.json > "$TMP/items.json"
+
+# Newest loop report, if any prior loop has run
+LAST=$(ls -t "$DIR/reports"/loop-*.md 2>/dev/null | head -1)
+
+# Render: the ONLY place counts/sums/ages are computed (tests/status-report.test.ts
+# gates both the numbers and this pipeline reference)
+bun "$PACK/lib/status-report.ts" report --board-items "$TMP/items.json" \
+  --locks-dir "$DIR/locks" ${LAST:+--last-report "$LAST"}
 ```
-
-The skill assembles a snapshot from:
-- `z-board list --status <Status>` for each of the nine statuses
-- `locks/` directory (lane locks listing)
-- `reports/loop-*.md` (newest report, if present)
-
-Then renders the dashboard to stdout as markdown.
 
 ## Understanding the output
 

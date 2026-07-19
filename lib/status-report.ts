@@ -188,5 +188,7 @@ export function main(argv: string[]): number {
 }
 
 if (import.meta.main) {
-  main(process.argv.slice(2)).then((code) => process.exit(code));
+  // main() is synchronous -- a .then() here TypeErrors after the report prints
+  // and turns every successful render into exit 1 (issue #14 item 15).
+  process.exit(main(process.argv.slice(2)));
 }

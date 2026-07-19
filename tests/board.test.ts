@@ -122,6 +122,126 @@ describe("list", () => {
     const board = new Board(CFG, makeExecutor());
     await expect(board.list("Backlog")).rejects.toThrow(/Unknown status "Backlog".*Todo.*In progress.*Done/);
   });
+
+  // Issue #14 item 1: >100-item boards silently dropped tickets before cursor
+  // pagination. Two fake pages (100 + 1) must all come back.
+  test("paginates past 100 items: a 101-item board lists fully", async () => {
+    const page = (numbers: number[], pageInfo: { hasNextPage: boolean; endCursor: string | null }) => ({
+      node: {
+        items: {
+          pageInfo,
+          nodes: numbers.map((n) => ({
+            content: { number: n, title: `T${n}`, url: `http://x/${n}` },
+            fieldValues: {
+              nodes: [{ __typename: "ProjectV2ItemFieldSingleSelectValue", name: "Todo", field: { name: "Status" } }],
+            },
+          })),
+        },
+      },
+    });
+    const firstPage = Array.from({ length: 100 }, (_, i) => i + 1);
+    const calls: Call[] = [];
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        calls,
+        overrides: {
+          ProjectItems: (vars) =>
+            vars.cursor === "CUR_100"
+              ? page([101], { hasNextPage: false, endCursor: null })
+              : page(firstPage, { hasNextPage: true, endCursor: "CUR_100" }),
+        },
+      })
+    );
+    const items = await board.list("Todo");
+    expect(items.map((i) => i.number)).toEqual([...firstPage, 101]);
+    const reqs = calls.filter((c) => c.op === "ProjectItems");
+    expect(reqs.length).toBe(2);
+    expect(reqs[0].vars.cursor).toBeUndefined();
+    expect(reqs[1].vars.cursor).toBe("CUR_100"); // the loop actually followed the cursor
+  });
+
+  test("hasNextPage without an endCursor throws instead of silently truncating", async () => {
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        overrides: {
+          ProjectItems: { node: { items: { pageInfo: { hasNextPage: true, endCursor: null }, nodes: [] } } },
+        },
+      })
+    );
+    await expect(board.list("Todo")).rejects.toThrow(/no endCursor/);
+  });
+});
+
+// Ceilings assessed per issue #14 item 1: nested/bounded lists are not
+// paginated; instead overflow must throw loudly, never truncate.
+describe("single-page ceiling guards", () => {
+  test("fieldValues overflow (>20 values on an item) throws", async () => {
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        overrides: {
+          ProjectItems: {
+            node: {
+              items: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    content: { number: 5, title: "T5", url: "http://x/5" },
+                    fieldValues: { pageInfo: { hasNextPage: true }, nodes: [] },
+                  },
+                ],
+              },
+            },
+          },
+        },
+      })
+    );
+    await expect(board.list("Todo")).rejects.toThrow(/fieldValues for issue #5.*truncated/);
+  });
+
+  test("an issue on more than 20 projects throws instead of 'not on project'", async () => {
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        overrides: {
+          IssueLookup: {
+            repository: {
+              issue: {
+                id: "I_5",
+                number: 5,
+                title: "T5",
+                body: "",
+                assignees: { nodes: [] },
+                projectItems: { pageInfo: { hasNextPage: true }, nodes: [] },
+              },
+            },
+          },
+        },
+      })
+    );
+    await expect(board.move(5, "Done")).rejects.toThrow(/projectItems for issue #5.*truncated/);
+  });
+
+  test("milestones overflow throws instead of a bogus 'not found'", async () => {
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        overrides: {
+          RepoMeta: {
+            repository: {
+              id: "R_1",
+              milestones: { pageInfo: { hasNextPage: true }, nodes: [] },
+              labels: { pageInfo: { hasNextPage: false }, nodes: [] },
+            },
+          },
+        },
+      })
+    );
+    const file = tmpBodyFile("Body.");
+    await expect(board.create("T", file, "zstack-v1")).rejects.toThrow(/milestones for .*truncated/);
+  });
 });
 
 describe("move", () => {
@@ -234,49 +354,99 @@ describe("create", () => {
   });
 });
 
+// Stateful body backend for link (issue #14 item 10): bodies are real state and
+// UpdateIssueBody is a last-write-wins snapshot, exactly like GitHub's
+// updateIssue, so lost-update interleavings are reproducible. loseWrites
+// simulates a concurrent writer clobbering our write (the re-read then misses
+// our line, as it would live).
+function linkBackend(
+  initialBodies: Record<number, string>,
+  opts: { loseWrites?: (id: string) => boolean } = {}
+) {
+  const bodies: Record<string, string> = {};
+  for (const [n, b] of Object.entries(initialBodies)) bodies[`I_${n}`] = b;
+  const calls: Call[] = [];
+  const exec: GraphQLExecutor = async (query, vars: any) => {
+    const op = opName(query);
+    calls.push({ op, vars });
+    switch (op) {
+      case "RateLimit":
+        return { rateLimit: { remaining: 5000, resetAt: "2026-07-19T00:00:00Z" } };
+      case "IssueLookup":
+        return {
+          repository: {
+            issue: {
+              id: `I_${vars.number}`,
+              number: vars.number,
+              title: `#${vars.number}`,
+              body: bodies[`I_${vars.number}`] ?? "",
+              assignees: { nodes: [] },
+              projectItems: { nodes: [{ id: `PVTI_${vars.number}`, project: { number: 1 } }] },
+            },
+          },
+        };
+      case "UpdateIssueBody": {
+        if (!opts.loseWrites?.(vars.id)) bodies[vars.id] = vars.body;
+        return { updateIssue: { issue: { number: 0 } } };
+      }
+      case "AddComment":
+        return { addComment: { clientMutationId: null } };
+      default:
+        throw new Error(`linkBackend: unexpected op ${op}`);
+    }
+  };
+  return { exec, bodies, calls };
+}
+
 describe("link", () => {
   test("records the dependency both directions with body line + comment", async () => {
-    const calls: Call[] = [];
-    const perIssue = (vars: any): GraphQLData => ({
-      repository: {
-        issue: {
-          id: `I_${vars.number}`,
-          number: vars.number,
-          title: `#${vars.number}`,
-          body: "Body.",
-          assignees: { nodes: [] },
-          projectItems: { nodes: [{ id: `PVTI_${vars.number}`, project: { number: 1 } }] },
-        },
-      },
-    });
-    const board = new Board(CFG, makeExecutor({ calls, overrides: { IssueLookup: perIssue } }));
+    const b = linkBackend({ 5: "Body.", 6: "Body." });
+    const board = new Board(CFG, b.exec);
     await board.link(5, 6);
 
-    const comments = calls.filter((c) => c.op === "AddComment");
+    expect(b.bodies["I_5"]).toContain("Depends on #6");
+    expect(b.bodies["I_6"]).toContain("Blocks #5");
+    const comments = b.calls.filter((c) => c.op === "AddComment");
     expect(comments.map((c) => c.vars.body).sort()).toEqual(["Blocks #5", "Depends on #6"]);
-    const bodies = calls.filter((c) => c.op === "UpdateIssueBody");
-    expect(bodies.find((c) => c.vars.id === "I_5")!.vars.body).toContain("Depends on #6");
-    expect(bodies.find((c) => c.vars.id === "I_6")!.vars.body).toContain("Blocks #5");
   });
 
   test("is idempotent: an already-present line is skipped", async () => {
-    const calls: Call[] = [];
-    const linked = (vars: any): GraphQLData => ({
-      repository: {
-        issue: {
-          id: `I_${vars.number}`,
-          number: vars.number,
-          title: `#${vars.number}`,
-          body: vars.number === 5 ? "Body.\n\nDepends on #6" : "Body.\n\nBlocks #5",
-          assignees: { nodes: [] },
-          projectItems: { nodes: [{ id: `PVTI_${vars.number}`, project: { number: 1 } }] },
-        },
-      },
-    });
-    const board = new Board(CFG, makeExecutor({ calls, overrides: { IssueLookup: linked } }));
+    const b = linkBackend({ 5: "Body.\n\nDepends on #6", 6: "Body.\n\nBlocks #5" });
+    const board = new Board(CFG, b.exec);
     await board.link(5, 6);
-    expect(calls.some((c) => c.op === "AddComment")).toBe(false);
-    expect(calls.some((c) => c.op === "UpdateIssueBody")).toBe(false);
+    expect(b.calls.some((c) => c.op === "AddComment")).toBe(false);
+    expect(b.calls.some((c) => c.op === "UpdateIssueBody")).toBe(false);
+  });
+
+  // -- issue #14 item 10: read-check-write clobber protection ----------------
+  test("a lost update is retried until the relation line survives", async () => {
+    let lose = 1; // swallow exactly the first write to #5, as a concurrent clobber would
+    const b = linkBackend({ 5: "Body.", 6: "" }, { loseWrites: (id) => id === "I_5" && lose-- > 0 });
+    const board = new Board(CFG, b.exec);
+    await board.link(5, 6);
+    expect(b.bodies["I_5"]).toContain("Depends on #6");
+    expect(b.calls.filter((c) => c.op === "UpdateIssueBody" && c.vars.id === "I_5").length).toBe(2);
+    // comment posted once, only after the write verifiably stuck
+    expect(b.calls.filter((c) => c.op === "AddComment" && c.vars.body === "Depends on #6").length).toBe(1);
+  });
+
+  test("throws loudly after bounded retries when writes keep getting clobbered", async () => {
+    const b = linkBackend({ 5: "Body.", 6: "" }, { loseWrites: (id) => id === "I_5" });
+    const board = new Board(CFG, b.exec);
+    await expect(board.link(5, 6)).rejects.toThrow(/did not survive 3 body writes/);
+    expect(b.calls.filter((c) => c.op === "UpdateIssueBody" && c.vars.id === "I_5").length).toBe(3);
+    expect(b.calls.some((c) => c.op === "AddComment")).toBe(false); // no success signal on failure
+  });
+
+  test("concurrent link() calls on the same issue drop no lines", async () => {
+    const b = linkBackend({ 5: "Body.", 6: "", 7: "" });
+    const boardA = new Board(CFG, b.exec);
+    const boardB = new Board(CFG, b.exec);
+    await Promise.all([boardA.link(5, 6), boardB.link(5, 7)]);
+    expect(b.bodies["I_5"]).toContain("Depends on #6");
+    expect(b.bodies["I_5"]).toContain("Depends on #7");
+    expect(b.bodies["I_6"]).toContain("Blocks #5");
+    expect(b.bodies["I_7"]).toContain("Blocks #5");
   });
 });
 
@@ -467,6 +637,61 @@ describe("contract enforcement", () => {
   test("lib/board.ts is in fact the caller (guards against the gate passing vacuously)", () => {
     const content = readFileSync(join(REPO_ROOT, "lib", "board.ts"), "utf8");
     expect(/\bgh\b/.test(content) && content.includes("api")).toBe(true);
+  });
+
+  // Issue #14 item 2: the code gate above excludes *.md, so the skill files --
+  // the pack's actual executed surface -- were never scanned and the gate
+  // passed vacuously. Skill files DO shell out to gh. Every direct
+  // `gh api graphql` / `gh issue` invocation in a SKILL.md must match this
+  // explicit allowlist exactly (whitespace-normalized, so incidental reflow
+  // within a line doesn't break it); a NEW direct call fails until it is
+  // consciously sanctioned here.
+  const SKILL_GH_ALLOWLIST: Record<string, string[]> = {
+    "z-setup/SKILL.md": [
+      // Step 1 auth-scope probe: read-only, mutates nothing
+      `gh api graphql -f query='query { viewer { login } }' >/dev/null`,
+    ],
+    "z-loop/SKILL.md": [
+      // read-only body fetches (planning pass + board snapshot); z-board has no
+      // body-read subcommand
+      `gh issue view <N> --json body -q .body > "$TMP/body-<N>.md"`,
+      `gh issue view "$N" --json body -q .body > "$TMP/body-$N.md"`,
+      `gh issue view`, // prose reference in the builder-input table
+      // planning-pass body write; z-board has no issue-body-edit subcommand
+      // (flagged in issue #14 item 2 findings as the one mutation outside z-board)
+      `gh issue edit <N> --body-file ...`,
+      `gh issue close`, // prose PROHIBITION: "never gh issue close"
+    ],
+  };
+
+  // Extracts each gh invocation: from the `gh` token to end of line or closing
+  // backtick, whitespace collapsed, any line-continuation backslash stripped.
+  function ghInvocations(content: string): string[] {
+    const out: string[] = [];
+    for (const line of content.split(/\r?\n/)) {
+      for (const m of line.matchAll(/\bgh\s+(?:api\s+graphql|issue)\b[^`]*/g)) {
+        out.push(m[0].replace(/\s+/g, " ").replace(/\s*\\$/, "").trim());
+      }
+    }
+    return out;
+  }
+
+  test("skill .md files: every direct gh api graphql / gh issue call is allowlisted", () => {
+    const skillFiles = trackedFiles().filter((f) => f.endsWith("/SKILL.md"));
+    // Canary: the scan must actually contain the real skill files, or this gate
+    // has gone vacuous again (the exact bug it replaces).
+    expect(skillFiles).toContain("z-loop/SKILL.md");
+    expect(skillFiles).toContain("z-setup/SKILL.md");
+    expect(skillFiles).toContain("z-status/SKILL.md");
+
+    const offenders: string[] = [];
+    for (const f of skillFiles) {
+      const allowed = new Set(SKILL_GH_ALLOWLIST[f] ?? []);
+      for (const inv of ghInvocations(readFileSync(join(REPO_ROOT, f), "utf8"))) {
+        if (!allowed.has(inv)) offenders.push(`${f}: ${inv}`);
+      }
+    }
+    expect(offenders).toEqual([]);
   });
 });
 

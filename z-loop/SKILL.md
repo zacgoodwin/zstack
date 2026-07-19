@@ -235,8 +235,8 @@ every stage so far, and z-cost dedupes by requestId, so its total IS the
 cumulative and you never add dollars in prose:
 
 ```bash
-"$Z_COST" "$STATE_DIR/transcripts/ticket-<N>/*.jsonl"     # -> "$X.XX total ..."
-"$Z_BOARD" field-set <N> Actual <that X.XX> --slug "$SLUG"
+ACTUAL=$("$Z_COST" --json "$STATE_DIR/transcripts/ticket-<N>/*.jsonl" | jq -r .total)
+"$Z_BOARD" field-set <N> Actual "$ACTUAL" --slug "$SLUG"
 ```
 
 ## Step 5 — Watchdog (PROCESS.md global rule)

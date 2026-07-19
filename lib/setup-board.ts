@@ -217,6 +217,25 @@ const Q_PROJECT_BY_NUMBER = `query ProjectByNumber($owner: String!, $repo: Strin
   }
 }`;
 
+// Counts live items per Status option so the adopt guard can see which
+// non-canonical options still hold items before they are wholesale-replaced.
+// Paginated: undercounting past 100 items would let the guard wave through a
+// destructive adopt on a big board.
+const Q_STATUS_USAGE = `query StatusUsage($project: ID!, $after: String) {
+  node(id: $project) {
+    ... on ProjectV2 {
+      items(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          fieldValueByName(name: "Status") {
+            ... on ProjectV2ItemFieldSingleSelectValue { name }
+          }
+        }
+      }
+    }
+  }
+}`;
+
 const Q_PROJECT_FIELDS = `query ProjectFields($project: ID!) {
   node(id: $project) {
     ... on ProjectV2 {
@@ -274,12 +293,20 @@ export interface ApplyOptions {
   epicStyle?: EpicStyle;
   maxLanes?: number;
   watchdogMinutes?: number;
+  force?: boolean; // adopt even when non-canonical Status options still hold items
+}
+
+// A non-canonical Status option that had items when it was replaced (--force).
+export interface DroppedOption {
+  name: string;
+  count: number;
 }
 
 export interface ApplyResult {
   config: BoardConfig;
   actions: SetupAction[];
   created: boolean;
+  dropped: DroppedOption[];
 }
 
 function optionMap(options: OptionState[] | undefined): Record<string, string> {
@@ -326,6 +353,24 @@ export class SetupBoard {
     return stateFromNode(data.node);
   }
 
+  // Item count per Status option name, across every page.
+  private async statusUsage(projectId: string): Promise<Record<string, number>> {
+    const counts: Record<string, number> = {};
+    let after: string | undefined;
+    do {
+      // The cursor is only sent when present: ghExecutor encodes every variable
+      // it is given, and "$after: String" may simply be omitted on page one.
+      const data = await this.exec(Q_STATUS_USAGE, after ? { project: projectId, after } : { project: projectId });
+      const items = data.node?.items;
+      for (const n of items?.nodes ?? []) {
+        const name = n?.fieldValueByName?.name;
+        if (name) counts[name] = (counts[name] ?? 0) + 1;
+      }
+      after = items?.pageInfo?.hasNextPage ? items.pageInfo.endCursor : undefined;
+    } while (after);
+    return counts;
+  }
+
   // Reads the full state, or null when the project does not exist.
   async readState(
     owner: string,
@@ -366,6 +411,34 @@ export class SetupBoard {
     // field ids from `state`.
     const actions = diffState(state, opts.title).filter((a) => a.kind !== "create-project");
 
+    // Destructive-adopt guard (issue #14 item 5). Replacing the Status options
+    // deletes every non-canonical option, and items assigned to a deleted
+    // option silently lose their Status. On an adopted board (never one we just
+    // created: its default options hold zero items) refuse before ANY mutation
+    // runs, unless --force; --force still surfaces what is dropped.
+    let dropped: DroppedOption[] = [];
+    if (!created && actions.some((a) => a.kind === "set-status-options")) {
+      const status = state.fields.find((f) => f.name === STATUS_FIELD_NAME);
+      const nonCanonical = (status?.options ?? [])
+        .map((o) => o.name)
+        .filter((n) => !(STATUS_OPTIONS as readonly string[]).includes(n));
+      if (nonCanonical.length) {
+        const usage = await this.statusUsage(header.id);
+        dropped = nonCanonical
+          .map((name) => ({ name, count: usage[name] ?? 0 }))
+          .filter((d) => d.count > 0);
+        if (dropped.length && !opts.force) {
+          const detail = dropped.map((d) => `  "${d.name}": ${d.count} item(s)`).join("\n");
+          throw new ZError(
+            `Refusing to adopt project #${header.number} "${header.title}": replacing the Status ` +
+              `options would delete non-canonical options that still have items assigned ` +
+              `(those items silently lose their Status):\n${detail}\n` +
+              `Re-run with --force to drop them anyway.`
+          );
+        }
+      }
+    }
+
     for (const a of actions) {
       if (a.kind === "set-status-options") {
         const fieldId = requireFieldId(state, STATUS_FIELD_NAME);
@@ -386,7 +459,7 @@ export class SetupBoard {
     const finalState = actions.length ? await this.readFields(header.id) : state;
     const config = buildConfig(finalState, { owner, repo, repositoryId, ...opts });
     validateConfig(config);
-    return { config, actions, created };
+    return { config, actions, created, dropped };
   }
 
   async verify(owner: string, repo: string, opts: { number?: number; title: string }): Promise<VerifyReport> {
@@ -462,9 +535,11 @@ const USAGE = `z-setup-board <command> [flags]
 
   plan   --owner O --repo R --title T [--project-number N]
          print the mutations needed to reach the canonical board (zero writes)
-  apply  --owner O --repo R --slug S --title T [--project-number N]
-         [--epic-style milestones|issue-type] [--max-lanes 3] [--watchdog-minutes 10]
+  apply  --owner O --repo R --slug S --title T [--project-number N] [--force]
+         [--epic-style milestones] [--max-lanes 3] [--watchdog-minutes 10]
          create/adopt the project, run the mutations, write config.json
+         (adopting a board whose non-canonical Status options still hold items
+         refuses and lists them unless --force is given)
   verify --owner O --repo R [--title T | --project-number N]
          check the live board against the 9 statuses + 4 fields; non-zero on drift
 
@@ -475,10 +550,15 @@ interface Parsed {
   flags: Record<string, string>;
 }
 
+// Flags that take no value; everything else consumes the next argument.
+const BOOLEAN_FLAGS = new Set(["force"]);
+
 function parseFlags(args: string[]): Parsed {
   const flags: Record<string, string> = {};
   for (let i = 0; i < args.length; i++) {
-    if (args[i].startsWith("--")) flags[args[i].slice(2)] = args[++i];
+    if (!args[i].startsWith("--")) continue;
+    const name = args[i].slice(2);
+    flags[name] = BOOLEAN_FLAGS.has(name) ? "true" : args[++i];
   }
   return { flags };
 }
@@ -489,10 +569,17 @@ function requireFlag(flags: Record<string, string>, name: string): string {
   return v;
 }
 
-function toEpicStyle(v: string | undefined): EpicStyle | undefined {
+// Exported for the gate test: rejecting "issue-type" here keeps the CLI from
+// ever calling GraphQL with a config the loop cannot act on (issue #14 item 6).
+export function toEpicStyle(v: string | undefined): EpicStyle | undefined {
   if (v === undefined) return undefined;
-  if (v !== "milestones" && v !== "issue-type") {
-    throw new ZError(`--epic-style must be "milestones" or "issue-type", got "${v}".`);
+  if (v === "issue-type") {
+    throw new ZError(
+      `--epic-style "issue-type" is not yet supported (no sub-issue create path exists yet; issue #14). Use "milestones".`
+    );
+  }
+  if (v !== "milestones") {
+    throw new ZError(`--epic-style must be "milestones", got "${v}".`);
   }
   return v;
 }
@@ -540,12 +627,19 @@ export async function main(argv: string[]): Promise<number> {
           epicStyle: toEpicStyle(flags["epic-style"]),
           maxLanes: flags["max-lanes"] ? Number(flags["max-lanes"]) : undefined,
           watchdogMinutes: flags["watchdog-minutes"] ? Number(flags["watchdog-minutes"]) : undefined,
+          force: flags["force"] === "true",
         });
         const path = writeConfig(result.config);
         console.log(
           `${result.created ? "Created" : "Adopted"} project #${result.config.projectNumber} ` +
             `"${result.config.projectId}" with ${result.actions.length} mutation(s).`
         );
+        if (result.dropped.length) {
+          console.log(
+            "--force dropped non-canonical Status options that had items: " +
+              result.dropped.map((d) => `"${d.name}" (${d.count} item(s))`).join(", ")
+          );
+        }
         console.log(`Wrote ${path}`);
         return 0;
       }

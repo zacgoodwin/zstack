@@ -32,13 +32,20 @@ const defaultSleep: Sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // list/object variables (see ghExecutor). --------------------------------------
 const Q_RATE_LIMIT = `query RateLimit { rateLimit { remaining resetAt } }`;
 
-const Q_PROJECT_ITEMS = `query ProjectItems($project: ID!) {
+// items is cursor-paginated in list() -- z-setup forces auto-archive OFF and the
+// loop leaves Done issues OPEN, so growth past one page of 100 is guaranteed.
+// fieldValues stays single-page with a loud overflow guard (assertSinglePage):
+// its ceiling is 20 values per item against the board's 5 defined fields, and
+// paginating a nested connection would need a per-item follow-up query.
+const Q_PROJECT_ITEMS = `query ProjectItems($project: ID!, $cursor: String) {
   node(id: $project) {
     ... on ProjectV2 {
-      items(first: 100) {
+      items(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           content { ... on Issue { number title url } }
           fieldValues(first: 20) {
+            pageInfo { hasNextPage }
             nodes {
               __typename
               ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2FieldCommon { name } } }
@@ -52,12 +59,14 @@ const Q_PROJECT_ITEMS = `query ProjectItems($project: ID!) {
   }
 }`;
 
+// projectItems ceiling: 20 boards per issue; ours must be among them or itemId
+// silently reports "not on project", so overflow throws via assertSinglePage.
 const Q_ISSUE_LOOKUP = `query IssueLookup($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     issue(number: $number) {
       id number title body
       assignees(first: 10) { nodes { login } }
-      projectItems(first: 20) { nodes { id project { number } } }
+      projectItems(first: 20) { pageInfo { hasNextPage } nodes { id project { number } } }
     }
   }
 }`;
@@ -66,6 +75,7 @@ const Q_FIELD_VALUE = `query FieldValue($owner: String!, $repo: String!, $number
   repository(owner: $owner, name: $repo) {
     issue(number: $number) {
       projectItems(first: 20) {
+        pageInfo { hasNextPage }
         nodes {
           project { number }
           fieldValueByName(name: $field) {
@@ -88,11 +98,14 @@ const Q_ISSUE_ASSIGNEES = `query IssueAssignees($owner: String!, $repo: String!,
 
 const Q_USER_ID = `query UserId($login: String!) { user(login: $login) { id } }`;
 
+// Ceilings: 50 milestones / 100 labels per repo. Overflow would turn a real
+// milestone/label into a bogus "not found", so create() guards both with
+// assertSinglePage rather than paginating a lookup this rarely-large.
 const Q_REPO_META = `query RepoMeta($owner: String!, $repo: String!) {
   repository(owner: $owner, name: $repo) {
     id
-    milestones(first: 50) { nodes { id title } }
-    labels(first: 100) { nodes { id name } }
+    milestones(first: 50) { pageInfo { hasNextPage } nodes { id title } }
+    labels(first: 100) { pageInfo { hasNextPage } nodes { id name } }
   }
 }`;
 
@@ -227,8 +240,25 @@ export class Board {
 
   async list(status: string): Promise<BoardItem[]> {
     this.assertStatus(status);
-    const data = await this.gql(Q_PROJECT_ITEMS, { project: this.cfg.projectId });
-    const nodes: any[] = data.node?.items?.nodes ?? [];
+    // Cursor pagination (issue #14 item 1): the board WILL exceed 100 items
+    // (auto-archive is forced off and Done issues stay open), and list()
+    // filters client-side, so truncation here silently drops tickets.
+    const nodes: any[] = [];
+    let cursor: string | undefined;
+    do {
+      const vars: Record<string, unknown> = { project: this.cfg.projectId };
+      if (cursor !== undefined) vars.cursor = cursor;
+      const data = await this.gql(Q_PROJECT_ITEMS, vars);
+      const items = data.node?.items;
+      nodes.push(...(items?.nodes ?? []));
+      const page = items?.pageInfo;
+      if (page?.hasNextPage && typeof page.endCursor !== "string") {
+        throw new ZError(
+          `ProjectItems advertises another page but returned no endCursor -- refusing to silently drop board items.`
+        );
+      }
+      cursor = page?.hasNextPage ? page.endCursor : undefined;
+    } while (cursor !== undefined);
     return nodes
       .map((n) => toItem(n))
       .filter((it): it is BoardItem => it !== null && it.fields["Status"] === status);
@@ -260,6 +290,7 @@ export class Board {
       number: n,
       field,
     });
+    assertSinglePage(data.repository?.issue?.projectItems, `projectItems for issue #${n} (ceiling: 20 boards per issue)`);
     const items: any[] = data.repository?.issue?.projectItems?.nodes ?? [];
     const item =
       items.find((i) => i.project?.number === this.cfg.projectNumber) ?? items[0];
@@ -301,6 +332,10 @@ export class Board {
       repo: this.cfg.repo,
     });
     const repository = meta.repository;
+    // Overflow past the RepoMeta page sizes would misreport a real milestone or
+    // label as "not found" -- fail loudly instead (ceilings named on Q_REPO_META).
+    assertSinglePage(repository?.milestones, `milestones for ${this.cfg.owner}/${this.cfg.repo} (ceiling: 50)`);
+    assertSinglePage(repository?.labels, `labels for ${this.cfg.owner}/${this.cfg.repo} (ceiling: 100)`);
     const ms = (repository?.milestones?.nodes ?? []).find(
       (m: any) => m.title === milestone
     );
@@ -344,10 +379,28 @@ export class Board {
     await this.addRelation(b, `Blocks #${n}`);
   }
 
+  // Body appends are read-modify-write with no server-side CAS, so a concurrent
+  // link() that read the same base body can clobber our line (issue #14 item
+  // 10). Mirror setup-permissions.verifyWrite: after writing, re-read and
+  // confirm the line survived; on a lost update, re-append against the fresh
+  // body and retry (bounded), then fail loudly instead of reporting success on
+  // a write that didn't stick.
   private async addRelation(issue: IssueNode, line: string): Promise<void> {
-    if ((issue.body ?? "").includes(line)) return;
-    const body = issue.body && issue.body.length ? `${issue.body}\n\n${line}` : line;
-    await this.gql(M_UPDATE_BODY, { id: issue.id, body });
+    if ((issue.body ?? "").includes(line)) return; // pre-existing: skip body write AND comment
+    const RETRIES = 3;
+    let current = issue;
+    for (let attempt = 1; ; attempt++) {
+      const body = current.body && current.body.length ? `${current.body}\n\n${line}` : line;
+      await this.gql(M_UPDATE_BODY, { id: current.id, body });
+      current = await this.lookup(current.number);
+      if ((current.body ?? "").includes(line)) break;
+      if (attempt >= RETRIES) {
+        throw new ZError(
+          `Issue #${current.number}: relation line "${line}" did not survive ${RETRIES} body writes -- ` +
+            `a concurrent writer keeps clobbering it. Re-run z-board link once the other writer settles.`
+        );
+      }
+    }
     await this.gql(M_ADD_COMMENT, { subject: issue.id, body: line });
   }
 
@@ -423,6 +476,8 @@ export class Board {
     });
     const issue = data.repository?.issue;
     if (!issue) throw new ZError(`Issue #${n} not found in ${this.cfg.owner}/${this.cfg.repo}.`);
+    // Our project must be on the first page or itemId misreports "not on project".
+    assertSinglePage(issue.projectItems, `projectItems for issue #${n} (ceiling: 20 boards per issue)`);
     return issue as IssueNode;
   }
 
@@ -465,9 +520,24 @@ interface IssueNode {
   projectItems: { nodes: { id: string; project: { number: number } | null }[] };
 }
 
+// Loud ceiling guard for connections list-shaped queries do NOT paginate
+// (nested or bounded lists where cursor-following is impractical from the call
+// shape). Silent truncation corrupts board decisions, so overflow throws.
+function assertSinglePage(conn: any, what: string): void {
+  if (conn?.pageInfo?.hasNextPage) {
+    throw new ZError(
+      `${what} exceeds its single query page and would be silently truncated -- ` +
+        `raise the page size or add pagination in lib/board.ts before proceeding.`
+    );
+  }
+}
+
 function toItem(node: any): BoardItem | null {
   const content = node?.content;
   if (!content || content.number === undefined) return null;
+  // fieldValues is nested per-item; overflow past first:20 (5 fields defined on
+  // the canonical board) would drop Status/Model/etc. silently.
+  assertSinglePage(node.fieldValues, `fieldValues for issue #${content.number} (ceiling: 20 values per item)`);
   const fields: Record<string, string | number> = {};
   for (const fv of node.fieldValues?.nodes ?? []) {
     const name = fv?.field?.name;
@@ -503,8 +573,11 @@ function readBody(bodyFile: string): string {
   }
 }
 
-// Production executor: shells out to `gh api graphql`. This is the ONLY place in
-// the whole pack allowed to call gh directly (enforced by a grep gate test).
+// Production executor: shells out to `gh api graphql`. This is the only place
+// in the pack's CODE allowed to call `gh api graphql` / `gh issue` directly
+// (grep gate in tests/board.test.ts). Skill .md files DO shell out to gh for
+// reads and the planning-pass body edit; every such invocation is pinned to an
+// explicit allowlist by the same gate, so a new direct call fails it.
 // All operation variables are scalars, so -f (string) / -F (typed) suffice and
 // we never have to encode list/object variables on the CLI.
 export function ghExecutor(): GraphQLExecutor {

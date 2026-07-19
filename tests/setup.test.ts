@@ -11,6 +11,7 @@ import { join } from "node:path";
 import {
   SetupBoard,
   diffState,
+  toEpicStyle,
   verifyReport,
   writeConfig,
   STATUS_OPTIONS,
@@ -50,6 +51,7 @@ interface BackendProject {
   number: number;
   title: string;
   fields: BackendField[];
+  items?: (string | null)[]; // one Status option name per item; null = no Status
 }
 
 function fullProjectSpec(title = "zstack"): BackendProject {
@@ -124,6 +126,16 @@ function setupBackend(existing?: BackendProject) {
       case "ProjectFields":
         if (!project) throw new Error("ProjectFields called with no project");
         return nodeFrom(project);
+      case "StatusUsage":
+        if (!project) throw new Error("StatusUsage called with no project");
+        return {
+          node: {
+            items: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: (project.items ?? []).map((s) => ({ fieldValueByName: s ? { name: s } : null })),
+            },
+          },
+        };
       case "CreateProject":
         project = {
           id: "PVT_new",
@@ -365,6 +377,63 @@ describe("SetupBoard.apply — adoption path", () => {
   });
 });
 
+// -- destructive adopt guard (issue #14 item 5) -------------------------------
+describe("SetupBoard.apply — destructive adopt guard", () => {
+  // GitHub's default board: Todo / In Progress are non-canonical and would be
+  // deleted by set-status-options; Done is canonical and survives.
+  function legacyProject(items: (string | null)[]): BackendProject {
+    return {
+      id: "PVT_legacy",
+      number: 4,
+      title: "zstack",
+      fields: [
+        { id: "F_title", name: "Title", dataType: "TEXT" },
+        { id: "F_status", name: "Status", dataType: "SINGLE_SELECT", options: ["Todo", "In Progress", "Done"] },
+      ],
+      items,
+    };
+  }
+
+  test("adopt with live items in non-canonical options refuses without --force, naming options + counts, issuing no mutation", async () => {
+    const backend = setupBackend(legacyProject(["Todo", "Todo", "In Progress", "Done", null]));
+    const setup = new SetupBoard(backend.exec);
+    await expect(
+      setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" })
+    ).rejects.toThrow(/"Todo": 2 item\(s\)[\s\S]*"In Progress": 1 item\(s\)[\s\S]*--force/);
+    // No destructive (or any) mutation was issued, and the backend still holds
+    // the original options. The item in canonical "Done" did not trigger it.
+    expect(backend.calls.some((c) => c.op.startsWith("Create") || c.op.startsWith("Update"))).toBe(false);
+    expect(backend.project!.fields.find((f) => f.name === "Status")!.options).toEqual([
+      "Todo",
+      "In Progress",
+      "Done",
+    ]);
+  });
+
+  test("adopt with --force proceeds, reports what was dropped, and replaces Status", async () => {
+    const backend = setupBackend(legacyProject(["Todo", "In Progress", "Done"]));
+    const setup = new SetupBoard(backend.exec);
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", force: true });
+    expect(result.created).toBe(false);
+    expect(result.dropped).toEqual([
+      { name: "Todo", count: 1 },
+      { name: "In Progress", count: 1 },
+    ]);
+    expect(backend.calls.some((c) => c.op === "UpdateFieldOptions")).toBe(true);
+    expect(backend.project!.fields.find((f) => f.name === "Status")!.options).toEqual([...STATUS_OPTIONS]);
+    expect(() => validateConfig(result.config)).not.toThrow();
+  });
+
+  test("adopt with no items in non-canonical options proceeds without --force", async () => {
+    const backend = setupBackend(legacyProject(["Done", null]));
+    const setup = new SetupBoard(backend.exec);
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    expect(result.created).toBe(false);
+    expect(result.dropped).toEqual([]);
+    expect(backend.calls.some((c) => c.op === "UpdateFieldOptions")).toBe(true);
+  });
+});
+
 // -- writeConfig round-trip --------------------------------------------------
 describe("writeConfig", () => {
   const homes: string[] = [];
@@ -435,6 +504,22 @@ describe("validateConfig", () => {
     const cfg = goodConfig() as any;
     cfg.epicStyle = "labels";
     expect(() => validateConfig(cfg)).toThrow(/epicStyle/);
+  });
+
+  // issue #14 item 6: "issue-type" has no create path yet, so the schema is the
+  // single enforcement point that keeps it out of every config.
+  test('epicStyle "issue-type" is rejected as not yet supported, pointing at milestones', () => {
+    const cfg = goodConfig() as any;
+    cfg.epicStyle = "issue-type";
+    expect(() => validateConfig(cfg)).toThrow(/"issue-type" is not yet supported[\s\S]*"milestones"/);
+    cfg.epicStyle = "milestones";
+    expect(() => validateConfig(cfg)).not.toThrow();
+  });
+
+  test('--epic-style "issue-type" is rejected at the CLI parse layer, before any GraphQL call', () => {
+    expect(() => toEpicStyle("issue-type")).toThrow(/not yet supported[\s\S]*milestones/);
+    expect(toEpicStyle("milestones")).toBe("milestones");
+    expect(toEpicStyle(undefined)).toBeUndefined();
   });
 
   test("a statusField with the wrong dataType fails", () => {
