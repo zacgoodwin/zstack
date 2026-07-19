@@ -102,7 +102,16 @@ export function validateConfig(cfg: unknown): BoardConfig {
     if (typeof c.quota !== "object" || c.quota === null) {
       throw new ZError(`Config "quota" must be an object.`);
     }
-    if (c.quota.threshold !== undefined && (typeof c.quota.threshold !== "number" || c.quota.threshold < 0)) {
+    // Number.isFinite matters (issue #14 item 18): a NaN threshold passed the
+    // old typeof/negative checks, and `remaining >= NaN` is always false -- the
+    // quota guard would trip on EVERY call, sleeping or aborting forever.
+    // Number.isFinite matters (issue #14 item 18): a NaN threshold passed the
+    // old typeof/negative checks, and `remaining >= NaN` is always false -- the
+    // quota guard would trip on EVERY call, sleeping or aborting forever.
+    if (
+      c.quota.threshold !== undefined &&
+      (typeof c.quota.threshold !== "number" || !Number.isFinite(c.quota.threshold) || c.quota.threshold < 0)
+    ) {
       throw new ZError(`Config "quota.threshold" must be a non-negative number.`);
     }
     if (c.quota.mode !== undefined && c.quota.mode !== "sleep" && c.quota.mode !== "abort") {

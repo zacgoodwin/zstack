@@ -28,10 +28,12 @@ import {
 } from "../lib/loop.ts";
 import {
   claimableTickets,
+  claimStage,
   mergeOrder,
   parseDependsOn,
   watchdogExpired,
 } from "../lib/lanes.ts";
+import type { BoardStatus } from "../lib/loop.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 
@@ -161,6 +163,29 @@ describe("Questions tickets", () => {
     });
     const s2 = applyAction(s, a, 0);
     expect(nextAction(s2.tickets, s2.lanes, OPTS(s2))).toEqual({ kind: "drain-complete" });
+  });
+});
+
+// -- issue #14 item 18: the claimStage guard ----------------------------------
+
+describe("claimStage guard (item 18)", () => {
+  const CLAIMABLE: [BoardStatus, Stage][] = [
+    ["Ready", "builder"],
+    ["Building", "builder"],
+    ["QA", "qa"],
+    ["Review", "reviewer"],
+  ];
+  const UNCLAIMABLE: BoardStatus[] = ["Backlog", "Questions", "Blocked", "Skipped", "Done"];
+
+  test("each claimable status maps to its entry stage", () => {
+    for (const [status, stage] of CLAIMABLE) expect(claimStage(status)).toBe(stage);
+  });
+
+  test("every non-claimable status is rejected with a ZError naming the status", () => {
+    for (const status of UNCLAIMABLE) {
+      expect(() => claimStage(status)).toThrow(ZError);
+      expect(() => claimStage(status)).toThrow(`Status "${status}" is not claimable.`);
+    }
   });
 });
 

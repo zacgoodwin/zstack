@@ -29,7 +29,12 @@ function binDir(name: string): string {
 }
 
 const BUN_DIR = binDir("bun");
-const GH_DIR = binDir("gh");
+// gh may legitimately be absent on a dev machine (issue #14 item 18). binDir()
+// would throw at module load and fail the WHOLE file; instead the tests that
+// need gh on the fixture PATH carry a skipIf(!GH_DIR) guard and skip cleanly.
+// bun and coreutils stay hard preconditions: without them nothing here runs.
+const GH_PATH = Bun.which("gh");
+const GH_DIR = GH_PATH ? toPosixPath(dirname(GH_PATH)) : null;
 const CORE_DIR = binDir("uname"); // /usr/bin on Windows: uname, mkdir, cp, rm
 
 const tmpHomes: string[] = [];
@@ -91,7 +96,7 @@ describe("setup preconditions", () => {
     expect(result.stderr).toContain("gh (GitHub CLI) is required");
   });
 
-  test("all deps present: registers the pack dir without error", () => {
+  test.skipIf(!GH_DIR)("all deps present: registers the pack dir without error", () => {
     const home = makeTmpHome(true);
     const result = runSetup({ path: `${BUN_DIR}:${GH_DIR}:${CORE_DIR}`, home });
     expect(result.exitCode).toBe(0);
@@ -104,7 +109,7 @@ describe("setup preconditions", () => {
     ); // the registered copy matches the repo VERSION (whatever the parent bumped it to)
   });
 
-  test("--team flag is accepted", () => {
+  test.skipIf(!GH_DIR)("--team flag is accepted", () => {
     const home = makeTmpHome(true);
     const result = runSetup({
       path: `${BUN_DIR}:${GH_DIR}:${CORE_DIR}`,

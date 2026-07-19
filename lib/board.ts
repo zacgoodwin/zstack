@@ -291,11 +291,18 @@ export class Board {
       number: n,
       field,
     });
-    assertSinglePage(data.repository?.issue?.projectItems, `projectItems for issue #${n} (ceiling: 20 boards per issue)`);
-    const items: any[] = data.repository?.issue?.projectItems?.nodes ?? [];
-    const item =
-      items.find((i) => i.project?.number === this.cfg.projectNumber) ?? items[0];
-    return fieldValue(item?.fieldValueByName);
+    const issue = data.repository?.issue;
+    if (!issue) throw new ZError(`Issue #${n} not found in ${this.cfg.owner}/${this.cfg.repo}.`);
+    assertSinglePage(issue.projectItems, `projectItems for issue #${n} (ceiling: 20 boards per issue)`);
+    const items: any[] = issue.projectItems?.nodes ?? [];
+    // No cross-project fallback: another board's same-named field is not our value.
+    const item = items.find((i) => i.project?.number === this.cfg.projectNumber);
+    if (!item) {
+      throw new ZError(
+        `Issue #${n} is not on project ${this.cfg.slug} (#${this.cfg.projectNumber}).`
+      );
+    }
+    return fieldValue(item.fieldValueByName);
   }
 
   async fieldSet(n: number, field: string, value: string): Promise<void> {

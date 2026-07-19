@@ -1,10 +1,14 @@
 // Gate tests for C4's estimator (lib/estimate.ts). Covers AC1 (determinism),
 // AC2 (staleness with an injected clock, never Date.now()), and AC5
 // (rounding to the cent, hand-computed).
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, afterEach } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   estimate,
   isStale,
+  loadBuckets,
   loadRates,
   priceTokens,
   resolveRate,
@@ -122,5 +126,77 @@ describe("loadRates", () => {
 
   test("missing file raises a ZError naming the path", () => {
     expect(() => loadRates("/no/such/rates.json")).toThrow(ZError);
+  });
+});
+
+// -- issue #14 item 18: type validation at the buckets trust boundary ---------
+// Key presence alone let wrong-typed JSON through: a non-string model leaked a
+// raw TypeError out of resolveRate, and string token counts silently coerced
+// through the arithmetic. Fields present but WRONG TYPE must reject with a
+// ZError naming the field, before any math runs.
+describe("loadBuckets type validation (item 18)", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+  });
+  function bucketsFile(contents: unknown): string {
+    const d = mkdtempSync(join(tmpdir(), "zstack-buckets-"));
+    dirs.push(d);
+    const p = join(d, "buckets.json");
+    writeFileSync(p, JSON.stringify(contents));
+    return p;
+  }
+  const GOOD: Buckets = {
+    output_tokens: 100_000,
+    fresh_input_tokens: 200_000,
+    cached_input_tokens: 0,
+    model: "sonnet",
+    buffer_pct: 30,
+  };
+
+  test("well-typed buckets load and estimate end to end", () => {
+    const b = loadBuckets(bucketsFile(GOOD));
+    const result = estimate(b, RATES, new Date("2026-07-05T00:00:00Z"));
+    expect(result.rate_key).toBe("sonnet");
+    expect(result.total).toBeGreaterThan(0);
+  });
+
+  test("a missing key is still named (presence check unchanged)", () => {
+    const rest: Partial<Buckets> = { ...GOOD };
+    delete rest.model;
+    expect(() => loadBuckets(bucketsFile(rest))).toThrow(/missing: model/);
+  });
+
+  test.each([["output_tokens"], ["fresh_input_tokens"], ["cached_input_tokens"]])(
+    "%s rejects a numeric STRING, a boolean, an object, and a negative",
+    (key) => {
+      for (const bad of ["100000", true, {}, -1]) {
+        expect(() => loadBuckets(bucketsFile({ ...GOOD, [key]: bad }))).toThrow(
+          new RegExp(`"${key}" must be a non-negative finite number`)
+        );
+      }
+    }
+  );
+
+  test("a non-string model is a ZError naming the field, not a raw TypeError from resolveRate", () => {
+    let caught: unknown;
+    try {
+      loadBuckets(bucketsFile({ ...GOOD, model: 42 }));
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ZError);
+    expect(caught).not.toBeInstanceOf(TypeError);
+    expect((caught as ZError).message).toMatch(/"model" must be a non-empty string/);
+  });
+
+  test("an empty model string is rejected before rate resolution", () => {
+    expect(() => loadBuckets(bucketsFile({ ...GOOD, model: "" }))).toThrow(/"model" must be a non-empty string/);
+  });
+
+  test('a string buffer_pct like "30" is rejected, never coerced by the arithmetic', () => {
+    expect(() => loadBuckets(bucketsFile({ ...GOOD, buffer_pct: "30" }))).toThrow(
+      /"buffer_pct" must be a finite number/
+    );
   });
 });

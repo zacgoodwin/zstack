@@ -533,6 +533,72 @@ describe("validateConfig", () => {
     cfg.statusField.options.Done = 42;
     expect(() => validateConfig(cfg)).toThrow(/statusField\.options\.Done/);
   });
+
+  // -- issue #14 item 18: every numeric + quota guard branch ------------------
+  describe("numeric + quota guards (item 18)", () => {
+    const NUMERIC_KEYS = ["maxLanes", "watchdogMinutes", "lockStalenessMinutes"] as const;
+
+    test.each(NUMERIC_KEYS.map((k) => [k] as [string]))(
+      "%s rejects a string, NaN, zero, and a negative",
+      (key) => {
+        for (const bad of ["3", NaN, 0, -1]) {
+          const cfg = goodConfig() as any;
+          cfg[key] = bad;
+          expect(() => validateConfig(cfg)).toThrow(new RegExp(`"${key}" must be a positive number`));
+        }
+      }
+    );
+
+    test.each(NUMERIC_KEYS.map((k) => [k] as [string]))("%s accepts a positive number and is optional", (key) => {
+      const cfg = goodConfig() as any;
+      cfg[key] = 5;
+      expect(() => validateConfig(cfg)).not.toThrow();
+      delete cfg[key];
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    test("projectNumber rejects NaN and a float, not just a string", () => {
+      for (const bad of [NaN, 1.5]) {
+        const cfg = goodConfig() as any;
+        cfg.projectNumber = bad;
+        expect(() => validateConfig(cfg)).toThrow(/"projectNumber" must be an integer/);
+      }
+    });
+
+    test("quota must be an object when present", () => {
+      for (const bad of ["high", null, 200]) {
+        const cfg = goodConfig() as any;
+        cfg.quota = bad;
+        expect(() => validateConfig(cfg)).toThrow(/"quota" must be an object/);
+      }
+    });
+
+    // NaN matters here: `remaining >= NaN` is always false, so a NaN threshold
+    // would trip the board's quota guard on every single call, forever.
+    test("quota.threshold rejects a string, a negative, NaN, and Infinity", () => {
+      for (const bad of ["200", -1, NaN, Infinity]) {
+        const cfg = goodConfig() as any;
+        cfg.quota = { threshold: bad, mode: "sleep" };
+        expect(() => validateConfig(cfg)).toThrow(/"quota\.threshold" must be a non-negative number/);
+      }
+    });
+
+    test("quota.threshold accepts 0, and partial quota objects pass", () => {
+      const cfg = goodConfig() as any;
+      cfg.quota = { threshold: 0 }; // guard on every call: valid
+      expect(() => validateConfig(cfg)).not.toThrow();
+      cfg.quota = { mode: "abort" }; // loadConfig fills the default threshold
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    test('quota.mode rejects anything but "sleep" or "abort"', () => {
+      for (const bad of ["retry", 1, null]) {
+        const cfg = goodConfig() as any;
+        cfg.quota = { threshold: 200, mode: bad };
+        expect(() => validateConfig(cfg)).toThrow(/"quota\.mode" must be "sleep" or "abort"/);
+      }
+    });
+  });
 });
 
 // -- loadConfig surfaces schema errors (deep validation is wired in) ---------

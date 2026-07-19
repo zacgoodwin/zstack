@@ -4,7 +4,7 @@
 // project scope and no live board exists). Covers the four acceptance criteria:
 // per-subcommand fixtures, the quota guard, the grep contract-enforcement gate,
 // and claim atomicity.
-import { test, expect, describe, afterEach } from "bun:test";
+import { test, expect, describe, afterEach, beforeEach } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -310,6 +310,84 @@ describe("field-get / field-set", () => {
   });
 });
 
+// -- issue #14 item 18: TEXT field path + not-found branches ------------------
+describe("fieldSet TEXT + not-found branches (item 18)", () => {
+  // CFG has no TEXT field, so the M_SET_TEXT branch was never exercised.
+  const TEXT_CFG: BoardConfig = {
+    ...CFG,
+    fields: { ...CFG.fields, Notes: { id: "F_notes", dataType: "TEXT" } },
+  };
+
+  test("field-set on a TEXT field routes through SetText with the raw string", async () => {
+    const calls: Call[] = [];
+    const board = new Board(TEXT_CFG, makeExecutor({ calls }));
+    await board.fieldSet(5, "Notes", "hello world");
+    const set = calls.find((c) => c.op === "SetText");
+    expect(set).toBeDefined();
+    expect(set!.vars).toMatchObject({ project: "PVT_1", item: "PVTI_5", field: "F_notes", text: "hello world" });
+    // The TEXT path must not leak into the number/select mutations.
+    expect(calls.some((c) => c.op === "SetNumber" || c.op === "SetSingleSelect")).toBe(false);
+  });
+
+  test("field-set on an unknown field lists the valid set and issues no mutation", async () => {
+    const calls: Call[] = [];
+    const board = new Board(CFG, makeExecutor({ calls }));
+    await expect(board.fieldSet(5, "Priority", "high")).rejects.toThrow(/Unknown field "Priority".*Model.*Estimate.*Actual/);
+    expect(calls.some((c) => c.op.startsWith("Set"))).toBe(false);
+  });
+
+  test("operations on a nonexistent issue raise a clear not-found ZError", async () => {
+    const gone = { repository: { issue: null } };
+    const board = new Board(CFG, makeExecutor({ overrides: { IssueLookup: gone } }));
+    await expect(board.move(404, "Done")).rejects.toThrow(ZError);
+    await expect(board.move(404, "Done")).rejects.toThrow(/Issue #404 not found in zacgoodwin\/zstack/);
+    await expect(board.fieldSet(404, "Estimate", "3")).rejects.toThrow(/Issue #404 not found/);
+    await expect(board.claim(404, "alice")).rejects.toThrow(/Issue #404 not found/);
+  });
+
+  test("field-get on a nonexistent issue raises the same not-found ZError, not a silent null", async () => {
+    const gone = { repository: { issue: null } };
+    const board = new Board(CFG, makeExecutor({ overrides: { FieldValue: gone } }));
+    await expect(board.fieldGet(404, "Model")).rejects.toThrow(ZError);
+    await expect(board.fieldGet(404, "Model")).rejects.toThrow(/Issue #404 not found in zacgoodwin\/zstack/);
+  });
+
+  test("field-get never falls back to another project's same-named field", async () => {
+    const otherBoardOnly = {
+      repository: {
+        issue: {
+          projectItems: {
+            nodes: [
+              { project: { number: 99 }, fieldValueByName: { __typename: "ProjectV2ItemFieldSingleSelectValue", name: "haiku" } },
+            ],
+          },
+        },
+      },
+    };
+    const board = new Board(CFG, makeExecutor({ overrides: { FieldValue: otherBoardOnly } }));
+    await expect(board.fieldGet(5, "Model")).rejects.toThrow(/Issue #5 is not on project zstack \(#1\)/);
+  });
+
+  test("an issue that exists but is not on this project names project + slug", async () => {
+    const offBoard = {
+      repository: {
+        issue: {
+          id: "I_5",
+          number: 5,
+          title: "T5",
+          body: "",
+          assignees: { nodes: [] },
+          projectItems: { nodes: [{ id: "PVTI_other", project: { number: 99 } }] },
+        },
+      },
+    };
+    const calls: Call[] = [];
+    const board = new Board(CFG, makeExecutor({ calls, overrides: { IssueLookup: offBoard } }));
+    await expect(board.fieldSet(5, "Estimate", "3")).rejects.toThrow(/Issue #5 is not on project zstack \(#1\)/);
+    expect(calls.some((c) => c.op.startsWith("Set"))).toBe(false); // no mutation on the miss
+  });
+});
+
 describe("create", () => {
   test("creates an issue against a resolved milestone", async () => {
     const calls: Call[] = [];
@@ -524,8 +602,10 @@ describe("quota guard", () => {
 // behaves, so the contract's first-assignee-wins tiebreaker is what gets tested.
 function claimBackend(initial: string[] = []) {
   const assignees = [...initial];
+  const calls: Call[] = [];
   const login = (userId: string) => userId.replace(/^U_/, "");
   const exec: GraphQLExecutor = async (query, vars: any) => {
+    calls.push({ op: opName(query), vars });
     switch (opName(query)) {
       case "RateLimit":
         return { rateLimit: { remaining: 5000, resetAt: "2026-07-19T00:00:00Z" } };
@@ -560,7 +640,7 @@ function claimBackend(initial: string[] = []) {
         throw new Error(`claimBackend: unexpected op ${opName(query)}`);
     }
   };
-  return { exec, assignees };
+  return { exec, assignees, calls };
 }
 
 describe("claim", () => {
@@ -586,6 +666,16 @@ describe("claim", () => {
     const won = results.filter((r) => r.status === "fulfilled");
     expect(won.length).toBe(1);
     expect(backend.assignees.length).toBe(1); // loser backed its assignment out
+  });
+
+  // -- issue #14 item 18: re-claiming your own ticket is idempotent ------------
+  test("re-claim by the sole existing claimer is a no-op success, not a second mutation", async () => {
+    const backend = claimBackend(["alice"]);
+    const board = new Board(CFG, backend.exec);
+    await board.claim(9, "alice"); // resolves -- crash-recovery re-entry must not error
+    expect(backend.assignees).toEqual(["alice"]); // unchanged
+    // No assignee mutation was issued: the early return fired before UserId/Add.
+    expect(backend.calls.filter((c) => c.op === "AddAssignees" || c.op === "RemoveAssignees" || c.op === "UserId")).toEqual([]);
   });
 });
 
@@ -743,5 +833,105 @@ describe("config loader", () => {
     } finally {
       if (saved !== undefined) process.env.ZSTACK_SLUG = saved;
     }
+  });
+});
+
+// -- issue #14 item 18: resolveSlug + loadConfig error paths ------------------
+describe("resolveSlug + loadConfig error paths (item 18)", () => {
+  const homes: string[] = [];
+  let savedSlug: string | undefined;
+
+  beforeEach(() => {
+    savedSlug = process.env.ZSTACK_SLUG;
+    delete process.env.ZSTACK_SLUG;
+  });
+  afterEach(() => {
+    if (savedSlug !== undefined) process.env.ZSTACK_SLUG = savedSlug;
+    else delete process.env.ZSTACK_SLUG;
+    while (homes.length) rmSync(homes.pop()!, { recursive: true, force: true });
+  });
+
+  function makeHome(): string {
+    const dir = mkdtempSync(join(tmpdir(), "zstack-slug-"));
+    homes.push(dir);
+    return dir;
+  }
+  function writeProject(home: string, slug: string): void {
+    const dir = join(home, ".zstack", "projects", slug);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "config.json"), JSON.stringify({ ...CFG, slug }));
+  }
+
+  test("ambiguity: multiple projects and no disambiguator names every candidate", () => {
+    const home = makeHome();
+    writeProject(home, "alpha");
+    writeProject(home, "beta");
+    let caught: unknown;
+    try {
+      resolveSlug(undefined, home);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ZError); // actionable, not a bug-stack
+    const msg = (caught as ZError).message;
+    expect(msg).toMatch(/Multiple zstack projects configured/);
+    expect(msg).toContain("alpha"); // every candidate is named
+    expect(msg).toContain("beta");
+    expect(msg).toMatch(/--slug/); // and both escape hatches are offered
+    expect(msg).toMatch(/ZSTACK_SLUG/);
+  });
+
+  test("no projects at all points at /z-setup", () => {
+    expect(() => resolveSlug(undefined, makeHome())).toThrow(/No zstack project configured.*\/z-setup/);
+  });
+
+  test("ZSTACK_SLUG disambiguates between multiple configured projects", () => {
+    const home = makeHome();
+    writeProject(home, "alpha");
+    writeProject(home, "beta");
+    process.env.ZSTACK_SLUG = "beta";
+    expect(resolveSlug(undefined, home)).toBe("beta");
+    expect(loadConfig(undefined, home).slug).toBe("beta"); // loads the env-chosen config
+  });
+
+  test("an explicit slug wins over ZSTACK_SLUG", () => {
+    const home = makeHome();
+    writeProject(home, "alpha");
+    writeProject(home, "beta");
+    process.env.ZSTACK_SLUG = "beta";
+    expect(resolveSlug("alpha", home)).toBe("alpha");
+  });
+
+  test("ZSTACK_SLUG naming a project that does not exist fails with a clear ZError", () => {
+    const home = makeHome();
+    writeProject(home, "alpha");
+    process.env.ZSTACK_SLUG = "ghost";
+    let caught: unknown;
+    try {
+      loadConfig(undefined, home);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ZError);
+    expect((caught as ZError).message).toMatch(/No zstack config for "ghost"/);
+    expect((caught as ZError).message).toMatch(/z-setup/); // the fix is named
+  });
+
+  test("corrupt config JSON raises a ZError naming the file, never a raw SyntaxError", () => {
+    const home = makeHome();
+    const dir = join(home, ".zstack", "projects", "zstack");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "config.json"), "{ this is not json");
+    let caught: unknown;
+    try {
+      loadConfig("zstack", home);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ZError); // handleCliError prints it; a SyntaxError would rethrow as a bug
+    expect(caught).not.toBeInstanceOf(SyntaxError);
+    const msg = (caught as ZError).message;
+    expect(msg).toMatch(/is not valid JSON/);
+    expect(msg).toContain(join(".zstack", "projects", "zstack", "config.json")); // the offending file is named
   });
 });

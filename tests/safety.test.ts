@@ -24,10 +24,12 @@ import {
   main as locksMain,
   processAlive,
   processStartTime,
+  readLaneLock,
   readLoopLock,
   removeLaneLock,
   sameHost,
   writeLaneLock,
+  ZError,
   type LoopLock,
 } from "../lib/locks.ts";
 import {
@@ -755,5 +757,82 @@ describe("control 6: wave reconciliation (mid-loop human moves)", () => {
       s = applyAction(s, a, 0);
     }
     expect(s.tickets.find((t) => t.number === 6)!.status).toBe("Done");
+  });
+});
+
+// ============================================================================
+// issue #14 item 18 -- corrupt-lock ZErrors on the crash-recovery path
+// ============================================================================
+// A crash can leave a half-written or hand-mangled lock on disk. Every read
+// path (readLaneLock, listLaneLocks, readLoopLock, and acquire's EEXIST
+// inspection) must surface a ZError naming the file -- actionable via
+// handleCliError -- never a raw SyntaxError, and never silently treat the
+// slot as free.
+describe("item 18: corrupt locks fail with ZErrors on the recovery path", () => {
+  test("an unparseable lane lock raises a ZError naming the file, not a raw SyntaxError", () => {
+    const d = tmp();
+    writeFileSync(join(d, "ticket-3.json"), "{ definitely not json");
+    let caught: unknown;
+    try {
+      readLaneLock(d, 3);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ZError);
+    expect(caught).not.toBeInstanceOf(SyntaxError);
+    expect((caught as ZError).message).toMatch(/ticket-3\.json is not valid JSON/);
+  });
+
+  test("a structurally invalid lane lock names the required shape", () => {
+    const d = tmp();
+    writeFileSync(join(d, "ticket-3.json"), JSON.stringify({ ticket: 3, stage: "builder" })); // no session/claimedAt
+    expect(() => readLaneLock(d, 3)).toThrow(ZError);
+    expect(() => readLaneLock(d, 3)).toThrow(/ticket-3\.json must be \{ticket, stage, session, claimedAt\}/);
+  });
+
+  test("a lane lock with wrong-typed fields is structurally invalid, not accepted", () => {
+    const d = tmp();
+    writeFileSync(
+      join(d, "ticket-4.json"),
+      JSON.stringify({ ticket: "4", stage: "builder", session: "s", claimedAt: "now" }) // strings where numbers belong
+    );
+    expect(() => readLaneLock(d, 4)).toThrow(/must be \{ticket, stage, session, claimedAt\}/);
+  });
+
+  test("the crash-recovery sweep (listLaneLocks) surfaces a corrupt lock loudly", () => {
+    const d = tmp();
+    writeLaneLock(d, { ticket: 1, stage: "builder", session: "s", claimedAt: 0 });
+    writeFileSync(join(d, "ticket-2.json"), "%%%");
+    expect(() => listLaneLocks(d)).toThrow(ZError);
+    expect(() => listLaneLocks(d)).toThrow(/ticket-2\.json is not valid JSON/);
+  });
+
+  test("an unparseable loop lock raises a ZError, and acquire refuses instead of clobbering", () => {
+    const d = tmp();
+    writeFileSync(loopLockPath(d), "not json at all");
+    let caught: unknown;
+    try {
+      readLoopLock(d);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ZError);
+    expect((caught as ZError).message).toMatch(/loop\.lock is not valid JSON/);
+
+    // The recovery path proper: a fresh acquire hits EEXIST, inspects the
+    // incumbent, and must surface the corruption -- not read it as free/stale
+    // and steal the slot.
+    expect(() =>
+      acquireLoopLock(d, { session: "fresh", startedAt: 10 }, { nowMs: 10, stalenessMs: 60_000 })
+    ).toThrow(/loop\.lock is not valid JSON/);
+    expect(readFileSync(loopLockPath(d), "utf8")).toBe("not json at all"); // incumbent untouched
+  });
+
+  test("a structurally invalid loop lock names the required shape through inspect", () => {
+    const d = tmp();
+    writeFileSync(loopLockPath(d), JSON.stringify({ session: "s" })); // no startedAt
+    expect(() => readLoopLock(d)).toThrow(ZError);
+    expect(() => readLoopLock(d)).toThrow(/loop\.lock must be \{session, startedAt, pid\?\}/);
+    expect(() => inspectLoopLock(d, 0, 60_000)).toThrow(/must be \{session, startedAt, pid\?\}/);
   });
 });

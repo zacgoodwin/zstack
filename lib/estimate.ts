@@ -143,7 +143,7 @@ const USAGE = `z-estimate <buckets.json> [--rates <path>]
   buffer_pct guidance (ESTIMATION.md): 30 for a normal feature, 50-100 for a
   multi-ticket epic or unfamiliar code.`;
 
-function loadBuckets(path: string): Buckets {
+export function loadBuckets(path: string): Buckets {
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(path, "utf8"));
@@ -160,6 +160,27 @@ function loadBuckets(path: string): Buckets {
   ];
   const missing = required.filter((k) => b[k] === undefined || b[k] === null);
   if (missing.length) throw new ZError(`Buckets at ${path} missing: ${missing.join(", ")}.`);
+  // Type validation at the trust boundary (issue #14 item 18): key presence
+  // alone let a string token count coerce through the arithmetic and a
+  // non-string model leak a raw TypeError from resolveRate. Wrong types must
+  // reject with a ZError naming the field, before any math runs.
+  // Type validation at the trust boundary (issue #14 item 18): key presence
+  // alone let a string token count coerce through the arithmetic and a
+  // non-string model leak a raw TypeError from resolveRate. Wrong types must
+  // reject with a ZError naming the field, before any math runs.
+  const tokenKeys = ["output_tokens", "fresh_input_tokens", "cached_input_tokens"] as const;
+  for (const k of tokenKeys) {
+    const v = b[k];
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+      throw new ZError(`Buckets at ${path}: "${k}" must be a non-negative finite number, got ${JSON.stringify(v)}.`);
+    }
+  }
+  if (typeof b.buffer_pct !== "number" || !Number.isFinite(b.buffer_pct)) {
+    throw new ZError(`Buckets at ${path}: "buffer_pct" must be a finite number, got ${JSON.stringify(b.buffer_pct)}.`);
+  }
+  if (typeof b.model !== "string" || !b.model) {
+    throw new ZError(`Buckets at ${path}: "model" must be a non-empty string, got ${JSON.stringify(b.model)}.`);
+  }
   return b as Buckets;
 }
 
