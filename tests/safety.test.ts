@@ -15,12 +15,15 @@ import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   acquireLoopLock,
+  confirmIdentity,
   inspectLoopLock,
   laneLockPath,
   listLaneLocks,
   loopLockLiveness,
   loopLockPath,
+  main as locksMain,
   processAlive,
+  processStartTime,
   readLoopLock,
   removeLaneLock,
   sameHost,
@@ -33,6 +36,7 @@ import {
   reconcileBoardMoves,
   reconcilePlan,
   scanOrphans,
+  sweep,
   type ReconcileAction,
   type ReconcileEffects,
 } from "../lib/reconcile.ts";
@@ -115,35 +119,71 @@ describe("control 1: loop lock (second-invocation refusal)", () => {
   });
 
   // -- issue #14 H12: a recycled pid must not pin a lock "live forever" --------
-  test("pid-reuse safety: an unconfirmable pid falls back to age, so --reconcile can clear it", () => {
+  // (d) foreign host + (c) legacy/host-less lock: pid is unconfirmable -> age decides.
+  test("pid-reuse safety: foreign-host / legacy locks fall back to age (--reconcile can clear)", () => {
     // A lock from ANOTHER machine. process.kill on THIS host may hit a coincidentally
     // -live local pid, but the lock isn't ours to verify -- identity is unconfirmable.
     const foreign: LoopLock = { session: "s", startedAt: 0, pid: 4242, host: "some-other-host" };
-    // Even with the pid "alive" here, past staleness reads STALE (clearable), not live.
-    expect(loopLockLiveness(foreign, STALE + 1, STALE, () => true)).toBe("stale");
-    // Within the staleness window it still reads live (don't nuke a maybe-running loop).
-    expect(loopLockLiveness(foreign, STALE - 1, STALE, () => true)).toBe("live");
-    // A confirmably-dead pid is stale immediately, host regardless.
-    expect(loopLockLiveness(foreign, 0, STALE, () => false)).toBe("stale");
+    expect(loopLockLiveness(foreign, STALE + 1, STALE, () => true)).toBe("stale"); // past staleness -> clearable
+    expect(loopLockLiveness(foreign, STALE - 1, STALE, () => true)).toBe("live"); // within window -> don't nuke
+    expect(loopLockLiveness(foreign, 0, STALE, () => false)).toBe("stale"); // dead pid -> stale, host regardless
 
-    // A SAME-host live pid is confirmed ours -> live even past staleness.
-    const local: LoopLock = { session: "s", startedAt: 0, pid: 4242, host: hostname() };
-    expect(sameHost(local)).toBe(true);
-    expect(loopLockLiveness(local, STALE + 1, STALE, () => true)).toBe("live");
+    // (c) A same-host lock with NO stored start-time is a legacy lock -> unconfirmable
+    // -> age decides, both directions (fresh -> live, old -> stale). This is what the
+    // old same-host branch got wrong (it read "live" past staleness on pid alone).
+    const legacy: LoopLock = { session: "s", startedAt: 0, pid: 4242, host: hostname() };
+    expect(sameHost(legacy)).toBe(true);
+    expect(loopLockLiveness(legacy, STALE + 1, STALE, () => true)).toBe("stale"); // old legacy lock -> clearable
+    expect(loopLockLiveness(legacy, STALE - 1, STALE, () => true)).toBe("live"); // fresh legacy lock -> live
 
-    // A host-less legacy lock is unconfirmable too -> age decides.
-    const legacy: LoopLock = { session: "s", startedAt: 0, pid: 4242 };
-    expect(loopLockLiveness(legacy, STALE + 1, STALE, () => true)).toBe("stale");
+    // A host-less lock is unconfirmable too.
+    const hostless: LoopLock = { session: "s", startedAt: 0, pid: 4242 };
+    expect(loopLockLiveness(hostless, STALE + 1, STALE, () => true)).toBe("stale");
 
-    // An injected identity mismatch (e.g. a future start-time check) -> age fallback.
-    expect(loopLockLiveness(local, STALE + 1, STALE, () => true, () => false)).toBe("stale");
+    // The three injected identity results drive the three outcomes directly.
+    expect(loopLockLiveness(legacy, STALE + 1, STALE, () => true, () => "confirmed")).toBe("live"); // provably ours
+    expect(loopLockLiveness(legacy, 0, STALE, () => true, () => "recycled")).toBe("stale"); // pid reused, mid-window
+    expect(loopLockLiveness(legacy, STALE + 1, STALE, () => true, () => "unknown")).toBe("stale"); // age fallback
   });
 
-  test("acquire records the host so a foreign-machine lock is later unverifiable", () => {
+  // (a) matching start-time -> live; (b) mismatched start-time on a REAL live pid ->
+  // stale. Uses this very process (process.pid, definitely alive) and its real OS
+  // start-time, so the whole shell-out roundtrip is exercised, not a stub.
+  test("pid-reuse safety: same-host start-time identity (real roundtrip against this process)", () => {
+    const realStart = processStartTime(process.pid);
+    expect(realStart).not.toBeNull(); // the helper works on this platform
+
+    // (a) matching start-time: reads live even PAST staleness -- the pid is provably
+    // still our loop, so age is irrelevant.
+    const mine: LoopLock = { session: "s", startedAt: 0, pid: process.pid, host: hostname(), startTime: realStart! };
+    expect(loopLockLiveness(mine, STALE + 1, STALE)).toBe("live");
+
+    // (b) mismatched stored start-time on the SAME real live pid: the OS recycled the
+    // integer to an unrelated process -> stale/clearable even INSIDE the staleness
+    // window (where a pure age check would wrongly say "live"). This is #14 item 12's
+    // headline bug -- the same-host recycled pid that used to read "live forever".
+    const recycled: LoopLock = { session: "s", startedAt: 0, pid: process.pid, host: hostname(), startTime: "1999-01-01T00:00:00.0000000+00:00" };
+    expect(loopLockLiveness(recycled, 0, STALE)).toBe("stale");
+  });
+
+  test("confirmIdentity: same host + matching start-time confirms; mismatch is recycled; else unknown", () => {
+    const realStart = processStartTime(process.pid)!;
+    const ours: LoopLock = { session: "s", startedAt: 0, pid: process.pid, host: hostname(), startTime: realStart };
+    expect(confirmIdentity(ours)).toBe("confirmed");
+    expect(confirmIdentity({ ...ours, startTime: "1999-01-01T00:00:00.0000000+00:00" })).toBe("recycled");
+    expect(confirmIdentity({ ...ours, host: "some-other-host" })).toBe("unknown"); // foreign host
+    expect(confirmIdentity({ session: "s", startedAt: 0, pid: process.pid, host: hostname() })).toBe("unknown"); // legacy: no startTime
+  });
+
+  test("acquire records host AND the pid's start-time so a recycled pid is later detectable (H12)", () => {
     const d = tmp();
-    const res = acquireLoopLock(d, { session: "s", startedAt: 0, host: hostname(), pid: process.pid }, { nowMs: 0, stalenessMs: STALE });
-    expect(res.acquired).toBe(true);
-    expect(readLoopLock(d)!.host).toBe(hostname());
+    // Drive the CLI acquire path (main()) so the host + start-time are recorded as in
+    // production, not hand-set. --pid is this live process; its start-time is stored.
+    const rc = locksMain(["acquire", "--dir", d, "--session", "s", "--pid", String(process.pid), "--now", "0"]);
+    expect(rc).toBe(0);
+    const written = readLoopLock(d)!;
+    expect(written.host).toBe(hostname());
+    expect(written.startTime).toBe(processStartTime(process.pid)); // the real start-time, roundtripped
   });
 
   test("a stale lock refuses without --reconcile, and is cleared with it", () => {
@@ -183,6 +223,7 @@ describe("control 1: loop lock (second-invocation refusal)", () => {
 // ============================================================================
 describe("stale+reconcile keeps the exclusive-create guard (H11)", () => {
   const LOCKS = join(REPO_ROOT, "lib", "locks.ts");
+  const STALE = 60 * 60_000; // 60 min staleness (config default)
 
   // Seeds a definitely-stale loop lock (no pid, startedAt far in the past).
   function seedStale(dir: string): void {
@@ -206,6 +247,27 @@ describe("stale+reconcile keeps the exclusive-create guard (H11)", () => {
     expect(winners).toBe(1); // never two loops both "acquiring" the same project
     // And a live lock is left behind (the winner's), readable back.
     expect(readLoopLock(dir)!.session).toMatch(/^sess-\d$/);
+  });
+
+  // The spawn race above can serialize by luck (one process finishes the whole
+  // clear-and-replace before the next reads the lock), so it does NOT reliably fail
+  // when the CAS is removed. This test forces the exact contended interleaving
+  // deterministically: racer A is already inside the critical section (it holds the
+  // one-shot claim file), and racer B reconciles concurrently. WITHOUT the CAS, B
+  // would clear+overwrite and also "acquire" (two winners); WITH it, B sees A's claim
+  // (EEXIST) and defers. Removing the CAS block makes this assertion fail.
+  test("a second --reconcile deferring to an in-flight claim does NOT also acquire (CAS gate)", () => {
+    const dir = tmp();
+    const now = STALE + 1; // the seeded lock is stale at `now`
+    seedStale(dir); // crashed loop's stale lock (no pid, startedAt 0)
+    // Racer A is mid-reconcile: it holds the one-shot claim file (loop.lock.reconcile).
+    writeFileSync(`${loopLockPath(dir)}.reconcile`, "racer-A\n");
+
+    // Racer B reconciles the SAME stale lock at the same moment: it must defer to A.
+    const res = acquireLoopLock(dir, { session: "racer-B", startedAt: now }, { nowMs: now, stalenessMs: STALE, reconcile: true });
+    expect(res.acquired).toBe(false); // the CAS blocked the second winner
+    expect(res.reason).toBe("stale"); // still stale under A's claim
+    expect(readLoopLock(dir)!.session).toBe("crashed"); // B did NOT overwrite the lock
   });
 
   test("the stale+reconcile branch no longer unconditionally overwrites (structural)", () => {
@@ -340,6 +402,51 @@ describe("control 2: orphan scan (crash recovery)", () => {
     expect(byKind(plan, "park-ready")).toEqual([8]);
     expect(byKind(plan, "release-claim")).toEqual([8]);
     expect(byKind(plan, "remove-lock")).toEqual([8]);
+  });
+
+  // -- issue #14 C4: sweep() must read the FULL board, not just INFLIGHT ---------
+  // The C4 tests above feed scanOrphans a hand-built snapshot, so they never prove
+  // sweep() actually PUTS a Done ticket's status into that snapshot. This drives the
+  // real sweep()->scanOrphans->reconcilePlan chain against a fake board where the
+  // crashed lane's ticket is Done. Reverting sweep()'s loop from BOARD_STATUSES to
+  // INFLIGHT drops Done from the snapshot -> boardStatus undefined -> park+release
+  // -> this test fails (merged work would be reopened).
+  test("sweep() carries a Done crashed-lane's status through: pruned, never parked (C4 end-to-end)", async () => {
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    // A crashed lane for ticket 5: lock + worktree left behind after a merge crash.
+    writeLaneLock(locksDir, { ticket: 5, stage: "merge", session: "dead", claimedAt: 0 });
+    mkdirSync(join(worktreesDir, "ticket-5"));
+
+    // A fake board where ticket 5 is Done. sweep() lists every status; Board.list
+    // filters this item set client-side, so it only surfaces under "Done".
+    const doneBoard: GraphQLExecutor = async (query) => {
+      const op = opName(query);
+      if (op === "RateLimit") return { rateLimit: { remaining: 5000, resetAt: "2026-07-19T00:00:00Z" } };
+      if (op === "ProjectItems")
+        return {
+          node: {
+            items: {
+              nodes: [
+                {
+                  content: { number: 5, title: "t5", url: "u5" },
+                  fieldValues: { nodes: [{ __typename: "ProjectV2ItemFieldSingleSelectValue", name: "Done", field: { name: "Status" } }] },
+                },
+              ],
+            },
+          },
+        };
+      throw new Error(`doneBoard: unexpected op ${op}`);
+    };
+
+    const snapshot = await sweep(new Board(CFG, doneBoard));
+    expect(snapshot).toContainEqual({ number: 5, status: "Done" }); // sweep() saw the Done status
+
+    const plan = reconcilePlan(scanOrphans(locksDir, worktreesDir, snapshot, 0));
+    expect(byKind(plan, "park-ready")).toEqual([]); // NEVER reopen merged work
+    expect(byKind(plan, "release-claim")).toEqual([]); // NEVER unassign it either
+    expect(byKind(plan, "prune-worktree")).toEqual([5]); // just clear the crashed run's state
+    expect(byKind(plan, "remove-lock")).toEqual([5]);
   });
 
   test("no orphans -> empty plan, hasOrphans false", () => {

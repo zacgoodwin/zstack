@@ -275,7 +275,7 @@ function parseFlags(args: string[]): Record<string, string> {
 // Sweeps EVERY status, not just the in-flight ones (issue #14 C4): a crashed
 // lane's recovery hinges on whether its ticket is already terminal (Done/parked),
 // so the plan needs the full board picture, not only Building/QA/Review.
-async function sweep(board: Board): Promise<BoardTicketStatus[]> {
+export async function sweep(board: Board): Promise<BoardTicketStatus[]> {
   const out: BoardTicketStatus[] = [];
   for (const status of BOARD_STATUSES) {
     for (const it of await board.list(status)) out.push({ number: it.number, status });

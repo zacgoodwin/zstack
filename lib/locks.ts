@@ -51,6 +51,7 @@ export interface LoopLock {
   startedAt: number; // ms
   pid?: number; // best-effort; when present AND its identity is confirmable it decides liveness
   host?: string; // the machine that wrote the lock; a foreign host makes the pid unverifiable
+  startTime?: string; // the pid's OS process-start-time at lock creation; a mismatch on read proves pid reuse
 }
 
 export type LockLiveness = "live" | "stale";
@@ -168,6 +169,35 @@ export function processAlive(pid: number): boolean {
   }
 }
 
+// The OS process-start-time of a pid, as an opaque string, or null when the pid is
+// gone / the value can't be read. Paired with the pid it disambiguates a RECYCLED
+// pid (issue #14 H12): the OS never assigns the same (pid, start-time) to two
+// processes, so a stored start-time that no longer matches the live pid's proves the
+// integer was reused. No Node/Bun API exposes another process's start-time, so this
+// shells out -- guarded to null so a failed probe degrades to the staleness-age
+// heuristic rather than throwing. ponytail: one spawn per liveness check on the
+// pid path; upgrade path is a native binding, not worth it for a solo-dev tool.
+export function processStartTime(pid: number): string | null {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const cmd =
+      process.platform === "win32"
+        ? [
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            // -ErrorAction SilentlyContinue => no such pid prints nothing (stdout empty -> null).
+            // ToString('o') is round-trippable and stable for a fixed process, so two reads match.
+            `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($p) { $p.StartTime.ToString('o') }`,
+          ]
+        : ["ps", "-o", "lstart=", "-p", String(pid)]; // lstart: full start timestamp, empty when gone
+    const r = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe" });
+    if (r.exitCode !== 0) return null;
+    const out = r.stdout.toString().trim();
+    return out.length > 0 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
 // Can we trust this lock's pid as "our loop's pid" on this machine? Only when the
 // lock records the SAME host we're running on. A foreign host (or a host-less
 // legacy lock) is unconfirmable: process.kill would probe THIS host's pid space,
@@ -176,26 +206,60 @@ export function sameHost(lock: LoopLock, host: string = hostname()): boolean {
   return lock.host !== undefined && lock.host === host;
 }
 
-// Liveness with pid-reuse safety (issue #14 H12). A pid is trusted only when it is
-// (a) confirmably ours -- alive AND from this host -- which reads "live"; a
-// confirmably-dead pid reads "stale" immediately (a crashed loop recovers without
-// waiting out the staleness window). When the pid is present but UNCONFIRMABLE
-// (foreign host, or a recycled pid we can't attribute), we do NOT let it pin the
-// lock "live forever"; we fall back to the age heuristic so --reconcile can clear
-// a genuinely stale lock. Clock and both probes injected for deterministic tests.
-// ponytail: same-host pid reuse within the staleness window still reads live
-// (upgrade path: an OS process-start-time check plugged into confirmIdentity).
+export type IdentityCheck = "confirmed" | "recycled" | "unknown";
+
+// Three-valued pid-identity check for the SAME host (issue #14 H12). A pid alive on
+// this host is trusted as OUR loop ONLY when its current OS start-time matches the
+// one stored at lock creation:
+//   * "confirmed" -- start-times match: the pid is still our loop.
+//   * "recycled"  -- start-times differ: the OS handed this pid to an unrelated
+//     process, so the lock is stale and --reconcile may clear it. THIS is the case
+//     the pre-fix code got wrong -- it read such a lock "live forever".
+//   * "unknown"   -- foreign/legacy host, a legacy lock carrying no start-time, or
+//     the probe couldn't read the live pid's start-time: the caller must fall back
+//     to the staleness-age heuristic rather than guess. Host + start-time probe are
+//     injected so tests need neither a real hostname nor a shell-out.
+export function confirmIdentity(
+  lock: LoopLock,
+  host: string = hostname(),
+  startTimeOf: (pid: number) => string | null = processStartTime
+): IdentityCheck {
+  if (!sameHost(lock, host)) return "unknown"; // foreign/legacy host: pid unattributable
+  if (lock.pid === undefined || lock.startTime === undefined) return "unknown"; // legacy lock
+  const current = startTimeOf(lock.pid);
+  if (current === null) return "unknown"; // couldn't read it -> don't guess
+  return current === lock.startTime ? "confirmed" : "recycled";
+}
+
+// Liveness with pid-reuse safety (issue #14 H12). A present pid decides ONLY when its
+// identity is provable:
+//   * dead pid          -> "stale" immediately (a crashed loop recovers without
+//                          waiting out the staleness window).
+//   * alive + confirmed -> "live" (same host AND the OS start-time still matches the
+//                          one stored at lock creation: provably our loop).
+//   * alive + recycled  -> "stale" (same host, but the pid was reused by an unrelated
+//                          process -- never "live forever" on the same host again).
+//   * alive + unknown   -> fall through to the age heuristic (foreign host, a legacy
+//                          lock with no start-time, or an unreadable start-time), so
+//                          --reconcile can still clear a genuinely stale lock.
+// Clock, liveness probe, and identity check are all injected for deterministic tests.
 export function loopLockLiveness(
   lock: LoopLock,
   nowMs: number,
   stalenessMs: number,
   isAlive: (pid: number) => boolean = processAlive,
-  confirmIdentity: (lock: LoopLock) => boolean = (l) => sameHost(l)
+  identify: (lock: LoopLock) => IdentityCheck = (l) => confirmIdentity(l)
 ): LockLiveness {
   if (lock.pid !== undefined) {
     if (!isAlive(lock.pid)) return "stale"; // dead pid: our loop is definitely gone
-    if (confirmIdentity(lock)) return "live"; // alive AND provably ours
-    // alive but unconfirmable: fall through to age rather than trust a maybe-reused pid.
+    switch (identify(lock)) {
+      case "confirmed":
+        return "live"; // alive AND provably ours (start-time matches)
+      case "recycled":
+        return "stale"; // alive but the pid was reused by an unrelated process
+      case "unknown":
+        break; // unconfirmable: fall through to the age heuristic
+    }
   }
   return nowMs - lock.startedAt > stalenessMs ? "stale" : "live";
 }
@@ -378,7 +442,14 @@ export function main(argv: string[]): number {
       // it (issue #14 H12): a foreign-host lock falls back to the age heuristic.
       const lock: LoopLock = { session: requireFlag(flags, "session"), startedAt: nowMs, host: hostname() };
       const pid = str(flags, "pid");
-      if (pid !== undefined) lock.pid = Number(pid);
+      if (pid !== undefined) {
+        lock.pid = Number(pid);
+        // Record the pid's OS start-time now so a later same-host liveness check can
+        // detect a recycled pid (issue #14 H12). Null when unreadable -> the lock
+        // just falls back to the staleness-age heuristic, never "live forever".
+        const st = processStartTime(lock.pid);
+        if (st !== null) lock.startTime = st;
+      }
       const res = acquireLoopLock(locksDir, lock, { nowMs, stalenessMs, reconcile: flags.reconcile === true });
       if (res.acquired) {
         console.log(`acquired loop lock for session ${lock.session}`);
