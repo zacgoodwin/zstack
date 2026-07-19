@@ -156,10 +156,10 @@ describe("references/ restructure", () => {
 });
 
 describe("root scaffold", () => {
-  test("VERSION starts at 0.1.0", () => {
-    // Matches the 0.1.0 line whether or not the parent has appended a release
-    // segment (e.g. 0.1.0.0); the point is the pack shipped at the 0.1.0 baseline.
-    expect(readFileSync(join(REPO_ROOT, "VERSION"), "utf8").trim()).toMatch(/^0\.1\.0(\.\d+)?$/);
+  test("VERSION uses the 4-segment MAJOR.MINOR.PATCH.MICRO scheme", () => {
+    // Pinning a literal version broke on the first release bump; the durable
+    // contract is the 4-segment scheme /ship's version-bump tooling parses.
+    expect(readFileSync(join(REPO_ROOT, "VERSION"), "utf8").trim()).toMatch(/^\d+\.\d+\.\d+\.\d+$/);
   });
 
   test("package.json wires bun test", () => {
