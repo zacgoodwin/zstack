@@ -7,6 +7,7 @@
 // worktreePath}, pinned at compile time (Exact assert below) and at runtime
 // (reviewerPrompt rejects any other key set).
 import { readFileSync } from "node:fs";
+import { handleCliError } from "./cli.ts";
 import { ZError } from "./config.ts";
 
 export { ZError } from "./config.ts";
@@ -309,11 +310,7 @@ export function main(argv: string[]): number {
     console.error(`Unknown command "${cmd}".\n\n${USAGE}`);
     return 1;
   } catch (e) {
-    if (e instanceof ZError) {
-      console.error(e.message);
-      return 1;
-    }
-    throw e;
+    return handleCliError(e);
   }
 }
 

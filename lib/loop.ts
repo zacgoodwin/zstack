@@ -6,12 +6,14 @@
 // applies the returned Action with applyAction -- it never re-derives a
 // scheduling or transition decision in prose. No Date.now() outside the CLI
 // edge; every pure function takes nowMs.
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { atomicWrite, handleCliError, readJson } from "./cli.ts";
 import {
+  BOARD_STATUSES,
   DEFAULT_MAX_LANES,
   DEFAULT_WATCHDOG_MINUTES,
   ZError,
+  type BoardStatus,
 } from "./config.ts";
 import {
   claimStage,
@@ -29,23 +31,11 @@ export { ZError } from "./config.ts";
 
 // -- ticket states ------------------------------------------------------------
 
-// The canonical nine board statuses (z-setup). Terminal-for-this-batch states
-// are Done, Questions, Blocked, Skipped: the batch is drained when every ticket
-// sits in one of those.
-export type BoardStatus =
-  | "Backlog"
-  | "Ready"
-  | "Questions"
-  | "Building"
-  | "QA"
-  | "Review"
-  | "Blocked"
-  | "Skipped"
-  | "Done";
-
-export const BOARD_STATUSES: BoardStatus[] = [
-  "Backlog", "Ready", "Questions", "Building", "QA", "Review", "Blocked", "Skipped", "Done",
-];
+// The canonical nine statuses and the terminal-for-this-batch subset live in
+// lib/config.ts (single source, issue #14 item 21); re-exported here so every
+// existing importer of the state machine keeps its import path.
+export { BOARD_STATUSES, TERMINAL_STATUSES } from "./config.ts";
+export type { BoardStatus } from "./config.ts";
 
 // Legal status transitions (PROCESS.md). Questions/Blocked/Skipped/Done exits
 // are the human's moves (bounce back to Ready, or return a parked ticket to its
@@ -538,23 +528,9 @@ const USAGE = `loop <command> [args]
 
   --now defaults to the wall clock; tests pass it explicitly.`;
 
-function readJson(path: string): any {
-  try {
-    return JSON.parse(readFileSync(path, "utf8"));
-  } catch (e) {
-    throw new ZError(`Cannot read JSON at ${path}: ${(e as Error).message}`);
-  }
-}
-
-// tmp + rename: atomic on the same volume on POSIX and NTFS (same technique as
-// lib/endloop.ts / lib/locks.ts), so a crash mid-write can't leave a truncated
-// state.json for the next ingest to misread as corrupt.
-function atomicWrite(path: string, content: string): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-  writeFileSync(tmp, content, "utf8");
-  renameSync(tmp, path);
-}
+// readJson / atomicWrite come from lib/cli.ts: atomicWrite's tmp+rename keeps a
+// crash mid-write from leaving a truncated state.json for the next ingest to
+// misread as corrupt.
 
 // Reads the previous loop state for an ingest. ONLY a missing file (ENOENT) is a
 // first ingest; a present-but-corrupt/truncated or wrong-shaped state.json is a
@@ -672,11 +648,7 @@ export function main(argv: string[]): number {
     console.error(`Unknown command "${cmd}".\n\n${USAGE}`);
     return 1;
   } catch (e) {
-    if (e instanceof ZError) {
-      console.error(e.message);
-      return 1;
-    }
-    throw e;
+    return handleCliError(e);
   }
 }
 

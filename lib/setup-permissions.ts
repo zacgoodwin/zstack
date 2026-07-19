@@ -21,9 +21,10 @@
 // only place that computes the real path, so every test in
 // tests/setup-permissions.test.ts is structurally incapable of touching the
 // real file.
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
+import { atomicWrite, handleCliError, parseFlags, str } from "./cli.ts";
 import { ZError } from "./config.ts";
 
 export { ZError } from "./config.ts";
@@ -227,17 +228,9 @@ function assertSettingsShape(value: any, path: string): void {
   }
 }
 
-// tmp + rename: rename() is atomic on the same volume on both POSIX and NTFS,
-// so a reader never observes a half-written file. mode 0o600 (owner-only) is set
-// on the temp file BEFORE the rename so settings.json -- which can carry blanket
-// auto-approval -- is never briefly world-readable. (No-op on Windows, where fs
-// modes don't map to POSIX perms.)
-function atomicWrite(path: string, content: string): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-  writeFileSync(tmp, content, { encoding: "utf8", mode: 0o600 });
-  renameSync(tmp, path);
-}
+// Writes go through lib/cli.ts atomicWrite (tmp + rename, mode 0o600): a reader
+// never observes a half-written settings.json, and a file that can carry
+// blanket auto-approval is never briefly world-readable.
 
 // Implementation note from the live incident (issue #12 point 5): a running
 // Claude Code session persists its in-memory permission state back to
@@ -302,14 +295,6 @@ PATH defaults to ~/.claude/settings.json. Read-modify-write merge: every
 existing key and rule is preserved. Re-running once everything is configured
 makes zero changes and says so.`;
 
-function parseFlags(args: string[]): Record<string, string> {
-  const flags: Record<string, string> = {};
-  for (let i = 0; i < args.length; i++) {
-    if (args[i].startsWith("--")) flags[args[i].slice(2)] = args[++i];
-  }
-  return flags;
-}
-
 function defaultSettingsPath(): string {
   return join(homedir(), ".claude", "settings.json");
 }
@@ -327,8 +312,8 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   try {
-    const flags = parseFlags(argv.slice(1));
-    const path = flags.path ?? defaultSettingsPath();
+    const { flags } = parseFlags(argv.slice(1));
+    const path = str(flags, "path") ?? defaultSettingsPath();
 
     if (cmd === "check") {
       const report = checkSettings(path);
@@ -348,11 +333,7 @@ export async function main(argv: string[]): Promise<number> {
     for (const c of result.changes) console.log(`  ${c}`);
     return 0;
   } catch (e) {
-    if (e instanceof ZError) {
-      console.error(e.message);
-      return 1;
-    }
-    throw e;
+    return handleCliError(e);
   }
 }
 

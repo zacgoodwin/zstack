@@ -183,7 +183,10 @@ describe("control 1: loop lock (second-invocation refusal)", () => {
     expect(rc).toBe(0);
     const written = readLoopLock(d)!;
     expect(written.host).toBe(hostname());
-    expect(written.startTime).toBe(processStartTime(process.pid)); // the real start-time, roundtripped
+    // Non-null is a real invariant here: we are probing our OWN live pid, whose
+    // start-time is always readable (the confirmIdentity test above relies on
+    // the same fact).
+    expect(written.startTime).toBe(processStartTime(process.pid)!); // the real start-time, roundtripped
   });
 
   test("a stale lock refuses without --reconcile, and is cleared with it", () => {

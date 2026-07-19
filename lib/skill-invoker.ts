@@ -12,6 +12,7 @@
 // createRecordingInvoker is the in-memory test double tests assert against.
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { handleCliError, parseFlags, requireFlag } from "./cli.ts";
 import { ZError } from "./config.ts";
 
 export { ZError } from "./config.ts";
@@ -91,28 +92,6 @@ const USAGE = `skill-invoker record --log <path> --skill <name> [--note <text>]
   Appends one invocation to the JSONL log at <path> (created if missing).
   <name> is one of: ${SKILL_NAMES.join(", ")}.`;
 
-interface Parsed {
-  positionals: string[];
-  flags: Record<string, string | boolean>;
-}
-
-function parseArgs(args: string[]): Parsed {
-  const positionals: string[] = [];
-  const flags: Record<string, string | boolean> = {};
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a.startsWith("--")) flags[a.slice(2)] = args[++i];
-    else positionals.push(a);
-  }
-  return { positionals, flags };
-}
-
-function requireFlag(flags: Record<string, string | boolean>, name: string): string {
-  const v = flags[name];
-  if (typeof v !== "string" || !v) throw new ZError(`Missing required --${name}.`);
-  return v;
-}
-
 export function main(argv: string[]): number {
   const cmd = argv[0];
   if (!cmd || cmd === "help" || cmd === "-h" || cmd === "--help") {
@@ -121,7 +100,7 @@ export function main(argv: string[]): number {
   }
   try {
     if (cmd === "record") {
-      const { flags } = parseArgs(argv.slice(1));
+      const { flags } = parseFlags(argv.slice(1));
       const logPath = requireFlag(flags, "log");
       const skill = requireFlag(flags, "skill");
       assertSkillName(skill);
@@ -134,11 +113,7 @@ export function main(argv: string[]): number {
     console.error(`Unknown command "${cmd}".\n\n${USAGE}`);
     return 1;
   } catch (e) {
-    if (e instanceof ZError) {
-      console.error(e.message);
-      return 1;
-    }
-    throw e;
+    return handleCliError(e);
   }
 }
 

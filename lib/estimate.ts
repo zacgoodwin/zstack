@@ -7,6 +7,7 @@
 // wall clock; bin/z-estimate supplies the real date at the CLI boundary.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { handleCliError } from "./cli.ts";
 import { ZError } from "./config.ts";
 
 export { ZError } from "./config.ts";
@@ -192,11 +193,7 @@ export async function main(argv: string[]): Promise<number> {
     if (result.warning) console.error(result.warning);
     return 0;
   } catch (e) {
-    if (e instanceof ZError) {
-      console.error(e.message);
-      return 1;
-    }
-    throw e;
+    return handleCliError(e);
   }
 }
 

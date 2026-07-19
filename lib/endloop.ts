@@ -11,10 +11,11 @@
 // markdown. The SKILL performs every actual side effect and feeds this file's
 // pure outputs into them (bin/z-board create, the Skill tool, lib/skill-invoker
 // for the audit log).
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { ZError, projectsDir } from "./config.ts";
+import { join } from "node:path";
+import { atomicWrite, handleCliError, readJson } from "./cli.ts";
+import { TERMINAL_STATUSES, ZError, projectsDir } from "./config.ts";
 import type { CompletionEdge } from "./stage-prompts.ts";
 
 export { ZError } from "./config.ts";
@@ -79,15 +80,8 @@ export function defaultLoopCounterPath(slug: string, home = homedir()): string {
   return join(projectsDir(home), slug, "loop-counter");
 }
 
-// tmp + rename: same technique as lib/locks.ts / lib/setup-permissions.ts --
-// rename() is atomic on the same volume on POSIX and NTFS, so a concurrent
-// reader never observes a half-written counter.
-function atomicWrite(path: string, content: string): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-  writeFileSync(tmp, content, "utf8");
-  renameSync(tmp, path);
-}
+// Counter writes go through lib/cli.ts atomicWrite (tmp + rename) so a
+// concurrent reader never observes a half-written counter.
 
 // Missing file reads as 0 (no loops completed yet). A present-but-unparseable
 // file is a loud error, never a silent reset -- a corrupt counter is exactly
@@ -176,7 +170,7 @@ export interface EndLoopReportInput {
   bugsFiled: BugFiled[];
 }
 
-const STATUS_ORDER = ["Done", "Questions", "Blocked", "Skipped"];
+// Report row order = the canonical terminal set's order (lib/config.ts).
 
 // Pure markdown render of the whole loop's outcome (issue #9 AC4): verdict with
 // evidence, dollars (summed here from the Actuals passed in -- never re-priced
@@ -193,7 +187,7 @@ export function buildEndLoopReport(input: EndLoopReportInput): string {
       ? "NO deploy -- regression is red. Every finding below is filed to Backlog with repro + first-suspect file; fix and re-run before shipping."
       : `land-and-deploy -> canary -> document-release completed, in that order.${auditsRan ? " 5th-loop audits (cso + health) also ran; findings below." : ""}`;
 
-  const statusCounts = STATUS_ORDER.map((s) => `- ${s}: ${tickets.filter((t) => t.status === s).length}`).join("\n");
+  const statusCounts = TERMINAL_STATUSES.map((s) => `- ${s}: ${tickets.filter((t) => t.status === s).length}`).join("\n");
 
   const ticketRows = tickets.length
     ? tickets.map((t) => `| #${t.number} | ${t.title} | ${t.status} | $${t.actualDollars.toFixed(2)} |`).join("\n")
@@ -243,14 +237,6 @@ const USAGE = `endloop <command> [args]
   bug <finding.json> <regression|cso|health> <loopCount>   print a BugTicketDraft {title, body} as JSON
   report <input.json>                             print the markdown end-of-loop report (EndLoopReportInput)`;
 
-function readJson(path: string): any {
-  try {
-    return JSON.parse(readFileSync(path, "utf8"));
-  } catch (e) {
-    throw new ZError(`Cannot read JSON at ${path}: ${(e as Error).message}`);
-  }
-}
-
 export function main(argv: string[]): number {
   const cmd = argv[0];
   if (!cmd || cmd === "--help" || cmd === "-h") {
@@ -295,11 +281,7 @@ export function main(argv: string[]): number {
     console.error(`Unknown command "${cmd}".\n\n${USAGE}`);
     return 1;
   } catch (e) {
-    if (e instanceof ZError) {
-      console.error(e.message);
-      return 1;
-    }
-    throw e;
+    return handleCliError(e);
   }
 }
 

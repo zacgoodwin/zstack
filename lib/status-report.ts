@@ -2,10 +2,11 @@
 // Takes a snapshot of the board + locks + last report + clock, returns markdown.
 // No mutations, no side effects: the SKILL assembles the snapshot and writes output.
 import { readFileSync } from "node:fs";
-import { ZError, listLaneLocks } from "./locks.ts";
+import { handleCliError, parseFlags, requireFlag, str } from "./cli.ts";
+import { listLaneLocks } from "./locks.ts";
 import type { BoardItem } from "./board.ts";
 import type { LaneLock } from "./locks.ts";
-import { BOARD_STATUSES, type BoardStatus } from "./loop.ts";
+import { BOARD_STATUSES } from "./loop.ts";
 
 export { ZError } from "./config.ts";
 
@@ -23,12 +24,6 @@ export interface StatusReportInput {
 export function buildStatusReport(input: StatusReportInput): string {
   const { boardItems, laneLocks, lastReport, clock } = input;
   const nowMs = clock();
-
-  // Count tickets per status
-  const counts: Record<BoardStatus, number> = {};
-  for (const status of BOARD_STATUSES) {
-    counts[status] = boardItems.filter((item) => item.fields["Status"] === status).length;
-  }
 
   // Questions and Blocked tickets with their numbers and titles
   const questionTickets = boardItems
@@ -72,8 +67,12 @@ export function buildStatusReport(input: StatusReportInput): string {
     }
   }
 
-  // Build the markdown report
-  const statusCounts = BOARD_STATUSES.map((s) => `- ${s}: ${counts[s]}`).join("\n");
+  // Build the markdown report: one count line per canonical status, computed
+  // inline so no partially-filled Record<BoardStatus, number> ever exists
+  // (issue #14 item 20: `= {}` was a strict-mode lie about totality).
+  const statusCounts = BOARD_STATUSES.map(
+    (s) => `- ${s}: ${boardItems.filter((item) => item.fields["Status"] === s).length}`
+  ).join("\n");
 
   const questionsSection = questionTickets.length ? questionTickets.join("\n") : "- None.";
   const blockedSection = blockedTickets.length ? blockedTickets.join("\n") : "- None.";
@@ -118,33 +117,6 @@ const USAGE = `status <command> [args]
   report --board-items FILE --locks-dir DIR [--last-report FILE]
                                                build markdown report from snapshot`;
 
-interface Parsed {
-  flags: Record<string, string | boolean>;
-}
-
-function parseFlags(args: string[]): Parsed {
-  const flags: Record<string, string | boolean> = {};
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a.startsWith("--")) {
-      const key = a.slice(2);
-      flags[key] = args[++i];
-    }
-  }
-  return { flags };
-}
-
-function str(flags: Record<string, string | boolean>, name: string): string | undefined {
-  const v = flags[name];
-  return typeof v === "string" ? v : undefined;
-}
-
-function requireFlag(flags: Record<string, string | boolean>, name: string): string {
-  const v = str(flags, name);
-  if (!v) throw new ZError(`Missing required --${name}.`);
-  return v;
-}
-
 export function main(argv: string[]): number {
   const cmd = argv[0];
   if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
@@ -179,11 +151,7 @@ export function main(argv: string[]): number {
     console.error(`Unknown command "${cmd}".\n\n${USAGE}`);
     return 1;
   } catch (e) {
-    if (e instanceof ZError) {
-      console.error(e.message);
-      return 1;
-    }
-    throw e;
+    return handleCliError(e);
   }
 }
 

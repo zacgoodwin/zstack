@@ -184,7 +184,9 @@ describe("AC2: green path -> land-and-deploy -> canary -> document-release, in o
   });
 
   test("SKILL_NAMES names exactly the six gstack skills the invoker knows", () => {
-    expect([...SKILL_NAMES].sort()).toEqual(
+    // Widened to string[] so toEqual compares against the plain-string list
+    // below without demanding SkillName literals; the assertion is unchanged.
+    expect(([...SKILL_NAMES] as string[]).sort()).toEqual(
       ["canary", "cso", "document-release", "health", "land-and-deploy", "qa-only"].sort()
     );
   });

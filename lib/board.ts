@@ -7,6 +7,7 @@
 // (GraphQLExecutor) so gate tests run against recorded fixtures with zero
 // network; production wires ghExecutor().
 import { readFileSync } from "node:fs";
+import { handleCliError, parseFlags, requireFlag } from "./cli.ts";
 import {
   BoardConfig,
   DEFAULT_QUOTA,
@@ -630,39 +631,12 @@ const COMMANDS = new Set([
   "quota",
 ]);
 
-interface Parsed {
-  positionals: string[];
-  flags: Record<string, string | boolean>;
-}
-
-function parseFlags(args: string[], booleans: string[] = []): Parsed {
-  const positionals: string[] = [];
-  const flags: Record<string, string | boolean> = {};
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a.startsWith("--")) {
-      const key = a.slice(2);
-      if (booleans.includes(key)) flags[key] = true;
-      else flags[key] = args[++i];
-    } else {
-      positionals.push(a);
-    }
-  }
-  return { positionals, flags };
-}
-
 function requireInt(v: string | undefined, label: string): number {
   const n = Number(v);
   if (v === undefined || !Number.isInteger(n)) {
     throw new ZError(`${label} must be an integer issue number, got "${v}".`);
   }
   return n;
-}
-
-function requireFlag(flags: Record<string, string | boolean>, name: string): string {
-  const v = flags[name];
-  if (typeof v !== "string" || !v) throw new ZError(`Missing required --${name}.`);
-  return v;
 }
 
 export async function main(argv: string[]): Promise<number> {
@@ -773,11 +747,7 @@ export async function main(argv: string[]): Promise<number> {
         return 1;
     }
   } catch (e) {
-    if (e instanceof ZError) {
-      console.error(e.message);
-      return 1;
-    }
-    throw e;
+    return handleCliError(e);
   }
 }
 

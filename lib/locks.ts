@@ -21,12 +21,12 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
-  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
+import { atomicWrite, handleCliError, parseFlags, requireFlag, str } from "./cli.ts";
 import {
   DEFAULT_LOCK_STALENESS_MINUTES,
   ZError,
@@ -72,21 +72,9 @@ export function loopLockPath(locksDir: string): string {
   return join(locksDir, "loop.lock");
 }
 
-// -- atomic write -------------------------------------------------------------
-
-// tmp + rename: rename() is atomic on the same volume on POSIX and NTFS, so a
-// concurrent reader never observes a half-written lane lock (same technique as
-// lib/setup-permissions.ts atomicWrite). mode 0o600 (owner-only) is set on the
-// temp file before the rename so a lockfile is never world-readable. (No-op on
-// Windows, where fs modes don't map to POSIX perms.)
-function atomicWrite(path: string, content: string): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-  writeFileSync(tmp, content, { encoding: "utf8", mode: 0o600 });
-  renameSync(tmp, path);
-}
-
 // -- lane locks ---------------------------------------------------------------
+// Writes go through lib/cli.ts atomicWrite (tmp + rename, mode 0o600) so a
+// concurrent reader never observes a half-written or world-readable lock.
 
 // Written at claim and re-stamped on every stage transition (`claimedAt` set to
 // nowMs each time), so the lock's age tracks the lane's liveness after a crash.
@@ -367,38 +355,6 @@ const USAGE = `locks <command> [args]
 
 Paths default to ~/.zstack/projects/<slug>/locks; --dir overrides for tests.`;
 
-interface Parsed {
-  positionals: string[];
-  flags: Record<string, string | boolean>;
-}
-
-function parseArgs(args: string[], booleans: string[] = []): Parsed {
-  const positionals: string[] = [];
-  const flags: Record<string, string | boolean> = {};
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a.startsWith("--")) {
-      const key = a.slice(2);
-      if (booleans.includes(key)) flags[key] = true;
-      else flags[key] = args[++i];
-    } else {
-      positionals.push(a);
-    }
-  }
-  return { positionals, flags };
-}
-
-function str(flags: Record<string, string | boolean>, name: string): string | undefined {
-  const v = flags[name];
-  return typeof v === "string" ? v : undefined;
-}
-
-function requireFlag(flags: Record<string, string | boolean>, name: string): string {
-  const v = str(flags, name);
-  if (!v) throw new ZError(`Missing required --${name}.`);
-  return v;
-}
-
 // Parses --staleness-minutes to a finite positive number, ZError otherwise
 // (issue #14 M19). A garbage value (e.g. a typo'd number) used to yield NaN, and
 // `nowMs - startedAt > NaN` is always false -- so every no-pid lock read "live"
@@ -433,7 +389,7 @@ export function main(argv: string[]): number {
     return cmd ? 0 : 1;
   }
   try {
-    const { positionals, flags } = parseArgs(argv.slice(1), ["reconcile"]);
+    const { positionals, flags } = parseFlags(argv.slice(1), ["reconcile"]);
     const nowMs = Number(str(flags, "now") ?? Date.now());
 
     if (cmd === "acquire") {
@@ -500,11 +456,7 @@ export function main(argv: string[]): number {
     console.error(`Unknown command "${cmd}".\n\n${USAGE}`);
     return 1;
   } catch (e) {
-    if (e instanceof ZError) {
-      console.error(e.message);
-      return 1;
-    }
-    throw e;
+    return handleCliError(e);
   }
 }
 

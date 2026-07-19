@@ -8,6 +8,31 @@ import { validateConfig } from "./config-schema.ts";
 
 export type FieldDataType = "SINGLE_SELECT" | "NUMBER" | "TEXT";
 
+// The canonical nine board statuses (z-setup writes them as the Status field's
+// options; the loop enforces transitions over them). Single source for the
+// whole pack (issue #14 item 21) -- lib/loop.ts re-exports for its importers.
+export type BoardStatus =
+  | "Backlog"
+  | "Ready"
+  | "Questions"
+  | "Building"
+  | "QA"
+  | "Review"
+  | "Blocked"
+  | "Skipped"
+  | "Done";
+
+export const BOARD_STATUSES: BoardStatus[] = [
+  "Backlog", "Ready", "Questions", "Building", "QA", "Review", "Blocked", "Skipped", "Done",
+];
+
+// Terminal-for-this-batch statuses: the work landed (Done) or a human parked
+// it. The batch is drained when every ticket sits in one of these; reconcile
+// never reopens one; a human moving an in-flight ticket here stops its lane.
+// Order matters only to lib/endloop.ts's report, which lists counts in this
+// sequence.
+export const TERMINAL_STATUSES: BoardStatus[] = ["Done", "Questions", "Blocked", "Skipped"];
+
 // A ProjectV2 field: its node ID, its value type, and (single-select only) the
 // map from human option name -> option node ID. GraphQL mutations need the IDs;
 // humans pass the names.

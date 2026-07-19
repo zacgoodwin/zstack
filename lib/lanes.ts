@@ -6,7 +6,8 @@
 // prose. Types live in lib/loop.ts (the state machine); importing them as
 // type-only keeps the loop<->lanes import cycle erased at runtime.
 import { readFileSync } from "node:fs";
-import { ZError } from "./config.ts";
+import { handleCliError } from "./cli.ts";
+import { TERMINAL_STATUSES, ZError } from "./config.ts";
 import type { BoardStatus, LaneState, Stage, TicketSnapshot } from "./loop.ts";
 
 export { ZError } from "./config.ts";
@@ -62,11 +63,13 @@ export function depsSatisfied(t: TicketSnapshot, byNumber: Map<number, TicketSna
 }
 
 // Dependencies that can never complete in this batch: the loop must not let the
-// dependent sit and burn tokens waiting on them (PROCESS.md global rule).
+// dependent sit and burn tokens waiting on them (PROCESS.md global rule). Dead =
+// terminal (lib/config.ts TERMINAL_STATUSES) minus Done -- a Done dep is
+// satisfied, not dead.
 export function deadDeps(t: TicketSnapshot, byNumber: Map<number, TicketSnapshot>): number[] {
   return t.dependsOn.filter((d) => {
     const dep = byNumber.get(d);
-    return dep !== undefined && ["Questions", "Blocked", "Skipped"].includes(dep.status);
+    return dep !== undefined && dep.status !== "Done" && TERMINAL_STATUSES.includes(dep.status);
   });
 }
 
@@ -164,11 +167,7 @@ export function main(argv: string[]): number {
     console.error(`Unknown command "${cmd}".\n\n${USAGE}`);
     return 1;
   } catch (e) {
-    if (e instanceof ZError) {
-      console.error(e.message);
-      return 1;
-    }
-    throw e;
+    return handleCliError(e);
   }
 }
 

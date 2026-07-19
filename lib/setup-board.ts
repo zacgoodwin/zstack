@@ -15,8 +15,11 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
+import { handleCliError, parseFlags, requireFlag, str } from "./cli.ts";
 import {
+  BOARD_STATUSES,
   BoardConfig,
+  type BoardStatus,
   DEFAULT_EPIC_STYLE,
   DEFAULT_MAX_LANES,
   DEFAULT_QUOTA,
@@ -35,19 +38,10 @@ export { ZError } from "./config.ts";
 // -- desired board shape (references/PROCESS.md + issue #1) -------------------
 export const STATUS_FIELD_NAME = "Status";
 
-// Canonical board columns, in order. Order is the contract: it's the left-to-
-// right column order on the board, and diffState compares it as a sequence.
-export const STATUS_OPTIONS = [
-  "Backlog",
-  "Ready",
-  "Questions",
-  "Building",
-  "QA",
-  "Review",
-  "Blocked",
-  "Skipped",
-  "Done",
-] as const;
+// Canonical board columns, in order (single source: lib/config.ts
+// BOARD_STATUSES). Order is the contract: it's the left-to-right column order
+// on the board, and diffState compares it as a sequence.
+export const STATUS_OPTIONS: readonly BoardStatus[] = BOARD_STATUSES;
 
 export interface DesiredField {
   name: string;
@@ -546,29 +540,6 @@ const USAGE = `z-setup-board <command> [flags]
 Statuses: ${STATUS_OPTIONS.join(", ")}
 Fields:   ${CUSTOM_FIELDS.map((f) => f.name).join(", ")}`;
 
-interface Parsed {
-  flags: Record<string, string>;
-}
-
-// Flags that take no value; everything else consumes the next argument.
-const BOOLEAN_FLAGS = new Set(["force"]);
-
-function parseFlags(args: string[]): Parsed {
-  const flags: Record<string, string> = {};
-  for (let i = 0; i < args.length; i++) {
-    if (!args[i].startsWith("--")) continue;
-    const name = args[i].slice(2);
-    flags[name] = BOOLEAN_FLAGS.has(name) ? "true" : args[++i];
-  }
-  return { flags };
-}
-
-function requireFlag(flags: Record<string, string>, name: string): string {
-  const v = flags[name];
-  if (!v) throw new ZError(`Missing required --${name}.`);
-  return v;
-}
-
 // Exported for the gate test: rejecting "issue-type" here keeps the CLI from
 // ever calling GraphQL with a config the loop cannot act on (issue #14 item 6).
 export function toEpicStyle(v: string | undefined): EpicStyle | undefined {
@@ -596,12 +567,13 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   try {
-    const { flags } = parseFlags(argv.slice(1));
+    const { flags } = parseFlags(argv.slice(1), ["force"]);
     const owner = requireFlag(flags, "owner");
     const repo = requireFlag(flags, "repo");
-    const number = flags["project-number"] ? Number(flags["project-number"]) : undefined;
+    const projectNumberFlag = str(flags, "project-number");
+    const number = projectNumberFlag ? Number(projectNumberFlag) : undefined;
     if (number !== undefined && !Number.isInteger(number)) {
-      throw new ZError(`--project-number must be an integer, got "${flags["project-number"]}".`);
+      throw new ZError(`--project-number must be an integer, got "${projectNumberFlag}".`);
     }
     const setup = new SetupBoard(ghExecutor());
 
@@ -620,14 +592,16 @@ export async function main(argv: string[]): Promise<number> {
       case "apply": {
         const slug = requireFlag(flags, "slug");
         const title = requireFlag(flags, "title");
+        const maxLanes = str(flags, "max-lanes");
+        const watchdogMinutes = str(flags, "watchdog-minutes");
         const result = await setup.apply(owner, repo, {
           slug,
           title,
           projectNumber: number,
-          epicStyle: toEpicStyle(flags["epic-style"]),
-          maxLanes: flags["max-lanes"] ? Number(flags["max-lanes"]) : undefined,
-          watchdogMinutes: flags["watchdog-minutes"] ? Number(flags["watchdog-minutes"]) : undefined,
-          force: flags["force"] === "true",
+          epicStyle: toEpicStyle(str(flags, "epic-style")),
+          maxLanes: maxLanes ? Number(maxLanes) : undefined,
+          watchdogMinutes: watchdogMinutes ? Number(watchdogMinutes) : undefined,
+          force: flags["force"] === true,
         });
         const path = writeConfig(result.config);
         console.log(
@@ -644,7 +618,7 @@ export async function main(argv: string[]): Promise<number> {
         return 0;
       }
       case "verify": {
-        const title = flags["title"];
+        const title = str(flags, "title");
         if (number === undefined && !title) {
           throw new ZError("verify needs --title or --project-number.");
         }
@@ -658,11 +632,7 @@ export async function main(argv: string[]): Promise<number> {
         return 1;
     }
   } catch (e) {
-    if (e instanceof ZError) {
-      console.error(e.message);
-      return 1;
-    }
-    throw e;
+    return handleCliError(e);
   }
 }
 

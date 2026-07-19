@@ -1,0 +1,21 @@
+{
+  // Typecheck-only config (issue #14 item 20): bun executes the .ts directly,
+  // so tsc never emits -- settings mirror how bun actually runs this code
+  // (ESM, .ts-extension imports, bundler-style resolution, Bun globals).
+  "compilerOptions": {
+    "lib": ["ESNext"],
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleDetection": "force",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["bun"]
+  },
+  // The pack's own code: lib/ + gate tests + the e2e checker the tests import.
+  // The eval fixture apps (evals/*fixture-app*) are separate packages with
+  // their own package.json and are deliberately not part of this project.
+  "include": ["lib", "tests", "evals/e2e"]
+}

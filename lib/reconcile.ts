@@ -12,7 +12,8 @@
 import { readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Board, ghExecutor } from "./board.ts";
-import { ZError, loadConfig } from "./config.ts";
+import { handleCliError, parseFlags, str } from "./cli.ts";
+import { TERMINAL_STATUSES, loadConfig } from "./config.ts";
 import { defaultLocksDir, listLaneLocks, type LaneLock } from "./locks.ts";
 import { BOARD_STATUSES, type BoardStatus, type LaneState, type TicketSnapshot } from "./loop.ts";
 
@@ -25,12 +26,12 @@ export { ZError } from "./config.ts";
 // parked back to Ready alongside the prune.
 const INFLIGHT: BoardStatus[] = ["Building", "QA", "Review"];
 
-// Terminal-for-this-batch statuses (mirrors lib/loop.ts). A crashed lane whose
-// ticket already reached one of these did its work (Done) or was intentionally
-// parked by a human (Questions/Blocked/Skipped): reconcile must NOT reopen it
-// (issue #14 C4) -- a crash between the Done move and lock removal would otherwise
-// rebuild already-merged work. Such a lane is only pruned + unlocked.
-const TERMINAL: BoardStatus[] = ["Done", "Questions", "Blocked", "Skipped"];
+// Terminal-for-this-batch statuses come from lib/config.ts (TERMINAL_STATUSES).
+// A crashed lane whose ticket already reached one of these did its work (Done)
+// or was intentionally parked by a human (Questions/Blocked/Skipped): reconcile
+// must NOT reopen it (issue #14 C4) -- a crash between the Done move and lock
+// removal would otherwise rebuild already-merged work. Such a lane is only
+// pruned + unlocked.
 
 export type BoardTicketStatus = Pick<TicketSnapshot, "number" | "status">;
 
@@ -141,7 +142,7 @@ export type ReconcileAction =
 export function reconcilePlan(orphans: Orphans): ReconcileAction[] {
   const actions: ReconcileAction[] = [];
   for (const c of orphans.crashedLanes) {
-    if (c.boardStatus && TERMINAL.includes(c.boardStatus)) {
+    if (c.boardStatus && TERMINAL_STATUSES.includes(c.boardStatus)) {
       // Terminal: leave the board alone; just clear the crashed run's on-disk state.
       if (c.worktreePath) actions.push({ kind: "prune-worktree", ticket: c.ticket, path: c.worktreePath });
       actions.push({ kind: "remove-lock", ticket: c.ticket, path: c.lockPath });
@@ -208,20 +209,19 @@ export async function applyReconcile(actions: ReconcileAction[], fx: ReconcileEf
 
 // -- wave reconciliation (mid-loop board moves) -------------------------------
 
-// Statuses a human can move an in-flight ticket to that mean "take this lane out
-// of the loop." The loop's own reducers (lib/loop.ts) drop a lane BEFORE setting
-// any of these on its ticket, so a lane co-existing with one of these on a fresh
-// board snapshot is proof a human intervened -- no stage/status comparison
-// needed. Replaces super-board's 120s tick (issue #2): the board is re-read
-// before every stage transition, so a mid-loop move is respected at the boundary.
-const STOP_STATUSES: BoardStatus[] = ["Questions", "Blocked", "Skipped", "Done"];
-
+// A human moving an in-flight ticket to a terminal status (TERMINAL_STATUSES)
+// means "take this lane out of the loop." The loop's own reducers (lib/loop.ts)
+// drop a lane BEFORE setting any of these on its ticket, so a lane co-existing
+// with one of these on a fresh board snapshot is proof a human intervened -- no
+// stage/status comparison needed. Replaces super-board's 120s tick (issue #2):
+// the board is re-read before every stage transition, so a mid-loop move is
+// respected at the boundary.
 export function reconcileBoardMoves(tickets: TicketSnapshot[], lanes: LaneState[]): Set<number> {
   const byNumber = new Map(tickets.map((t) => [t.number, t]));
   const stopped = new Set<number>();
   for (const lane of lanes) {
     const t = byNumber.get(lane.ticket);
-    if (t && STOP_STATUSES.includes(t.status)) stopped.add(lane.ticket);
+    if (t && TERMINAL_STATUSES.includes(t.status)) stopped.add(lane.ticket);
   }
   return stopped;
 }
@@ -264,14 +264,6 @@ const USAGE = `reconcile <command> [args] --slug S
   --dir / --worktrees override the locks + worktrees dirs (tests). Otherwise
   locks default to ~/.zstack/projects/<slug>/locks and worktrees to ./.worktrees.`;
 
-function parseFlags(args: string[]): Record<string, string> {
-  const flags: Record<string, string> = {};
-  for (let i = 0; i < args.length; i++) {
-    if (args[i].startsWith("--")) flags[args[i].slice(2)] = args[++i];
-  }
-  return flags;
-}
-
 // Sweeps EVERY status, not just the in-flight ones (issue #14 C4): a crashed
 // lane's recovery hinges on whether its ticket is already terminal (Done/parked),
 // so the plan needs the full board picture, not only Building/QA/Review.
@@ -294,12 +286,12 @@ export async function main(argv: string[]): Promise<number> {
     return 1;
   }
   try {
-    const flags = parseFlags(argv.slice(1));
-    const nowMs = Number(flags["now"] ?? Date.now());
-    const cfg = loadConfig(flags["slug"]);
+    const { flags } = parseFlags(argv.slice(1));
+    const nowMs = Number(str(flags, "now") ?? Date.now());
+    const cfg = loadConfig(str(flags, "slug"));
     const board = new Board(cfg, ghExecutor());
-    const locksDir = flags["dir"] ?? defaultLocksDir(cfg.slug);
-    const worktreesDir = flags["worktrees"] ?? join(process.cwd(), ".worktrees");
+    const locksDir = str(flags, "dir") ?? defaultLocksDir(cfg.slug);
+    const worktreesDir = str(flags, "worktrees") ?? join(process.cwd(), ".worktrees");
 
     const orphans = scanOrphans(locksDir, worktreesDir, await sweep(board), nowMs);
     const plan = reconcilePlan(orphans);
@@ -318,11 +310,7 @@ export async function main(argv: string[]): Promise<number> {
     console.log(`reconciled: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(", ") || "nothing"}`);
     return 0;
   } catch (e) {
-    if (e instanceof ZError) {
-      console.error(e.message);
-      return 1;
-    }
-    throw e;
+    return handleCliError(e);
   }
 }
 

@@ -31,6 +31,7 @@
 // with a mutated-fixture canary).
 import { readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { handleCliError } from "./cli.ts";
 import { ZError } from "./config.ts";
 import { loadRates, priceTokens, ratesPath, resolveRate, roundCents, type RatesFile } from "./estimate.ts";
 
@@ -223,11 +224,7 @@ export async function main(argv: string[]): Promise<number> {
     }
     return 0;
   } catch (e) {
-    if (e instanceof ZError) {
-      console.error(e.message);
-      return 1;
-    }
-    throw e;
+    return handleCliError(e);
   }
 }
 
