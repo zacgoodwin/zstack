@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Thin entry for the estimator contract: everything lives in lib/estimate.ts
+# under bun. This wrapper only resolves its own location and hands off.
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+exec bun "$HERE/../lib/estimate.ts" "$@"
