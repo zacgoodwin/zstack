@@ -48,5 +48,5 @@ First release of the zstack dev-loop skill pack. Installs at `~/.claude/skills/z
 
 ### Known limitations
 
-- The pre-landing review filed remediation issue #14 (pagination beyond 100 board items, epicStyle `issue-type` create path, cross-session claim identity, and others); all 22 items are closed in [Unreleased] above.
+- The pre-landing review filed remediation issue #14 (pagination beyond 100 board items, epicStyle `issue-type` create path, cross-session claim identity, and others); all 22 items are closed in [0.1.1.0] above.
 - Board creation, real multi-session lock concurrency, and issue-stays-open-on-Done are validated by design and gate tests but need one live run (`gh auth refresh -s project`, then `/z-setup`) to confirm end to end.
