@@ -5,6 +5,7 @@
 # Windows checkouts with core.autocrlf=true rewrite it to CRLF, which breaks
 # bash keywords ("fi\r", "then\r" aren't recognized). Same fix as gstack's setup.
 setup   text eol=lf
+bin/z-board text eol=lf
 *.ts    text eol=lf
 *.json  text eol=lf
 *.toml  text eol=lf

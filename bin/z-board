@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Thin entry for the board contract: everything lives in lib/board.ts under bun.
+# This wrapper only resolves its own location and hands off; it must never call
+# gh itself (a grep gate test enforces that lib/board.ts is the sole caller).
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+exec bun "$HERE/../lib/board.ts" "$@"

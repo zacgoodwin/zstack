@@ -1,0 +1,14 @@
+{
+  "repository": {
+    "issue": {
+      "projectItems": {
+        "nodes": [
+          {
+            "project": { "number": 1 },
+            "fieldValueByName": { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "opus" }
+          }
+        ]
+      }
+    }
+  }
+}

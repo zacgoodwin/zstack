@@ -1,0 +1,16 @@
+{
+  "repository": {
+    "issue": {
+      "id": "I_5",
+      "number": 5,
+      "title": "C2: bin/z-board",
+      "body": "Original body.",
+      "assignees": { "nodes": [] },
+      "projectItems": {
+        "nodes": [
+          { "id": "PVTI_5", "project": { "number": 1 } }
+        ]
+      }
+    }
+  }
+}
