@@ -1,0 +1,13 @@
+{
+  "shipped": "Added a structured JSON response helper in src/respond.ts that all routes now return through (ok/error shapes), refactoring src/routes.ts to use it",
+  "prUrl": "https://github.com/acme/fixture-app/pull/1",
+  "acceptancePassed": [
+    "ok(body) returns {status:200, body} -> a 200 JSON Response with that body",
+    "err(404, 'msg') returns {status:404, body:{error:'msg'}} -> a 404 JSON Response"
+  ],
+  "edges": [
+    { "check": "a non-serializable body", "doStep": "call ok() with a value containing a BigInt", "expect": "a 500 with a clear error, not a thrown exception that crashes the server" }
+  ],
+  "filedTickets": [],
+  "actualDollars": 1.35
+}

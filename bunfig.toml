@@ -1,0 +1,4 @@
+[test]
+# Scope discovery to tests/ so bun test never picks up stray *.test.ts
+# files dropped elsewhere in the repo (e.g. references/).
+root = "tests"

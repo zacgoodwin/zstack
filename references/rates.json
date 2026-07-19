@@ -1,0 +1,9 @@
+{
+  "checked_at": "2026-07-18",
+  "rates": {
+    "fable": { "input": 10.00, "output": 50.00, "cached_input": 1.00 },
+    "opus": { "input": 5.00, "output": 25.00, "cached_input": 0.50 },
+    "sonnet": { "input": 3.00, "output": 15.00, "cached_input": 0.30 },
+    "haiku": { "input": 1.00, "output": 5.00, "cached_input": 0.10 }
+  }
+}

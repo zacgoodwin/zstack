@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Thin entry for the /z-setup auto-approvals step (C11): everything lives in
+# lib/setup-permissions.ts under bun. Same wrapper pattern as bin/z-setup-board.
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+exec bun "$HERE/../lib/setup-permissions.ts" "$@"

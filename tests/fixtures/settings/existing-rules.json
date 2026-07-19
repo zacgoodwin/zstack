@@ -1,0 +1,26 @@
+{
+  "model": "claude-fable-5[1m]",
+  "permissions": {
+    "allow": [
+      "Bash(git add *)",
+      "Bash(npm install *)",
+      "Read(//c/Users/zacgo/.claude/**)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\zacgo\\.claude"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:/Users/zacgo/.claude/skills/gstack/bin/gstack-session-update"
+          }
+        ]
+      }
+    ]
+  },
+  "effortLevel": "xhigh"
+}

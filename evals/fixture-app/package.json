@@ -1,0 +1,17 @@
+{
+  "name": "fixture-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal but real Bun web app used as the zstack end-to-end eval target. The e2e eval instantiates this tree into a temp git repo per run, then drives /z-setup -> /z-plan -> /z-loop against it with deploy stubbed.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "build": "bun build ./src/server.ts --outdir dist --target bun",
+    "deploy": "bash scripts/deploy"
+  },
+  "devDependencies": {
+    "bun-types": "latest",
+    "typescript": "^5"
+  }
+}

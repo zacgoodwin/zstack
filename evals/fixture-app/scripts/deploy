@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Stubbed deploy for the zstack e2e eval. A real repo wires /land-and-deploy to
+# push to its host; the fixture must NEVER touch a network or a real environment,
+# so this only echoes and exits 0. The end-of-loop stage's /land-and-deploy runs
+# in dry-run against this: the green path is exercised, nothing ships.
+set -euo pipefail
+
+echo "[fixture-app] deploy dry-run: pretending to ship $(git rev-parse --short HEAD 2>/dev/null || echo '<no-git>')"
+echo "[fixture-app] deploy dry-run: no network, no real environment touched."
+echo "[fixture-app] deploy OK"
+exit 0

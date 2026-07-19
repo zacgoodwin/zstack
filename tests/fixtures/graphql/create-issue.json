@@ -1,0 +1,5 @@
+{
+  "createIssue": {
+    "issue": { "id": "I_42", "number": 42, "url": "https://github.com/zacgoodwin/zstack/issues/42" }
+  }
+}

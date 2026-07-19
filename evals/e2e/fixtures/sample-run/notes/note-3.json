@@ -1,0 +1,15 @@
+{
+  "shipped": "Added GET /metrics in src/routes.ts + src/metrics.ts, counting requests per route via a middleware wrapper, returning the counts through the respond helper",
+  "prUrl": "https://github.com/acme/fixture-app/pull/3",
+  "acceptancePassed": [
+    "hit /health twice then GET /metrics -> counts['/health'] === 2",
+    "GET /metrics -> 200 with a per-route count object"
+  ],
+  "edges": [
+    { "check": "counter persistence across restart", "doStep": "record counts, restart the server, GET /metrics", "expect": "counts reset to zero (in-memory only) -- a human decides whether that is acceptable" }
+  ],
+  "filedTickets": [
+    { "number": 4, "title": "Rate-limit the /metrics route" }
+  ],
+  "actualDollars": 1.68
+}

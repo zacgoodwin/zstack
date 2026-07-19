@@ -1,0 +1,35 @@
+{
+  "node": {
+    "items": {
+      "nodes": [
+        {
+          "content": { "number": 4, "title": "C1: Pack scaffold", "url": "https://github.com/zacgoodwin/zstack/issues/4" },
+          "fieldValues": {
+            "nodes": [
+              { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "Done", "field": { "name": "Status" } }
+            ]
+          }
+        },
+        {
+          "content": { "number": 5, "title": "C2: bin/z-board", "url": "https://github.com/zacgoodwin/zstack/issues/5" },
+          "fieldValues": {
+            "nodes": [
+              { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "In progress", "field": { "name": "Status" } },
+              { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "opus", "field": { "name": "Model" } },
+              { "__typename": "ProjectV2ItemFieldNumberValue", "number": 6, "field": { "name": "Estimate" } }
+            ]
+          }
+        },
+        {
+          "content": { "number": 6, "title": "C3: z-setup", "url": "https://github.com/zacgoodwin/zstack/issues/6" },
+          "fieldValues": {
+            "nodes": [
+              { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "In progress", "field": { "name": "Status" } },
+              { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "sonnet", "field": { "name": "Model" } }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

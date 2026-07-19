@@ -1,0 +1,45 @@
+{
+  "_comment": "Bucket dictionary for /z-plan. The planner never eyeballs token counts (ESTIMATION.md: 'this is arithmetic, so compute it'). It picks ONE tier per ticket by the ESTIMATION.md model rules-of-thumb, copies that tier's entry verbatim into a buckets.json, and shells it to bin/z-estimate for the dollar figure. Same tier -> same buckets -> same z-estimate output, so estimates are reproducible across runs (issue #7 AC2). Each tier's buckets are directional full-lifecycle volumes (plan + build + QA + review + merge, per ESTIMATION.md step 3). tests/plan-schema.test.ts pins the resulting dollar total of every tier so a rate or bucket change fails the gate instead of silently drifting from SKILL.md.",
+  "tiers": {
+    "haiku-low": {
+      "model": "haiku",
+      "effort": "low",
+      "buffer_pct": 30,
+      "output_tokens": 20000,
+      "fresh_input_tokens": 50000,
+      "cached_input_tokens": 250000
+    },
+    "sonnet-medium": {
+      "model": "sonnet",
+      "effort": "medium",
+      "buffer_pct": 30,
+      "output_tokens": 50000,
+      "fresh_input_tokens": 100000,
+      "cached_input_tokens": 700000
+    },
+    "opus-high": {
+      "model": "opus",
+      "effort": "high",
+      "buffer_pct": 30,
+      "output_tokens": 80000,
+      "fresh_input_tokens": 150000,
+      "cached_input_tokens": 1200000
+    },
+    "opus-xhigh": {
+      "model": "opus",
+      "effort": "xhigh",
+      "buffer_pct": 30,
+      "output_tokens": 130000,
+      "fresh_input_tokens": 250000,
+      "cached_input_tokens": 2000000
+    },
+    "fable-xhigh": {
+      "model": "fable",
+      "effort": "xhigh",
+      "buffer_pct": 50,
+      "output_tokens": 150000,
+      "fresh_input_tokens": 300000,
+      "cached_input_tokens": 2500000
+    }
+  }
+}

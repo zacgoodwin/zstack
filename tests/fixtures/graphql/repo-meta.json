@@ -1,0 +1,17 @@
+{
+  "repository": {
+    "id": "R_1",
+    "milestones": {
+      "nodes": [
+        { "id": "MS_v1", "title": "zstack-v1" },
+        { "id": "MS_v2", "title": "zstack-v2" }
+      ]
+    },
+    "labels": {
+      "nodes": [
+        { "id": "LBL_bug", "name": "bug" },
+        { "id": "LBL_feat", "name": "feature" }
+      ]
+    }
+  }
+}

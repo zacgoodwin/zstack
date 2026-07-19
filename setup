@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# zstack setup: verify preconditions and register the pack directory for
+# Claude Code (and Codex/Factory when installed). Modeled on gstack's setup.
+set -e
+
+TEAM_MODE=0
+for arg in "$@"; do
+  case "$arg" in
+    --team) TEAM_MODE=1 ;;
+  esac
+done
+
+# --- 1. bun required -------------------------------------------------------
+if ! command -v bun >/dev/null 2>&1; then
+  echo "Error: bun is required but not installed." >&2
+  echo "Install: https://bun.sh" >&2
+  exit 1
+fi
+
+# --- 2. gstack required (zstack's skills route through gstack's /browse, ---
+# /review, /ship, etc. -- hard dependency, not optional) --------------------
+if [ ! -d "$HOME/.claude/skills/gstack" ]; then
+  echo "Error: gstack is required but not installed at ~/.claude/skills/gstack." >&2
+  echo "Install it:" >&2
+  echo "  git clone --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack" >&2
+  echo "  cd ~/.claude/skills/gstack && ./setup --team" >&2
+  exit 1
+fi
+
+# --- 3. gh required (issue/PR workflow shells out to gh) -------------------
+if ! command -v gh >/dev/null 2>&1; then
+  echo "Error: gh (GitHub CLI) is required but not installed." >&2
+  echo "Install: https://cli.github.com" >&2
+  exit 1
+fi
+
+PACK_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+
+IS_WINDOWS=0
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*|Windows_NT) IS_WINDOWS=1 ;;
+esac
+
+# Symlink on macOS/Linux. On Windows without Developer Mode, a plain `ln -snf`
+# silently creates a frozen copy that doesn't refresh after `git pull`, so we
+# copy explicitly there instead (same tradeoff gstack's setup makes).
+_link_or_copy() {
+  local src="$1" dst="$2"
+  if [ "$IS_WINDOWS" -eq 1 ]; then
+    rm -rf "$dst"
+    cp -R "$src" "$dst"
+  else
+    ln -snf "$src" "$dst"
+  fi
+}
+
+# Register PACK_DIR under a host's skills directory as "zstack".
+# The pack ships four skills (z-setup, z-plan, z-loop, z-status); registering the
+# pack dir makes all of them discoverable to the host at once.
+register() {
+  local skills_dir="$1" label="$2"
+  mkdir -p "$skills_dir"
+  local target="$skills_dir/zstack"
+
+  # Already installed directly inside a skills/ dir (e.g. cloned straight to
+  # ~/.claude/skills/zstack)? Then target == PACK_DIR: symlinking or copying
+  # it onto itself would corrupt it (Windows copy path does `rm -rf "$dst"`
+  # first). Detect via parent-dir match and skip.
+  local skills_real pack_parent_real
+  skills_real="$(cd "$skills_dir" && pwd -P)"
+  pack_parent_real="$(cd "$(dirname "$PACK_DIR")" && pwd -P)"
+  if [ "$skills_real" = "$pack_parent_real" ]; then
+    echo "  $label: already installed at $PACK_DIR"
+    return 0
+  fi
+
+  # Target exists as a real (non-symlink) dir pointing somewhere else? Don't
+  # clobber a separate install.
+  if [ -e "$target" ] && [ ! -L "$target" ]; then
+    local existing_real
+    existing_real="$(cd "$target" 2>/dev/null && pwd -P || echo "")"
+    if [ -n "$existing_real" ] && [ "$existing_real" != "$PACK_DIR" ]; then
+      echo "  $target already exists as a separate install; skipping $label registration." >&2
+      return 0
+    fi
+  fi
+
+  _link_or_copy "$PACK_DIR" "$target"
+  echo "  registered for $label: $target"
+}
+
+register "$HOME/.claude/skills" "Claude Code"
+
+# Codex/Factory: same auto-detection gstack's setup uses (binary on PATH).
+if command -v codex >/dev/null 2>&1; then
+  register "$HOME/.codex/skills" "Codex"
+fi
+if command -v droid >/dev/null 2>&1; then
+  register "$HOME/.factory/skills" "Factory"
+fi
+
+if [ "$TEAM_MODE" -eq 1 ]; then
+  echo "Team mode requested: no session hooks to register (the four shipped skills -- z-setup, z-plan, z-loop, z-status -- need none)."
+fi
+
+echo "zstack setup complete."

@@ -1,0 +1,3 @@
+{"skill":"land-and-deploy","atMs":1000,"note":"CI green, deploy dry-run OK (fixture stub), production health verified"}
+{"skill":"canary","atMs":2000,"note":"no error-rate regression in the canary window"}
+{"skill":"document-release","atMs":3000,"note":"docs/user-guide updated for /health + /metrics"}

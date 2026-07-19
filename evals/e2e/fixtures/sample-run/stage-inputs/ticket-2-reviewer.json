@@ -1,0 +1,6 @@
+{
+  "ticketBody": "## Context\n/health returns a bare ok. Report uptime + version.\n\n## Plan\nUse the respond helper (#1) in route('/health').\n\n### Acceptance Criteria\n- GET /health -> {status:'ok', uptimeSeconds:number, version:string}.\n- uptimeSeconds grows across calls.\n\n## Tests + evals\ntest/routes.test.ts health cases.\n\n## Docs pages touched\ndocs/user-guide/index.md.\n\n## Out of scope\nAuth.\n\nDepends on: #1",
+  "acceptanceCriteria": "- GET /health -> {status:'ok', uptimeSeconds:number, version:string}.\n- uptimeSeconds grows across calls.",
+  "diff": "diff --git a/src/routes.ts b/src/routes.ts\n@@\n-    case \"/health\":\n-      return { status: 200, body: { status: \"ok\" } };\n+    case \"/health\":\n+      return ok({ status: \"ok\", uptimeSeconds: process.uptime(), version: VERSION });",
+  "worktreePath": "/tmp/z-review-2"
+}

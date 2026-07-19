@@ -1,0 +1,2 @@
+{"type":"user","message":{"role":"user","content":"Build ticket #2"}}
+{"type":"assistant","requestId":"req-t2-a","message":{"model":"claude-sonnet-4-5-20260101","usage":{"input_tokens":150000,"output_tokens":30000,"cache_read_input_tokens":400000,"cache_creation_input_tokens":0}}}

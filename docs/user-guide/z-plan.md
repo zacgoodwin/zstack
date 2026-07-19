@@ -1,0 +1,59 @@
+# /z-plan
+
+Turns a plan/spec file into milestones and board-ready GitHub tickets: each
+grounded in the real codebase, written to the enforced body schema, fielded with
+a Model / Model Effort recommendation and a reproducible dollar Estimate, and
+linked to its dependencies both directions. Idempotent: re-running on the same
+spec updates tickets in place instead of duplicating.
+
+Full skill contract: `z-plan/SKILL.md`. Usable outside the loop (it is the
+"planner" box of the develop stage) or automatically as the loop's planning pass.
+
+## When to run it
+
+After `/z-setup`, whenever you have a spec to turn into tickets:
+
+```bash
+/z-plan path/to/spec.md
+```
+
+With no argument it defaults to the newest gstack CEO plan for the repo.
+
+## What it does
+
+1. **Grounds in the codebase first.** Reads the files the spec touches; every
+   ticket's `## Plan` cites real paths and line refs, not guesses.
+2. **Milestones per `epicStyle`.** Groups work into epics. Only `milestones` is
+   supported today; the `issue-type` style (epic issue + sub-issues) is not yet
+   supported (issue #14).
+3. **Drafts each ticket to the schema and gates it.** Mandatory sections:
+   `## Context`, `## Plan`, `### Acceptance Criteria` (setup → action → expected,
+   authored before any code), `## Tests + evals`, `## Docs pages touched`,
+   `## Out of scope`, and an optional `Depends on:` line. Every body must pass
+   `bin/z-ticket-lint` before it hits the board.
+4. **Splits oversized tickets.** A ticket needing more than a 400K-token context
+   is broken into ordered subtasks (the `needsSplit` gate), with the order
+   recorded in the parent.
+5. **Fields and a reproducible Estimate.** Model + Model Effort per the
+   ESTIMATION.md rules of thumb (when in doubt, tier up — rework is expensive).
+   The tier selects a fixed bucket entry that `bin/z-estimate` prices, so the same
+   spec always yields the same dollar figure. No arithmetic in prose.
+6. **Dependencies both directions.** Finds or creates each dependency, links
+   "N Depends on #M" and "M Blocks #N", and pulls the next-to-analyze dependents
+   into Ready.
+7. **Questions to a human.** A genuine ambiguity (Confusion Protocol bar) is
+   commented on the ticket and the ticket moved to Questions — never guessed into
+   the plan.
+
+## Dry-run / eval mode
+
+`/z-plan --dry-run <spec>` emits the full result (each ticket body + fields +
+`Depends on:` lines) to stdout with no board writes, so a scorer can grade it
+offline. This is what the planner eval (`evals/planner/`) runs through local
+`claude -p`.
+
+## Done when
+
+Every filed ticket passes the lint gate, carries Model/Effort/Estimate via
+`z-board`, links its dependencies both ways, splits anything over the context
+gate, parks open questions, and a re-run creates zero duplicates.

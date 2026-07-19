@@ -1,0 +1,11 @@
+{
+  "tickets": [
+    { "number": 1, "title": "Structured JSON response helper", "status": "Done", "dependsOn": [], "model": "sonnet", "modelEffort": "medium" },
+    { "number": 2, "title": "Health route reports uptime and version", "status": "Done", "dependsOn": [1], "model": "sonnet", "modelEffort": "medium" },
+    { "number": 3, "title": "Metrics route aggregates request counts", "status": "Done", "dependsOn": [2], "model": "sonnet", "modelEffort": "medium" }
+  ],
+  "lanes": [],
+  "maxLanes": 3,
+  "watchdogMinutes": 10,
+  "mergedThisRun": [1, 2, 3]
+}

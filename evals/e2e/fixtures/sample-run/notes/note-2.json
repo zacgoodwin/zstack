@@ -1,0 +1,13 @@
+{
+  "shipped": "Reworked GET /health in src/routes.ts to report process uptime and the package version via the respond helper from #1",
+  "prUrl": "https://github.com/acme/fixture-app/pull/2",
+  "acceptancePassed": [
+    "GET /health -> 200 with {status:'ok', uptimeSeconds:<number>, version:<string>}",
+    "uptimeSeconds increases across two calls a second apart"
+  ],
+  "edges": [
+    { "check": "the reported version source", "doStep": "bump version in package.json and restart", "expect": "the /health version field tracks package.json, not a hardcoded constant" }
+  ],
+  "filedTickets": [],
+  "actualDollars": 1.02
+}

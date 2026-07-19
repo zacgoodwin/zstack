@@ -1,0 +1,6 @@
+{
+  "ticketBody": "## Context\nAll routes hand-build ad-hoc JSON. Add one helper so shapes stay consistent.\n\n## Plan\nAdd src/respond.ts with ok()/err(); route() in src/routes.ts returns through it.\n\n### Acceptance Criteria\n- ok(body) -> {status:200, body}.\n- err(404,'x') -> {status:404, body:{error:'x'}}.\n\n## Tests + evals\nUnit tests for ok/err in test/respond.test.ts.\n\n## Docs pages touched\ndocs/user-guide/index.md response shapes.\n\n## Out of scope\nContent negotiation.",
+  "acceptanceCriteria": "- ok(body) -> {status:200, body}.\n- err(404,'x') -> {status:404, body:{error:'x'}}.",
+  "diff": "diff --git a/src/respond.ts b/src/respond.ts\nnew file mode 100644\n+++ b/src/respond.ts\n@@\n+export const ok = (body: unknown) => ({ status: 200, body });\n+export const err = (status: number, error: string) => ({ status, body: { error } });",
+  "worktreePath": "/tmp/z-review-1"
+}

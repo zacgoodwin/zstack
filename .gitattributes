@@ -1,2 +1,22 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# The `setup` script is bash, checked in without a .sh suffix. Without this,
+# Windows checkouts with core.autocrlf=true rewrite it to CRLF, which breaks
+# bash keywords ("fi\r", "then\r" aren't recognized). Same fix as gstack's setup.
+setup   text eol=lf
+bin/z-board text eol=lf
+bin/z-estimate text eol=lf
+bin/z-cost text eol=lf
+bin/z-setup-board text eol=lf
+bin/z-setup-permissions text eol=lf
+bin/z-ticket-lint text eol=lf
+# Extensionless bash in the eval fixture app; same CRLF hazard as setup.
+evals/fixture-app/scripts/deploy text eol=lf
+*.ts    text eol=lf
+*.json  text eol=lf
+*.jsonl text eol=lf
+*.toml  text eol=lf
+
+# Diagrams: never touch bytes.
+*.png binary

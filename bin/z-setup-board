@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Thin entry for the /z-setup GraphQL half: everything lives in lib/setup-board.ts
+# under bun. This wrapper only resolves its own location and hands off; the gh
+# call is reused from lib/board.ts (the sole gh caller in the pack).
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+exec bun "$HERE/../lib/setup-board.ts" "$@"

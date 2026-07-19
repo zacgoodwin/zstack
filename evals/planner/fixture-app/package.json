@@ -1,0 +1,10 @@
+{
+  "name": "shortcli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Toy link-shortener CLI used as the /z-plan eval target. Only src/store.ts exists so far; the eval spec asks the planner to build the rest.",
+  "scripts": {
+    "test": "bun test"
+  }
+}
