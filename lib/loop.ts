@@ -298,6 +298,15 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
     if (lane.outcome) continue;
     if (!watchdogExpired(lane, opts.nowMs, wd)) continue;
     if (lane.workerDead) {
+      // A dead MERGE worker is never blind-skipped (issue #14 H9): `gh pr merge`
+      // may have landed the PR before the worker died, and skipping would lose it
+      // from mergedThisRun (breaking a stacked child's step-18 retarget) and let
+      // batch-end branch deletion close the dependent PR. The SKILL must verify PR
+      // state via `gh pr view` and record an outcome -- `merged` (-> complete,
+      // counted in mergedThisRun) if it landed, else `stage-blocked` (-> park
+      // Blocked for a human). So a dead merge lane holds at check-worker until an
+      // outcome is recorded, never falling through to skip.
+      if (lane.stage === "merge") return { kind: "check-worker", ticket: lane.ticket };
       return { kind: "skip", ticket: lane.ticket, note: `Worker died mid-${lane.stage}: silent past the ${wd}-minute watchdog and not alive on probe. Skipped per the PROCESS.md no-token-burn rule; worktree left for inspection.` };
     }
     return { kind: "check-worker", ticket: lane.ticket };
@@ -323,9 +332,24 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
     return { kind: "claim", ticket: t.number, stage: claimStage(t.status) };
   }
 
-  // 6. Lanes idle, nothing claimable, work remains: a dependency cycle (or a
-  // dep chain ending in one). Park the lowest ticket to break it.
+  // 6. Lanes idle, nothing claimable, work remains. Two very different cases hide
+  //    here (issue #14 C7): a genuine in-batch deadlock (a dependency cycle, or a
+  //    dep that can never complete in this batch) that MUST be broken by parking to
+  //    avoid a token-burning spin; versus a dependent merely waiting on a dep that
+  //    ANOTHER live session is still building (claimedByOther). The second will
+  //    complete and re-ingest will unblock it, so it must WAIT, never park.
+  //    Discriminator: at this point nothing in THIS batch can advance (no lanes, no
+  //    claimable), so the only external progress possible is a claimedByOther dep.
+  //    If any stuck ticket depends on one, wait; otherwise the stuck set is a real
+  //    deadlock -- park the lowest to break it.
   if (lanes.length === 0 && claimable.length === 0 && unclaimed.length > 0) {
+    const waitsOnOtherSession = unclaimed.some((t) =>
+      t.dependsOn.some((d) => {
+        const dep = byNumber.get(d);
+        return dep !== undefined && dep.claimedByOther === true && dep.status !== "Done";
+      })
+    );
+    if (waitsOnOtherSession) return { kind: "wait" };
     const t = unclaimed[0];
     return { kind: "park", ticket: t.number, status: "Blocked", note: `Dependency deadlock: depends on #${t.dependsOn.join(", #")} and no lane can make progress. Likely a dependency cycle in the batch.` };
   }
@@ -483,9 +507,17 @@ export function ingestBoardItems(
     if (prevByNumber.get(it.number)?.claimedByOther) t.claimedByOther = true;
     return t;
   });
+  // Drop any lane whose ticket vanished from the snapshot (issue #14 H14): if an
+  // issue is removed from the project mid-run, keeping its lane would make the
+  // next apply throw in findTicket and wedge every subsequent apply. The worker
+  // (if any) is left for the SKILL to tear down; the loop simply stops tracking a
+  // ticket the board no longer knows about.
+  const present = new Set(tickets.map((t) => t.number));
+  const lanes = (prev?.lanes ?? []).filter((l) => present.has(l.ticket));
+
   return {
     tickets: tickets.sort((a, b) => a.number - b.number),
-    lanes: structuredClone(prev?.lanes ?? []),
+    lanes: structuredClone(lanes),
     maxLanes: cfg?.maxLanes ?? prev?.maxLanes ?? DEFAULT_MAX_LANES,
     watchdogMinutes: cfg?.watchdogMinutes ?? prev?.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES,
     mergedThisRun: [...(prev?.mergedThisRun ?? [])],

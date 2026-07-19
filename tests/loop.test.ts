@@ -354,6 +354,97 @@ describe("drain-complete", () => {
   });
 });
 
+// -- deadlock breaker vs cross-session deps (issue #14 C7) --------------------
+
+describe("deadlock breaker excludes still-completable deps", () => {
+  test("a ticket whose only unsatisfied dep is claimedByOther waits, never parks", () => {
+    // #2 is being built by another session (claimedByOther, not Done). #1 depends
+    // on it. There is no in-batch cycle -- #2 will finish elsewhere -- so #1 must
+    // WAIT, not be wrongly parked Blocked as a phantom cycle.
+    const s = state([ticket(1, "Building", [2]), ticket(2, "Building", [], { claimedByOther: true })]);
+    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toEqual({ kind: "wait" });
+  });
+
+  test("a genuine in-batch 2-cycle still parks the lowest ticket Blocked", () => {
+    const s = state([ticket(1, "Building", [2]), ticket(2, "Building", [1])]);
+    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toMatchObject({
+      kind: "park", ticket: 1, status: "Blocked", note: expect.stringContaining("cycle"),
+    });
+  });
+
+  test("a dep that can never complete in THIS batch (Backlog, not claimed elsewhere) parks, never waits forever", () => {
+    // #7 (Ready) depends on #8 which sits in Backlog: the loop never pulls Backlog
+    // into the batch and no other session owns it, so waiting would burn tokens
+    // forever. It must park Blocked so a human notices -- NOT wait.
+    const s = state([ticket(7, "Ready", [8]), ticket(8, "Backlog")]);
+    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toMatchObject({ kind: "park", ticket: 7, status: "Blocked" });
+  });
+
+  test("a real cycle plus a cross-session dependent waits until the external work resolves", () => {
+    // #1<->#2 are a real cycle, but #3 waits on #9 (claimed elsewhere). Not EVERY
+    // stuck ticket is mutually blocked, so wait rather than park anything yet; once
+    // #9 lands and #3 drains, the residual pure cycle parks on a later tick.
+    const s = state([
+      ticket(1, "Building", [2]),
+      ticket(2, "Building", [1]),
+      ticket(3, "Building", [9]),
+      ticket(9, "Building", [], { claimedByOther: true }),
+    ]);
+    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toEqual({ kind: "wait" });
+  });
+});
+
+// -- dead merge worker: verify PR, don't blind-skip (issue #14 H9) ------------
+
+describe("dead merge worker path", () => {
+  const MIN = 60_000;
+
+  test("a dead merge lane is held at check-worker, never blind-skipped", () => {
+    const s = state([ticket(1, "Review")], [lane(1, "merge", { workerDead: true, lastActivityMs: 0 })]);
+    // Silent past the watchdog AND probed dead: a normal stage would skip here.
+    const a = nextAction(s.tickets, s.lanes, { ...OPTS(s), nowMs: 11 * MIN });
+    expect(a).toEqual({ kind: "check-worker", ticket: 1 });
+  });
+
+  test("recording MERGED on the dead merge lane completes it and counts mergedThisRun", () => {
+    let s = state([ticket(1, "Review")], [lane(1, "merge", { workerDead: true })]);
+    // The SKILL's gh pr view found the PR landed before the worker died.
+    s = recordOutcome(s, 1, "MERGED: https://pr/9", 0);
+    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(a).toMatchObject({ kind: "complete", ticket: 1 });
+    s = applyAction(s, a, 0);
+    expect(s.tickets[0].status).toBe("Done");
+    expect(s.mergedThisRun).toContain(1); // retarget/branch-delete logic still sees it
+  });
+
+  test("a dead non-merge worker still skips (regression guard)", () => {
+    const s = state([ticket(1, "Building")], [lane(1, "builder", { workerDead: true, lastActivityMs: 0 })]);
+    expect(nextAction(s.tickets, s.lanes, { ...OPTS(s), nowMs: 11 * MIN }).kind).toBe("skip");
+  });
+});
+
+// -- ingest drops an orphaned lane (issue #14 H14) ---------------------------
+
+describe("ingest drops a lane whose ticket vanished", () => {
+  test("a lane whose ticket left the board is dropped; nextAction/apply never throw", () => {
+    const prev: LoopState = {
+      tickets: [ticket(1, "Building"), ticket(2, "Building")],
+      lanes: [lane(1, "builder"), lane(2, "builder", { outcome: { kind: "built" } })],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      mergedThisRun: [],
+    };
+    // #2 was removed from the project mid-run; the snapshot only has #1. Before the
+    // fix, lane #2 survived and the next apply threw in findTicket(#2), wedging
+    // every subsequent apply.
+    const s = ingestBoardItems(prev, [{ number: 1, title: "t1", fields: { Status: "Building" } }], { "1": "" });
+    expect(s.tickets.map((t) => t.number)).toEqual([1]);
+    expect(s.lanes.map((l) => l.ticket)).toEqual([1]); // lane #2 dropped
+    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(() => applyAction(s, a, 0)).not.toThrow();
+  });
+});
+
 // -- fresh-stage guarantee (AC4): lane state carries no conversation id -------
 
 describe("fresh-stage lane state", () => {

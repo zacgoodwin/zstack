@@ -25,7 +25,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import {
   DEFAULT_LOCK_STALENESS_MINUTES,
@@ -49,7 +49,8 @@ export interface LaneLock {
 export interface LoopLock {
   session: string;
   startedAt: number; // ms
-  pid?: number; // best-effort; when present it decides liveness
+  pid?: number; // best-effort; when present AND its identity is confirmable it decides liveness
+  host?: string; // the machine that wrote the lock; a foreign host makes the pid unverifiable
 }
 
 export type LockLiveness = "live" | "stale";
@@ -154,8 +155,9 @@ export function readLoopLock(locksDir: string): LoopLock | null {
 
 // Is the process holding a loop lock alive on THIS host? signal 0 checks
 // existence: EPERM means it exists but is another user's (alive); ESRCH / any
-// other error means gone. ponytail: assumes same host, which holds for local
-// Claude Code (CLAUDE.md); upgrade path is recording the hostname in the lock.
+// other error means gone. Only meaningful when the lock was written on THIS host
+// (see confirmIdentity) -- a pid alive here says nothing about a lock from another
+// machine, and the same integer may have been recycled to an unrelated process.
 export function processAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -166,16 +168,35 @@ export function processAlive(pid: number): boolean {
   }
 }
 
-// A verifiable pid is definitive (a crashed loop's dead pid reads stale at once,
-// a running loop's live pid reads live); with no pid we fall back to the age
-// heuristic against the configured staleness threshold. Clock injected.
+// Can we trust this lock's pid as "our loop's pid" on this machine? Only when the
+// lock records the SAME host we're running on. A foreign host (or a host-less
+// legacy lock) is unconfirmable: process.kill would probe THIS host's pid space,
+// so a coincidentally-live local pid would falsely read the foreign lock as live.
+export function sameHost(lock: LoopLock, host: string = hostname()): boolean {
+  return lock.host !== undefined && lock.host === host;
+}
+
+// Liveness with pid-reuse safety (issue #14 H12). A pid is trusted only when it is
+// (a) confirmably ours -- alive AND from this host -- which reads "live"; a
+// confirmably-dead pid reads "stale" immediately (a crashed loop recovers without
+// waiting out the staleness window). When the pid is present but UNCONFIRMABLE
+// (foreign host, or a recycled pid we can't attribute), we do NOT let it pin the
+// lock "live forever"; we fall back to the age heuristic so --reconcile can clear
+// a genuinely stale lock. Clock and both probes injected for deterministic tests.
+// ponytail: same-host pid reuse within the staleness window still reads live
+// (upgrade path: an OS process-start-time check plugged into confirmIdentity).
 export function loopLockLiveness(
   lock: LoopLock,
   nowMs: number,
   stalenessMs: number,
-  isAlive: (pid: number) => boolean = processAlive
+  isAlive: (pid: number) => boolean = processAlive,
+  confirmIdentity: (lock: LoopLock) => boolean = (l) => sameHost(l)
 ): LockLiveness {
-  if (lock.pid !== undefined) return isAlive(lock.pid) ? "live" : "stale";
+  if (lock.pid !== undefined) {
+    if (!isAlive(lock.pid)) return "stale"; // dead pid: our loop is definitely gone
+    if (confirmIdentity(lock)) return "live"; // alive AND provably ours
+    // alive but unconfirmable: fall through to age rather than trust a maybe-reused pid.
+  }
   return nowMs - lock.startedAt > stalenessMs ? "stale" : "live";
 }
 
@@ -225,9 +246,41 @@ export function acquireLoopLock(
   if (liveness.state === "stale" && !opts.reconcile) {
     return { acquired: false, held: liveness.lock, reason: "stale" };
   }
-  // stale + reconcile (or the file vanished between checks): overwrite.
-  atomicWrite(path, body);
-  return { acquired: true };
+  // stale + reconcile: clear the stale lock and take a fresh one WITHOUT abandoning
+  // the exclusive-create guard (issue #14 H11). The old code atomicWrite()+return
+  // let two racing --reconcile invocations both "acquire". Serialize the whole
+  // clear-and-replace through a one-shot claim file: exactly one racer wins the
+  // exclusive-create of the claim, and only under it does it re-inspect + clear a
+  // STILL-stale lock and take the loop lock (also exclusive-create). Every loser
+  // -- of the claim, or of a fresh lock a racer wrote first -- re-inspects and
+  // defers. ponytail: a process killed inside the (synchronous) claimed section
+  // could orphan the claim file and wedge future reconciles; the window is one
+  // uninterrupted burst of sync fs calls, so this is a documented ceiling.
+  const claimPath = `${path}.reconcile`;
+  try {
+    writeFileSync(claimPath, `${lock.session}\n`, { flag: "wx", mode: 0o600 });
+  } catch (e: any) {
+    if (e?.code !== "EEXIST") throw e; // another reconcile holds the claim: defer to it
+    const again = inspectLoopLock(locksDir, opts.nowMs, opts.stalenessMs, opts.isAlive);
+    return { acquired: false, held: again.lock, reason: again.state === "live" ? "live" : "stale" };
+  }
+  try {
+    // Under the claim: a racer that reconciled just ahead of us leaves a fresh LIVE
+    // lock -- never clear that.
+    const under = inspectLoopLock(locksDir, opts.nowMs, opts.stalenessMs, opts.isAlive);
+    if (under.state === "live") return { acquired: false, held: under.lock, reason: "live" };
+    rmSync(path, { force: true }); // clear the (still) stale lock
+    try {
+      writeFileSync(path, body, { flag: "wx", mode: 0o600 });
+      return { acquired: true };
+    } catch (e: any) {
+      if (e?.code !== "EEXIST") throw e; // a fresh loop grabbed it in the gap: defer
+      const again = inspectLoopLock(locksDir, opts.nowMs, opts.stalenessMs, opts.isAlive);
+      return { acquired: false, held: again.lock, reason: again.state === "live" ? "live" : "stale" };
+    }
+  } finally {
+    rmSync(claimPath, { force: true });
+  }
 }
 
 export function releaseLoopLock(locksDir: string): void {
@@ -282,17 +335,30 @@ function requireFlag(flags: Record<string, string | boolean>, name: string): str
   return v;
 }
 
+// Parses --staleness-minutes to a finite positive number, ZError otherwise
+// (issue #14 M19). A garbage value (e.g. a typo'd number) used to yield NaN, and
+// `nowMs - startedAt > NaN` is always false -- so every no-pid lock read "live"
+// forever and no --reconcile could ever clear it. Fail loud instead of silently
+// disabling the staleness judgment.
+function stalenessMinutes(stale: string | undefined, fallback: number): number {
+  if (stale === undefined) return fallback;
+  const min = Number(stale);
+  if (!Number.isFinite(min) || min <= 0) {
+    throw new ZError(`--staleness-minutes must be a positive number of minutes, got ${JSON.stringify(stale)}.`);
+  }
+  return min;
+}
+
 // Resolves the locks dir and staleness ms for a CLI invocation: --dir wins for
 // tests; otherwise ~/.zstack/projects/<slug>/locks and the config's threshold.
 function resolveDir(flags: Record<string, string | boolean>): { locksDir: string; stalenessMs: number } {
   const dir = str(flags, "dir");
   const stale = str(flags, "staleness-minutes");
   if (dir) {
-    const min = stale !== undefined ? Number(stale) : DEFAULT_LOCK_STALENESS_MINUTES;
-    return { locksDir: dir, stalenessMs: min * 60_000 };
+    return { locksDir: dir, stalenessMs: stalenessMinutes(stale, DEFAULT_LOCK_STALENESS_MINUTES) * 60_000 };
   }
   const cfg = loadConfig(requireFlag(flags, "slug"));
-  const min = stale !== undefined ? Number(stale) : cfg.lockStalenessMinutes ?? DEFAULT_LOCK_STALENESS_MINUTES;
+  const min = stalenessMinutes(stale, cfg.lockStalenessMinutes ?? DEFAULT_LOCK_STALENESS_MINUTES);
   return { locksDir: defaultLocksDir(cfg.slug), stalenessMs: min * 60_000 };
 }
 
@@ -308,7 +374,9 @@ export function main(argv: string[]): number {
 
     if (cmd === "acquire") {
       const { locksDir, stalenessMs } = resolveDir(flags);
-      const lock: LoopLock = { session: requireFlag(flags, "session"), startedAt: nowMs };
+      // host is recorded so a lock's pid is only trusted on the machine that wrote
+      // it (issue #14 H12): a foreign-host lock falls back to the age heuristic.
+      const lock: LoopLock = { session: requireFlag(flags, "session"), startedAt: nowMs, host: hostname() };
       const pid = str(flags, "pid");
       if (pid !== undefined) lock.pid = Number(pid);
       const res = acquireLoopLock(locksDir, lock, { nowMs, stalenessMs, reconcile: flags.reconcile === true });

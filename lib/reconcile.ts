@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { Board, ghExecutor } from "./board.ts";
 import { ZError, loadConfig } from "./config.ts";
 import { defaultLocksDir, listLaneLocks, type LaneLock } from "./locks.ts";
-import type { BoardStatus, LaneState, TicketSnapshot } from "./loop.ts";
+import { BOARD_STATUSES, type BoardStatus, type LaneState, type TicketSnapshot } from "./loop.ts";
 
 export { ZError } from "./config.ts";
 
@@ -25,16 +25,26 @@ export { ZError } from "./config.ts";
 // parked back to Ready alongside the prune.
 const INFLIGHT: BoardStatus[] = ["Building", "QA", "Review"];
 
+// Terminal-for-this-batch statuses (mirrors lib/loop.ts). A crashed lane whose
+// ticket already reached one of these did its work (Done) or was intentionally
+// parked by a human (Questions/Blocked/Skipped): reconcile must NOT reopen it
+// (issue #14 C4) -- a crash between the Done move and lock removal would otherwise
+// rebuild already-merged work. Such a lane is only pruned + unlocked.
+const TERMINAL: BoardStatus[] = ["Done", "Questions", "Blocked", "Skipped"];
+
 export type BoardTicketStatus = Pick<TicketSnapshot, "number" | "status">;
 
-// A lane lock left behind by a crashed loop: its ticket must be released,
-// parked back to Ready, its worktree (if any) pruned, and the lock removed.
+// A lane lock left behind by a crashed loop. How it is reconciled depends on the
+// ticket's current board status (issue #14 C4): an INFLIGHT lane is released +
+// parked to Ready + pruned + unlocked; a TERMINAL lane (the work already landed
+// or a human parked it) is only pruned + unlocked.
 export interface CrashedLane {
   ticket: number;
   lockPath: string;
   lock: LaneLock;
   ageMs: number;
   worktreePath?: string;
+  boardStatus?: BoardStatus; // the ticket's status in the board snapshot, if present
 }
 
 // A worktree with no backing lock. Pruned; also parked when the board still
@@ -92,6 +102,7 @@ export function scanOrphans(
     lock: l.lock,
     ageMs: nowMs - l.lock.claimedAt,
     worktreePath: wtByTicket.get(l.lock.ticket)?.path,
+    boardStatus: statusByTicket.get(l.lock.ticket),
   }));
 
   const orphanWorktrees: OrphanWorktree[] = worktrees
@@ -118,13 +129,24 @@ export type ReconcileAction =
   | { kind: "prune-worktree"; ticket: number; path: string }
   | { kind: "remove-lock"; ticket: number; path: string };
 
-// Pure: orphans in, ordered action list out. For each crashed lane: release the
-// assignee, prune its worktree (if present), park it to Ready, remove its lock.
+// Pure: orphans in, ordered action list out. For each crashed lane the board
+// status decides the recovery (issue #14 C4):
+//   * TERMINAL (Done/Questions/Blocked/Skipped): the work already landed or a
+//     human parked it -- ONLY prune the worktree + remove the lock. Never release
+//     or park, which would reopen merged work or undo a human's decision.
+//   * INFLIGHT or unknown: release the assignee, prune its worktree (if present),
+//     park it back to Ready, remove its lock -- the crash left it mid-build.
 // A lockless worktree is pruned, and also released+parked when the board still
 // thinks it in-flight. A Building ticket with no on-disk state is released+parked.
 export function reconcilePlan(orphans: Orphans): ReconcileAction[] {
   const actions: ReconcileAction[] = [];
   for (const c of orphans.crashedLanes) {
+    if (c.boardStatus && TERMINAL.includes(c.boardStatus)) {
+      // Terminal: leave the board alone; just clear the crashed run's on-disk state.
+      if (c.worktreePath) actions.push({ kind: "prune-worktree", ticket: c.ticket, path: c.worktreePath });
+      actions.push({ kind: "remove-lock", ticket: c.ticket, path: c.lockPath });
+      continue;
+    }
     actions.push({ kind: "release-claim", ticket: c.ticket });
     if (c.worktreePath) actions.push({ kind: "prune-worktree", ticket: c.ticket, path: c.worktreePath });
     actions.push({
@@ -250,10 +272,13 @@ function parseFlags(args: string[]): Record<string, string> {
   return flags;
 }
 
+// Sweeps EVERY status, not just the in-flight ones (issue #14 C4): a crashed
+// lane's recovery hinges on whether its ticket is already terminal (Done/parked),
+// so the plan needs the full board picture, not only Building/QA/Review.
 async function sweep(board: Board): Promise<BoardTicketStatus[]> {
   const out: BoardTicketStatus[] = [];
-  for (const status of INFLIGHT) {
-    for (const it of await board.list(status)) out.push({ number: it.number, status: status as BoardStatus });
+  for (const status of BOARD_STATUSES) {
+    for (const it of await board.list(status)) out.push({ number: it.number, status });
   }
   return out;
 }

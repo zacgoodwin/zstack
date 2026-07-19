@@ -99,7 +99,9 @@ describe("setup preconditions", () => {
 
     const registered = join(home, ".claude", "skills", "zstack");
     expect(existsSync(registered)).toBe(true);
-    expect(readFileSync(join(registered, "VERSION"), "utf8").trim()).toBe("0.1.0");
+    expect(readFileSync(join(registered, "VERSION"), "utf8").trim()).toBe(
+      readFileSync(join(REPO_ROOT, "VERSION"), "utf8").trim()
+    ); // the registered copy matches the repo VERSION (whatever the parent bumped it to)
   });
 
   test("--team flag is accepted", () => {
@@ -142,7 +144,9 @@ describe("references/ restructure", () => {
 
 describe("root scaffold", () => {
   test("VERSION starts at 0.1.0", () => {
-    expect(readFileSync(join(REPO_ROOT, "VERSION"), "utf8").trim()).toBe("0.1.0");
+    // Matches the 0.1.0 line whether or not the parent has appended a release
+    // segment (e.g. 0.1.0.0); the point is the pack shipped at the 0.1.0 baseline.
+    expect(readFileSync(join(REPO_ROOT, "VERSION"), "utf8").trim()).toMatch(/^0\.1\.0(\.\d+)?$/);
   });
 
   test("package.json wires bun test", () => {

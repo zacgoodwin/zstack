@@ -34,6 +34,10 @@ Z_ESTIMATE="$PACK/bin/z-estimate"
 Z_LINT="$PACK/bin/z-ticket-lint"
 TIERS="$PACK/z-plan/tiers.json"
 SLUG=$(gh repo view --json name -q .name)   # one board per repo; matches /z-setup
+export ZSTACK_SLUG="$SLUG"   # H13: so any z-board call that omits --slug still
+                             # resolves the right project (resolveSlug honors
+                             # ZSTACK_SLUG) instead of throwing "Multiple zstack
+                             # projects" on a multi-project machine.
 ```
 
 ---

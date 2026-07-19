@@ -20,6 +20,7 @@ import {
   buildBugTicket,
   buildEndLoopReport,
   endLoopPlan,
+  peekLoopCounter,
   readLoopCounter,
   writeLoopCounter,
   ZError,
@@ -258,6 +259,40 @@ describe("AC3: counter at 4 -> no audits; at 5 -> both fire; persistence tested"
   test("endLoopPlan rejects a non-positive loopCount (must be the post-increment value)", () => {
     expect(() => endLoopPlan(GREEN, 0)).toThrow(ZError);
     expect(() => endLoopPlan(GREEN, -1)).toThrow(ZError);
+  });
+
+  // -- issue #14 H17: peek (no write) + bump-last is crash-safe cadence --------
+  test("peek returns the prospective next count WITHOUT persisting it", () => {
+    const path = join(tmp(), "loop-counter");
+    writeLoopCounter(path, 4);
+    expect(peekLoopCounter(path)).toBe(5);
+    expect(readLoopCounter(path)).toBe(4); // NOT advanced -- peek never writes
+    expect(peekLoopCounter(path)).toBe(5); // idempotent: repeated peeks are stable
+  });
+
+  test("peek then bump return the same value on a clean run", () => {
+    const path = join(tmp(), "loop-counter"); // missing -> reads 0
+    const planned = peekLoopCounter(path); // 1, used to size the plan mid-loop
+    // ... end-of-loop work happens here ...
+    const persisted = bumpLoopCounter(path); // persisted AFTER the report
+    expect(planned).toBe(1);
+    expect(persisted).toBe(planned);
+    expect(readLoopCounter(path)).toBe(1);
+  });
+
+  test("a crash after peek but before bump does NOT drift the cadence", () => {
+    const path = join(tmp(), "loop-counter");
+    writeLoopCounter(path, 4); // four loops completed
+    // Loop 5 begins: peek says 5, its plan would include the audits...
+    expect(peekLoopCounter(path)).toBe(5);
+    // ...but the loop crashes before bumping. Counter is untouched.
+    expect(readLoopCounter(path)).toBe(4);
+    // The re-run peeks 5 again (same loop id, audits still due) -- no forward drift.
+    expect(peekLoopCounter(path)).toBe(5);
+    expect(endLoopPlan(GREEN, peekLoopCounter(path))).toContain("cso");
+    // Only a clean finish advances it.
+    expect(bumpLoopCounter(path)).toBe(5);
+    expect(peekLoopCounter(path)).toBe(6);
   });
 });
 

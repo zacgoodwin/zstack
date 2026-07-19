@@ -107,13 +107,24 @@ export function writeLoopCounter(path: string, value: number): void {
   atomicWrite(path, `${value}\n`);
 }
 
-// The single read-increment-persist cycle the SKILL calls once per loop: reads
-// the current count (0 if missing), increments, persists atomically, and
-// returns the NEW value -- the loopCount endLoopPlan expects.
+// The single read-increment-persist cycle the SKILL calls ONCE per loop, at the
+// very end (after the report). Kept crash-safe by pairing with peekLoopCounter:
+// the loop computes its plan from the peek (no write) and only persists here, so
+// a crash before this point re-runs the same loop id rather than drifting the
+// 5th-loop cadence forward by one (issue #14 H17).
 export function bumpLoopCounter(path: string): number {
   const next = readLoopCounter(path) + 1;
   writeLoopCounter(path, next);
   return next;
+}
+
+// The prospective post-increment count WITHOUT persisting it (issue #14 H17). The
+// SKILL peeks this at the START of the end-of-loop stage to size the plan (the
+// 5th-loop cadence), does all its work, then calls bumpLoopCounter AFTER the
+// report -- so peek and the later bump return the same value on a clean run, and a
+// crash in between leaves the counter untouched for a clean re-run (no drift).
+export function peekLoopCounter(path: string): number {
+  return readLoopCounter(path) + 1;
 }
 
 // -- bug-ticket drafting (pure data; the SKILL calls z-board create with it) ----
@@ -227,6 +238,7 @@ const USAGE = `endloop <command> [args]
 
   plan <regression.json> <loopCount>              print the ordered EndLoopActionKind[] as JSON
   counter read <path>                             print the current loop counter (0 if missing)
+  counter peek <path>                             print the prospective next count (read+1), NO write
   counter bump <path>                             increment + persist atomically, print the new value
   bug <finding.json> <regression|cso|health> <loopCount>   print a BugTicketDraft {title, body} as JSON
   report <input.json>                             print the markdown end-of-loop report (EndLoopReportInput)`;
@@ -257,8 +269,8 @@ export function main(argv: string[]): number {
     if (cmd === "counter") {
       const sub = argv[1];
       const path = argv[2];
-      if (!path || (sub !== "read" && sub !== "bump")) throw new ZError(`Usage: endloop counter <read|bump> <path>`);
-      const value = sub === "read" ? readLoopCounter(path) : bumpLoopCounter(path);
+      if (!path || (sub !== "read" && sub !== "peek" && sub !== "bump")) throw new ZError(`Usage: endloop counter <read|peek|bump> <path>`);
+      const value = sub === "read" ? readLoopCounter(path) : sub === "peek" ? peekLoopCounter(path) : bumpLoopCounter(path);
       console.log(String(value));
       return 0;
     }

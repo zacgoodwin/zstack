@@ -10,8 +10,8 @@
 //   5. Quota exhaustion mid-loop: sweep pauses then resumes      -> "quota guard"
 //   6. Human moves a ticket mid-loop: the lane stops cleanly     -> "wave reconcile"
 import { test, expect, describe, afterEach } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   acquireLoopLock,
@@ -19,9 +19,11 @@ import {
   laneLockPath,
   listLaneLocks,
   loopLockLiveness,
+  loopLockPath,
   processAlive,
   readLoopLock,
   removeLaneLock,
+  sameHost,
   writeLaneLock,
   type LoopLock,
 } from "../lib/locks.ts";
@@ -112,6 +114,38 @@ describe("control 1: loop lock (second-invocation refusal)", () => {
     expect(loopLockLiveness(noPid, STALE + 1, STALE)).toBe("stale"); // one ms past
   });
 
+  // -- issue #14 H12: a recycled pid must not pin a lock "live forever" --------
+  test("pid-reuse safety: an unconfirmable pid falls back to age, so --reconcile can clear it", () => {
+    // A lock from ANOTHER machine. process.kill on THIS host may hit a coincidentally
+    // -live local pid, but the lock isn't ours to verify -- identity is unconfirmable.
+    const foreign: LoopLock = { session: "s", startedAt: 0, pid: 4242, host: "some-other-host" };
+    // Even with the pid "alive" here, past staleness reads STALE (clearable), not live.
+    expect(loopLockLiveness(foreign, STALE + 1, STALE, () => true)).toBe("stale");
+    // Within the staleness window it still reads live (don't nuke a maybe-running loop).
+    expect(loopLockLiveness(foreign, STALE - 1, STALE, () => true)).toBe("live");
+    // A confirmably-dead pid is stale immediately, host regardless.
+    expect(loopLockLiveness(foreign, 0, STALE, () => false)).toBe("stale");
+
+    // A SAME-host live pid is confirmed ours -> live even past staleness.
+    const local: LoopLock = { session: "s", startedAt: 0, pid: 4242, host: hostname() };
+    expect(sameHost(local)).toBe(true);
+    expect(loopLockLiveness(local, STALE + 1, STALE, () => true)).toBe("live");
+
+    // A host-less legacy lock is unconfirmable too -> age decides.
+    const legacy: LoopLock = { session: "s", startedAt: 0, pid: 4242 };
+    expect(loopLockLiveness(legacy, STALE + 1, STALE, () => true)).toBe("stale");
+
+    // An injected identity mismatch (e.g. a future start-time check) -> age fallback.
+    expect(loopLockLiveness(local, STALE + 1, STALE, () => true, () => false)).toBe("stale");
+  });
+
+  test("acquire records the host so a foreign-machine lock is later unverifiable", () => {
+    const d = tmp();
+    const res = acquireLoopLock(d, { session: "s", startedAt: 0, host: hostname(), pid: process.pid }, { nowMs: 0, stalenessMs: STALE });
+    expect(res.acquired).toBe(true);
+    expect(readLoopLock(d)!.host).toBe(hostname());
+  });
+
   test("a stale lock refuses without --reconcile, and is cleared with it", () => {
     const d = tmp();
     acquireLoopLock(d, { session: "crashed", startedAt: 0 }, { nowMs: 0, stalenessMs: STALE });
@@ -141,6 +175,70 @@ describe("control 1: loop lock (second-invocation refusal)", () => {
     acquireLoopLock(d, { session: "s", startedAt: 0 }, { nowMs: 0, stalenessMs: STALE });
     expect(inspectLoopLock(d, 1000, STALE).state).toBe("live");
     expect(inspectLoopLock(d, STALE + 1, STALE).state).toBe("stale");
+  });
+});
+
+// ============================================================================
+// issue #14 H11 + M19 -- stale+reconcile CAS race, and staleness-flag validation
+// ============================================================================
+describe("stale+reconcile keeps the exclusive-create guard (H11)", () => {
+  const LOCKS = join(REPO_ROOT, "lib", "locks.ts");
+
+  // Seeds a definitely-stale loop lock (no pid, startedAt far in the past).
+  function seedStale(dir: string): void {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(loopLockPath(dir), JSON.stringify({ session: "crashed", startedAt: 0 }) + "\n");
+  }
+
+  test("N concurrent --reconcile acquires against one stale lock: exactly one wins", async () => {
+    const dir = tmp();
+    seedStale(dir);
+    const now = 10 * 60_000; // 10 min; --staleness-minutes 1 => the seeded lock is stale
+    // Spawn several real processes racing the same stale lock in parallel.
+    const procs = Array.from({ length: 6 }, (_, i) =>
+      Bun.spawn(
+        ["bun", LOCKS, "acquire", "--dir", dir, "--session", `sess-${i}`, "--reconcile", "--now", String(now), "--staleness-minutes", "1"],
+        { stdout: "pipe", stderr: "pipe" }
+      )
+    );
+    const codes = await Promise.all(procs.map((p) => p.exited));
+    const winners = codes.filter((c) => c === 0).length;
+    expect(winners).toBe(1); // never two loops both "acquiring" the same project
+    // And a live lock is left behind (the winner's), readable back.
+    expect(readLoopLock(dir)!.session).toMatch(/^sess-\d$/);
+  });
+
+  test("the stale+reconcile branch no longer unconditionally overwrites (structural)", () => {
+    const src = readFileSync(LOCKS, "utf8");
+    // The fix serializes the clear-and-replace through a one-shot claim file and
+    // takes the lock with an exclusive create -- proof the CAS wasn't abandoned.
+    expect(src).toContain(".reconcile"); // claim-file mutex
+    expect(src).toMatch(/writeFileSync\(path, body, \{ flag: "wx"/); // exclusive create on the reconcile path
+  });
+});
+
+describe("staleness-minutes validation (M19)", () => {
+  const LOCKS = join(REPO_ROOT, "lib", "locks.ts");
+  test("a non-numeric --staleness-minutes throws instead of yielding NaN", () => {
+    const dir = tmp();
+    acquireLoopLock(dir, { session: "s", startedAt: 0 }, { nowMs: 0, stalenessMs: 60_000 });
+    const proc = Bun.spawnSync(
+      ["bun", LOCKS, "inspect", "--dir", dir, "--staleness-minutes", "ten", "--now", "1000"],
+      { stdout: "pipe", stderr: "pipe" }
+    );
+    expect(proc.exitCode).toBe(1);
+    expect(proc.stderr.toString()).toMatch(/staleness-minutes must be a positive number/);
+  });
+
+  test("a valid --staleness-minutes still works", () => {
+    const dir = tmp();
+    acquireLoopLock(dir, { session: "s", startedAt: 0 }, { nowMs: 0, stalenessMs: 60_000 });
+    const proc = Bun.spawnSync(
+      ["bun", LOCKS, "inspect", "--dir", dir, "--staleness-minutes", "5", "--now", "1000"],
+      { stdout: "pipe", stderr: "pipe" }
+    );
+    expect(proc.exitCode).toBe(0);
+    expect(JSON.parse(proc.stdout.toString()).state).toBe("live");
   });
 });
 
@@ -207,6 +305,41 @@ describe("control 2: orphan scan (crash recovery)", () => {
     const orphans = scanOrphans(locksDir, worktreesDir, [{ number: 3, status: "Done" }], 0);
     const plan = reconcilePlan(orphans);
     expect(plan).toEqual([{ kind: "prune-worktree", ticket: 3, path: join(worktreesDir, "ticket-3") }]);
+  });
+
+  // -- issue #14 C4: a crashed lane's recovery depends on its board status ------
+  test("a crashed lane whose ticket is TERMINAL is only pruned + unlocked, never reopened", () => {
+    // #5 crashed AFTER its PR merged and the ticket moved to Done, but before the
+    // lock was removed. Parking it back to Ready would rebuild already-merged work.
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    writeLaneLock(locksDir, { ticket: 5, stage: "merge", session: "dead", claimedAt: 0 });
+    mkdirSync(join(worktreesDir, "ticket-5"));
+    const orphans = scanOrphans(locksDir, worktreesDir, [{ number: 5, status: "Done" }], 0);
+    expect(orphans.crashedLanes[0].boardStatus).toBe("Done");
+
+    const plan = reconcilePlan(orphans);
+    expect(byKind(plan, "prune-worktree")).toEqual([5]);
+    expect(byKind(plan, "remove-lock")).toEqual([5]);
+    expect(byKind(plan, "park-ready")).toEqual([]); // NEVER reopen a Done ticket
+    expect(byKind(plan, "release-claim")).toEqual([]); // NEVER unassign it either
+  });
+
+  test("each terminal status (Done/Questions/Blocked/Skipped) is pruned-only, INFLIGHT is parked", () => {
+    for (const status of ["Done", "Questions", "Blocked", "Skipped"] as const) {
+      const locksDir = tmp();
+      writeLaneLock(locksDir, { ticket: 8, stage: "builder", session: "dead", claimedAt: 0 });
+      const plan = reconcilePlan(scanOrphans(locksDir, tmp(), [{ number: 8, status }], 0));
+      expect(byKind(plan, "park-ready")).toEqual([]);
+      expect(byKind(plan, "remove-lock")).toEqual([8]);
+    }
+    // Contrast: a Building crashed lane IS released + parked + unlocked.
+    const locksDir = tmp();
+    writeLaneLock(locksDir, { ticket: 8, stage: "builder", session: "dead", claimedAt: 0 });
+    const plan = reconcilePlan(scanOrphans(locksDir, tmp(), [{ number: 8, status: "Building" }], 0));
+    expect(byKind(plan, "park-ready")).toEqual([8]);
+    expect(byKind(plan, "release-claim")).toEqual([8]);
+    expect(byKind(plan, "remove-lock")).toEqual([8]);
   });
 
   test("no orphans -> empty plan, hasOrphans false", () => {
@@ -328,6 +461,23 @@ describe("control 3: claim race (lock only after a won claim)", () => {
     const exec = claimBackend(["someone-else"]); // already claimed
     await expect(claimThenLock(exec, locksDir, 9, "alice", "sess-alice", "builder")).rejects.toThrow(/already claimed/);
     expect(listLaneLocks(locksDir)).toEqual([]);
+  });
+
+  // -- issue #14 C8: claim identity is the LOGIN, not the session (documented) --
+  test("a re-claim by the SAME login is a no-op -- the per-machine limitation's root", async () => {
+    // This no-op is correct WITHIN one machine (a resume re-claims its own ticket),
+    // but it is exactly why two loops under the same login on different machines
+    // both see "already ours". The safe fix needs shared cross-machine state; the
+    // limitation is documented loudly in lib/board.ts claim() and z-loop/SKILL.md.
+    const exec = claimBackend(["alice"]); // already solely assigned to alice
+    const board = new Board(CFG, exec);
+    await expect(board.claim(9, "alice")).resolves.toBeUndefined(); // treated as already-ours, no throw
+
+    // The limitation must be documented where an operator will see it.
+    const skill = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
+    expect(skill).toMatch(/same (github )?login on different machines/i);
+    const boardSrc = readFileSync(join(REPO_ROOT, "lib", "board.ts"), "utf8");
+    expect(boardSrc).toMatch(/KNOWN LIMITATION/);
   });
 });
 

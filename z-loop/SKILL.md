@@ -48,6 +48,11 @@ PACK="$HOME/.claude/skills/zstack"
 Z_BOARD="$PACK/bin/z-board"; Z_COST="$PACK/bin/z-cost"
 Z_ESTIMATE="$PACK/bin/z-estimate"; Z_LINT="$PACK/bin/z-ticket-lint"
 SLUG=$(gh repo view --json name -q .name)
+export ZSTACK_SLUG="$SLUG"   # H13: every z-board / lib call resolves the slug from
+                             # here, so a call that omits --slug never dies with
+                             # "Multiple zstack projects" mid-drain (resolveSlug
+                             # honors ZSTACK_SLUG; lib/config.ts). Keep passing
+                             # --slug where already present -- explicit still wins.
 BASE=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
 BASE_SHA_START=$(git rev-parse "origin/$BASE" 2>/dev/null || git rev-parse "$BASE")  # C8: the e2e-detection diff base
 ME=$(gh api user -q .login)
@@ -157,11 +162,36 @@ it after board writes is always safe.
 
 ## Step 4 — The drain loop
 
-Repeat until `next` returns `drain-complete`:
+Repeat until `next` returns `drain-complete`. **Re-read the board before every
+iteration** — this is what makes wave reconciliation reachable (C3 / issue #14):
 
 ```bash
-bun "$PACK/lib/loop.ts" next "$STATE"    # prints ONE Action as JSON
+# Re-run the Step 3 snapshot + ingest FIRST, every iteration, before `next`. This
+# refreshes each ticket's status from the board so a human's mid-loop move to
+# Blocked/Questions/Skipped/Done is seen by reconcileBoardMoves and turned into a
+# stop-lane at the next boundary. Skipping it makes `next` decide off a stale
+# snapshot and clobber the human's move (defeats C7 safety control #6).
+for S in Backlog Ready Questions Building QA Review Blocked Skipped Done; do
+  "$Z_BOARD" list --status "$S" --json --slug "$SLUG" > "$TMP/items-$S.json"
+done
+jq -s 'add' "$TMP"/items-*.json > "$TMP/items.json"
+jq -r '.[].number' "$TMP/items.json" | while read -r N; do
+  gh issue view "$N" --json body -q .body > "$TMP/body-$N.md"
+done
+bun -e "import {readFileSync, readdirSync, writeFileSync} from 'node:fs';
+  const b = {}; for (const f of readdirSync('$TMP')) {
+    const m = f.match(/^body-(\d+)\.md\$/); if (m) b[m[1]] = readFileSync('$TMP/' + f, 'utf8'); }
+  writeFileSync('$TMP/bodies.json', JSON.stringify(b));"
+bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json"   # preserves lanes + lost claims
+
+bun "$PACK/lib/loop.ts" next "$STATE"    # NOW ask: prints ONE Action as JSON
 ```
+
+`ingest` preserves lanes and lost-claim flags, so re-running it every iteration is
+safe; it only refreshes ticket statuses (and drops a lane whose ticket was removed
+from the board mid-run, H14). Do this snapshot+ingest before EVERY
+`next` — especially before any advance/park/complete, so no stage transition acts
+on a board the human has since changed.
 
 Perform exactly that action, then record it. Action → side effects:
 
@@ -173,7 +203,7 @@ Perform exactly that action, then record it. Action → side effects:
 | `park N Blocked` | Comment the note (what was wrong + recommended next steps), `move <N> Blocked`, apply, remove the lane lock. |
 | `skip N` | Comment the note (the confusion or the dead-worker evidence), `move <N> Skipped`, apply, remove the lane lock. (PROCESS.md global rule.) |
 | `stop-lane N` | A human moved #N to a stop status (Blocked/Questions/Skipped/Done) mid-run; the board already reflects it — do NOT move or comment it. Tear down the lane's background agent, remove the lane lock (`lane-remove`), keep the worktree for inspection, and apply (drops the lane, leaves the human's status). Other lanes are unaffected. |
-| `check-worker N` | Is the lane's background agent still running (harness task list)? Alive → `bun "$PACK/lib/loop.ts" probe "$STATE" <N> alive`. Dead with no final message → `probe "$STATE" <N> dead` (the next `next` returns the skip). |
+| `check-worker N` | Is the lane's background agent still running (harness task list)? Alive → `bun "$PACK/lib/loop.ts" probe "$STATE" <N> alive`. Dead with no final message: **if the lane's stage is `merge`, do NOT probe-dead/skip** — verify PR state first (H9): `gh pr view <branch> --json state,url -q '.state'`. If `MERGED`, the PR landed before the worker died, so record it as merged (`printf 'MERGED: %s\n' "$prUrl" > msg.txt; bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`) → the reducer completes it and counts it in `mergedThisRun` (so a stacked child still retargets and the batch-end branch delete can't close its PR). If NOT merged, record `printf 'BLOCKED: merge worker died with the PR unmerged (%s)\n' "$state" > msg.txt; outcome ...` → parks it Blocked for a human. For any OTHER stage, dead with no final message → `probe "$STATE" <N> dead` (the next `next` returns the skip). |
 | `complete N` | The completion flow — Step 6 — then apply, then **remove the lane lock**. |
 | `wait` | Block until a background stage agent finishes (the harness notifies you) or one minute passes, then re-run `next` — the watchdog only fires if `next` is called with a fresh clock. When an agent finishes: save its final message to a file and `bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`, then update Actual (below), then re-run `next`. |
 | `drain-complete` | Step 7. |
@@ -217,6 +247,13 @@ The expiry decision is inside `next` (silent past `watchdogMinutes` →
 from the harness's task list, and never let a lane idle unprobed. A stage that
 returns a `CONFUSED:` final message routes to `skip` automatically — comment
 its confusion note into the ticket when you execute the skip.
+
+**Merge lanes are the one exception (H9):** `next` never auto-skips a dead
+`merge` lane (it returns `check-worker` instead), because `gh pr merge` may have
+landed the PR before the worker died. Resolve a dead merge lane by verifying PR
+state (`gh pr view`) and recording a `MERGED:` or `BLOCKED:` outcome per the
+`check-worker` row — never a dead probe. Skipping a landed merge would drop it
+from `mergedThisRun` and let batch-end branch deletion close a dependent PR.
 
 ## Step 6 — Completion (PROCESS.md steps 19–21), on `complete N`
 
@@ -271,12 +308,14 @@ and never re-derive the order in prose. Nothing here may edit `$BASE` except
 through `/land-and-deploy` on the green path -- the regression pass itself
 (gates + `/qa-only`) is read-only by construction.
 
-**1. Bump the loop counter first** — every loop counts toward the 5th-loop
-cadence, red or green:
+**1. Peek the loop counter (do NOT persist yet)** — every loop counts toward the
+5th-loop cadence, red or green, and the count sizes the plan below. But the
+persist happens LAST, after the report (step 6), so a crash mid-stage re-runs the
+same loop id instead of drifting the 5th-loop cadence forward by one (H17):
 
 ```bash
 LOOP_COUNTER_PATH="$HOME/.zstack/projects/$SLUG/loop-counter"
-LOOP_COUNT=$(bun "$PACK/lib/endloop.ts" counter bump "$LOOP_COUNTER_PATH")
+LOOP_COUNT=$(bun "$PACK/lib/endloop.ts" counter peek "$LOOP_COUNTER_PATH")  # read+1, no write
 ```
 
 **2. Regression on merged main** (step 22). Sync the checkout to what actually
@@ -327,8 +366,9 @@ jq -c '.findings[]' "$TMP/regression.json" | while read -r FINDING; do
   jq -r .body "$TMP/bug.json" > "$TMP/bug-body.md"
   NEW=$("$Z_BOARD" create --title "$(jq -r .title "$TMP/bug.json")" --body-file "$TMP/bug-body.md" \
     --milestone <the batch's milestone> --slug "$SLUG")   # "#<N> <url>"
-  "$Z_BOARD" move <N> Backlog --slug "$SLUG"
-  # append {number, title} to "$TMP/endloop-bugs.json" for the report (step 5)
+  BUG_N=${NEW%% *}; BUG_N=${BUG_N#\#}   # M22: the NEW bug's number, NOT the drained ticket's
+  "$Z_BOARD" move "$BUG_N" Backlog --slug "$SLUG"
+  # append {number: $BUG_N, title} to "$TMP/endloop-bugs.json" for the report (step 5)
 done
 ```
 
@@ -381,6 +421,14 @@ bun "$PACK/lib/endloop.ts" report "$TMP/report-input.json" \
 
 That file is the loop's report — nothing else builds one.
 
+**6. Persist the loop counter LAST** (H17) — only now that the report is written
+does the loop count actually advance, so a crash anywhere above re-runs this loop
+id cleanly instead of drifting the 5th-loop cadence:
+
+```bash
+bun "$PACK/lib/endloop.ts" counter bump "$LOOP_COUNTER_PATH"   # matches the peek in step 1
+```
+
 ---
 
 ## `--reconcile` and the safety locks (C7, issue #2)
@@ -391,12 +439,24 @@ Two lock kinds live under `$LOCKS` (`~/.zstack/projects/<slug>/locks/`):
   in-flight lane, written right after a successful claim, re-stamped on each
   stage transition, removed at lane end. They survive a crash, which is how the
   next run knows a lane was mid-flight.
-- **Loop lock** `loop.lock` `{session, startedAt, pid?}` — one per project. A
+- **Loop lock** `loop.lock` `{session, startedAt, pid?, host?}` — one per project. A
   second `/z-loop` on the same project reads it and **refuses to start, naming
   the live session**: `Refusing to start: a /z-loop is already running on this
   project in session "<session>" ...`. A crashed loop's lock is judged *stale*
-  (dead pid, or older than the config `lockStalenessMinutes`) and reported as
-  such rather than live.
+  (dead pid on the SAME host, or older than the config `lockStalenessMinutes`) and
+  reported as such rather than live.
+
+> **UNSUPPORTED: two loops under the same GitHub login on different machines.**
+> The second-invocation guard is the `loop.lock`, and that lock lives in local
+> `~/.zstack` — it is **per machine**. Board claims are keyed on the GitHub login
+> (assignees are logins; a per-run session id cannot be stored as an assignee), so
+> two loops running as the SAME login on DIFFERENT machines each see "the sole
+> assignee is me", treat every ticket as already-ours, and both proceed —
+> duplicate lanes, duplicate branches, racing merges. Do not do this. A safe
+> cross-machine claim needs shared board-held state (a claim marker both loops
+> check), which is deliberately out of scope for this remediation (issue #14 C8).
+> Run one loop per (login, project) at a time; if you must parallelize, use
+> distinct logins or distinct projects.
 
 **Startup, without `--reconcile`:** if `loop.lock` is live → refuse (name the
 session). If it is stale, or any orphans exist (lane locks with no running loop,

@@ -358,11 +358,21 @@ export class Board {
   // Net effect: exactly one claimer survives any interleaving.
   // ponytail: relies on GitHub's assignee ordering as the tiebreaker; upgrade
   // path is a dedicated lock field if that ordering ever proves unstable.
+  //
+  // KNOWN LIMITATION (issue #14 C8): claims are keyed on the GitHub LOGIN, not the
+  // per-run session. GitHub assignees ARE logins, so a session id cannot be stored
+  // as one. The cross-run guard against a SECOND loop is the per-machine loop lock
+  // in ~/.zstack (lib/locks.ts) -- which is exactly that, PER MACHINE. Running two
+  // loops under the SAME login on DIFFERENT machines is therefore UNSUPPORTED: both
+  // see "sole assignee is me" below, treat the ticket as already-ours, and both
+  // proceed -- duplicate lanes, branches, racing merges. A safe fix needs shared
+  // cross-machine state (a claim marker the board holds and both loops check),
+  // which is board-schema design beyond this remediation; see z-loop/SKILL.md.
   async claim(n: number, assignee: string): Promise<void> {
     const issue = await this.lookup(n);
     const existing = issue.assignees.nodes.map((a) => a.login);
     if (existing.length > 0) {
-      if (existing.length === 1 && existing[0] === assignee) return; // already ours
+      if (existing.length === 1 && existing[0] === assignee) return; // already ours (per-login; see KNOWN LIMITATION above)
       throw new ZError(`Issue #${n} already claimed by ${existing.join(", ")}.`);
     }
 
