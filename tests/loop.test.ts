@@ -6,7 +6,7 @@
 // Questions never claimable (AC6), plus dependency-order claiming, merge
 // ordering with a stacked chain, and drain-complete detection.
 import { test, expect, describe, afterAll } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -489,5 +489,46 @@ describe("loop CLI", () => {
     const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", statePath, "--now", "0"], { stdout: "pipe", stderr: "pipe" });
     expect(proc.exitCode).toBe(0);
     expect(JSON.parse(proc.stdout.toString())).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+  });
+
+  // -- fix 7: ingest must not treat a corrupt state as a first ingest ---------
+  const ITEMS = JSON.stringify([{ number: 1, title: "x", fields: { Status: "Ready" } }]);
+  const BODIES = JSON.stringify({ "1": "no deps" });
+
+  function runIngest(statePath: string): { exitCode: number | null; stderr: string } {
+    const itemsPath = join(dir, "items.json");
+    const bodiesPath = join(dir, "bodies.json");
+    writeFileSync(itemsPath, ITEMS);
+    writeFileSync(bodiesPath, BODIES);
+    const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "ingest", statePath, itemsPath, bodiesPath], { stdout: "pipe", stderr: "pipe" });
+    return { exitCode: proc.exitCode, stderr: proc.stderr.toString() };
+  }
+
+  test("ingest on a corrupt state.json exits non-zero and does NOT silently reset it", () => {
+    const statePath = join(dir, "corrupt-state.json");
+    const corrupt = '{ "tickets": [ {"number": 1, '; // truncated -> invalid JSON
+    writeFileSync(statePath, corrupt);
+    const { exitCode, stderr } = runIngest(statePath);
+    expect(exitCode).toBe(1);
+    expect(stderr).toMatch(/not valid JSON/);
+    expect(readFileSync(statePath, "utf8")).toBe(corrupt); // left untouched, never overwritten
+  });
+
+  test("ingest on a present-but-wrong-shape state.json exits non-zero, no silent reset", () => {
+    const statePath = join(dir, "wrongshape-state.json");
+    const wrong = JSON.stringify({ foo: 1 }); // valid JSON, not a LoopState
+    writeFileSync(statePath, wrong);
+    const { exitCode, stderr } = runIngest(statePath);
+    expect(exitCode).toBe(1);
+    expect(stderr).toMatch(/not a LoopState/);
+    expect(readFileSync(statePath, "utf8")).toBe(wrong);
+  });
+
+  test("ingest on a MISSING state.json is a legitimate first ingest: creates it, exit 0", () => {
+    const statePath = join(dir, "fresh-state.json");
+    expect(existsSync(statePath)).toBe(false);
+    const { exitCode } = runIngest(statePath);
+    expect(exitCode).toBe(0);
+    expect(existsSync(statePath)).toBe(true);
   });
 });

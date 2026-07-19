@@ -55,8 +55,8 @@ _link_or_copy() {
 }
 
 # Register PACK_DIR under a host's skills directory as "zstack".
-# No individual skill subdirectories exist yet (later children add them);
-# this just makes the pack itself discoverable.
+# The pack ships four skills (z-setup, z-plan, z-loop, z-status); registering the
+# pack dir makes all of them discoverable to the host at once.
 register() {
   local skills_dir="$1" label="$2"
   mkdir -p "$skills_dir"
@@ -100,7 +100,7 @@ if command -v droid >/dev/null 2>&1; then
 fi
 
 if [ "$TEAM_MODE" -eq 1 ]; then
-  echo "Team mode requested: no session hooks to register yet (zstack has no skills until later milestones)."
+  echo "Team mode requested: no session hooks to register (the four shipped skills -- z-setup, z-plan, z-loop, z-status -- need none)."
 fi
 
 echo "zstack setup complete."

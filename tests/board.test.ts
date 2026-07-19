@@ -319,6 +319,33 @@ describe("quota guard", () => {
     await expect(board.list("In progress")).rejects.toThrow(/quota exhausted/);
     expect(slept).toEqual([]);
   });
+
+  test("missing rateLimit fails loudly instead of running unguarded (fix 2)", async () => {
+    const slept: number[] = [];
+    const board = new Board(CFG, makeExecutor({ overrides: { RateLimit: {} } }), async (ms) => void slept.push(ms));
+    await expect(board.list("In progress")).rejects.toThrow(/rateLimit probe returned no usable/);
+    expect(slept).toEqual([]); // guard threw; no call slipped through
+  });
+
+  test("a malformed rateLimit (non-numeric remaining) fails loudly (fix 2)", async () => {
+    const board = new Board(
+      CFG,
+      makeExecutor({ overrides: { RateLimit: { rateLimit: { remaining: "lots", resetAt: "2026-07-18T23:30:00Z" } } } })
+    );
+    await expect(board.list("In progress")).rejects.toThrow(/rateLimit probe returned no usable/);
+  });
+
+  test("an unparseable resetAt throws instead of sleep(NaN) hammering the API (fix 3)", async () => {
+    const slept: number[] = [];
+    const board = new Board(
+      CFG,
+      makeExecutor({ overrides: { RateLimit: { rateLimit: { remaining: 150, resetAt: "not-a-date" } } } }),
+      async (ms) => void slept.push(ms),
+      () => at("2026-07-18T23:00:00Z")
+    );
+    await expect(board.list("In progress")).rejects.toThrow(/resetAt is not a parseable timestamp/);
+    expect(slept).toEqual([]); // never slept, let alone slept(NaN)
+  });
 });
 
 // -- AC4: claim atomicity ----------------------------------------------------

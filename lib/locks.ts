@@ -74,11 +74,13 @@ export function loopLockPath(locksDir: string): string {
 
 // tmp + rename: rename() is atomic on the same volume on POSIX and NTFS, so a
 // concurrent reader never observes a half-written lane lock (same technique as
-// lib/setup-permissions.ts atomicWrite).
+// lib/setup-permissions.ts atomicWrite). mode 0o600 (owner-only) is set on the
+// temp file before the rename so a lockfile is never world-readable. (No-op on
+// Windows, where fs modes don't map to POSIX perms.)
 function atomicWrite(path: string, content: string): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-  writeFileSync(tmp, content, "utf8");
+  writeFileSync(tmp, content, { encoding: "utf8", mode: 0o600 });
   renameSync(tmp, path);
 }
 
@@ -212,7 +214,7 @@ export function acquireLoopLock(
   mkdirSync(locksDir, { recursive: true });
   const body = JSON.stringify(lock, null, 2) + "\n";
   try {
-    writeFileSync(path, body, { flag: "wx" }); // exclusive create
+    writeFileSync(path, body, { flag: "wx", mode: 0o600 }); // exclusive create, owner-only
     return { acquired: true };
   } catch (e: any) {
     if (e?.code !== "EEXIST") throw e;

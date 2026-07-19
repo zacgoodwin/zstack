@@ -166,10 +166,23 @@ Run the typecheck and the tests this diff touches here. Nothing you do in it lan
 REVIEW-APPROVE: <one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green
 REVIEW-FINDINGS: <numbered findings>          each with file:line and why it blocks the merge
 NEEDS-HUMAN: <the judgment call>              a genuine spec ambiguity a human must settle
+BLOCKED: <reason>                             the throwaway worktree is unusable -- can't check out or execute the diff at all
 CONFUSED: <what makes no sense>`;
 }
 
 // -- merge --------------------------------------------------------------------
+
+// POSIX single-quote escaping for a value that lands inside a bash command the
+// merge agent will run. Wrap in single quotes and rewrite each embedded single
+// quote as '\'' (close-quote, escaped-quote, reopen-quote). Inside single
+// quotes bash performs NO expansion, so $(...), backticks, and $VARS in a
+// spec-derived PR title stay inert literals instead of executing when the agent
+// runs `gh pr create --title <here>`. JSON.stringify would double-quote it,
+// leaving those metacharacters live -- a title like `Fix $(cmd) parsing` would
+// execute cmd.
+export function shSingleQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
 
 export interface MergePromptInput {
   ticketNumber: number;
@@ -191,7 +204,7 @@ This branch stacks on ticket(s) #${i.stackedOn.join(", #")}. Their PRs merge FIR
 - Worktree: ${i.worktreePath}, branch ${i.branch}, base ${i.baseBranch}.
 ${stacked}
 ## Steps
-1. Open the PR: gh pr create --base ${i.baseBranch} --head ${i.branch} --title ${JSON.stringify(i.prTitle)} with a body that links the ticket and summarizes what shipped.
+1. Open the PR: gh pr create --base ${i.baseBranch} --head ${i.branch} --title ${shSingleQuote(i.prTitle)} with a body that links the ticket and summarizes what shipped.
 2. If ${i.branch} conflicts with ${i.baseBranch}: resolve ON the branch, then rerun the full gauntlet (typecheck + full test suite) before merging. Never resolve in the merge commit blind.
 3. Merge with gh pr merge only when everything is green. Never pass --delete-branch: branch cleanup happens once at batch end, after every dependent PR has landed.
 4. Do not close the ticket issue and do not comment on it -- the orchestrator posts the completion note.

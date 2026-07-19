@@ -38,9 +38,10 @@ does not exist yet, you need `/z-setup`.
    - **A) Full auto-approvals** — a permission-allow hook + `bypassPermissions`
      default mode + broad allow rules. Zero prompts, this session and every future
      one. Biggest blast radius.
-   - **B) Loop allowlist only** — broad allow rules for `git/gh/bun/bunx/bash/
-     claude` + Edit + Write, no hook, no mode change. A genuinely novel command
-     still prompts.
+   - **B) Loop allowlist only** — specific allow rules for `git/gh/bun/bunx`
+     only, no hook, no mode change. Deliberately excludes `bash`/`claude` and
+     blanket Edit/Write, so Edit, Write, and any novel command still prompt —
+     the smallest blast radius, not fully unattended.
    - **C) Skip** — no permission changes.
    Applied only through `bin/z-setup-permissions` (atomic write, JSON-validated,
    never clobbers existing keys). `z-setup-permissions --check` reports which of

@@ -10,12 +10,13 @@
 //   5. Quota exhaustion mid-loop: sweep pauses then resumes      -> "quota guard"
 //   6. Human moves a ticket mid-loop: the lane stops cleanly     -> "wave reconcile"
 import { test, expect, describe, afterEach } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   acquireLoopLock,
   inspectLoopLock,
+  laneLockPath,
   listLaneLocks,
   loopLockLiveness,
   processAlive,
@@ -140,6 +141,28 @@ describe("control 1: loop lock (second-invocation refusal)", () => {
     acquireLoopLock(d, { session: "s", startedAt: 0 }, { nowMs: 0, stalenessMs: STALE });
     expect(inspectLoopLock(d, 1000, STALE).state).toBe("live");
     expect(inspectLoopLock(d, STALE + 1, STALE).state).toBe("stale");
+  });
+});
+
+// ============================================================================
+// Fix 6 -- lockfiles are written owner-only (0o600), never world-readable
+// ============================================================================
+describe("lockfile permissions", () => {
+  test("a lane lock is written 0o600 (owner-only)", () => {
+    const locksDir = tmp();
+    writeLaneLock(locksDir, { ticket: 5, stage: "builder", session: "s", claimedAt: 0 });
+    // fs mode bits don't map to POSIX perms on Windows; skip the assertion there
+    // so the gate stays green cross-platform (the mode arg is a harmless no-op).
+    if (process.platform === "win32") return;
+    expect(statSync(laneLockPath(locksDir, 5)).mode & 0o777).toBe(0o600);
+  });
+
+  test("the loop lock is created 0o600 (owner-only)", () => {
+    const locksDir = tmp();
+    const res = acquireLoopLock(locksDir, { session: "s", startedAt: 0 }, { nowMs: 0, stalenessMs: 60_000 });
+    expect(res.acquired).toBe(true);
+    if (process.platform === "win32") return;
+    expect(statSync(join(locksDir, "loop.lock")).mode & 0o777).toBe(0o600);
   });
 });
 

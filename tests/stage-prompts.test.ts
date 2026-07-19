@@ -13,6 +13,7 @@ import {
   mergePrompt,
   qaPrompt,
   reviewerPrompt,
+  shSingleQuote,
   REVIEWER_INPUT_KEYS,
   ZError,
   type BuilderPromptInput,
@@ -94,6 +95,9 @@ describe("reviewer blindness", () => {
     expect(p).toContain("no PR description, no plan rationale, no builder or QA transcript");
     expect(p).toContain("REVIEW-APPROVE:");
     expect(p).toContain("REVIEW-FINDINGS:");
+    // Fix 8a: the reviewer must be able to park Blocked (loop.ts MARKERS.reviewer
+    // parses BLOCKED:), so an unusable worktree parks instead of being Skipped.
+    expect(p).toContain("BLOCKED:");
   });
 });
 
@@ -182,6 +186,26 @@ describe("merge prompt", () => {
     expect(p).toContain("retarget this PR");
     expect(p).toContain("gh pr edit --base main");
     expect(p).toContain("Delete branches only after the whole batch");
+  });
+
+  // -- fix 1: PR-title shell injection ---------------------------------------
+  test("shSingleQuote renders shell metacharacters inert (POSIX single-quote escaping)", () => {
+    // $() and backticks stay literal; each embedded single quote becomes '\''.
+    expect(shSingleQuote("a'b$(c)")).toBe("'a'\\''b$(c)'");
+    expect(shSingleQuote("Fix $(cmd) `bt` and O'Brien")).toBe("'Fix $(cmd) `bt` and O'\\''Brien'");
+    // Round-trips through bash to the exact original (no expansion, no splitting).
+    const evil = "Fix $(rm -rf ~) and `whoami` in O'Brien's parser";
+    const echoed = Bun.spawnSync(["bash", "-c", `printf %s ${shSingleQuote(evil)}`], { stdout: "pipe" });
+    expect(echoed.stdout.toString()).toBe(evil);
+  });
+
+  test("a shell-metachar PR title is quoted inertly, never as an injectable double-quoted string", () => {
+    const evil = "Fix $(rm -rf ~) and `whoami` in O'Brien's parser";
+    const p = mergePrompt({ ...MERGE_INPUT, prTitle: evil });
+    // The title appears only inside the single-quoted literal shSingleQuote built.
+    expect(p).toContain(`--title ${shSingleQuote(evil)}`);
+    // ...and NOT via JSON.stringify, whose double quotes let bash expand $()/backticks.
+    expect(p).not.toContain(`--title ${JSON.stringify(evil)}`);
   });
 });
 

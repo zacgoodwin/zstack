@@ -6,7 +6,8 @@
 // applies the returned Action with applyAction -- it never re-derives a
 // scheduling or transition decision in prose. No Date.now() outside the CLI
 // edge; every pure function takes nowMs.
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import {
   DEFAULT_MAX_LANES,
   DEFAULT_WATCHDOG_MINUTES,
@@ -513,6 +514,48 @@ function readJson(path: string): any {
   }
 }
 
+// tmp + rename: atomic on the same volume on POSIX and NTFS (same technique as
+// lib/endloop.ts / lib/locks.ts), so a crash mid-write can't leave a truncated
+// state.json for the next ingest to misread as corrupt.
+function atomicWrite(path: string, content: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tmp, content, "utf8");
+  renameSync(tmp, path);
+}
+
+// Reads the previous loop state for an ingest. ONLY a missing file (ENOENT) is a
+// first ingest; a present-but-corrupt/truncated or wrong-shaped state.json is a
+// loud error, never a silent null -- treating corruption as a first ingest would
+// wipe live lanes and mergedThisRun (same discipline as lib/endloop.ts's
+// readLoopCounter).
+function readPrevState(path: string): LoopState | null {
+  if (!existsSync(path)) return null;
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (e) {
+    throw new ZError(`Cannot read state at ${path}: ${(e as Error).message}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new ZError(
+      `State file ${path} is present but not valid JSON (${(e as Error).message}). ` +
+        `Refusing to treat a corrupt state as a first ingest -- that would silently reset lanes and mergedThisRun. Fix or delete it.`
+    );
+  }
+  const s = parsed as any;
+  if (typeof s !== "object" || s === null || !Array.isArray(s.tickets) || !Array.isArray(s.lanes)) {
+    throw new ZError(
+      `State file ${path} is present but is not a LoopState {tickets[], lanes[], ...}. ` +
+        `Refusing to silently reset lanes and mergedThisRun.`
+    );
+  }
+  return s as LoopState;
+}
+
 function flagValue(argv: string[], flag: string): string | undefined {
   const i = argv.indexOf(flag);
   return i >= 0 ? argv[i + 1] : undefined;
@@ -546,7 +589,7 @@ export function main(argv: string[]): number {
       if (!argv[2]) throw new ZError("Usage: loop apply <state.json> <action.json> [--now <ms>]");
       const state = readJson(statePath) as LoopState;
       const action = readJson(argv[2]) as Action;
-      writeFileSync(statePath, JSON.stringify(applyAction(state, action, nowMs), null, 2));
+      atomicWrite(statePath, JSON.stringify(applyAction(state, action, nowMs), null, 2));
       console.log(`applied ${action.kind}${"ticket" in action ? ` #${action.ticket}` : ""}`);
       return 0;
     }
@@ -556,7 +599,7 @@ export function main(argv: string[]): number {
       const state = readJson(statePath) as LoopState;
       const message = readFileSync(argv[3], "utf8");
       const next = recordOutcome(state, ticket, message, nowMs);
-      writeFileSync(statePath, JSON.stringify(next, null, 2));
+      atomicWrite(statePath, JSON.stringify(next, null, 2));
       console.log(JSON.stringify(next.lanes.find((l) => l.ticket === ticket)!.outcome));
       return 0;
     }
@@ -567,7 +610,7 @@ export function main(argv: string[]): number {
         throw new ZError("Usage: loop probe <state.json> <ticket> <alive|dead> [--now <ms>]");
       }
       const state = readJson(statePath) as LoopState;
-      writeFileSync(statePath, JSON.stringify(recordProbe(state, ticket, verdict === "alive", nowMs), null, 2));
+      atomicWrite(statePath, JSON.stringify(recordProbe(state, ticket, verdict === "alive", nowMs), null, 2));
       console.log(`#${ticket} ${verdict}`);
       return 0;
     }
@@ -575,18 +618,13 @@ export function main(argv: string[]): number {
       const ticket = Number(argv[2]);
       if (!Number.isInteger(ticket)) throw new ZError("Usage: loop claim-lost <state.json> <ticket>");
       const state = readJson(statePath) as LoopState;
-      writeFileSync(statePath, JSON.stringify(markClaimLost(state, ticket), null, 2));
+      atomicWrite(statePath, JSON.stringify(markClaimLost(state, ticket), null, 2));
       console.log(`#${ticket} claimed by another session; out of this batch`);
       return 0;
     }
     if (cmd === "ingest") {
       if (!argv[2] || !argv[3]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M]");
-      let prev: LoopState | null = null;
-      try {
-        prev = readJson(statePath) as LoopState;
-      } catch {
-        prev = null; // first ingest creates the file
-      }
+      const prev = readPrevState(statePath);
       const items = readJson(argv[2]) as BoardItemLike[];
       const bodies = readJson(argv[3]) as Record<string, string>;
       const maxLanes = flagValue(argv, "--max-lanes");
@@ -595,7 +633,7 @@ export function main(argv: string[]): number {
         maxLanes: maxLanes === undefined ? undefined : Number(maxLanes),
         watchdogMinutes: watchdogMinutes === undefined ? undefined : Number(watchdogMinutes),
       });
-      writeFileSync(statePath, JSON.stringify(state, null, 2));
+      atomicWrite(statePath, JSON.stringify(state, null, 2));
       console.log(`${state.tickets.length} ticket(s), ${state.lanes.length} lane(s)`);
       return 0;
     }

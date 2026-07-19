@@ -185,13 +185,37 @@ export class Board {
   private async enforceQuota(): Promise<void> {
     const data = await this.exec(Q_RATE_LIMIT, {});
     const rl = data.rateLimit;
-    if (!rl || rl.remaining >= this.threshold) return;
+    // Format-drift guard (same discipline as lib/cost.ts): a missing/renamed
+    // rateLimit must fail LOUDLY, never silently disable the guard. Failing open
+    // here means the loop hammers the API straight into a hard 403 with no pause.
+    if (
+      !rl ||
+      typeof rl !== "object" ||
+      typeof rl.remaining !== "number" ||
+      typeof rl.resetAt !== "string"
+    ) {
+      throw new ZError(
+        `GraphQL rateLimit probe returned no usable {remaining, resetAt} (got ${JSON.stringify(rl)}). ` +
+          `GitHub's rateLimit response may have changed -- refusing to run unguarded against the API quota.`
+      );
+    }
+    if (rl.remaining >= this.threshold) return;
     if (this.mode === "abort") {
       throw new ZError(
         `GraphQL quota exhausted: ${rl.remaining} < ${this.threshold} remaining. Resets at ${rl.resetAt}.`
       );
     }
-    const ms = Math.max(0, new Date(rl.resetAt).getTime() - this.now());
+    // A malformed resetAt yields NaN; Math.max(0, NaN) is NaN, and setTimeout(NaN)
+    // fires immediately -- a busy-loop hammering the API instead of pausing. Refuse
+    // loudly rather than sleep(NaN).
+    const resetMs = new Date(rl.resetAt).getTime();
+    if (!Number.isFinite(resetMs)) {
+      throw new ZError(
+        `GraphQL rateLimit.resetAt is not a parseable timestamp: ${JSON.stringify(rl.resetAt)}. ` +
+          `Refusing to sleep(NaN), which would busy-hammer the API instead of pausing for the window.`
+      );
+    }
+    const ms = Math.max(0, resetMs - this.now());
     await this.sleep(ms);
   }
 

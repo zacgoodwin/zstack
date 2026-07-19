@@ -2,7 +2,11 @@
 // C11, issue #12). Merges up to three permission layers into a Claude Code
 // settings.json:
 //
-//   1. allowlist  -- broad Bash(git/gh/bun/bunx/bash/claude *) + Edit + Write
+//   1. allowlist  -- specific Bash(git/gh/bun/bunx *) rules ONLY. Deliberately
+//                    narrow: no Bash(bash *)/Bash(claude *) (arbitrary-command
+//                    escape hatches) and no bare Edit/Write, so option B is a
+//                    genuinely smaller blast radius than "full", not a rename of
+//                    it. "full" grants everything anyway via the bypass hook.
 //   2. bypassMode -- permissions.defaultMode: "bypassPermissions" +
 //                    skipDangerousModePermissionPrompt/skipAutoPermissionPrompt
 //   3. hook       -- a PermissionRequest hook that answers every prompt "allow"
@@ -25,16 +29,22 @@ import { ZError } from "./config.ts";
 export { ZError } from "./config.ts";
 
 // -- desired shape ------------------------------------------------------------
+// The allowlist tier: specific tool prefixes the loop actually shells out to and
+// nothing more. Deliberately EXCLUDES Bash(bash *) / Bash(claude *) (which are
+// arbitrary-command escape hatches equivalent to full bypass) and bare Edit /
+// Write, so option B in z-setup is honestly the narrower, safer choice.
 export const ALLOW_RULES = [
   "Bash(git *)",
   "Bash(gh *)",
   "Bash(bun *)",
   "Bash(bunx *)",
-  "Bash(bash *)",
-  "Bash(claude *)",
-  "Edit",
-  "Write",
 ] as const;
+
+// The fixed reason string this tool stamps on its own allow-hook. It doubles as
+// the stable detection marker (hasPermissionRequestAllowHook): it is specific to
+// us, so a foreign hook -- even one that answers "deny" but happens to mention
+// the allow token -- never matches it.
+export const HOOK_REASON = "blanket approval per user instruction";
 
 // Proven live on 2026-07-18 (issue #12): the only hook event a running session
 // re-checks, so it's the one lever that works mid-session. Single-quoted bash
@@ -42,7 +52,7 @@ export const ALLOW_RULES = [
 // write, JSON.parse hands them back unescaped on read, so every in-memory
 // comparison in this file works against the literal text below.
 export const PERMISSION_REQUEST_HOOK_COMMAND =
-  `echo '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","permissionDecision":"allow","permissionDecisionReason":"blanket approval per user instruction"}}'`;
+  `echo '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","permissionDecision":"allow","permissionDecisionReason":"${HOOK_REASON}"}}'`;
 
 export function permissionRequestHookEntry(): { hooks: Array<{ type: string; command: string }> } {
   return { hooks: [{ type: "command", command: PERMISSION_REQUEST_HOOK_COMMAND }] };
@@ -52,10 +62,12 @@ export type PermissionsMode = "full" | "allowlist";
 
 // -- layer detection (pure, read-only) ----------------------------------------
 
-// "Equivalent" per issue #12 point 4 means: some PermissionRequest hook
-// already answers "allow" -- not a byte-identical match on the reason text.
-// A hook that answers "deny" (or any other event) does not count, so `full`
-// still adds ours alongside it.
+// Idempotence marker: does a PermissionRequest hook carry OUR reason string
+// (HOOK_REASON)? Keyed off that fixed marker, not the bare "permissionDecision":
+// "allow" token -- a deny-hook whose command text happens to contain the allow
+// literal (e.g. in a comment or its own decision logic) is NOT a false positive,
+// and a foreign allow-hook with a different reason isn't mistaken for ours, so
+// `full` re-adds ours alongside it. Only our own prior write dedupes here.
 export function hasPermissionRequestAllowHook(settings: any): boolean {
   const groups = settings?.hooks?.PermissionRequest;
   if (!Array.isArray(groups)) return false;
@@ -63,7 +75,7 @@ export function hasPermissionRequestAllowHook(settings: any): boolean {
     const hooks = g?.hooks;
     if (!Array.isArray(hooks)) continue;
     for (const h of hooks) {
-      if (h?.type === "command" && typeof h.command === "string" && /"permissionDecision"\s*:\s*"allow"/.test(h.command)) {
+      if (h?.type === "command" && typeof h.command === "string" && h.command.includes(HOOK_REASON)) {
         return true;
       }
     }
@@ -216,11 +228,14 @@ function assertSettingsShape(value: any, path: string): void {
 }
 
 // tmp + rename: rename() is atomic on the same volume on both POSIX and NTFS,
-// so a reader never observes a half-written file.
+// so a reader never observes a half-written file. mode 0o600 (owner-only) is set
+// on the temp file BEFORE the rename so settings.json -- which can carry blanket
+// auto-approval -- is never briefly world-readable. (No-op on Windows, where fs
+// modes don't map to POSIX perms.)
 function atomicWrite(path: string, content: string): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-  writeFileSync(tmp, content, "utf8");
+  writeFileSync(tmp, content, { encoding: "utf8", mode: 0o600 });
   renameSync(tmp, path);
 }
 
@@ -276,9 +291,10 @@ export function checkSettings(path: string): CheckReport {
 const USAGE = `z-setup-permissions <full|allowlist|--check> [--path PATH]
 
   full       merge the PermissionRequest allow hook + bypassPermissions +
-             skip flags + broad allow rules into PATH
-  allowlist  merge only the broad allow rules (git/gh/bun/bunx/bash/claude,
-             Edit, Write); no hook, no defaultMode/skip-flag changes
+             skip flags + the allow rules into PATH (grants everything via the
+             hook regardless of the allow list)
+  allowlist  merge ONLY the specific allow rules (git/gh/bun/bunx); no hook, no
+             defaultMode/skip-flag changes, no bash/claude/Edit/Write blanket
   --check    report each of the three layers (hook, bypassMode, allowlist)
              independently present/absent; makes no changes
 

@@ -5,11 +5,7 @@
       "Bash(git *)",
       "Bash(gh *)",
       "Bash(bun *)",
-      "Bash(bunx *)",
-      "Bash(bash *)",
-      "Bash(claude *)",
-      "Edit",
-      "Write"
+      "Bash(bunx *)"
     ],
     "defaultMode": "bypassPermissions"
   },

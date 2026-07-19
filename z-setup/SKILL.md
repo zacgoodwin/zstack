@@ -207,31 +207,33 @@ ELI10: Claude Code asks permission before running most commands. In a loop
   forever and you become a click-through machine. There are three levers:
   (1) a hook that answers every permission prompt "allow" automatically,
   (2) a default mode that skips the dialog for future sessions, (3) a short
-  list of broad rules (any git/gh/bun/bunx/bash/claude command, any Edit, any
-  Write) that cover almost everything the loop does, with no hook at all.
+  list of specific rules (any git/gh/bun/bunx command) that cover the commands
+  the loop runs most, with no hook at all — Edit, Write, and everything else
+  still prompt.
 Stakes if we pick wrong: THIS EDITS ~/.claude/settings.json, which is
   MACHINE-WIDE — every project on this machine inherits whatever you pick
   here, not just this one. Picking A and regretting it means every repo you
   touch ran with zero prompts until you undo it (see Undo below).
 Recommendation: A (full auto-approvals) for a machine dedicated to running
   the zstack loop unattended; B if you still want prompts for anything
-  outside git/gh/bun/bunx/bash/claude/Edit/Write; C if this machine is shared
-  or you are not ready to hand over blanket approval yet.
+  outside git/gh/bun/bunx (including every Edit and Write); C if this machine
+  is shared or you are not ready to hand over blanket approval yet.
 Completeness: A=9/10, B=8/10, C=10/10 (C is "do nothing", so it can't be wrong)
 Pros / cons:
 A) Full auto-approvals (recommended for solo loop use)
    [PermissionRequest allow hook + defaultMode: bypassPermissions +
    skipDangerousModePermissionPrompt/skipAutoPermissionPrompt: true + the
-   broad allow rules from B]
+   allow rules from B — the hook grants everything regardless of that list]
   ✅ Zero prompts, this session and every future one — the loop runs unattended
   ✅ Survives a session restart (defaultMode + skip flags are read at startup)
   ❌ Machine-wide: every other project on this machine also runs unprompted
 B) Loop allowlist only
-   [just the broad allow rules: Bash(git *), Bash(gh *), Bash(bun *),
-   Bash(bunx *), Bash(bash *), Bash(claude *), Edit, Write]
-  ✅ Covers what the loop actually runs, no hook, no mode change
-  ✅ Smaller blast radius: anything outside those six prefixes still prompts
-  ❌ A genuinely novel command still stops and waits for a human
+   [just the specific allow rules: Bash(git *), Bash(gh *), Bash(bun *),
+   Bash(bunx *) — no hook, no mode change, and deliberately NO Bash(bash *) /
+   Bash(claude *) / bare Edit / bare Write blanket]
+  ✅ Smallest blast radius: only git/gh/bun/bunx commands run unprompted
+  ❌ Everything else — Edit, Write, and any novel command — still prompts, so
+     the loop is NOT fully unattended under B
 C) Skip
   ✅ No permission changes at all; today's behavior continues untouched
   ❌ Back to a prompt per novel command; one-off rules keep piling up
@@ -265,9 +267,8 @@ writes.
 - restore `permissions.defaultMode` to whatever it was before (or delete the
   key), and remove `skipDangerousModePermissionPrompt` /
   `skipAutoPermissionPrompt`,
-- optionally also drop the broad `Bash(git *)` / `Bash(gh *)` / `Bash(bun *)` /
-  `Bash(bunx *)` / `Bash(bash *)` / `Bash(claude *)` / `Edit` / `Write` entries
-  from `permissions.allow` if you want B's changes gone too.
+- optionally also drop the `Bash(git *)` / `Bash(gh *)` / `Bash(bun *)` /
+  `Bash(bunx *)` entries from `permissions.allow` if you want B's changes gone too.
 There is no automated undo command — the change is small enough to hand-edit
 and re-validate as JSON afterward.
 

@@ -5,7 +5,7 @@
 // passes a path derived from homedir(): acceptance criterion 4 (no test
 // touches the real ~/.claude/settings.json) is structural, not a convention.
 import { test, expect, describe, afterEach } from "bun:test";
-import { copyFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -51,10 +51,10 @@ function readJson(path: string): any {
 
 // -- mergeSettings (pure, no fs) -------------------------------------------
 describe("mergeSettings", () => {
-  test("empty input + full: adds all three layers (12 changes)", () => {
+  test("empty input + full: adds all three layers", () => {
     const { settings, changed, changes } = mergeSettings({}, "full");
     expect(changed).toBe(true);
-    expect(changes).toHaveLength(ALLOW_RULES.length + 3 + 1); // 8 allow + defaultMode + 2 skip flags + hook
+    expect(changes).toHaveLength(ALLOW_RULES.length + 3 + 1); // allow rules + defaultMode + 2 skip flags + hook
     expect(settings.permissions.allow).toEqual([...ALLOW_RULES]);
     expect(settings.permissions.defaultMode).toBe("bypassPermissions");
     expect(settings.skipDangerousModePermissionPrompt).toBe(true);
@@ -71,6 +71,17 @@ describe("mergeSettings", () => {
     expect(settings.permissions.defaultMode).toBeUndefined();
     expect(settings.skipDangerousModePermissionPrompt).toBeUndefined();
     expect(settings.hooks).toBeUndefined();
+  });
+
+  test("the allowlist tier is genuinely narrow: no bash/claude escape hatches, no blanket Edit/Write (fix 4)", () => {
+    const { settings } = mergeSettings({}, "allowlist");
+    // These four made option B equivalent to full bypass; they must be gone.
+    expect(settings.permissions.allow).not.toContain("Bash(bash *)");
+    expect(settings.permissions.allow).not.toContain("Bash(claude *)");
+    expect(settings.permissions.allow).not.toContain("Edit");
+    expect(settings.permissions.allow).not.toContain("Write");
+    // Exactly the specific tool prefixes, nothing else.
+    expect(settings.permissions.allow).toEqual(["Bash(git *)", "Bash(gh *)", "Bash(bun *)", "Bash(bunx *)"]);
   });
 
   test("a fully-configured object plans zero changes in full mode (idempotence)", () => {
@@ -100,7 +111,18 @@ describe("mergeSettings", () => {
     expect(hasBypassMode(settings)).toBe(true);
   });
 
-  test("an existing PermissionRequest hook that already answers allow is not duplicated", () => {
+  test("an existing hook carrying OUR reason marker is recognized as ours and not duplicated (idempotence)", () => {
+    const input = {
+      hooks: {
+        PermissionRequest: [{ hooks: [{ type: "command", command: PERMISSION_REQUEST_HOOK_COMMAND }] }],
+      },
+    };
+    const { settings, changes } = mergeSettings(input, "full");
+    expect(settings.hooks.PermissionRequest).toHaveLength(1); // not duplicated
+    expect(changes.some((c) => c.includes("hooks.PermissionRequest"))).toBe(false);
+  });
+
+  test("a foreign allow-hook with a different reason is NOT mistaken for ours; full adds ours alongside (fix 5)", () => {
     const input = {
       hooks: {
         PermissionRequest: [
@@ -109,8 +131,25 @@ describe("mergeSettings", () => {
       },
     };
     const { settings, changes } = mergeSettings(input, "full");
-    expect(settings.hooks.PermissionRequest).toHaveLength(1); // not duplicated
-    expect(changes.some((c) => c.includes("hooks.PermissionRequest"))).toBe(false);
+    expect(settings.hooks.PermissionRequest).toHaveLength(2); // theirs + ours
+    expect(changes.some((c) => c.includes("hooks.PermissionRequest"))).toBe(true);
+  });
+
+  test("a deny-hook whose text contains the allow literal is NOT a false positive (fix 5)", () => {
+    // A legitimate deny hook can mention the allow token in its own logic/comment.
+    // Detection keys off our reason marker, so this must not read as an existing
+    // allow-hook -- and full must still add ours alongside it.
+    const denyWithAllowLiteral = {
+      hooks: {
+        PermissionRequest: [
+          { hooks: [{ type: "command", command: 'echo \'{"permissionDecision":"deny"}\'  # not "permissionDecision":"allow"' }] },
+        ],
+      },
+    };
+    expect(hasPermissionRequestAllowHook(denyWithAllowLiteral)).toBe(false);
+    const { settings, changes } = mergeSettings(denyWithAllowLiteral, "full");
+    expect(settings.hooks.PermissionRequest).toHaveLength(2); // deny hook + ours
+    expect(changes.some((c) => c.includes("hooks.PermissionRequest"))).toBe(true);
   });
 
   test("an existing PermissionRequest hook that denies does not block ours from being added", () => {
@@ -285,6 +324,18 @@ describe("readSettingsFile", () => {
     writeFileSync(path, JSON.stringify({ permissions: { allow: "oops" } }));
     expect(() => readSettingsFile(path)).toThrow(path);
     expect(() => readSettingsFile(path)).toThrow(/permissions\.allow/);
+  });
+});
+
+// -- fix 6: settings.json written owner-only, never world-readable ---------
+describe("atomicWrite file mode", () => {
+  test("applySettings writes settings.json 0o600 (owner-only)", () => {
+    const path = tempPath("empty.json");
+    applySettings(path, "full");
+    // fs mode bits don't map to POSIX perms on Windows; skip the assertion there
+    // so the gate stays green cross-platform (the mode arg is a harmless no-op).
+    if (process.platform === "win32") return;
+    expect(statSync(path).mode & 0o777).toBe(0o600);
   });
 });
 
