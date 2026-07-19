@@ -125,11 +125,17 @@ const M_REMOVE_ASSIGNEES = `mutation RemoveAssignees($assignable: ID!, $user: ID
 }`;
 
 const M_CREATE_ISSUE = `mutation CreateIssue($repo: ID!, $title: String!, $body: String!, $milestone: ID!) {
-  createIssue(input: {repositoryId: $repo, title: $title, body: $body, milestoneId: $milestone}) { issue { number url } }
+  createIssue(input: {repositoryId: $repo, title: $title, body: $body, milestoneId: $milestone}) { issue { id number url } }
 }`;
 
 const M_CREATE_ISSUE_LABELED = `mutation CreateIssueLabeled($repo: ID!, $title: String!, $body: String!, $milestone: ID!, $label: ID!) {
-  createIssue(input: {repositoryId: $repo, title: $title, body: $body, milestoneId: $milestone, labelIds: [$label]}) { issue { number url } }
+  createIssue(input: {repositoryId: $repo, title: $title, body: $body, milestoneId: $milestone, labelIds: [$label]}) { issue { id number url } }
+}`;
+
+// Adds a just-created issue to the project board. Scalar variables only, so the
+// ghExecutor encodes it the same way as every other mutation here.
+const M_ADD_PROJECT_ITEM = `mutation AddProjectItem($project: ID!, $content: ID!) {
+  addProjectV2ItemById(input: {projectId: $project, contentId: $content}) { item { id } }
 }`;
 
 export interface BoardItem {
@@ -297,7 +303,12 @@ export class Board {
     }
 
     const data = await this.gql(query, vars);
-    return data.createIssue.issue as CreatedIssue;
+    const issue = data.createIssue.issue as CreatedIssue & { id: string };
+    // Fold-in gap from C2 (issue #5): a created issue must land ON the board, or
+    // it never shows up in `list`/`move` and the loop can't see it. addProjectV2-
+    // ItemById is idempotent server-side, so re-adding an existing item is safe.
+    await this.gql(M_ADD_PROJECT_ITEM, { project: this.cfg.projectId, content: issue.id });
+    return { number: issue.number, url: issue.url };
   }
 
   // Records a dependency both ways: N "Depends on #M", M "Blocks #N". Each side

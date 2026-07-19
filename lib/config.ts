@@ -4,6 +4,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { validateConfig } from "./config-schema.ts";
 
 export type FieldDataType = "SINGLE_SELECT" | "NUMBER" | "TEXT";
 
@@ -23,6 +24,10 @@ export interface QuotaConfig {
   mode: "sleep" | "abort";
 }
 
+// How epics are modeled on the board (chosen once, at /z-setup): a GitHub
+// milestone per epic (recommended) or a parent issue with sub-issue relations.
+export type EpicStyle = "milestones" | "issue-type";
+
 export interface BoardConfig {
   slug: string;
   owner: string; // repo owner, for repository/issue lookups
@@ -32,10 +37,16 @@ export interface BoardConfig {
   repositoryId: string; // Repository node ID, for createIssue
   statusField: FieldConfig; // the board's single-select Status field
   fields: Record<string, FieldConfig>; // Model | Model Effort | Estimate | Actual
+  epicStyle?: EpicStyle; // set at /z-setup; defaults to "milestones"
+  maxLanes?: number; // max concurrent workers (PROCESS.md: no more than 3)
+  watchdogMinutes?: number; // stuck-worker timeout in minutes (PROCESS.md: 10)
   quota?: Partial<QuotaConfig>;
 }
 
 export const DEFAULT_QUOTA: QuotaConfig = { threshold: 200, mode: "sleep" };
+export const DEFAULT_EPIC_STYLE: EpicStyle = "milestones";
+export const DEFAULT_MAX_LANES = 3;
+export const DEFAULT_WATCHDOG_MINUTES = 10;
 
 // Every actionable failure in the pack is a ZError; main() prints .message to
 // stderr and exits non-zero. Anything else is a bug and bubbles up with a stack.
@@ -117,6 +128,19 @@ export function loadConfig(slug?: string, home = homedir()): BoardConfig {
     );
   }
 
+  // Deep structural validation (single-select option maps, field dataTypes,
+  // enum/number shapes). The required-key check above stays first so a config
+  // that is only missing top-level keys keeps its original "missing: ..." error.
+  try {
+    validateConfig(cfg);
+  } catch (e) {
+    if (e instanceof ZError) throw new ZError(`Config at ${path} is invalid: ${e.message}`);
+    throw e;
+  }
+
   cfg.quota = { ...DEFAULT_QUOTA, ...(cfg.quota ?? {}) };
+  cfg.epicStyle = cfg.epicStyle ?? DEFAULT_EPIC_STYLE;
+  cfg.maxLanes = cfg.maxLanes ?? DEFAULT_MAX_LANES;
+  cfg.watchdogMinutes = cfg.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES;
   return cfg;
 }

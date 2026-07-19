@@ -42,6 +42,7 @@ const FIXTURE_BY_OP: Record<string, string> = {
   RepoMeta: "repo-meta",
   CreateIssue: "create-issue",
   CreateIssueLabeled: "create-issue",
+  AddProjectItem: "add-project-item",
   SetSingleSelect: "set-field",
   SetNumber: "set-field",
   SetText: "set-field",
@@ -207,6 +208,17 @@ describe("create", () => {
     await board.create("New ticket", file, "zstack-v1", "bug");
     const create = calls.find((c) => c.op === "CreateIssueLabeled")!;
     expect(create.vars).toMatchObject({ milestone: "MS_v1", label: "LBL_bug" });
+  });
+
+  // Fold-in gap from C2 (issue #5): create must also add the issue to the board.
+  test("adds the created issue to the project board", async () => {
+    const calls: Call[] = [];
+    const board = new Board(CFG, makeExecutor({ calls }));
+    const file = tmpBodyFile("Body.");
+    await board.create("New ticket", file, "zstack-v1");
+    const add = calls.find((c) => c.op === "AddProjectItem")!;
+    expect(add).toBeDefined();
+    expect(add.vars).toMatchObject({ project: "PVT_1", content: "I_42" });
   });
 
   test("unknown milestone lists the valid set", async () => {
