@@ -629,14 +629,22 @@ export function ingestBoardItems(
   // batch, nothing new committed) would wrongly read as "fresh", wiping
   // initialReadyCount/humanNeededNotified for a crossing that just happened on
   // that final ticket. A drained prev has, by definition, zero Building
-  // tickets (Building is a workable status); so a fresh batch is when there is
-  // no prior state at all, OR the prior state was fully drained AND the
-  // incoming snapshot actually shows new Building tickets (the batch-commit
+  // tickets belonging to THIS batch (drainComplete explicitly permits a
+  // Building ticket to remain when claimedByOther -- it belongs to another
+  // session's batch, not this one); so a fresh batch is when there is no
+  // prior state at all, OR the prior state was fully drained AND the incoming
+  // snapshot actually shows new, UNCLAIMED Building tickets (the batch-commit
   // step moves the whole new batch to Building before its first ingest, so
-  // "any Building tickets present" IS "a new batch was just committed"). A
-  // drained prev whose incoming snapshot is still all-terminal is the SAME
-  // batch's final state, not a new one -- preserve its counters.
-  const buildingCount = tickets.filter((t) => t.status === "Building").length;
+  // "any unclaimed Building tickets present" IS "a new batch was just
+  // committed"). buildingCount must exclude claimedByOther for the same
+  // reason every other workable-for-this-batch check in this file does
+  // (nextAction's unclaimed filter, the deadlock discriminator, drainComplete
+  // itself) -- otherwise a lingering foreign Building ticket in the snapshot
+  // masquerades as a new batch on the very re-ingest that should be preserving
+  // this batch's counters. A drained prev whose incoming snapshot has no new
+  // unclaimed Building tickets is the SAME batch's final state, not a new one
+  // -- preserve its counters.
+  const buildingCount = tickets.filter((t) => t.status === "Building" && !t.claimedByOther).length;
   const startingFreshBatch = !prev || (drainComplete(prev.tickets, prev.lanes) && buildingCount > 0);
 
   return {

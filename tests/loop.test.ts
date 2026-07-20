@@ -893,6 +893,57 @@ describe("ingestBoardItems", () => {
     expect(s.initialReadyCount).toBe(1); // only the new batch's Building count
     expect(s.humanNeededNotified).toBe(false);
   });
+
+  // Regression (issue #63 second review bounce): AC11/AC12 above only ever
+  // left a foreign lane's ticket in a terminal status by the time the batch
+  // drained. But drainComplete permits a claimedByOther ticket to remain in
+  // *Building* -- it belongs to another session's batch, not this one. The
+  // bounce-1 fix's buildingCount didn't exclude claimedByOther, so a lingering
+  // foreign Building ticket in the snapshot made startingFreshBatch wrongly
+  // true on the confirmation re-ingest after THIS session's own last ticket
+  // resolved, silently resetting initialReadyCount/humanNeededNotified from a
+  // ticket this session never committed.
+  test("AC13: a drained prev's lingering claimedByOther Building ticket does not read as a fresh batch, but a genuinely new UNCLAIMED Building ticket still does", () => {
+    const bodies = { "1": "no deps", "9": "no deps" };
+    const prev: LoopState = {
+      tickets: [ticket(1, "Done"), ticket(9, "Building", [], { claimedByOther: true })],
+      lanes: [],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      initialReadyCount: 5,
+      humanNeededNotified: true,
+    };
+    // sanity: OWN batch is drained (ticket 1 terminal); #9 is another
+    // session's Building ticket, which drainComplete explicitly permits.
+    expect(drainComplete(prev.tickets, prev.lanes)).toBe(true);
+
+    // Confirmation tick: the same foreign Building ticket #9 is still there,
+    // nothing new committed. Must NOT read as a fresh batch.
+    const same = ingestBoardItems(
+      prev,
+      [
+        { number: 1, title: "a", fields: { Status: "Done" } },
+        { number: 9, title: "z", fields: { Status: "Building" } },
+      ],
+      bodies
+    );
+    expect(same.initialReadyCount).toBe(5); // preserved, not recomputed from the foreign ticket
+    expect(same.humanNeededNotified).toBe(true); // preserved, not silently reset
+
+    // A genuinely new batch -- an UNCLAIMED Building ticket appears alongside
+    // the still-foreign #9 -- DOES reset, same as AC10/AC12.
+    const fresh = ingestBoardItems(
+      prev,
+      [
+        { number: 1, title: "a", fields: { Status: "Done" } },
+        { number: 9, title: "z", fields: { Status: "Building" } },
+        { number: 10, title: "New", fields: { Status: "Building" } },
+      ],
+      { ...bodies, "10": "no deps" }
+    );
+    expect(fresh.initialReadyCount).toBe(1); // only the new UNCLAIMED Building ticket, not the foreign #9
+    expect(fresh.humanNeededNotified).toBe(false); // reset
+  });
 });
 
 // -- CLI smoke ----------------------------------------------------------------
