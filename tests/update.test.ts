@@ -90,11 +90,15 @@ function setVersion(dir: string, version: string) {
 // Appends harmless padding to bin/z-update itself, so the "ahead" commit's
 // `git pull` rewrites the running script's OWN bytes mid-run (69 -> 269
 // lines, shifting every downstream byte offset) instead of only bumping
-// VERSION -- the exact self-replacement hazard the main(){...}; main "$@"
-// wrapper (bin/z-update:5-14/56-69) exists to defend against. 200 lines
-// matches the scale a hand-built fixture already confirmed the wrapper
-// survives (pull rewrites bin/z-update mid-run, script still completes:
-// version bump printed, setup exec'd, exit 0).
+// VERSION. This verifies the update path still completes correctly when
+// bin/z-update's own file is rewritten/resized mid-`git pull --ff-only`
+// (version bump printed, setup exec'd, exit 0) at a realistic padding
+// scale. It is NOT a regression test for the main(){...}; main "$@"
+// wrapper (bin/z-update:5-14/56-69): on this platform (Windows Git Bash /
+// bash 5.3) the pull rewrites the file in place and the script completes
+// identically with or without the wrapper, so this fixture can't catch the
+// wrapper's removal. The wrapper stays as cheap defensive insurance for
+// platforms where that in-place tolerance doesn't hold.
 function padSelf(dir: string) {
   const path = join(dir, "bin", "z-update");
   const padding = Array.from({ length: 200 }, (_, i) => `# padding ${i}`).join("\n");
@@ -135,7 +139,7 @@ function makeAheadClone(): AheadFixture {
   git(tmpdir(), ["clone", "-q", origin, srcDir]);
 
   setVersion(seed, "0.2.0");
-  padSelf(seed); // exercise the self-replacement hazard, not just a VERSION bump
+  padSelf(seed); // rewrite bin/z-update's own bytes mid-pull, not just VERSION
   git(seed, ["add", "-A"]);
   git(seed, ["commit", "-q", "-m", "v0.2.0"]);
   git(seed, ["push", "-q", origin, "HEAD:main"]);

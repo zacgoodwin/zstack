@@ -2,16 +2,24 @@
 # zstack update: resolve the git clone that backs this install, pull it
 # --ff-only, then re-run its setup so every registered skill refreshes.
 #
-# Self-replacement hazard: this script and setup both live inside the git
-# source `git pull` rewrites. Bash reads a script's bytes incrementally as it
-# executes, so if `pull` mutates bin/z-update's own file mid-run, anything
-# read AFTER that point can be misaligned garbage. A `name() { ... }` function
-# body is a single compound command -- bash's parser must read all the way to
-# the matching `}` before executing any of it -- so wrapping the pull-onward
-# logic in main() forces the WHOLE thing into the parser before the pull ever
-# runs. main's own last statement is `exec`, which replaces this process with
-# setup's, so control never falls back into (possibly-rewritten) bin/z-update
-# afterward either.
+# Self-replacement defense: this script and setup both live inside the git
+# source `git pull` rewrites, so bin/z-update's own file can be resized
+# mid-run. A `name() { ... }` function body is a single compound command --
+# bash's parser must read all the way to the matching `}` before executing
+# any of it -- so wrapping the pull-onward logic in main() forces the WHOLE
+# thing into the parser before the pull ever runs, and main's own last
+# statement is `exec`, which replaces this process with setup's so control
+# never falls back into (possibly-rewritten) bin/z-update afterward either.
+# This is cheap, standard portability insurance for bash implementations/
+# platforms where an incrementally-read script COULD misread bytes after a
+# mid-run rewrite. On the platform this repo tests against (Windows Git
+# Bash / bash 5.3), `git pull` rewrites this file in place (same inode) and
+# bash tolerates that with or without the wrapper -- so the wrapper is not
+# proven load-bearing here (see tests/update.test.ts's padSelf fixture,
+# which verifies the update completes correctly under a mid-pull self-
+# rewrite, not that removing this wrapper would break it). Kept regardless:
+# it costs nothing and protects any platform/bash build where that
+# tolerance doesn't hold.
 set -e
 
 MARKER=".zstack-registered"   # kept in sync with the same literal in ./setup
