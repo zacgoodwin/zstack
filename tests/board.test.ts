@@ -1350,7 +1350,7 @@ describe("config loader", () => {
     writeConfig(home, "zstack", written);
     const loaded = loadConfig("zstack", home);
     expect(loaded.projectId).toBe("PVT_1");
-    expect(loaded.quota).toEqual({ threshold: 200, mode: "sleep" });
+    expect(loaded.quota).toEqual({ threshold: 100, mode: "sleep" });
     expect(loaded.lockStalenessMinutes).toBe(60); // C7 default applied (issue #2)
   });
 

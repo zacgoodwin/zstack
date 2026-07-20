@@ -102,6 +102,15 @@ export interface BoardConfig {
   // complements the REACTIVE enforceQuota() backstop (board.ts:199-234),
   // which only intervenes once remaining points are already low.
   tickThrottleSeconds?: number;
+  // The reviewer-confidence safety gate (issue #62): the aggregated confidence
+  // (0-100) #59's reviewer stamps into its REVIEW-APPROVE marker must clear
+  // this floor to merge; below it, reviewerBelowThresholdAction decides what
+  // happens ("block" parks Blocked with a truth-check note, "retry" bounces to
+  // the builder, "off" disables the gate -- the pre-#62 behavior). A reviewer
+  // approval with no parseable confidence is fail-closed the same as a
+  // below-floor score, whenever the gate is on.
+  minReviewerConfidence?: number;
+  reviewerBelowThresholdAction?: "block" | "retry" | "off";
   // Discord notifications for the five loop events (#60). Absent block = off (a
   // no-op), which is the correct default -- so there is deliberately no
   // DEFAULT_NOTIFICATIONS const and no loadConfig mutation. The URL is a SECRET:
@@ -114,7 +123,7 @@ export interface BoardConfig {
   };
 }
 
-export const DEFAULT_QUOTA: QuotaConfig = { threshold: 200, mode: "sleep" };
+export const DEFAULT_QUOTA: QuotaConfig = { threshold: 100, mode: "sleep" };
 export const DEFAULT_EPIC_STYLE: EpicStyle = "milestones";
 export const DEFAULT_MAX_LANES = 3;
 export const DEFAULT_WATCHDOG_MINUTES = 10;
@@ -124,6 +133,8 @@ export const DEFAULT_MAX_QA_PASSES = 3;
 export const DEFAULT_QA_INVESTIGATE_AFTER = 2;
 export const DEFAULT_ADVERSARIAL_MODE: AdversarialMode = "non-trivial";
 export const DEFAULT_TICK_THROTTLE_SECONDS = 0;
+export const DEFAULT_MIN_REVIEWER_CONFIDENCE = 70;
+export const DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION = "block" as const;
 
 // Every actionable failure in the pack is a ZError; main() prints .message to
 // stderr and exits non-zero. Anything else is a bug and bubbles up with a stack.
@@ -225,5 +236,7 @@ export function loadConfig(slug?: string, home = homedir()): BoardConfig {
   cfg.qaInvestigateAfter = cfg.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER;
   cfg.adversarialMode = cfg.adversarialMode ?? DEFAULT_ADVERSARIAL_MODE;
   cfg.tickThrottleSeconds = cfg.tickThrottleSeconds ?? DEFAULT_TICK_THROTTLE_SECONDS;
+  cfg.minReviewerConfidence = cfg.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE;
+  cfg.reviewerBelowThresholdAction = cfg.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION;
   return cfg;
 }
