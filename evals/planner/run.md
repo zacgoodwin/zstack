@@ -1,7 +1,7 @@
 # /z-plan eval harness
 
-The harness C10 wires fully. It is the **paid lane** (LLM calls) and is NOT part
-of the gate suite (`bun test`). Every LLM call goes through **local Claude Code
+Wired (issue #25). It is the **paid lane** (LLM calls) and is NOT part of
+the gate suite (`bun test`). Every LLM call goes through **local Claude Code
 (`claude -p`)** — never a hosted API (PRINCIPLES.md "LLM access").
 
 Two passes: **plan** (run the planner in dry-run mode on the fixture spec) and
@@ -17,48 +17,46 @@ the totals; pass when the average total ≥ 8/10 (`rubric.md`).
 - `../../z-plan/SKILL.md` — the planner under test.
 - `../../bin/z-ticket-lint` — the deterministic half of dimension 1.
 
-## Stub (shape only; C10 makes it robust)
+## The harness
+
+- `harness.ts` (bun) — the deterministic pipeline as pure functions: splits a
+  dry-run plan document into per-ticket bodies (`splitDryRunOutput`), lints
+  each through `bin/z-ticket-lint` (`lintTicketBody`), aggregates the graded
+  score JSON against the ≥ 8/10 pass threshold (`aggregateScores`,
+  `PASS_THRESHOLD`), and asserts Estimate reproducibility run-to-run
+  (`extractEstimates`, `checkReproducibility`, issue #7 AC2). `checkRun` ties
+  these into one report over a run directory; `computeExitCode` turns the
+  three gates (score, lint, reproducibility) into the one exit code the pass
+  gate is (AC4: "a run whose average total is below 8" → non-zero, not
+  prose). Gate-tested in `../../tests/planner-harness.test.ts` — fixture in,
+  expected out, no `claude -p` involved.
+- `run.sh` — the runnable orchestrator, generalized over both passes:
+  `run.sh <spec|backlog> [runs]`. Shells `$CLAUDE_CMD` (default `claude -p`)
+  for the plan/grade steps, writes `plan-<i>.md` / `score-<i>.json` to a temp
+  dir, then calls `bun harness.ts check <dir> <runs>` for the pipeline above.
+- `mock-claude.sh` — a canned stand-in for `claude -p`: emits a fixed plan or
+  score by sniffing the prompt text (the same two prompt shapes `run.sh`
+  always sends), so the whole paid-lane orchestration can be verified
+  end-to-end with zero cost and zero network. Point `CLAUDE_CMD` at it to
+  swap it in — `run.sh` itself is byte-for-byte identical either way.
+- `board-double.ts` — the backlog-scan pass's board double (see below).
+
+## Running it
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-HERE="$(cd "$(dirname "$0")" && pwd -P)"
-REPO="$(cd "$HERE/../.." && pwd -P)"
-RUNS="${1:-3}"
-OUT="$(mktemp -d)"
+# The real (paid) run -- nightly, or before ship:
+evals/planner/run.sh spec 3
+evals/planner/run.sh backlog 3
 
-for i in $(seq 1 "$RUNS"); do
-  # PLAN: run /z-plan in dry-run mode against the fixture app + spec.
-  # --add-dir grants read access to the fixture app tree for grounding.
-  claude -p "/z-plan --dry-run $HERE/fixture-spec.md" \
-    --add-dir "$HERE/fixture-app" \
-    > "$OUT/plan-$i.md"
-
-  # SCHEMA GATE (deterministic, dimension 1): split the dry-run output into its
-  # per-ticket bodies and lint each. C10 owns the splitter; each body must exit 0.
-  # "$REPO/bin/z-ticket-lint" "$OUT/ticket-<n>.md"
-
-  # GRADE: a fresh grader scores the plan against the rubric, returning JSON.
-  claude -p "Score the plan in $OUT/plan-$i.md against the rubric in
-    $HERE/rubric.md, grounded on the app in $HERE/fixture-app. Return only the
-    JSON object the rubric specifies." \
-    --add-dir "$OUT" --add-dir "$HERE" \
-    > "$OUT/score-$i.json"
-done
-
-# AGGREGATE: average the .total fields; pass when the mean >= 8.
-# C10 wires the jq/bun aggregation and the pass/fail exit code here.
-echo "scores in $OUT"
+# The free, structural verification (this build's AC1/AC2/AC4; see
+# tests/planner-harness.test.ts for the automated version of this):
+CLAUDE_CMD="evals/planner/mock-claude.sh" evals/planner/run.sh spec 1
+CLAUDE_CMD="evals/planner/mock-claude.sh" evals/planner/run.sh backlog 1
 ```
 
-## What C10 finishes
-
-- The dry-run output splitter (one file per ticket) feeding `z-ticket-lint`.
-- The aggregation of `score-*.json` totals and the ≥8 pass gate (exit code).
-- Determinism guard: the same fixture spec must yield the same Estimate values
-  across runs (issue #7 AC2), so the harness also asserts the Estimate fields are
-  identical run-to-run — the reproducible half, separate from the graded quality.
-- Nightly scheduling alongside the other periodic evals.
+Exit 0 = pass (score ≥ 8/10 AND every ticket body lints clean AND Estimates
+reproduced); exit 1 = fail, with the report (per-run totals, mean, lint
+failures if any, reproducibility detail) on stdout either way.
 
 ## Backlog-scan pass (issue #13)
 
@@ -75,49 +73,46 @@ rule, same `bin/z-ticket-lint` deterministic half, same ≥8/10 pass threshold
 - `fixture-app/` — the same grounding target as the spec pass; the fixture's
   ask (delete a code from the store) builds on `src/store.ts`'s `Store` class.
 
-### Stub (shape only; a live-board double is the follow-on that makes this robust)
+### The board double (issue #25)
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-HERE="$(cd "$(dirname "$0")" && pwd -P)"
-REPO="$(cd "$HERE/../.." && pwd -P)"
-RUNS="${1:-3}"
-OUT="$(mktemp -d)"
+`/z-plan --backlog --dry-run` must run with no live GitHub project and no
+network. `board-double.ts` is a fake `gh` CLI (not a fake `lib/board.ts`
+GraphQLExecutor — see the file's own header comment for why: z-board's
+`ghExecutor()` shells `gh api /graphql` directly, and the skill's Step 0/
+Step 10 also shell `gh repo view` / gh's issue-view subcommand directly, so
+faking `gh` itself is the one seam that covers both call paths without
+touching `lib/board.ts` (a sibling lane's file) or the skill text (out of
+scope)). It serves `fixture-backlog-ticket.md` as the sole Backlog item —
+Status = Backlog, no Model/Model Effort/Estimate set, exactly the unplanned
+brain-dump Step 10 exists to gate.
 
-for i in $(seq 1 "$RUNS"); do
-  # PLAN: run /z-plan --backlog in dry-run mode with fixture-backlog-ticket.md
-  # standing in for the sole item "$Z_BOARD" list --status Backlog would
-  # return in a live project. Wiring this fully needs a board double (a fake
-  # $Z_BOARD executor, the same pattern tests/board.test.ts already uses for
-  # lib/board.ts) so this pass never touches a real GitHub project.
-  claude -p "/z-plan --backlog --dry-run" \
-    --add-dir "$HERE/fixture-app" \
-    --add-dir "$HERE" \
-    > "$OUT/backlog-plan-$i.md"
+`run.sh`'s `backlog` case wires it in: it writes two shim files onto PATH —
+`gh` (a bash shebang script, for the skill's own bash-typed `gh` calls) and
+`gh.cmd` (a Windows batch file, for `lib/board.ts`'s `Bun.spawnSync(["gh",
+...])` call, which goes straight through the OS's CreateProcess with no shell
+in between and cannot follow a shebang on an extension-less file on Windows)
+— both delegating to `bun board-double.ts`.
 
-  # SCHEMA GATE (deterministic, dimension 1): the one emitted body must exit 0.
-  # "$REPO/bin/z-ticket-lint" "$OUT/backlog-ticket-$i.md"
+### Prerequisites for the REAL (non-mocked) run
 
-  # GRADE: a fresh grader scores the plan against the rubric's Backlog scan
-  # pass section, returning the same JSON shape as the spec pass.
-  claude -p "Score the plan in $OUT/backlog-plan-$i.md against the 'Backlog
-    scan pass' section of the rubric in $HERE/rubric.md, grounded on the app in
-    $HERE/fixture-app. Return only the JSON object the rubric specifies." \
-    --add-dir "$OUT" --add-dir "$HERE" \
-    > "$OUT/backlog-score-$i.json"
-done
+The board double covers every `gh` call the dry-run pass makes. It does NOT
+by itself satisfy Step 0's `bun lib/board.ts quota --slug <slug>`
+precondition, which also needs a readable
+`~/.zstack/projects/<slug>/config.json` (`/z-setup`'s output) before it will
+even attempt a call `board-double.ts` could answer. For a real nightly run,
+either point `$HOME` at a throwaway directory carrying a minimal config.json
+shaped like `tests/board.test.ts`'s `CFG` fixture (quota fields matter most —
+the double's `RateLimit` response is always healthy), or run once against a
+real scratch project (same caveat `../e2e/run.md` names for its own live-only
+board setup). This is the one gap the board double does not close; everything
+else in the backlog-scan pass runs fully offline.
 
-echo "backlog-scan scores in $OUT"
-```
+### Reproducibility (issue #7 AC2)
 
-### What's left to wire for the backlog-scan pass (same follow-on that finishes the stub above)
-
-- A board double so `/z-plan --backlog` sees exactly one Backlog ticket
-  (`fixture-backlog-ticket.md`'s body) with no live GitHub project.
-- The dry-run output splitter feeding `bin/z-ticket-lint`.
-- Aggregation of `backlog-score-*.json` totals against the same ≥8/10
-  threshold, and nightly scheduling alongside the spec pass.
+The tier → `z-estimate` chain is deterministic by design (`z-plan/SKILL.md`
+Step 6), so the harness asserts the Estimate fields are identical run-to-run
+— the reproducible half, separate from the graded quality (`checkReproducibility`
+in `harness.ts`).
 
 ## Multi-document pass (issue #16)
 
@@ -174,9 +169,6 @@ for i in $(seq 1 "$RUNS"); do
     --add-dir "$PROJECT" \
     > "$OUT/multidoc-plan-$i.md"
 
-  # SCHEMA GATE (deterministic, dimension 1): every emitted body must exit 0.
-  # "$REPO/bin/z-ticket-lint" "$OUT/multidoc-ticket-<n>.md"
-
   # GRADE: a fresh grader scores the plan against the 'Multi-document
   # coverage pass' section of the rubric, returning the same JSON shape as
   # the other passes.
@@ -191,16 +183,26 @@ done
 echo "multi-document scores in $OUT"
 ```
 
-### What's left to wire for the multi-document pass (same follow-on that finishes the stub above)
+### What's left to wire for the multi-document pass
 
-- Pointing the planner at the `$PROJECT` double (`$HOME`/`ZSTACK_SLUG`
+The shared machinery (splitter, `z-ticket-lint` gate, score aggregation, the
+≥8/10 threshold exit code, and Estimate reproducibility) is wired and
+generic — `harness.ts check <outDir> <runs>` covers this pass exactly the
+same way it covers the spec and backlog-scan passes above; only the
+plan/grade loop shown here (issuing this pass's own two prompts into the
+shared `OUT` directory naming convention) is still a manual stub, not a
+`run.sh` case, pending the one gap named below.
+
+- **Pointing the planner at the `$PROJECT` double** (`$HOME`/`ZSTACK_SLUG`
   resolution, or an equivalent override) instead of a real
-  `~/.gstack/projects/<slug>/`.
-- The dry-run output splitter feeding `bin/z-ticket-lint`.
-- Aggregation of `multidoc-score-*.json` totals against the same ≥8/10
-  threshold, and nightly scheduling alongside the other two passes.
+  `~/.gstack/projects/<slug>/` — unlike the backlog-scan pass's board double
+  (a `gh` PATH-shim, issue #25), this needs `lib/spec-sources.ts`'s project
+  directory argument to resolve to `$PROJECT`, which has no existing
+  override hook and is out of this ticket's scope (title: "board double,
+  splitter, score gate (spec + backlog passes)"). A follow-on ticket scoped
+  to this pass should add it once the resolution mechanism is decided.
 
-### Explicit two-path variant (issue #19)
+## Explicit two-path variant (issue #19)
 
 The pass above exercises the no-argument discovery route into the same
 cross-document-coverage check. Issue #19 adds a second, independent route to
@@ -233,9 +235,6 @@ for i in $(seq 1 "$RUNS"); do
     --add-dir "$HERE" \
     > "$OUT/multidoc-explicit-plan-$i.md"
 
-  # SCHEMA GATE (deterministic, dimension 1): every emitted body must exit 0.
-  # "$REPO/bin/z-ticket-lint" "$OUT/multidoc-explicit-ticket-<n>.md"
-
   # GRADE: same rubric section as the no-arg variant -- the expiration scope
   # from the SECOND path (fixture-spec-2.md) must reach the plan alongside
   # the persistence/shorten/resolve/CLI scope from the first, proving the
@@ -252,9 +251,21 @@ done
 echo "explicit two-path multi-document scores in $OUT"
 ```
 
-#### What's left to wire for the explicit two-path variant
+### What's left to wire for the explicit two-path variant
 
-- The dry-run output splitter feeding `bin/z-ticket-lint` (same splitter the
-  other passes need -- no new one).
-- Aggregation of `multidoc-explicit-score-*.json` totals against the same
-  ≥8/10 threshold, and nightly scheduling alongside the other passes.
+Same as the no-arg variant directly above: the shared machinery
+(`harness.ts check`) already covers the splitter/lint/aggregation/threshold/
+reproducibility contract for this pass unchanged (it needs no project-dir
+double at all, since explicit paths bypass discovery) — only turning the
+plan/grade loop above into a `run.sh` case is still open, and is the smaller
+half of the multi-document follow-on work named above.
+
+## Nightly scheduling
+
+Documentation only (per this ticket's scope) — the command to run; scheduling
+itself is the user's cron/routine:
+
+```cron
+# Nightly, all four passes, real claude -p:
+0 3 * * * cd /path/to/zstack-1 && evals/planner/run.sh spec 3 && evals/planner/run.sh backlog 3
+```

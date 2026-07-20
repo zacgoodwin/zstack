@@ -40,7 +40,11 @@ export const REQUIRED_SECTIONS: SectionSpec[] = [
   { title: "Out of scope", level: 2 },
 ];
 
-interface Heading {
+// Exported (issue #25): evals/planner/harness.ts's dry-run output splitter
+// reuses this exact fence-aware heading scan to find each ticket's "## Context"
+// boundary, instead of duplicating the fence-tracking logic in a second file
+// that could drift out of sync with this one.
+export interface Heading {
   line: number; // 0-based line index of the heading
   level: number;
   title: string; // trimmed heading text
@@ -57,7 +61,7 @@ function normTitle(t: string): string {
 // inside a fenced code block. A ticket's `## Plan` routinely embeds a bash fence
 // with "# comment" lines and file listings; without fence-awareness those would
 // read as headings and wrongly cut a section short or invent a phantom one.
-function parse(md: string): { headings: Heading[]; lines: string[] } {
+export function parse(md: string): { headings: Heading[]; lines: string[] } {
   const lines = md.split(/\r?\n/);
   const headings: Heading[] = [];
   let fence = ""; // the open fence marker char ("`" or "~"), "" when outside

@@ -14,8 +14,11 @@
     "skipLibCheck": true,
     "types": ["bun"]
   },
-  // The pack's own code: lib/ + gate tests + the e2e checker the tests import.
-  // The eval fixture apps (evals/*fixture-app*) are separate packages with
-  // their own package.json and are deliberately not part of this project.
-  "include": ["lib", "tests", "evals/e2e"]
+  // The pack's own code: lib/ + gate tests + the e2e checker the tests import,
+  // plus (issue #25) the planner harness's two .ts files, named explicitly
+  // rather than as "evals/planner" so the directory pattern does not also pull
+  // in evals/planner/fixture-app/ -- a separate package with its own
+  // package.json, same as evals/fixture-app and deliberately not part of this
+  // project either.
+  "include": ["lib", "tests", "evals/e2e", "evals/planner/harness.ts", "evals/planner/board-double.ts"]
 }
