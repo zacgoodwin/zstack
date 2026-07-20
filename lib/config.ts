@@ -111,7 +111,7 @@ export interface BoardConfig {
   // below-floor score, whenever the gate is on.
   minReviewerConfidence?: number;
   reviewerBelowThresholdAction?: "block" | "retry" | "off";
-  // Discord notifications for the five loop events (#60). Absent block = off (a
+  // Discord notifications for the six loop/plan events (#60, #68). Absent block = off (a
   // no-op), which is the correct default -- so there is deliberately no
   // DEFAULT_NOTIFICATIONS const and no loadConfig mutation. The URL is a SECRET:
   // config.json lives at ~/.zstack/projects/<slug>/config.json, OUTSIDE the repo

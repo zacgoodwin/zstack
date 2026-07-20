@@ -6,7 +6,7 @@
 // line or a rendered message; and config-schema's notifications branch is checked
 // good-and-bad, including that a bad value never leaks into the error.
 //
-// No eval suite (AC9): the five messages are fully templated and deterministic --
+// No eval suite (AC9): the six messages are fully templated and deterministic --
 // there is no latent/LLM step and no quality dimension to measure -- so per
 // CLAUDE.md's latent-vs-deterministic split these gate tests are the complete
 // verification. A future free-text notification (e.g. an LLM-summarized digest)
@@ -70,6 +70,7 @@ const WC: PayloadByEvent["work-complete"] = {
   totalDollars: 12.5,
   verdict: "green",
 };
+const PLAN: PayloadByEvent["plan-complete"] = { slug: "zstack", ticketsCreated: 4 };
 const PARK: PayloadByEvent["ticket-parked"] = {
   ticket: 42,
   title: "Notifications Feature",
@@ -86,6 +87,24 @@ describe("renderNotification", () => {
     expect(s).toContain("blocked 1");
     expect(s).toContain("$12.50");
     expect(s).toContain("regression green");
+  });
+
+  // AC1 + AC2 (#68): a plan run and a loop drain must read as distinct events
+  // -- the plan template never says "loop N" and the loop template is
+  // untouched by the new event's existence.
+  test("render: plan completion names the plan run", () => {
+    const s = renderNotification("plan-complete", PLAN);
+    expect(s).toContain("plan run");
+    expect(s).toContain("4 tickets");
+    expect(s).not.toContain("loop 0");
+    expect(s).not.toMatch(/\bloop\b/i);
+  });
+
+  test("render: loop work-complete unchanged", () => {
+    const loop3: PayloadByEvent["work-complete"] = { ...WC, loopCount: 3 };
+    expect(renderNotification("work-complete", loop3)).toBe(
+      "zstack zstack: loop 3 complete. done 3, questions 2, blocked 1, skipped 0. spend $12.50. regression green."
+    );
   });
 
   test("ticket-parked formats #, title, status, note", () => {
@@ -163,6 +182,20 @@ describe("notify", () => {
     expect(calls.length).toBe(0);
     // A key not listed defaults ON.
     const on = await notify("human-pause", PAUSE, cfg, { post });
+    expect(on).toBe(true);
+    expect(calls.length).toBe(1);
+  });
+
+  // AC3 (#68): toggling plan-complete off must not touch work-complete (or any
+  // other event), and vice versa -- the two are independent keys, not a shared
+  // discriminator on one event.
+  test("notify: plan event toggle independent", async () => {
+    const { post, calls } = spyPoster();
+    const cfg = cfgWith({ enabled: true, discordWebhookUrl: WEBHOOK, events: { "plan-complete": false } });
+    const off = await notify("plan-complete", PLAN, cfg, { post });
+    expect(off).toBe(false);
+    expect(calls.length).toBe(0);
+    const on = await notify("work-complete", WC, cfg, { post });
     expect(on).toBe(true);
     expect(calls.length).toBe(1);
   });
@@ -292,9 +325,9 @@ describe("validateConfig: notifications block shapes", () => {
     ).toThrow(/notifications\.events\.work-complete/);
   });
 
-  test("EVENT_KEYS enumerates exactly the five events", () => {
+  test("EVENT_KEYS enumerates exactly the six events", () => {
     expect(([...EVENT_KEYS] as string[]).sort()).toEqual(
-      ["human-pause", "safety-violation", "ticket-parked", "token-burn", "work-complete"].sort()
+      ["human-pause", "plan-complete", "safety-violation", "ticket-parked", "token-burn", "work-complete"].sort()
     );
   });
 });

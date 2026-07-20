@@ -515,16 +515,18 @@ Report DONE only when all hold:
   the only path anywhere in this skill that ever moves a Backlog ticket to
   Ready remains Step 7.4's dependency pull.
 
-**Notify.** Once DONE, `send work-complete` through the shared notification edge
+**Notify.** Once DONE, `send plan-complete` through the shared notification edge
 (`lib/notify.ts`) so a `/z-plan` run pings the same Discord channel as the loop —
 a no-op when the project has no `notifications` config
-(docs/user-guide/z-loop.md). There is no drain loop here, so `loopCount` is `0`
-and `done` carries the count of tickets created/updated this run (the rest are
-`0`):
+(docs/user-guide/z-loop.md). A plan run has no drain loop, no per-status
+counts, and no spend, so it is its own event (#68) rather than a `work-complete`
+with a fake `loopCount: 0` — the message names the plan run and the count of
+tickets created/updated this run, and toggles independently of loop
+completions under `notifications.events`:
 
 ```bash
 jq -n --arg slug "$SLUG" --argjson created "$CREATED" \
-  '{slug:$slug, loopCount:0, done:$created, questions:0, blocked:0, skipped:0, totalDollars:0}' \
+  '{slug:$slug, ticketsCreated:$created}' \
   > "$TMP/notify-plan.json"
-bun "$PACK/lib/notify.ts" send work-complete "$TMP/notify-plan.json" --slug "$SLUG"
+bun "$PACK/lib/notify.ts" send plan-complete "$TMP/notify-plan.json" --slug "$SLUG"
 ```
