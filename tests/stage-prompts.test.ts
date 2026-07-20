@@ -327,6 +327,10 @@ describe("builder prompt", () => {
     expect(p).toContain(".worktrees/ticket-42");
     expect(p).toContain("z/ticket-42-add-csv-export");
     expect(p).toContain("Ponytail ladder");
+    // Files-section nudge (issue #84): a ticket that carries a `## Files`
+    // section is the grounding map the builder should start from instead of
+    // re-discovering the same paths with fresh glob/grep.
+    expect(p).toContain("If the ticket has a `## Files` section, it is the map");
     expect(p).toContain("implementation + gate tests + evals");
     expect(p).toContain("BUILT:");
     expect(p).toContain("NEEDS-INPUT:");

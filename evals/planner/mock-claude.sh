@@ -17,6 +17,13 @@ PROMPT="${1:-}"
 
 ticket() {
   local title="$1" estimate="$2" depends="$3"
+  # issue #84: the grounding pass' `## Files` path -- normally
+  # `src/store.ts`, which is real under evals/planner/fixture-app. Overridable
+  # to a nonexistent path so a test can prove the harness's --check-paths
+  # grounding gate (evals/planner/harness.ts checkRun) actually catches a
+  # planner that lists a plausible-but-wrong path.
+  local files_path="${MOCK_CLAUDE_BAD_FILES:+src/does-not-exist.ts}"
+  files_path="${files_path:-src/store.ts}"
   cat << TICKET
 # Ticket: $title
 
@@ -45,6 +52,10 @@ check, issue #25) -- grounds on fixture-app/src/store.ts's Store class.
 ## Out of scope
 
 - anything not named above.
+
+## Files
+
+- \`$files_path\` -- the Store class this ticket extends.
 
 Model: sonnet
 Model Effort: medium

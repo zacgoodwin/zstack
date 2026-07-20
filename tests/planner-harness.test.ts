@@ -25,6 +25,7 @@ import {
   formatReport,
   defaultSpawn,
   PASS_THRESHOLD,
+  DEFAULT_FILES_ROOT,
   type Spawn,
   type RubricScore,
 } from "../evals/planner/harness.ts";
@@ -46,9 +47,10 @@ afterEach(() => {
 });
 
 // A minimal valid ticket body (passes bin/z-ticket-lint), parameterized so
-// tests can vary the Estimate and title.
-function ticketBody(opts: { title?: string; estimate?: number | string; depends?: string } = {}): string {
-  const { title = "Do the thing", estimate = 1.64, depends } = opts;
+// tests can vary the Estimate and title. `files`, when given, is a single
+// backticked path rendered as a `## Files` bullet (issue #84 grounding gate).
+function ticketBody(opts: { title?: string; estimate?: number | string; depends?: string; files?: string } = {}): string {
+  const { title = "Do the thing", estimate = 1.64, depends, files } = opts;
   return [
     `# Ticket: ${title}`,
     "",
@@ -76,6 +78,7 @@ function ticketBody(opts: { title?: string; estimate?: number | string; depends?
     "",
     "everything else.",
     "",
+    ...(files ? ["## Files", "", `- \`${files}\` -- grounding path.`, ""] : []),
     "Model: sonnet",
     "Model Effort: medium",
     `Estimate: ${estimate}`,
@@ -411,6 +414,47 @@ describe("lintTicketBody", () => {
     expect(r.output).toContain("Missing mandatory section");
     expect(r.output).toContain("Acceptance Criteria");
   });
+
+  // issue #84: the optional 5th arg threads `--check-paths <root>` through to
+  // the real bin/z-ticket-lint -- the planner eval's grounding gate.
+  test("injected fake spawn: a checkPathsRoot arg appends --check-paths <root> to the spawned command", () => {
+    const dir = tmpDir();
+    let seenCmd: string[] = [];
+    const fake: Spawn = (cmd) => {
+      seenCmd = cmd;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    };
+    lintTicketBody(ticketBody(), dir, LINT_BIN, fake, "/fake/repo/root");
+    expect(seenCmd).toEqual(["bash", LINT_BIN, seenCmd[2], "--check-paths", "/fake/repo/root"]);
+  });
+
+  test("no checkPathsRoot arg (default): no --check-paths on the spawned command", () => {
+    const dir = tmpDir();
+    let seenCmd: string[] = [];
+    const fake: Spawn = (cmd) => {
+      seenCmd = cmd;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    };
+    lintTicketBody(ticketBody(), dir, LINT_BIN, fake);
+    expect(seenCmd).not.toContain("--check-paths");
+  });
+
+  // Real bin/z-ticket-lint, real fixture-app: the actual grounding check
+  // (issue #84) -- a ticket whose `## Files` names the real `src/store.ts`
+  // lints clean; the same ticket naming a path that does not exist under
+  // fixture-app fails, naming exactly that path.
+  test("real bin/z-ticket-lint --check-paths against fixture-app: a real Files path lints clean", () => {
+    const dir = tmpDir();
+    const r = lintTicketBody(ticketBody({ files: "src/store.ts" }), dir, LINT_BIN, defaultSpawn, DEFAULT_FILES_ROOT);
+    expect(r.ok).toBe(true);
+  });
+
+  test("real bin/z-ticket-lint --check-paths against fixture-app: a plausible-but-wrong Files path fails, naming it", () => {
+    const dir = tmpDir();
+    const r = lintTicketBody(ticketBody({ files: "src/does-not-exist.ts" }), dir, LINT_BIN, defaultSpawn, DEFAULT_FILES_ROOT);
+    expect(r.ok).toBe(false);
+    expect(r.output).toContain("src/does-not-exist.ts");
+  });
 });
 
 // ============================================================================
@@ -466,6 +510,40 @@ describe("checkRun: the deterministic pipeline over a run directory", () => {
     writeRun(dir, 1, ticketBody(), 9);
     const { main } = await import("../evals/planner/harness.ts");
     expect(main(["check", dir, "1"])).toBe(0);
+  });
+
+  // -- issue #84: the `## Files` grounding gate, wired into checkRun's default
+  // pipeline against evals/planner/fixture-app. This is "the eval that would
+  // have caught a planner that lists plausible-but-wrong paths": a ticket
+  // whose Files section names a real fixture path is indistinguishable from
+  // one with none, but a fabricated path now fails the run even at a
+  // perfect score, exactly like a missing mandatory section already does.
+  test("a real `## Files` path (src/store.ts, exists in fixture-app) does not affect a passing run", () => {
+    const dir = tmpDir();
+    writeRun(dir, 1, ticketBody({ files: "src/store.ts" }), 9);
+    const report = checkRun(dir, 1, LINT_BIN);
+    expect(report.lintFailures).toEqual([]);
+    expect(report.exitCode).toBe(0);
+  });
+
+  test("a fabricated `## Files` path (does not exist in fixture-app) fails the run even at a perfect score", () => {
+    const dir = tmpDir();
+    writeRun(dir, 1, ticketBody({ files: "src/does-not-exist.ts" }), 10);
+    const report = checkRun(dir, 1, LINT_BIN);
+    expect(report.lintFailures.length).toBeGreaterThan(0);
+    expect(report.lintFailures[0]).toContain("src/does-not-exist.ts");
+    expect(report.exitCode).toBe(1);
+  });
+
+  test("filesRoot is overridable to a different grounding root", () => {
+    const groundingRoot = tmpDir();
+    writeFileSync(join(groundingRoot, "real.ts"), "// exists here, not in fixture-app", "utf8");
+    const dir = tmpDir();
+    writeRun(dir, 1, ticketBody({ files: "real.ts" }), 9);
+    // Against fixture-app (default) this path does not exist -> fails.
+    expect(checkRun(dir, 1, LINT_BIN).lintFailures.length).toBeGreaterThan(0);
+    // Against the custom root where it really is -> passes.
+    expect(checkRun(dir, 1, LINT_BIN, defaultSpawn, groundingRoot).lintFailures).toEqual([]);
   });
 });
 
@@ -634,5 +712,16 @@ describe("mocked end-to-end: run.sh + mock-claude.sh (AC1-AC4)", () => {
     expect(r.exitCode).toBe(0);
     // Both tickets in the chain must have lint-passed independently.
     expect(r.stdout).toContain("schema gate (z-ticket-lint): PASS");
+  });
+
+  // issue #84: the `## Files` grounding gate catches a planner that lists a
+  // plausible-but-wrong path, end to end -- real bin/z-ticket-lint
+  // --check-paths against the real fixture-app, through run.sh's actual
+  // orchestration, not just the unit-level checkRun tests above.
+  test("issue #84: a mocked plan naming a nonexistent Files path fails the grounding gate, even at a perfect score", () => {
+    const r = runHarnessE2E("backlog", 1, { MOCK_CLAUDE_BAD_FILES: "1" });
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toContain("schema gate (z-ticket-lint): FAIL");
+    expect(r.stdout).toContain("src/does-not-exist.ts");
   });
 });

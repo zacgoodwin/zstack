@@ -95,8 +95,16 @@ board writes rather than silently skipping.
 3. **Drafts each ticket to the schema and gates it.** Mandatory sections:
    `## Context`, `## Plan`, `### Acceptance Criteria` (setup → action → expected,
    authored before any code), `## Tests + evals`, `## Docs pages touched`,
-   `## Out of scope`, and an optional `Depends on:` line. Every body must pass
-   `bin/z-ticket-lint` before it hits the board.
+   `## Out of scope`. Two optional sections: `Depends on:` and `## Files` — one
+   bullet per file the grounding pass (step 1 above) discovered, each a path
+   like `lib/board.ts` in the bullet's first backticked span followed by a
+   one-clause role; a file the ticket will create (doesn't exist yet) is
+   suffixed literally `(new)`. This is the map the builder/QA/reviewer stages
+   reuse instead of re-discovering the same files with fresh glob/grep every
+   stage. Every body must pass `bin/z-ticket-lint --check-paths <repoRoot>`
+   before it hits the board — `--check-paths` also verifies every `## Files`
+   path actually exists (skipping `(new)` bullets), so a hallucinated or stale
+   path fails here, at plan time, not later in a build worktree.
 4. **Plan-time edges comment.** Once the body passes the lint gate, chosen
    defaults, spec-ambiguous calls, and data-loss-ish behaviors the PLAN itself
    introduces are collected as `{check, doStep, expect}` edges and, when
