@@ -1,7 +1,7 @@
 # zstack: The Part Gary Forgot
 
 zstack came about for two reason: 
-1. I am poor (but if you want to fix that Mr. Tan....). gstack was great at making a robust design but once I asked claude to "Make the thing" my usage shot through the roof.
+1. I am poor (but if you want to fix that Mr. Tan....). gstack is great at making a robust design but once I asked claude to "Make the thing" my usage shot through the roof.
 2. When I was learning the AI development loop I came across gstack which was great but I kept wondering "How do I make the agent make the code in the best way possible?". gstack provided the skills, the design framework but after that left me guessing.
 
 # This is my loop. There are many like it, but this one is mine.
