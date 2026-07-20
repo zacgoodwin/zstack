@@ -4,7 +4,7 @@ The failure modes zstack surfaces on purpose, and what to do about each. All of
 these are deliberate stops — the loop refuses to guess or to burn tokens while
 wedged.
 
-## Installed the pack but /z-setup, /z-plan, /z-loop, /z-status don't appear
+## Installed the pack but /z-setup, /z-plan, /z-loop, /z-status, /z-uninstall don't appear
 
 Claude Code builds its skill list from `~/.claude/skills/<name>/SKILL.md`,
 exactly one level deep — SKILL.md files nested inside the pack directory are
