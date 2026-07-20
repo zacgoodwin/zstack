@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# zstack setup: verify preconditions and register the pack directory for
-# Claude Code (and Codex/Factory when installed). Modeled on gstack's setup.
+# zstack setup: verify preconditions, then register the pack directory (runtime
+# assets) AND each z-* skill as its own top-level entry for Claude Code (and
+# Codex/Factory when installed). Modeled on gstack's setup.
 set -e
 
 TEAM_MODE=0
@@ -41,34 +42,61 @@ case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*|Windows_NT) IS_WINDOWS=1 ;;
 esac
 
-# Ownership sentinel: dropped into a COPIED registration so `uninstall` can prove
-# we created it before deleting it. A symlink is self-evidently ours (it points
-# into the pack); a copy is indistinguishable from a user's own same-named dir
-# without this marker. Kept in sync with the same literal in `uninstall`.
-SENTINEL=".zstack-registered"
-
 # Symlink on macOS/Linux. On Windows without Developer Mode, a plain `ln -snf`
 # silently creates a frozen copy that doesn't refresh after `git pull`, so we
 # copy explicitly there instead (same tradeoff gstack's setup makes).
+# Ownership sentinel: every copy this script creates carries this file, and it
+# is the ONLY proof a real dir is ours to refresh or for `uninstall` to remove.
+# Name-matching can't prove ownership — a genuine third-party z-loop skill also
+# declares `name: z-loop`. Symlinks prove themselves (we only ever link into the
+# pack). Kept in sync with the same literal in `uninstall`.
+MARKER=".zstack-registered"
+
+_owned() {
+  # $1 is ours to replace when it's a symlink or carries our sentinel.
+  [ -L "$1" ] || [ -f "$1/$MARKER" ]
+}
+
 _link_or_copy() {
   local src="$1" dst="$2"
   if [ "$IS_WINDOWS" -eq 1 ]; then
-    rm -rf "$dst"
-    cp -R "$src" "$dst"
-    # Mark the copy as zstack-created (see SENTINEL note above) so `uninstall`
-    # will remove it. Never written into a symlinked registration, and never
-    # into the git clone itself -- register()'s parent-match check returns
-    # before reaching here -- so a clone we don't own is never mistaken for a
-    # removable copy.
-    printf '%s\n' "Created by zstack ./setup. Safe to remove with ./uninstall (or by deleting this directory)." > "$dst/$SENTINEL"
+    # Stage into a dot-prefixed sibling dir (hosts skip dot dirs, so an
+    # orphaned staging dir can never be discovered as a phantom skill), then
+    # swap by rename: mv of a locked dir fails atomically with dst intact,
+    # unlike rm -rf which can half-delete it.
+    local parent base staging old
+    parent="$(dirname "$dst")" base="$(basename "$dst")"
+    staging="$parent/.$base.tmp.$$" old="$parent/.$base.old.$$"
+    rm -rf "$parent/.$base".tmp.* "$parent/.$base".old.* 2>/dev/null || true
+    mkdir -p "$staging"
+    # A repo-shaped pack drags .git / node_modules / .worktrees (tens of MB
+    # the skills never read) into every copy; filter them at the top level.
+    local entry name
+    for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do
+      [ -e "$entry" ] || continue
+      name="$(basename "$entry")"
+      case "$name" in .git|node_modules|.worktrees|.gstack) continue ;; esac
+      cp -R "$entry" "$staging/$name"
+    done
+    # Mark the copy as zstack-created so `uninstall` will remove it (existence
+    # is the only thing it checks; the text just orients a human who finds it).
+    printf '%s\n' "Created by zstack ./setup. Safe to remove with ./uninstall (or by deleting this directory)." > "$staging/$MARKER"
+    if [ -e "$dst" ]; then mv "$dst" "$old"; fi
+    mv "$staging" "$dst"
+    rm -rf "$old" 2>/dev/null || true
   else
+    # `ln -snf src dir` on an existing REAL dir nests the link inside it;
+    # callers verify ownership before we get here, so replace outright.
+    [ -d "$dst" ] && [ ! -L "$dst" ] && rm -rf "$dst"
     ln -snf "$src" "$dst"
   fi
 }
 
-# Register PACK_DIR under a host's skills directory as "zstack".
-# The pack ships five skills (z-setup, z-plan, z-loop, z-status, z-uninstall);
-# registering the pack dir makes all of them discoverable to the host at once.
+# Register PACK_DIR under a host's skills directory. Hosts build their skill
+# list from skills_dir/<name>/SKILL.md ONE level deep (Claude Code skips
+# repo-shaped pack dirs entirely — see gstack's setup), so the pack entry only
+# carries runtime assets (bin/, lib/); each z-* skill must ALSO be registered
+# as its own top-level entry or none of them appear.
 register() {
   local skills_dir="$1" label="$2"
   mkdir -p "$skills_dir"
@@ -77,38 +105,80 @@ register() {
   # Already installed directly inside a skills/ dir (e.g. cloned straight to
   # ~/.claude/skills/zstack)? Then target == PACK_DIR: symlinking or copying
   # it onto itself would corrupt it (Windows copy path does `rm -rf "$dst"`
-  # first). Detect via parent-dir match and skip.
+  # first). Detect via parent-dir match and skip the pack link only — the
+  # per-skill registration below must still run.
   local skills_real pack_parent_real
   skills_real="$(cd "$skills_dir" && pwd -P)"
   pack_parent_real="$(cd "$(dirname "$PACK_DIR")" && pwd -P)"
   if [ "$skills_real" = "$pack_parent_real" ]; then
-    echo "  $label: already installed at $PACK_DIR"
+    echo "  $label: pack already at $PACK_DIR"
+  elif [ -e "$target" ] && ! _owned "$target"; then
+    # A real dir we didn't create — a separate clone (with .git, dir or FILE
+    # as git worktrees produce), a ZIP/manual install, anything without our
+    # sentinel. It owns this host: every SKILL.md resolves
+    # PACK=~/.claude/skills/zstack, so registering THIS pack's skills next to
+    # that runtime would mix versions, and clobbering it could destroy work.
+    # Refuse the whole host, and tell the caller so Codex/Factory don't get
+    # registered against a runtime pack that isn't theirs either.
+    echo "  $target is a separate zstack install we didn't create; leaving $label untouched." >&2
+    echo "  To use it: run ./setup from it. To replace it with this pack: rm -rf \"$target\" and re-run." >&2
+    _ZSTACK_CONFLICT=1
     return 0
+  else
+    _link_or_copy "$PACK_DIR" "$target"
+    echo "  registered pack for $label: $target"
   fi
 
-  # Target exists as a real (non-symlink) dir pointing somewhere else? Don't
-  # clobber a separate install.
-  if [ -e "$target" ] && [ ! -L "$target" ]; then
-    local existing_real
-    existing_real="$(cd "$target" 2>/dev/null && pwd -P || echo "")"
-    if [ -n "$existing_real" ] && [ "$existing_real" != "$PACK_DIR" ]; then
-      echo "  $target already exists as a separate install; skipping $label registration." >&2
-      return 0
+  # Per-skill top-level entries: skills_dir/z-loop -> PACK_DIR/z-loop etc.
+  local skill_dir skill_name dst
+  local registered="" skipped=""
+  for skill_dir in "$PACK_DIR"/z-*/; do
+    [ -f "$skill_dir/SKILL.md" ] || continue
+    skill_name="$(basename "$skill_dir")"
+    dst="$skills_dir/$skill_name"
+    # Only entries we created (symlink or sentinel-carrying copy) are ours to
+    # refresh. A same-named third-party skill also declares `name: <skill>`,
+    # so frontmatter can't prove ownership — without the sentinel, leave it.
+    if [ -e "$dst" ] && ! _owned "$dst"; then
+      echo "  $dst exists but was not registered by zstack setup; leaving it." >&2
+      skipped="$skipped $skill_name"
+      continue
     fi
+    _link_or_copy "${skill_dir%/}" "$dst"
+    registered="$registered $skill_name"
+  done
+  # if-form, not `[ -n ] && echo`: an all-skipped pass would make the AND-list
+  # the function's failing last command and abort the whole script under set -e.
+  if [ -n "$registered" ]; then
+    echo "  registered $label skills:$registered"
   fi
-
-  _link_or_copy "$PACK_DIR" "$target"
-  echo "  registered for $label: $target"
+  if [ -z "$registered" ] && [ -z "$skipped" ]; then
+    # No skills found in the pack at all (partial download, renamed dirs):
+    # succeeding silently here is the invisible-skills bug this script exists
+    # to prevent. Fail loudly.
+    echo "Error: no z-*/SKILL.md skills found in $PACK_DIR — nothing registered for $label." >&2
+    exit 1
+  fi
+  return 0
 }
 
+_ZSTACK_CONFLICT=0
 register "$HOME/.claude/skills" "Claude Code"
 
 # Codex/Factory: same auto-detection gstack's setup uses (binary on PATH).
-if command -v codex >/dev/null 2>&1; then
-  register "$HOME/.codex/skills" "Codex"
-fi
-if command -v droid >/dev/null 2>&1; then
-  register "$HOME/.factory/skills" "Factory"
+# Skipped when the Claude Code host was refused: every SKILL.md resolves its
+# runtime from ~/.claude/skills/zstack, so skills registered for other hosts
+# would execute the OTHER install's bin/lib — the version mix the refusal
+# exists to prevent. Resolve the conflict there first, then re-run.
+if [ "$_ZSTACK_CONFLICT" -eq 1 ]; then
+  echo "  Skipping Codex/Factory registration until the ~/.claude/skills/zstack conflict above is resolved." >&2
+else
+  if command -v codex >/dev/null 2>&1; then
+    register "$HOME/.codex/skills" "Codex"
+  fi
+  if command -v droid >/dev/null 2>&1; then
+    register "$HOME/.factory/skills" "Factory"
+  fi
 fi
 
 if [ "$TEAM_MODE" -eq 1 ]; then

@@ -104,7 +104,7 @@ Sum of the **Estimate** and **Actual** fields across all tickets on the board.
   tests or manually).
 
 Use this to calibrate your estimates: if Actual routinely exceeds Estimate,
-your planning is undercharging (see references/ESTIMATION.md).
+your planning is undercharging (see docs/user-guide/spec/ESTIMATION.md).
 
 ## Done criteria
 

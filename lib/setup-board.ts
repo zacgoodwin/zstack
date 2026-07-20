@@ -46,7 +46,7 @@ import {
 export { ZError } from "./config.ts";
 export type { DesiredField } from "./board-template.ts";
 
-// -- desired board shape (references/PROCESS.md + issue #1) -------------------
+// -- desired board shape (docs/user-guide/spec/PROCESS.md + issue #1) ---------
 export const STATUS_FIELD_NAME = "Status";
 
 // The board shape is data now (issue #20): the nine statuses and four custom

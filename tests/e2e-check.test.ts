@@ -212,6 +212,7 @@ describe("C10 deliverables are on disk", () => {
     "evals/e2e/README.md",
     "evals/e2e/assertions.ts",
     "evals/e2e/check.ts",
+    "docs/user-guide/README.md",
     "docs/user-guide/z-setup.md",
     "docs/user-guide/z-plan.md",
     "docs/user-guide/z-loop.md",

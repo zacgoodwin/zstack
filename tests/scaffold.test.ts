@@ -1,7 +1,7 @@
 // Gate tests for the C1 scaffold: setup's precondition checks (run against
 // real bash with PATH/HOME manipulated so deps look present/absent) and the
-// references/ restructure. Deterministic, no network, must stay well under
-// the 2s gate budget.
+// docs/user-guide/spec restructure. Deterministic, no network, must stay well
+// under the 2s gate budget.
 import { test, expect, describe, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, mkdirSync, existsSync, readFileSync, lstatSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -115,6 +115,14 @@ describe("setup preconditions", () => {
     expect(readFileSync(join(registered, "VERSION"), "utf8").trim()).toBe(
       readFileSync(join(REPO_ROOT, "VERSION"), "utf8").trim()
     ); // the registered copy matches the repo VERSION (whatever the parent bumped it to)
+    // The Windows copy filters repo baggage — without this the copy hauls
+    // ~75MB of node_modules/.git/.worktrees and this test blows its timeout.
+    // (On macOS/Linux registration is a symlink to the repo, so the paths
+    // exist through it by design — the filter only applies to copies.)
+    if (process.platform === "win32") {
+      expect(existsSync(join(registered, "node_modules"))).toBe(false);
+      expect(existsSync(join(registered, ".git"))).toBe(false);
+    }
   }, SPAWN_TIMEOUT_MS);
 
   // Ticket #37: uninstall proves ownership before deleting a registration. A
@@ -149,7 +157,7 @@ describe("setup preconditions", () => {
   }, SPAWN_TIMEOUT_MS);
 });
 
-describe("references/ restructure", () => {
+describe("docs/user-guide/spec restructure", () => {
   const MOVED_DOCS = [
     "PROCESS.md",
     "ESTIMATION.md",
@@ -164,22 +172,24 @@ describe("references/ restructure", () => {
     "planning Process.png",
   ];
 
+  const SPEC_DIR = join(REPO_ROOT, "docs", "user-guide", "spec");
   for (const doc of MOVED_DOCS) {
-    test(`references/${doc} exists`, () => {
-      expect(existsSync(join(REPO_ROOT, "references", doc))).toBe(true);
+    test(`docs/user-guide/spec/${doc} exists`, () => {
+      expect(existsSync(join(SPEC_DIR, doc))).toBe(true);
     });
 
-    test(`${doc} is not left at repo root`, () => {
+    test(`${doc} is not left in references/ or at repo root`, () => {
+      expect(existsSync(join(REPO_ROOT, "references", doc))).toBe(false);
       expect(existsSync(join(REPO_ROOT, doc))).toBe(false);
     });
   }
 });
 
 describe("root scaffold", () => {
-  test("VERSION starts at 0.1.0", () => {
-    // Matches the 0.1.0 line whether or not the parent has appended a release
-    // segment (e.g. 0.1.0.0); the point is the pack shipped at the 0.1.0 baseline.
-    expect(readFileSync(join(REPO_ROOT, "VERSION"), "utf8").trim()).toMatch(/^0\.1\.0(\.\d+)?$/);
+  test("VERSION uses the 4-segment MAJOR.MINOR.PATCH.MICRO scheme", () => {
+    // Pinning a literal version broke on the first release bump; the durable
+    // contract is the 4-segment scheme /ship's version-bump tooling parses.
+    expect(readFileSync(join(REPO_ROOT, "VERSION"), "utf8").trim()).toMatch(/^\d+\.\d+\.\d+\.\d+$/);
   });
 
   test("package.json wires bun test", () => {

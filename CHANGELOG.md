@@ -2,16 +2,20 @@
 
 All notable changes to zstack are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/); versions use `MAJOR.MINOR.PATCH.MICRO`.
 
-## [Unreleased]
+## [0.1.1.0] - 2026-07-19
 
-Remediation of issue #14 (all 22 items now closed) plus an adversarial hardening pass (OpenAI Codex challenge + independent refute review, every fix mutation-tested).
+Installing zstack now actually surfaces its skills. Also adds a `/z-uninstall` command, releases the issue #14 remediation (all 22 items closed), and includes an adversarial hardening pass (OpenAI Codex challenge + independent refute review, every fix mutation-tested).
 
 ### Added
 
+- `/z-uninstall` (and the `uninstall` script beside `setup`) reverses `./setup`, honoring the same ownership rule setup uses: it removes only the host registrations it can prove it created — a symlink, or a copy carrying the `.zstack-registered` sentinel — and leaves any same-named directory it did not create, naming it. It never deletes the git clone at `~/.claude/skills/zstack` itself (it may be your only copy) — the exact `rm -rf` is printed instead. `--purge` also removes `~/.zstack` (config, loop state, locks, reports); `bin/z-setup-permissions --remove` strips exactly the auto-approval settings `/z-setup` wrote, leaving foreign keys/rules/hooks intact. The GitHub board, milestones, and labels are remote data and are never touched.
 - Board shape (nine statuses, four custom fields, intended views) is data now (issue #20): the shipped `z-setup/board-template.json`, loaded and validated by `lib/board-template.ts` before any board mutation. The default is 1:1 with the previously hardcoded shape (same statuses in order, same fields + option colors). `z-setup-board plan|apply|verify --template <file>` ships a variant; the loader refuses a template whose status set is not the canonical nine or that drops/renames a required field (Model, Model Effort, Estimate, Actual), naming the field and the tool that breaks. GitHub's API has no view-creation mutation, so the template's views are printed as explicit manual steps rather than silently dropped.
 
 ### Fixed
 
+- `./setup` now registers each skill (`z-setup`, `z-plan`, `z-loop`, `z-status`) as its own top-level entry in the host's skills directory. Hosts discover `skills/<name>/SKILL.md` one level deep only, so registering just the pack directory left all four skills invisible — worst on the documented clone-straight-into-`~/.claude/skills/zstack` path, which early-returned before registering anything. Run `./setup` after every install or update, then restart Claude Code; on Windows run it from Git Bash (`cmd.exe` leaves a literal `~` folder).
+- Registration is now safe around things setup didn't create. Every copy carries a `.zstack-registered` sentinel and only sentinel-carrying dirs (or symlinks) are refreshed: a separate zstack checkout at `~/.claude/skills/zstack` (including git worktrees, where `.git` is a file) or a ZIP/manual install refuses the whole host with the fix command printed and skips Codex/Factory, so no host ends up driving another install's `bin/lib`; a third-party skill that happens to be named `z-*` is skipped with a warning and left untouched. Nothing setup didn't create gets deleted.
+- Windows registration copies are staged and swapped by rename, so a locked file or mid-copy failure can't leave a half-registered skill, and they filter `.git` / `node_modules` / `.worktrees` / `.gstack` (~75MB of repo baggage the skills never read). A pack with no skills in it now fails setup loudly instead of printing the success banner over an empty registration.
 - `Board.list()` paginates past 100 items with cursor-loop hardening (empty/repeated cursor and missing `pageInfo` throw loudly); single-page ceilings (fieldValues, projectItems, milestones, labels) guard with loud throws.
 - Destructive board adopt now refuses without `--force` when non-canonical options on ANY single-select field (Status, Model, Model Effort) still hold items, names each option and count before any mutation, and rechecks immediately before mutating (refuses even under `--force` if the board moved).
 - Setup's project/field lookups paginate — a project past page one is adopted, not duplicated.
@@ -29,7 +33,7 @@ Remediation of issue #14 (all 22 items now closed) plus an adversarial hardening
 - `epicStyle "issue-type"` is rejected at config validation and z-setup until a sub-issue create path exists; epic style is always `milestones`.
 - `field-get` on a nonexistent issue throws the same not-found error as other subcommands (was a silent empty value), and never falls back to another project's same-named field.
 - Root strict `tsconfig` + `bun run typecheck` wired into the gate suite; shared CLI plumbing consolidated into `lib/cli.ts`; board statuses single-sourced in `lib/config.ts`.
-- 100+ new gate tests (456 total), each proven to bite via mutation testing.
+- 100+ new gate tests (682 total), each proven to bite via mutation testing.
 
 ## [0.1.0.0] - 2026-07-19
 
@@ -49,5 +53,5 @@ First release of the zstack dev-loop skill pack. Installs at `~/.claude/skills/z
 
 ### Known limitations
 
-- The pre-landing review filed remediation issue #14 (pagination beyond 100 board items, epicStyle `issue-type` create path, cross-session claim identity, and others); all 22 items are closed in [Unreleased] above.
+- The pre-landing review filed remediation issue #14 (pagination beyond 100 board items, epicStyle `issue-type` create path, cross-session claim identity, and others); all 22 items are closed in [0.1.1.0] above.
 - Board creation, real multi-session lock concurrency, and issue-stays-open-on-Done are validated by design and gate tests but need one live run (`gh auth refresh -s project`, then `/z-setup`) to confirm end to end.
