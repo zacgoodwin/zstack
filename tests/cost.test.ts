@@ -135,7 +135,7 @@ describe("format-drift canary (AC4)", () => {
 // but carries nothing billable -- z-cost must skip it before the rate lookup
 // and count the skip, rather than raising the fail-loud unknown-model ZError
 // every OTHER unrecognized model string still must raise.
-describe("harness-synthetic entries are skipped, not priced (ticket #30)", () => {
+describe("synthetic transcript entries are skipped, not priced (ticket #30)", () => {
   const ZERO_USAGE = {
     input_tokens: 0,
     output_tokens: 0,

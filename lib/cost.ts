@@ -82,10 +82,11 @@ export interface CostResult {
 
 // Claude Code itself (not this repo, not z-loop's watchdog) writes a
 // synthetic assistant entry with this exact model string inline in the
-// transcript whenever an API call fails transiently mid-session (usage.isApiErrorMessage:
-// true, apiErrorStatus 429/500/529 -- rate limit or server error). It is not
-// a real API response and carries nothing billable. Confirmed against 11/11
-// real "<synthetic>" occurrences in ~/.claude/projects/ transcripts. Must
+// transcript whenever an API call fails transiently mid-session (top-level
+// isApiErrorMessage: true and apiErrorStatus 429/500/529 fields on the
+// record -- rate limit or server error). It is not a real API response and
+// carries nothing billable. Confirmed against 11/11 real "<synthetic>"
+// occurrences in ~/.claude/projects/ transcripts. Must
 // skip BEFORE the rate lookup below so it never trips the fail-loud
 // unknown-model ZError that every genuinely-unrecognized model string
 // should still raise (resolveRate in lib/estimate.ts).
@@ -157,10 +158,10 @@ export function costOfFiles(paths: string[], rates: RatesFile): CostResult {
       if (!parsed) continue;
       linesParsed++;
 
-      // Harness-synthetic entries carry nothing billable (see
-      // SYNTHETIC_MODEL) -- skip before dedup/rate lookup, counted rather
-      // than silently dropped, and never reaching resolveRate's fail-loud
-      // unknown-model check below.
+      // Synthetic entries carry nothing billable (see SYNTHETIC_MODEL) --
+      // skip before dedup/rate lookup, counted rather than silently
+      // dropped, and never reaching resolveRate's fail-loud unknown-model
+      // check below.
       if (parsed.model === SYNTHETIC_MODEL) {
         skippedSynthetic++;
         continue;
