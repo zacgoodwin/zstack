@@ -67,7 +67,7 @@ And four custom fields per ticket:
 | `~/.zstack/projects/<slug>/locks/` | Lane locks + the loop lock (crash evidence) |
 | `~/.zstack/projects/<slug>/loop/` | The drain state file + stage transcripts |
 | `~/.zstack/projects/<slug>/reports/` | One `loop-<timestamp>.md` per run + invocation logs |
-| `~/.zstack/projects/<slug>/loop-counter` | How many loops have completed (drives the 5th-loop audits) |
+| `~/.zstack/projects/<slug>/loop-counter` | How many loops have completed (drives the every-Nth-loop audit cadence, config `auditEveryNLoops`, default 5) |
 | `<repo>/.worktrees/ticket-<N>/` | Each lane's isolated git worktree (disposable) |
 
 `<slug>` is the repo name. The board is the recoverable source of truth;
@@ -434,8 +434,9 @@ Also on disk:
   with a `checked_at` date. Both tools warn (not fail) when it's over 14 days
   old; update the rates and bump the date.
 - `~/.zstack/projects/<slug>/loop-counter` — a single integer. It drives the
-  5th-loop `/cso` + `/health` cadence; if corrupted, the loop fails loudly
-  rather than silently resetting. Fix it to the number of completed loops.
+  every-Nth-loop audit cadence (`auditEveryNLoops`, default 5): when the counter hits
+  a multiple of that config, `/cso` + `/health` audits run. If corrupted, the loop fails
+  loudly rather than silently resetting. Fix it to the number of completed loops.
 
 ## When something goes wrong
 
