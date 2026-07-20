@@ -40,17 +40,18 @@ On Windows, run both commands from **Git Bash** — `cmd.exe` doesn't expand `~`
 so the clone lands in a literal `~` folder instead of your home directory.
 
 `./setup` checks every precondition (bun, gstack, gh) and refuses with the exact
-fix command if one is missing. It then registers each of the four skills
-(`/z-setup`, `/z-plan`, `/z-loop`, `/z-status`) as its own top-level entry in
-the host's skills directory — hosts discover `skills/<name>/SKILL.md` exactly
-one level deep, so the pack directory alone is never enough:
+fix command if one is missing. It then registers each of the five skills
+(`/z-setup`, `/z-plan`, `/z-loop`, `/z-status`, `/z-uninstall`) as its own
+top-level entry in the host's skills directory — hosts discover
+`skills/<name>/SKILL.md` exactly one level deep, so the pack directory alone is
+never enough:
 
 - **Claude Code** — the pack at `~/.claude/skills/zstack` (runtime assets)
-  plus `~/.claude/skills/z-setup`, `z-plan`, `z-loop`, `z-status`. Running
-  `./setup` is mandatory even when you cloned straight into place.
+  plus `~/.claude/skills/z-setup`, `z-plan`, `z-loop`, `z-status`, `z-uninstall`.
+  Running `./setup` is mandatory even when you cloned straight into place.
 - **Codex / Factory** — auto-detected by binary on PATH (`codex` / `droid`) and
   registered the same way under `~/.codex/skills` / `~/.factory/skills`.
-  `--team` prints the team-mode note; the four skills need no session hooks.
+  `--team` prints the team-mode note; the five skills need no session hooks.
 
 Restart Claude Code after install — the skill list is scanned at session start.
 
@@ -111,7 +112,8 @@ What it **asks** — exactly two questions:
   | **C) Skip** | Nothing | Today's behavior; one-off approvals keep piling up |
 
   This edits `~/.claude/settings.json`, which affects **every project on the
-  machine**, not just this repo. Undo is a documented hand-edit;
+  machine**, not just this repo. Undo with `bin/z-setup-permissions --remove`
+  (strips exactly the auto-approval settings `/z-setup` wrote);
   `z-setup-permissions --check` reports which layers are active. Details in the
   [z-setup guide](docs/user-guide/z-setup.md).
 
@@ -125,9 +127,10 @@ What it **asks** — exactly two questions:
 | **`/z-status`** | Read-only dashboard: status counts, Questions/Blocked waiting on you, in-flight lanes with age, last loop's verdict, Estimate vs Actual totals. | — |
 | **`/z-uninstall`** | Reverse `./setup`: remove the host registrations it owns (a symlink into the pack, or a copy carrying `.zstack-registered`), leaving any dir — or a symlink pointing outside the pack — it did not create; strip `/z-setup`'s auto-approval settings when present. Confirms first; the GitHub board is remote and untouched. | `--purge` also deletes `~/.zstack` (config, loop state, locks, reports). |
 
-Tunables live in `~/.zstack/projects/<slug>/config.json`: `maxLanes` (default 3
-concurrent lanes), `watchdogMinutes` (default 10, stuck-worker timeout),
-`lockStalenessMinutes` (when a crashed loop's lock counts as stale). See the
+Tunables live in `~/.zstack/projects/<slug>/config.json`: `maxLanes` (default 3),
+`watchdogMinutes` (default 10), `lockStalenessMinutes` (default 60),
+`maxQaPasses` (default 3), `qaInvestigateAfter` (default 2),
+`auditEveryNLoops` (default 5). See the
 [configuration reference](docs/user-guide/README.md#configuration-reference).
 
 ## The loop in one diagram

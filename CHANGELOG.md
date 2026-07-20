@@ -20,7 +20,7 @@ Installing zstack now actually surfaces its skills. Also adds a `/z-uninstall` c
 
 ### Fixed
 
-- `./setup` now registers each skill (`z-setup`, `z-plan`, `z-loop`, `z-status`) as its own top-level entry in the host's skills directory. Hosts discover `skills/<name>/SKILL.md` one level deep only, so registering just the pack directory left all four skills invisible — worst on the documented clone-straight-into-`~/.claude/skills/zstack` path, which early-returned before registering anything. Run `./setup` after every install or update, then restart Claude Code; on Windows run it from Git Bash (`cmd.exe` leaves a literal `~` folder).
+- `./setup` now registers each skill (`z-setup`, `z-plan`, `z-loop`, `z-status`, `z-uninstall`) as its own top-level entry in the host's skills directory. Hosts discover `skills/<name>/SKILL.md` one level deep only, so registering just the pack directory left all five skills invisible — worst on the documented clone-straight-into-`~/.claude/skills/zstack` path, which early-returned before registering anything. Run `./setup` after every install or update, then restart Claude Code; on Windows run it from Git Bash (`cmd.exe` leaves a literal `~` folder).
 - Registration is now safe around things setup didn't create. Every copy carries a `.zstack-registered` sentinel and only sentinel-carrying dirs (or symlinks) are refreshed: a separate zstack checkout at `~/.claude/skills/zstack` (including git worktrees, where `.git` is a file) or a ZIP/manual install refuses the whole host with the fix command printed and skips Codex/Factory, so no host ends up driving another install's `bin/lib`; a third-party skill that happens to be named `z-*` is skipped with a warning and left untouched. Nothing setup didn't create gets deleted.
 - Windows registration copies are staged and swapped by rename, so a locked file or mid-copy failure can't leave a half-registered skill, and they filter `.git` / `node_modules` / `.worktrees` / `.gstack` (~75MB of repo baggage the skills never read). A pack with no skills in it now fails setup loudly instead of printing the success banner over an empty registration.
 - `Board.list()` paginates past 100 items with cursor-loop hardening (empty/repeated cursor and missing `pageInfo` throw loudly); single-page ceilings (fieldValues, projectItems, milestones, labels) guard with loud throws.
@@ -45,12 +45,12 @@ Installing zstack now actually surfaces its skills. Also adds a `/z-uninstall` c
 
 ## [0.1.0.0] - 2026-07-19
 
-First release of the zstack dev-loop skill pack. Installs at `~/.claude/skills/zstack` alongside gstack (required) and runs the [PROCESS.md](references/PROCESS.md) development loop after planning, deploying at end of loop. GitHub Projects backed; solo-dev, any repo.
+First release of the zstack dev-loop skill pack. Installs at `~/.claude/skills/zstack` alongside gstack (required) and runs the [PROCESS.md](docs/user-guide/spec/PROCESS.md) development loop after planning, deploying at end of loop. GitHub Projects backed; solo-dev, any repo.
 
 ### Added
 
 - **`/z-setup`** — creates or adopts a GitHub Projects board with the nine PROCESS.md statuses (Backlog, Ready, Questions, Building, QA, Review, Blocked, Skipped, Done) and four fields (Model, Model Effort, Estimate, Actual), disables the auto-close workflow, and offers an optional auto-approvals step so the loop runs unattended.
-- **`/z-plan`** — turns a spec or plan into board-ready tickets: code-grounded plans with `### Acceptance Criteria`, dependency links, reproducible dollar estimates (per [ESTIMATION.md](references/ESTIMATION.md)), and a model/effort recommendation per ticket. Oversized tickets split at a 400K-token context gate.
+- **`/z-plan`** — turns a spec or plan into board-ready tickets: code-grounded plans with `### Acceptance Criteria`, dependency links, reproducible dollar estimates (per [ESTIMATION.md](docs/user-guide/spec/ESTIMATION.md)), and a model/effort recommendation per ticket. Oversized tickets split at a 400K-token context gate.
 - **`/z-loop`** — the development loop: per-ticket worktree lanes (max 3 concurrent), a fresh agent per stage (Build → QA → Adversarial Review → Merge) with the reviewer blinded to everything but the ticket, acceptance criteria, diff, and a throwaway worktree. Drains the Ready batch, then runs regression → `/land-and-deploy` → `/canary` → `/document-release`, with `/cso` + `/health` audits every fifth loop. Drain-and-exit; `--reconcile` recovers a crashed run.
 - **`/z-status`** — read-only board dashboard: status counts, in-flight lanes, last-loop verdict, and Estimate-vs-Actual totals.
 - **`bin/z-board`** — the single GitHub Projects contract every skill speaks through, with a built-in GraphQL quota guard.

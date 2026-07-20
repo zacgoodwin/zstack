@@ -37,7 +37,8 @@ records the result. It never re-derives a scheduling decision in prose.
   `qaInvestigateAfter` (default 2) onward, the rebuild runs `/investigate`
   first; at config `maxQaPasses` (default 3), the ticket parks Blocked instead
   of bouncing again. A worker silent past the watchdog (default 10 min) is
-  probed and then Skipped with a note.
+  probed and then Skipped with a note. Exception: a dead merge lane is verified
+  via PR state and ends Merged or Blocked, never Skipped.
 - **Actual per ticket.** After each stage the ticket's transcripts are priced with
   `bin/z-cost` (dedup by requestId) and written to the Actual field.
 
