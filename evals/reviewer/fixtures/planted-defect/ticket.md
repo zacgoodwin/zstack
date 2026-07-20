@@ -17,7 +17,7 @@ Add `withinWindow(now, start, durationMs)` in `src/window.ts` returning whether
    (one millisecond before the boundary is still this window).
 3. **The boundary is exclusive.** `withinWindow(1500, 1000, 500)` → `false`
    — the window is half-open, so `start + durationMs` belongs to the NEXT
-   window, never this one. This is the boundary the double-count bug hides at.
+   window, never this one.
 4. **Before the window.** `withinWindow(999, 1000, 500)` → `false`.
 
 ### Model

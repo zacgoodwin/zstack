@@ -124,3 +124,44 @@ the two root causes found (the fixture's own AC3 prose narrates the defect's
 location, and `diff.patch`'s first hunk header miscounts its own added lines,
 so it is not a strictly valid patch either) plus the worktree-materialization
 gap.
+
+**2026-07-20, ticket #88 (fixture/harness fix; no new paid run yet).** Fixed
+all three root causes #71 found:
+
+- `ticket.md` AC3 no longer narrates "this is the boundary the double-count
+  bug hides at" — it states only the required half-open contract
+  (`withinWindow(1500, 1000, 500)` → `false`). Re-verified mechanically (ran
+  the planted `withinWindow` from the materialized diff against all four
+  criteria) that the diff still violates the rewritten AC3 — only the prose
+  changed, `now <= end` is untouched.
+- `diff.patch`'s first hunk header was `@@ -0,0 +1,10 @@` over 9 actual `+`
+  lines (direct count, confirmed); fixed to `+1,9`. `git apply --unsafe-paths
+  --directory=<tmp> evals/reviewer/fixtures/planted-defect/diff.patch` now
+  exits 0 from a fresh scratch dir, `<tmp>/src/window.ts` and
+  `<tmp>/src/window.test.ts` both present and matching the diff (AC1, gate-
+  checkable).
+- `run.sh` now applies `diff.patch` into a fresh `mktemp -d` before building
+  the blinded input and points `worktreePath` at that real directory (also
+  added to both live Agent calls via `--add-dir`), replacing the dead
+  `/tmp/review-throwaway-planted` placeholder — the synthetic-fixture
+  equivalent of production's `git worktree add` (z-loop/SKILL.md). The mocked
+  smoke test (`CLAUDE_CMD=evals/reviewer/mock-claude.sh evals/reviewer/run.sh
+  1`) still exits 1 at 1/1 trials, identical to the pre-fix baseline (diffed
+  against the unpatched `run.sh`); `run.sh 5` mocked still exits 0 at 5/5 — no
+  regression (AC2, gate-checkable).
+
+**AC3's paid 5-trial re-run has NOT been executed.** This ticket was built
+unattended inside a zstack-loop builder subagent with no real `claude -p` on
+`PATH` (nested headless `claude` denied by the classifier — MEMORY), and per
+this ticket's explicit build instructions the eval was not to be faked or
+substituted here (unlike #71, where the trials themselves were the
+deliverable being measured — for #88 the open question is whether *this
+fix* closes the gap, which only a real run can answer; simulating that
+answer would be exactly the fabrication this file's own discipline forbids).
+**A human or an environment with real `claude -p` access must run
+`evals/reviewer/run.sh 5` and append the real score below this entry** before
+AC3 can be marked closed. Whether the de-spoiled AC3 prose is enough to make
+single-pass approve where it caught the defect in 5/5 pre-fix trials, or
+whether the defect is simply too mechanically obvious for a frontier
+single-pass reviewer with real code execution regardless of prose (this
+ticket's own documented fallback), is exactly what that run will show.
