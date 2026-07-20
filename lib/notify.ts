@@ -22,7 +22,12 @@ import { loadConfig, ZError, type BoardConfig } from "./config.ts";
 export { ZError } from "./config.ts";
 
 // Per-event payload map: renderNotification is type-checked per event, and each
-// key is 1:1 with one of the ticket's five orchestrator triggers.
+// key is 1:1 with one of the ticket's six orchestrator triggers. `work-complete`
+// is a LOOP-drain report only (#68); a `/z-plan` run has no loop, no per-status
+// counts, and no spend, so it gets its own `plan-complete` event and template
+// rather than borrowing `work-complete`'s shape with a fake `loopCount: 0` --
+// that read as "loop 0 complete" in the channel and could not be toggled off
+// independently of real loop completions.
 export interface PayloadByEvent {
   "work-complete": {
     slug: string;
@@ -34,6 +39,7 @@ export interface PayloadByEvent {
     totalDollars: number;
     verdict?: "red" | "green";
   };
+  "plan-complete": { slug: string; ticketsCreated: number };
   "human-pause": { ticket: number; title: string; note: string };
   "ticket-parked": {
     ticket: number;
@@ -60,6 +66,7 @@ const RENDERERS: { [K in EventKey]: (p: PayloadByEvent[K]) => string } = {
     `zstack ${p.slug}: loop ${p.loopCount} complete. ` +
     `done ${p.done}, questions ${p.questions}, blocked ${p.blocked}, skipped ${p.skipped}. ` +
     `spend $${p.totalDollars.toFixed(2)}.${p.verdict ? ` regression ${p.verdict}.` : ""}`,
+  "plan-complete": (p) => `zstack ${p.slug}: plan run complete. ${p.ticketsCreated} tickets created.`,
   "human-pause": (p) => `zstack: needs input on #${p.ticket} ${p.title}. ${p.note}`,
   "ticket-parked": (p) => `zstack: #${p.ticket} ${p.title} → ${p.status}. ${p.note}`,
   "safety-violation": (p) =>

@@ -124,12 +124,13 @@ a secret — anyone holding it can post to your channel.
   `https://`; a pasted bare token is rejected by `loadConfig` (its error names the
   field only, never the value).
 
-**3. The five events**, each posted once at the moment the state machine reaches
+**3. The six events**, each posted once at the moment the state machine reaches
 it:
 
 | Event | Fires when |
 | --- | --- |
-| `work-complete` | a `/z-loop` (or `/z-plan`) run finishes — counts + spend + regression verdict |
+| `work-complete` | a `/z-loop` drain finishes — counts + spend + regression verdict |
+| `plan-complete` | a `/z-plan` run finishes — tickets created/updated, no loop counts or spend |
 | `human-pause` | a ticket parks to **Questions** waiting on your input |
 | `ticket-parked` | a ticket is moved to **Blocked** or **Skipped** by the work |
 | `safety-violation` | a safety control tripped (a wedged/dead worker; GraphQL quota exhausted) |

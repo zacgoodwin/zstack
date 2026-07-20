@@ -124,7 +124,7 @@ each defaulted by `loadConfig` when absent:
   `truth-check failed (confidence X/100)`; `retry` bounces it back to the
   builder; `off` disables the gate entirely (a low-confidence or unparseable
   approval merges, the pre-#62 behavior).
-- `notifications` (absent = off) — Discord notifications for the five loop
+- `notifications` (absent = off) — Discord notifications for the six loop/plan
   events. Shape: `{ "enabled": true, "discordWebhookUrl": "https://…",
   "events": { "human-pause": false } }`. `enabled` is the master switch; each
   key under `events` toggles one event (all default on). The webhook URL is a
