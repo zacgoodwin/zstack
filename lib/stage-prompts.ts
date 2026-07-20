@@ -26,7 +26,7 @@ export interface BuilderPromptInput {
   investigateFirst?: boolean; // second QA bounce: root-cause before touching code
 }
 
-// Derived from references/WORKER SAMPLE.md (unattended discipline, exit
+// Derived from docs/user-guide/spec/WORKER SAMPLE.md (unattended discipline, exit
 // contract, anti-loophole) and PRINCIPLES.md (ponytail ladder, tests + evals +
 // docs in the same diff, latent vs deterministic).
 export function builderPrompt(i: BuilderPromptInput): string {

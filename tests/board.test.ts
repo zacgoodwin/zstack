@@ -904,26 +904,89 @@ describe("contract enforcement", () => {
     return proc.stdout.toString().split(/\r?\n/).filter(Boolean);
   }
 
-  test("only lib/board.ts calls gh api graphql or gh issue directly", () => {
-    const files = trackedFiles().filter(
-      (f) =>
-        f !== "lib/board.ts" &&
-        !f.startsWith("tests/") &&
-        !f.startsWith("references/") &&
-        !f.endsWith(".md") &&
-        !f.endsWith(".png")
+  // Issue #23: ghExecutor shells to the RAW endpoint (`gh api /graphql`,
+  // issue #17), not the bare `graphql` subcommand. A regex that only matched
+  // the bare form would let a future .ts file that shells to the raw endpoint
+  // directly (a string like "gh api /graphql ...") evade this gate.
+  //
+  // Post-#17 QA bounce: the shell-string regex above only matches
+  // `gh api /graphql` written as one joined string. lib/board.ts's actual
+  // invocation is an ARRAY literal -- spawn(["gh", "api", "/graphql", ...]) --
+  // where "gh", "api", and "/graphql" are separate tokens with no `\bgh\s+api\b`
+  // substring anywhere in the source. A second pattern catches that array-of-
+  // string-literals shape directly (either quote style, whitespace-tolerant).
+  function callsGhDirectly(content: string): boolean {
+    return (
+      /\bgh\s+api\s+\/?graphql\b/.test(content) ||
+      /\bgh\s+issue\b/.test(content) ||
+      /["']gh["']\s*,\s*["']api["']\s*,\s*["']\/?graphql["']/.test(content)
     );
+  }
+
+  // Files this gate scans for direct gh invocations. `evals/` sits alongside
+  // `tests/` as a doubles-and-harnesses lane: the paid planner eval harness
+  // (evals/planner/board-double.ts, run.sh) quotes gh invocation strings in
+  // comments and prompts to describe what the double parses -- it never
+  // shells the real gh. #23 widened callsGhDirectly's regexes to catch the
+  // raw-endpoint and array-literal forms; #25 (based pre-#23) added that
+  // harness. Each passed its own gate in isolation; merged, the harness's
+  // documentation tripped the widened detector. The fix narrows the scanned
+  // set, not the detector -- see the canary below.
+  function gateScans(f: string): boolean {
+    return (
+      f !== "lib/board.ts" &&
+      !f.startsWith("tests/") &&
+      !f.startsWith("evals/") &&
+      !f.startsWith("references/") &&
+      !f.endsWith(".md") &&
+      !f.endsWith(".png")
+    );
+  }
+
+  test("only lib/board.ts calls gh api graphql or gh issue directly", () => {
+    const files = trackedFiles().filter(gateScans);
     const offenders: string[] = [];
     for (const f of files) {
       const content = readFileSync(join(REPO_ROOT, f), "utf8");
-      if (/\bgh\s+api\s+graphql\b/.test(content) || /\bgh\s+issue\b/.test(content)) offenders.push(f);
+      if (callsGhDirectly(content)) offenders.push(f);
     }
     expect(offenders).toEqual([]);
   });
 
+  // Canary: proves the evals/ exclusion is scoped narrowly and stays wired.
+  // If a future change drops the evals/ exclusion while a doubles harness
+  // that quotes gh strings still exists, this fails pre-merge instead of the
+  // gate above silently flagging documentation as an offense.
+  test("gateScans excludes tests/ and evals/ doubles-and-harnesses, keeps lib/ and bin/ scanned", () => {
+    expect(gateScans("evals/planner/board-double.ts")).toBe(false);
+    expect(gateScans("tests/x.test.ts")).toBe(false);
+    expect(gateScans("lib/foo.ts")).toBe(true);
+    expect(gateScans("bin/z-board")).toBe(true);
+  });
+
   test("lib/board.ts is in fact the caller (guards against the gate passing vacuously)", () => {
     const content = readFileSync(join(REPO_ROOT, "lib", "board.ts"), "utf8");
-    expect(/\bgh\b/.test(content) && content.includes("api")).toBe(true);
+    // Must assert the actual detector predicate, not a weaker proxy (`/\bgh\b/`
+    // + `includes("api")`): that proxy stayed green even while callsGhDirectly
+    // failed to recognize lib/board.ts's own array-literal invocation, so the
+    // gate and the sanctioned file could drift apart without this test noticing.
+    expect(callsGhDirectly(content)).toBe(true);
+  });
+
+  // Canary: proves the detector itself catches all known forms without needing
+  // a scratch file planted in the repo. A future narrowing of any of these
+  // regexes (e.g. dropping the `\/?`, or dropping the array-literal branch)
+  // turns this red.
+  test("the offender detector catches the bare, raw-endpoint, and array-literal gh api graphql forms", () => {
+    expect(callsGhDirectly("exec(\"gh api graphql -f query='mutation { m }'\")")).toBe(true);
+    expect(callsGhDirectly('exec("gh api /graphql --input -")')).toBe(true);
+    expect(callsGhDirectly("gh issue edit 1 --body x")).toBe(true);
+    // Array-literal form (lib/board.ts's real shape), both quote styles and
+    // both the bare and raw-endpoint subcommand spellings.
+    expect(callsGhDirectly('spawn(["gh", "api", "/graphql", "--input", "-"], body)')).toBe(true);
+    expect(callsGhDirectly('spawn(["gh", "api", "graphql"], body)')).toBe(true);
+    expect(callsGhDirectly("spawn(['gh', 'api', '/graphql'], body)")).toBe(true);
+    expect(callsGhDirectly("this file has nothing to do with any CLI")).toBe(false);
   });
 
   // Issue #14 item 2: the code gate above excludes *.md, so the skill files --
@@ -1163,6 +1226,17 @@ describe("ghExecutor JSON encoding + error contracts (issue #17)", () => {
     const proc: GhProc = { exitCode: 1, stdout: "", stderr: "error connecting to api.github.com" };
     const exec = ghExecutor(fakeSpawn(proc));
     await expect(exec("mutation SetNumber { x }", {})).rejects.toThrow(/gh api \/graphql failed: error connecting to api\.github\.com/);
+  });
+
+  // Issue #23: exit 0 does not guarantee a JSON body. Every other failure path
+  // in this executor is a named ZError; a raw SyntaxError from JSON.parse was
+  // the one gap.
+  test("exit 0 with non-JSON stdout raises ZError naming the parse failure and a stdout snippet, not a raw SyntaxError", async () => {
+    const proc: GhProc = { exitCode: 0, stdout: "not-json", stderr: "" };
+    const exec = ghExecutor(fakeSpawn(proc));
+    await expect(exec("mutation SetNumber { x }", {})).rejects.toThrow(ZError);
+    await expect(exec("mutation SetNumber { x }", {})).rejects.toThrow(/non-JSON stdout/);
+    await expect(exec("mutation SetNumber { x }", {})).rejects.toThrow(/not-json/);
   });
 });
 

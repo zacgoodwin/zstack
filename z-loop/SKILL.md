@@ -8,9 +8,10 @@ description: |
   (every ticket Done, Questions, Blocked, or Skipped), then runs an end-of-loop
   stage on the merged base -- regression first; red files bugs and stops (no
   deploy), green ships (land-and-deploy -> canary -> document-release) and,
-  every 5th loop, runs the security + quality audits -- writes a run report,
-  and exits. No daemon. Every scheduling, transition, watchdog, merge-order,
-  and end-of-loop decision is computed by lib/loop.ts / lib/lanes.ts /
+  every Nth loop (config `auditEveryNLoops`, default 5), runs the security +
+  quality audits -- writes a run report, and exits. No daemon. Every
+  scheduling, transition, watchdog, merge-order, and end-of-loop decision is
+  computed by lib/loop.ts / lib/lanes.ts /
   lib/stage-prompts.ts / lib/endloop.ts -- never in prose. Use when asked to
   "run the loop", "z-loop", "work the board", or "drain the Ready queue" on a
   repo /z-setup has configured.
@@ -71,11 +72,12 @@ mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports" 
    succeeds. If not, run /z-setup first.
 2. **gh authenticated** with the project scope (`gh auth status` clean).
 3. **bun present:** `command -v bun`.
-4. Read the loop knobs from config (defaults 3 lanes / 10 minutes):
+4. Read the loop knobs from config (defaults 3 lanes / 10 minutes / audits
+   every 5th loop / 3 QA passes before Blocked / investigate from QA bounce 2):
 
 ```bash
-read -r MAX_LANES WATCHDOG <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
-  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes)")"
+read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
+  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter)")"
 ```
 
 5. **Startup orphan scan (C7).** A crashed prior loop leaves lane locks in
@@ -154,7 +156,8 @@ bun -e "import {readFileSync, readdirSync, writeFileSync} from 'node:fs';
     const m = f.match(/^body-(\d+)\.md\$/); if (m) b[m[1]] = readFileSync('$TMP/' + f, 'utf8'); }
   writeFileSync('$TMP/bodies.json', JSON.stringify(b));"
 bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" \
-  --max-lanes "$MAX_LANES" --watchdog-minutes "$WATCHDOG"
+  --max-lanes "$MAX_LANES" --watchdog-minutes "$WATCHDOG" \
+  --max-qa-passes "$MAX_QA_PASSES" --qa-investigate-after "$QA_INVESTIGATE_AFTER"
 ```
 
 `ingest` preserves lanes and lost-claim flags across re-ingests, so re-running
@@ -290,9 +293,9 @@ bun "$PACK/lib/stage-prompts.ts" note "$TMP/note-<N>.json" > "$TMP/note-<N>.md"
    leftover throwaway review worktrees.
 2. **End-of-loop (PROCESS.md steps 22–23, C8):** run Step 7a below in full.
    It decides red/green from a real regression on the merged base, never
-   deploys on red, walks the deploy chain in order on green, runs the 5th-loop
-   audits, and writes the loop report -- Step 7's old "build a report" duty
-   lives there now, not here.
+   deploys on red, walks the deploy chain in order on green, runs the Nth-loop
+   audits (config `auditEveryNLoops`, default 5), and writes the loop report --
+   Step 7's old "build a report" duty lives there now, not here.
 3. **Release the loop lock** so the next invocation can start:
    `bun "$PACK/lib/locks.ts" release --slug "$SLUG"`. (Do this even on an early
    exit — wrap the run so a crash is the only way the lock survives, which is
@@ -300,18 +303,19 @@ bun "$PACK/lib/stage-prompts.ts" note "$TMP/note-<N>.json" > "$TMP/note-<N>.md"
 4. **Exit.** No daemon, no polling for new work. The next batch is the next
    /z-loop invocation.
 
-## Step 7a — End-of-Loop: regression, deploy, canary, docs, 5th-loop audits (C8)
+## Step 7a — End-of-Loop: regression, deploy, canary, docs, Nth-loop audits (C8)
 
 PROCESS.md steps 22–23 as a fixed sequence: `lib/endloop.ts` decides red/green
-consequences and the 5th-loop cadence; you perform the side effects it names
-and never re-derive the order in prose. Nothing here may edit `$BASE` except
-through `/land-and-deploy` on the green path -- the regression pass itself
-(gates + `/qa-only`) is read-only by construction.
+consequences and the audit cadence (config `auditEveryNLoops`, default 5 --
+issue #18); you perform the side effects it names and never re-derive the order
+in prose. Nothing here may edit `$BASE` except through `/land-and-deploy` on
+the green path -- the regression pass itself (gates + `/qa-only`) is read-only
+by construction.
 
 **1. Peek the loop counter (do NOT persist yet)** — every loop counts toward the
-5th-loop cadence, red or green, and the count sizes the plan below. But the
+audit cadence, red or green, and the count sizes the plan below. But the
 persist happens LAST, after the report (step 6), so a crash mid-stage re-runs the
-same loop id instead of drifting the 5th-loop cadence forward by one (H17):
+same loop id instead of drifting the audit cadence forward by one (H17):
 
 ```bash
 LOOP_COUNTER_PATH="$HOME/.zstack/projects/$SLUG/loop-counter"
@@ -353,7 +357,7 @@ test is its own finding; typecheck errors group by file; an e2e or `/qa-only`
 finding names the page/flow as the repro).
 
 ```bash
-PLAN=$(bun "$PACK/lib/endloop.ts" plan "$TMP/regression.json" "$LOOP_COUNT")   # e.g. ["file-bugs","report"]
+PLAN=$(bun "$PACK/lib/endloop.ts" plan "$TMP/regression.json" "$LOOP_COUNT" "$AUDIT_EVERY_N")   # e.g. ["file-bugs","report"]
 ```
 
 **3a. Red path** (`$PLAN` is `["file-bugs","report"]`) — every finding becomes
@@ -391,8 +395,8 @@ For `land-and-deploy`, then `canary`, then `document-release`:
    — before starting the next one, so a crash mid-chain leaves a log that ends
    exactly where the chain actually stopped.
 
-**4. 5th-loop audits** (only when `$PLAN` contains `cso`, i.e.
-`$LOOP_COUNT % 5 == 0`, step 23): invoke `/cso` then `/health`, logging each
+**4. Nth-loop audits** (only when `$PLAN` contains `cso`, i.e.
+`$LOOP_COUNT % $AUDIT_EVERY_N == 0`, step 23): invoke `/cso` then `/health`, logging each
 the same way as 3b. Every finding from either becomes a Backlog bug the same
 way as 3a (`bun "$PACK/lib/endloop.ts" bug finding.json cso "$LOOP_COUNT"` /
 `... health "$LOOP_COUNT"`, then `z-board create` + `move ... Backlog`). File a
@@ -423,7 +427,7 @@ That file is the loop's report — nothing else builds one.
 
 **6. Persist the loop counter LAST** (H17) — only now that the report is written
 does the loop count actually advance, so a crash anywhere above re-runs this loop
-id cleanly instead of drifting the 5th-loop cadence:
+id cleanly instead of drifting the audit cadence:
 
 ```bash
 bun "$PACK/lib/endloop.ts" counter bump "$LOOP_COUNTER_PATH"   # matches the peek in step 1
@@ -502,7 +506,8 @@ Report DONE only when all hold:
 - The End-of-Loop stage ran to a verdict: red means every finding is filed to
   Backlog and NO deploy Skill was invoked; green means `/land-and-deploy` →
   `/canary` → `/document-release` ran in that order (invocation log on disk),
-  plus `/cso` + `/health` on every 5th loop with their findings filed too.
+  plus `/cso` + `/health` on every Nth loop (config `auditEveryNLoops`, default
+  5) with their findings filed too.
 - The loop counter was bumped and persisted at
   `~/.zstack/projects/<slug>/loop-counter`.
 - You made zero scheduling decisions in prose: every claim/advance/park/skip

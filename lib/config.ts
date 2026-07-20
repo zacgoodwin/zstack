@@ -70,6 +70,17 @@ export interface BoardConfig {
   // next /z-loop (C7, issue #2). Sized well above a realistic batch so two near-
   // simultaneous invocations still see each other's lock as live and refuse.
   lockStalenessMinutes?: number;
+  // How often (in loops) the end-of-loop stage runs the /cso + /health audits
+  // (issue #18): loopCount % auditEveryNLoops === 0. Projects differ -- a
+  // high-churn repo may want 3, a docs-only repo 10 -- so this lives per
+  // project rather than hardcoded in lib/endloop.ts.
+  auditEveryNLoops?: number;
+  // QA bounce knobs (issue #41), siblings of maxLanes/watchdogMinutes: how many
+  // QA passes before a still-buggy ticket parks Blocked (PROCESS.md step 16),
+  // and the QA-bounce count at/after which the rebuild runs /investigate first
+  // (PROCESS.md step 15) instead of a direct patch.
+  maxQaPasses?: number;
+  qaInvestigateAfter?: number;
   quota?: Partial<QuotaConfig>;
 }
 
@@ -78,6 +89,9 @@ export const DEFAULT_EPIC_STYLE: EpicStyle = "milestones";
 export const DEFAULT_MAX_LANES = 3;
 export const DEFAULT_WATCHDOG_MINUTES = 10;
 export const DEFAULT_LOCK_STALENESS_MINUTES = 60;
+export const DEFAULT_AUDIT_EVERY_N_LOOPS = 5;
+export const DEFAULT_MAX_QA_PASSES = 3;
+export const DEFAULT_QA_INVESTIGATE_AFTER = 2;
 
 // Every actionable failure in the pack is a ZError; main() prints .message to
 // stderr and exits non-zero. Anything else is a bug and bubbles up with a stack.
@@ -174,5 +188,8 @@ export function loadConfig(slug?: string, home = homedir()): BoardConfig {
   cfg.maxLanes = cfg.maxLanes ?? DEFAULT_MAX_LANES;
   cfg.watchdogMinutes = cfg.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES;
   cfg.lockStalenessMinutes = cfg.lockStalenessMinutes ?? DEFAULT_LOCK_STALENESS_MINUTES;
+  cfg.auditEveryNLoops = cfg.auditEveryNLoops ?? DEFAULT_AUDIT_EVERY_N_LOOPS;
+  cfg.maxQaPasses = cfg.maxQaPasses ?? DEFAULT_MAX_QA_PASSES;
+  cfg.qaInvestigateAfter = cfg.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER;
   return cfg;
 }

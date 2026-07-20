@@ -1,7 +1,7 @@
 // Gate tests for the C1 scaffold: setup's precondition checks (run against
 // real bash with PATH/HOME manipulated so deps look present/absent) and the
-// references/ restructure. Deterministic, no network, must stay well under
-// the 2s gate budget.
+// docs/user-guide/spec restructure. Deterministic, no network, must stay well
+// under the 2s gate budget.
 import { test, expect, describe, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -68,13 +68,21 @@ function runSetup(opts: { path: string; home: string; args?: string[] }) {
   };
 }
 
+// Each test here spawns a real bash process running the setup script (no
+// mocking the shell out). 5000ms (bun's default) is comfortably clear in
+// isolation but was observed exceeded under full-suite parallel load on
+// Windows (issue #23) -- process spawn/teardown contends with every other
+// file's spawns. 20000ms keeps a genuine hang failing loud while absorbing
+// that contention; the test logic and what it asserts are unchanged.
+const SPAWN_TIMEOUT_MS = 20000;
+
 describe("setup preconditions", () => {
   test("bun missing: exits non-zero pointing to bun.sh", () => {
     const home = makeTmpHome(false);
     const result = runSetup({ path: CORE_DIR, home });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("bun is required");
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test("gstack missing: exits non-zero printing the exact gstack install command", () => {
     const home = makeTmpHome(false);
@@ -87,14 +95,14 @@ describe("setup preconditions", () => {
       "git clone --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack"
     );
     expect(result.stderr).toContain("cd ~/.claude/skills/gstack && ./setup --team");
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test("gh missing: exits non-zero", () => {
     const home = makeTmpHome(true);
     const result = runSetup({ path: `${BUN_DIR}:${CORE_DIR}`, home });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("gh (GitHub CLI) is required");
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test.skipIf(!GH_DIR)("all deps present: registers the pack dir without error", () => {
     const home = makeTmpHome(true);
@@ -115,7 +123,7 @@ describe("setup preconditions", () => {
       expect(existsSync(join(registered, "node_modules"))).toBe(false);
       expect(existsSync(join(registered, ".git"))).toBe(false);
     }
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test.skipIf(!GH_DIR)("--team flag is accepted", () => {
     const home = makeTmpHome(true);
@@ -126,10 +134,10 @@ describe("setup preconditions", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("Team mode requested");
-  });
+  }, SPAWN_TIMEOUT_MS);
 });
 
-describe("references/ restructure", () => {
+describe("docs/user-guide/spec restructure", () => {
   const MOVED_DOCS = [
     "PROCESS.md",
     "ESTIMATION.md",
@@ -144,12 +152,14 @@ describe("references/ restructure", () => {
     "planning Process.png",
   ];
 
+  const SPEC_DIR = join(REPO_ROOT, "docs", "user-guide", "spec");
   for (const doc of MOVED_DOCS) {
-    test(`references/${doc} exists`, () => {
-      expect(existsSync(join(REPO_ROOT, "references", doc))).toBe(true);
+    test(`docs/user-guide/spec/${doc} exists`, () => {
+      expect(existsSync(join(SPEC_DIR, doc))).toBe(true);
     });
 
-    test(`${doc} is not left at repo root`, () => {
+    test(`${doc} is not left in references/ or at repo root`, () => {
+      expect(existsSync(join(REPO_ROOT, "references", doc))).toBe(false);
       expect(existsSync(join(REPO_ROOT, doc))).toBe(false);
     });
   }

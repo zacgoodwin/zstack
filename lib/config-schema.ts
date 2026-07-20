@@ -102,8 +102,23 @@ export function validateConfig(cfg: unknown): BoardConfig {
   if (c.epicStyle !== undefined && c.epicStyle !== "milestones") {
     throw new ZError(`Config "epicStyle" must be "milestones", got ${JSON.stringify(c.epicStyle)}.`);
   }
-  for (const k of ["maxLanes", "watchdogMinutes", "lockStalenessMinutes"]) {
+  for (const k of ["maxLanes", "watchdogMinutes", "lockStalenessMinutes", "maxQaPasses", "qaInvestigateAfter"]) {
     requirePositiveNumber(k, c[k]);
+  }
+  // auditEveryNLoops (issue #18): the /cso + /health end-of-loop cadence. One
+  // combined check (the isInteger half of projectNumber's pattern at lines
+  // 78-80, plus a >= 1 floor) so every rejected value -- 0, a negative, NaN,
+  // a string, or a fraction like 2.5 ("every 2.5th loop" is meaningless) --
+  // gets the same "positive integer (>= 1)" message naming the field. Not
+  // requirePositiveNumber alone: that guard accepts fractions, which this
+  // knob must not.
+  if (
+    c.auditEveryNLoops !== undefined &&
+    (typeof c.auditEveryNLoops !== "number" || !Number.isInteger(c.auditEveryNLoops) || c.auditEveryNLoops < 1)
+  ) {
+    throw new ZError(
+      `Config "auditEveryNLoops" must be a positive integer (>= 1), got ${JSON.stringify(c.auditEveryNLoops)}.`
+    );
   }
   if (c.quota !== undefined) {
     if (typeof c.quota !== "object" || c.quota === null) {

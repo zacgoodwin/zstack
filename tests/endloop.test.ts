@@ -11,7 +11,9 @@
 //        file, corrupt file -> loud error)
 //   AC4 the final report contains verdict+evidence, dollars total, tickets by
 //        final status, and the edges-to-validate rollup
-import { test, expect, describe, afterEach } from "bun:test";
+//   issue #18: the audit cadence (`auditEveryNLoops`) is a parameter of
+//        endLoopPlan (and the `plan` CLI's optional 3rd arg), not hardcoded 5
+import { test, expect, describe, afterEach, beforeEach, spyOn } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +22,7 @@ import {
   buildBugTicket,
   buildEndLoopReport,
   endLoopPlan,
+  main,
   peekLoopCounter,
   readLoopCounter,
   writeLoopCounter,
@@ -299,6 +302,93 @@ describe("AC3: counter at 4 -> no audits; at 5 -> both fire; persistence tested"
 });
 
 // ============================================================================
+// issue #18 -- auditEveryNLoops parameterizes the cadence (endLoopPlan)
+// ============================================================================
+describe("issue #18: endLoopPlan takes the audit cadence as a parameter", () => {
+  test("N=1: every loop fires cso + health", () => {
+    for (let loopCount = 1; loopCount <= 4; loopCount++) {
+      const plan = endLoopPlan(GREEN, loopCount, 1);
+      expect(plan).toContain("cso");
+      expect(plan).toContain("health");
+    }
+  });
+
+  test("N=3: loop 3 fires, loop 4 does not", () => {
+    expect(endLoopPlan(GREEN, 3, 3)).toEqual(["land-and-deploy", "canary", "document-release", "cso", "health", "report"]);
+    const plan4 = endLoopPlan(GREEN, 4, 3);
+    expect(plan4).not.toContain("cso");
+    expect(plan4).not.toContain("health");
+  });
+
+  test("N omitted: default of 5 preserves the old hardcoded behavior (AC2)", () => {
+    expect(endLoopPlan(GREEN, 5)).toContain("cso"); // no 3rd arg at all
+    expect(endLoopPlan(GREEN, 4)).not.toContain("cso");
+  });
+
+  test("rejects a non-positive or non-integer cadence, naming the requirement", () => {
+    for (const bad of [0, -1, 2.5, NaN]) {
+      expect(() => endLoopPlan(GREEN, 5, bad)).toThrow(ZError);
+      expect(() => endLoopPlan(GREEN, 5, bad)).toThrow(/auditEveryNLoops must be a positive integer/);
+    }
+  });
+
+  test("red-path plans are unaffected by the cadence argument", () => {
+    const plan = endLoopPlan(redRegression(), 3, 1); // N=1 would fire cso on green; red never does
+    expect(plan).toEqual(["file-bugs", "report"]);
+  });
+});
+
+// ============================================================================
+// issue #18 -- `endloop plan` CLI: optional 3rd arg (auditEveryNLoops)
+// ============================================================================
+describe("issue #18: endloop CLI `plan <regression.json> <loopCount> [auditEveryNLoops]`", () => {
+  let logs: ReturnType<typeof spyOn>;
+  let errs: ReturnType<typeof spyOn>;
+  beforeEach(() => {
+    logs = spyOn(console, "log").mockImplementation(() => {});
+    errs = spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    logs.mockRestore();
+    errs.mockRestore();
+  });
+
+  function regressionFile(): string {
+    const path = join(tmp(), "regression.json");
+    writeFileSync(path, JSON.stringify(GREEN));
+    return path;
+  }
+  function lastPlan(): EndLoopActionKind[] {
+    return JSON.parse(logs.mock.calls.at(-1)![0] as string);
+  }
+
+  test("AC1: cadence 3 passed explicitly -- loop 3 includes cso/health, loop 4 does not", () => {
+    const path = regressionFile();
+    expect(main(["plan", path, "3", "3"])).toBe(0);
+    expect(lastPlan()).toContain("cso");
+
+    expect(main(["plan", path, "4", "3"])).toBe(0);
+    expect(lastPlan()).not.toContain("cso");
+  });
+
+  test("cadence omitted entirely defaults to 5 (back-compat)", () => {
+    const path = regressionFile();
+    expect(main(["plan", path, "5"])).toBe(0);
+    expect(lastPlan()).toContain("cso");
+    expect(main(["plan", path, "4"])).toBe(0);
+    expect(lastPlan()).not.toContain("cso");
+  });
+
+  test("AC3: a zero, negative, or non-integer cadence arg exits 1 with a named error, no crash", () => {
+    const path = regressionFile();
+    for (const bad of ["0", "-1", "2.5", "abc"]) {
+      expect(main(["plan", path, "5", bad])).toBe(1);
+      expect(errs).toHaveBeenCalled();
+    }
+  });
+});
+
+// ============================================================================
 // AC4 -- the final report: verdict+evidence, dollars, status table, edges rollup
 // ============================================================================
 describe("AC4: final report -- verdict, dollars, tickets by status, edges rollup", () => {
@@ -338,8 +428,8 @@ describe("AC4: final report -- verdict, dollars, tickets by status, edges rollup
     expect(report).toContain("to check empty-list export, do export with zero rows, expect a header-only CSV, not an error.");
     // bugs filed
     expect(report).toContain("#20 [cso] hardcoded secret in lib/x.ts");
-    // 5th-loop audits called out
-    expect(report).toContain("5th-loop audits");
+    // audits called out (cadence-neutral: no hardcoded "5th-loop" wording, since the cadence is configurable)
+    expect(report).toContain("audits (cso + health) also ran this loop");
   });
 
   test("red report states plainly that no deploy happened, and lists the filed bugs", () => {

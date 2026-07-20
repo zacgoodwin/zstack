@@ -14,6 +14,7 @@ import {
   toEpicStyle,
   verifyReport,
   writeConfig,
+  renderViewsBlock,
   STATUS_OPTIONS,
   CUSTOM_FIELDS,
   type FieldState,
@@ -21,6 +22,7 @@ import {
 } from "../lib/setup-board.ts";
 import { loadConfig, type BoardConfig } from "../lib/config.ts";
 import { validateConfig } from "../lib/config-schema.ts";
+import { loadBoardTemplate, deriveShape, DEFAULT_TEMPLATE } from "../lib/board-template.ts";
 import type { GraphQLData, GraphQLExecutor } from "../lib/board.ts";
 
 // -- helpers -----------------------------------------------------------------
@@ -672,6 +674,89 @@ describe("writeConfig", () => {
     expect(loaded.projectId).toBe("PVT_new");
     expect(loaded.statusField.options!.Done).toBeDefined();
     expect(loaded.maxLanes).toBe(3);
+    // issue #18: SetupBoard never writes this knob, so a config from /z-setup
+    // omits it entirely -- loadConfig must still default it to 5 (AC2:
+    // existing "every 5th loop" behavior unchanged for every already-set-up project).
+    expect(loaded.auditEveryNLoops).toBe(5);
+  });
+});
+
+// -- board template override (issue #20 AC2 + AC5) ---------------------------
+describe("board template override", () => {
+  test("a custom template's status color + description is honored in the emitted mutation; names intact -> verify green (AC2)", async () => {
+    const t = structuredClone(loadBoardTemplate());
+    const backlog = t.statuses.find((s) => s.name === "Backlog")!;
+    backlog.color = "PURPLE";
+    backlog.description = "not yet planned";
+    const shape = deriveShape(t);
+
+    const backend = setupBackend();
+    const setup = new SetupBoard(backend.exec, shape);
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    expect(result.created).toBe(true);
+
+    // The Status field is set via UpdateFieldOptions on the create path; its
+    // inlined literal must carry the CUSTOM color + description.
+    const statusUpdate = backend.calls.find((c) => c.op === "UpdateFieldOptions")!;
+    expect(statusUpdate.query).toContain('{name: "Backlog", color: PURPLE, description: "not yet planned"}');
+    // A field left at the default still emits the default color -- no bleed.
+    const modelCreate = backend.calls.find((c) => c.op === "CreateSingleSelectField" && c.vars.name === "Model")!;
+    expect(modelCreate.query).toContain('{name: "haiku", color: GRAY, description: ""}');
+
+    // Names are unchanged, so the live board still verifies against this shape.
+    const report = await setup.verify("zacgoodwin", "zstack", { title: "zstack" });
+    expect(report.ok).toBe(true);
+  });
+
+  test("the default emitted status literal is byte-identical to the old position-cycled shape (1:1)", async () => {
+    const backend = setupBackend();
+    const setup = new SetupBoard(backend.exec); // default shape
+    await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    const statusUpdate = backend.calls.find((c) => c.op === "UpdateFieldOptions")!;
+    // Backlog=GRAY, Ready=BLUE, ... Done wraps back to GRAY; all descriptions "".
+    expect(statusUpdate.query).toContain('{name: "Backlog", color: GRAY, description: ""}');
+    expect(statusUpdate.query).toContain('{name: "Ready", color: BLUE, description: ""}');
+    expect(statusUpdate.query).toContain('{name: "Done", color: GRAY, description: ""}');
+  });
+
+  test("renderViewsBlock names every template view as a manual step, never dropping one (AC5)", () => {
+    const block = renderViewsBlock(DEFAULT_TEMPLATE.views);
+    expect(block).toMatch(/manual/i);
+    for (const v of DEFAULT_TEMPLATE.views) {
+      expect(block).toContain(`"${v.name}"`);
+      expect(block).toContain(v.layout);
+    }
+  });
+
+  test("renderViewsBlock is empty for a template with no views", () => {
+    expect(renderViewsBlock([])).toBe("");
+  });
+
+  // AC3: a template dropping a required field is refused at load, BEFORE the
+  // executor is touched -- the CLI loads + validates the template up front, so no
+  // board mutation is ever attempted on a bad template.
+  test("a template missing a required field refuses before any GraphQL op (AC3)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ztpl-ac3-"));
+    try {
+      const bad: any = structuredClone(loadBoardTemplate());
+      bad.fields = bad.fields.filter((f: any) => f.name !== "Estimate");
+      const badPath = join(dir, "bad.json");
+      require("node:fs").writeFileSync(badPath, JSON.stringify(bad));
+
+      const calls: string[] = [];
+      const exec: GraphQLExecutor = async (q) => {
+        calls.push(q);
+        return {} as GraphQLData;
+      };
+      // Mirrors main()'s order: load+validate, derive, only then construct.
+      expect(() => {
+        const shape = deriveShape(loadBoardTemplate(badPath));
+        new SetupBoard(exec, shape);
+      }).toThrow(/required field "Estimate"/);
+      expect(calls).toEqual([]); // executor never touched
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -749,7 +834,7 @@ describe("validateConfig", () => {
 
   // -- issue #14 item 18: every numeric + quota guard branch ------------------
   describe("numeric + quota guards (item 18)", () => {
-    const NUMERIC_KEYS = ["maxLanes", "watchdogMinutes", "lockStalenessMinutes"] as const;
+    const NUMERIC_KEYS = ["maxLanes", "watchdogMinutes", "lockStalenessMinutes", "maxQaPasses", "qaInvestigateAfter"] as const;
 
     test.each(NUMERIC_KEYS.map((k) => [k] as [string]))(
       "%s rejects a string, NaN, zero, and a negative",
@@ -812,6 +897,26 @@ describe("validateConfig", () => {
       }
     });
   });
+
+  // -- issue #18: the /cso + /health audit cadence knob -----------------------
+  describe("auditEveryNLoops (issue #18)", () => {
+    test("accepts a positive integer and is optional", () => {
+      const cfg = goodConfig() as any;
+      cfg.auditEveryNLoops = 3;
+      expect(() => validateConfig(cfg)).not.toThrow();
+      delete cfg.auditEveryNLoops;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    // AC3: 0, -1, and 2.5 must all fail, naming the field and the integer >= 1
+    // requirement -- unlike maxLanes/watchdogMinutes/lockStalenessMinutes
+    // (requirePositiveNumber alone), a fraction is rejected too.
+    test.each([0, -1, 2.5, NaN, "3"])("rejects %p, naming the field and the integer >= 1 rule", (bad) => {
+      const cfg = goodConfig() as any;
+      cfg.auditEveryNLoops = bad;
+      expect(() => validateConfig(cfg)).toThrow(/"auditEveryNLoops" must be a positive integer \(>= 1\)/);
+    });
+  });
 });
 
 // -- loadConfig surfaces schema errors (deep validation is wired in) ---------
@@ -842,5 +947,67 @@ describe("loadConfig deep validation", () => {
       fields: {},
     });
     expect(() => loadConfig("zstack", home)).toThrow(/is invalid:.*statusField\.options/);
+  });
+
+  // -- issue #18 AC2/AC3: auditEveryNLoops end to end through loadConfig -------
+  function validRawConfig(extra: object = {}): object {
+    return {
+      slug: "zstack",
+      owner: "zacgoodwin",
+      repo: "zstack",
+      projectNumber: 1,
+      projectId: "PVT_1",
+      repositoryId: "R_1",
+      statusField: { id: "F_status", dataType: "SINGLE_SELECT", options: { Backlog: "o1", Done: "o2" } },
+      fields: {},
+      ...extra,
+    };
+  }
+
+  test("AC3: auditEveryNLoops 0, -1, and 2.5 all fail loadConfig, naming the field + integer >= 1 rule", () => {
+    for (const bad of [0, -1, 2.5]) {
+      const home = writeRaw("zstack", validRawConfig({ auditEveryNLoops: bad }));
+      expect(() => loadConfig("zstack", home)).toThrow(/"auditEveryNLoops" must be a positive integer \(>= 1\)/);
+    }
+  });
+
+  test("AC2: auditEveryNLoops absent -> loadConfig defaults it to 5 (existing every-5th-loop behavior unchanged)", () => {
+    const home = writeRaw("zstack", validRawConfig());
+    expect(loadConfig("zstack", home).auditEveryNLoops).toBe(5);
+  });
+
+  test("AC1: auditEveryNLoops 3 in config.json is honored through loadConfig, not overridden by the default", () => {
+    const home = writeRaw("zstack", validRawConfig({ auditEveryNLoops: 3 }));
+    expect(loadConfig("zstack", home).auditEveryNLoops).toBe(3);
+  });
+
+  // -- issue #41: maxQaPasses / qaInvestigateAfter end to end through loadConfig,
+  // same positive-number contract as maxLanes (AC4).
+  test("AC4: maxQaPasses 0, negative, or non-numeric fails loadConfig, naming the key (same as maxLanes)", () => {
+    for (const bad of [0, -1, "3"]) {
+      const home = writeRaw("zstack", validRawConfig({ maxQaPasses: bad }));
+      expect(() => loadConfig("zstack", home)).toThrow(/"maxQaPasses" must be a positive number/);
+    }
+  });
+
+  test("AC4: qaInvestigateAfter 0, negative, or non-numeric fails loadConfig, naming the key", () => {
+    for (const bad of [0, -1, "2"]) {
+      const home = writeRaw("zstack", validRawConfig({ qaInvestigateAfter: bad }));
+      expect(() => loadConfig("zstack", home)).toThrow(/"qaInvestigateAfter" must be a positive number/);
+    }
+  });
+
+  test("AC1: maxQaPasses/qaInvestigateAfter absent -> loadConfig defaults them to 3 / 2", () => {
+    const home = writeRaw("zstack", validRawConfig());
+    const cfg = loadConfig("zstack", home);
+    expect(cfg.maxQaPasses).toBe(3);
+    expect(cfg.qaInvestigateAfter).toBe(2);
+  });
+
+  test("explicit maxQaPasses/qaInvestigateAfter in config.json are honored through loadConfig, not overridden by the default", () => {
+    const home = writeRaw("zstack", validRawConfig({ maxQaPasses: 5, qaInvestigateAfter: 1 }));
+    const cfg = loadConfig("zstack", home);
+    expect(cfg.maxQaPasses).toBe(5);
+    expect(cfg.qaInvestigateAfter).toBe(1);
   });
 });

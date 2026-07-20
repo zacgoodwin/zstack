@@ -56,20 +56,21 @@ export ZSTACK_SLUG="$SLUG"   # H13: so any z-board call that omits --slug still
 
 ---
 
-## Step 1 — Resolve the input spec, and the `--backlog` / `--dry-run` flags
+## Step 1 — Resolve the input spec(s), and the `--backlog` / `--dry-run` flags
 
-Two flags are recognized ahead of the spec path; parse them first and treat
-whatever argument remains as the spec:
+Two flags are recognized ahead of any spec path arguments; parse them first
+and collect every remaining non-flag argument into an ordered list,
+first-is-primary (below):
 
 ```bash
 BACKLOG_ONLY=""
 DRY_RUN=""
-SPEC=""
+SPECS=()
 for arg in "$@"; do
   case "$arg" in
     --backlog) BACKLOG_ONLY=1 ;;
     --dry-run) DRY_RUN=1 ;;
-    *) SPEC="$arg" ;;
+    *) SPECS+=("$arg") ;;
   esac
 done
 ```
@@ -78,19 +79,84 @@ done
 no "No spec file found" failure (AC4). Steps 2–9 do not run; `--dry-run` still
 applies (Dry-run / eval mode below).
 
-**Otherwise**, resolve the spec as always: when none is given, default to the
-newest file in gstack's CEO-plans directory for this project:
+**Otherwise**, resolve the spec(s):
+
+**An explicit path argument wins unchanged** (back-compat, AC2 of issue #16):
+when exactly one non-flag argument is given, `$SPECS` holds that one path —
+use exactly that file, no discovery run, no reading of any other document.
+Identical to the behavior before this ticket (issue #19).
+
+**More than one explicit path argument is also supported**
+(`/z-plan a.md b.md c.md`, issue #19): `${SPECS[0]}` — the FIRST path — is the
+**primary spec**, the source of the milestones and tickets, same as the
+single-path case above. Every subsequent path is **mandatory grounding
+context**, the identical contract the no-arg discovery case below gives its
+non-primary documents: read every one of them, and scope named ONLY in one of
+these other files still belongs in the plan — nothing named on the command
+line is optional background reading, and nothing is silently dropped. (Before
+this ticket, Step 1's flag-parsing loop assigned every non-flag argument to a
+single `SPEC` variable, so only the LAST path survived and the rest were
+silently dropped — the bug issue #19 fixes.) Explicit paths, whether one or
+several, still bypass `lib/spec-sources.ts` discovery entirely — discovery
+(below) only runs with zero path arguments.
+
+**Every named path must exist before any of them is read** — checked up
+front, not discovered mid-plan:
 
 ```bash
-if [ -z "$SPEC" ]; then
-  PLANS="$HOME/.gstack/projects/$SLUG/ceo-plans"
-  SPEC=$(ls -t "$PLANS"/* 2>/dev/null | head -1)
-fi
-[ -n "$SPEC" ] && [ -f "$SPEC" ] || { echo "No spec file found; pass a path." >&2; exit 1; }
+for p in "${SPECS[@]}"; do
+  [ -f "$p" ] || { echo "z-plan: spec file not found: $p" >&2; exit 1; }
+done
 ```
 
-Read the whole spec. It is the source of the milestones and tickets; do not
-invent scope it does not contain. Run Steps 2–9 on it, then Step 10 — the
+A missing file fails loud, naming exactly which path does not exist, and
+exits 1 with no board writes — it does NOT fall back to planning from the
+paths that do exist: `/z-plan a.md missing.md` never plans from `a.md` alone.
+
+**With no argument** (`$SPECS` is empty), gstack writes several planning artifacts per project
+under `~/.gstack/projects/<slug>/` — not only the newest `ceo-plans/` file:
+`specs/`, `ceo-plans/`, loose `*-test-plan-*.md` files, and `checkpoints/`. A
+plan grounded on only the single newest file misses scope recorded in the
+others (issue #16), so discover and read EVERY one of them:
+
+```bash
+DOCS_JSON=$(bun "$PACK/lib/spec-sources.ts" "$HOME/.gstack/projects/$SLUG") || exit 1
+```
+
+`lib/spec-sources.ts` (issue #16) is the deterministic half: it lists
+`specs/*.md`, `ceo-plans/*.md`, `*-test-plan-*.md`, and `checkpoints/*.md`
+under the project dir, newest-first within each kind. On success it prints a
+JSON array of `{path, kind, mtimeMs}`; **read every file it names** — the
+newest entry whose `kind` is `specs` or `ceo-plans` (compare `mtimeMs` across
+just those two kinds; do not simply take the array's first element, since
+`specs` entries are always listed before `ceo-plans` entries regardless of
+which is actually newer) is the **primary spec** — the source of the
+milestones and tickets, same as a single-file run. Every other document
+returned (the rest of `specs`/`ceo-plans`, all of `test-plan`, all of
+`checkpoints`) is **mandatory grounding context**: do not invent scope no
+document contains, but scope named ONLY in one of these other documents still
+belongs in the plan (AC1) — it is not optional background reading.
+
+**On failure** (`lib/spec-sources.ts` exits non-zero: no planning documents
+exist in any searched directory), there is no "No spec file found" dead end
+(the bug that motivated this ticket) — the command substitution above only
+captures stdout, so its stderr message, already naming every directory it
+searched (AC3), has printed directly; just `exit 1`. No board writes happen on
+this path.
+
+**A second, distinct failure**: `lib/spec-sources.ts` also exits non-zero when
+it found documents but ZERO of them are `specs`/`ceo-plans` (only `test-plan`
+and/or `checkpoints` entries exist) — there is no primary-spec candidate,
+since the primary spec is picked from `specs`/`ceo-plans` only. Its stderr
+message is DISTINCT from the empty-result one above: it names every kind and
+path it did find and states plainly that no specs/ceo-plans primary-spec
+candidate exists. Echo that message and `exit 1` — do NOT auto-plan from
+checkpoints or test plans alone; those two kinds are mandatory grounding
+context only, never a substitute primary spec. Stop with no board writes on
+this path either; the caller must re-run with an explicit spec path instead.
+
+Run Steps 2–9 on the primary spec (grounded with the other documents' scope
+folded in), then Step 10 — the
 Backlog scan runs as the final step of every normal spec run too, not only via
 `--backlog`.
 

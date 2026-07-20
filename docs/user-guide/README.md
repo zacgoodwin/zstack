@@ -260,7 +260,7 @@ What makes a zstack ticket different from a hand-filed issue:
   | `fable-xhigh` | fable | xhigh | $19.50 |
 
   (Full-lifecycle: plan + build + QA + review + merge, with buffer. Rules of
-  thumb per tier are in `references/ESTIMATION.md`.)
+  thumb per tier are in `spec/ESTIMATION.md`.)
 - **Dependencies linked both directions.** "N Depends on #M" on the dependent,
   "M Blocks #N" on the dependency, existing tickets found by title slug so a
   reworded title doesn't create a duplicate.
@@ -396,7 +396,7 @@ The loop hands work back deliberately. After each run:
 4. **Read the loop report**, especially on red: the filed bugs are already in
    Backlog with repros — promote to Ready what the next batch should fix.
 5. **Calibrate.** If Actual routinely exceeds Estimate on `/z-status`, planning
-   is undercharging — see `references/ESTIMATION.md`.
+   is undercharging — see `spec/ESTIMATION.md`.
 
 Then fill Ready and run `/z-loop` again.
 

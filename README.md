@@ -149,15 +149,15 @@ concurrent lanes), `watchdogMinutes` (default 10, stuck-worker timeout),
                                    regression on merged main                               │
                                     ├─ RED  → file bugs to Backlog, NO deploy              │
                                     └─ GREEN→ land-and-deploy → canary → document-release  │
-                                              (+ cso + health every 5th loop)              │
+                                              (+ cso + health every Nth loop, default 5)   │
                                         write report · bump loop counter · exit            │
                                         └──────────────────────────────────────────────────┘
 
    /z-status — read-only dashboard of the board at any moment (no mutations)
 ```
 
-The stage diagrams the loop implements are in `references/` (`develop stage.png`,
-`merge stage.png`, `planning Process.png`). Anything the loop cannot resolve
+The stage diagrams the loop implements are in `docs/user-guide/spec/`
+(`develop stage.png`, `merge stage.png`, `planning Process.png`). Anything the loop cannot resolve
 (a genuine ambiguity, a dead worker, a third QA failure) parks in
 Questions / Blocked / Skipped with a comment — never a silent guess, never a stall.
 
@@ -207,16 +207,17 @@ clears it and restarts. See [troubleshooting](docs/user-guide/troubleshooting.md
 - `z-setup/`, `z-plan/`, `z-loop/`, `z-status/` — the four skills (`SKILL.md`).
 - `bin/` — bash entry shims; `lib/` — the bun TypeScript deterministic core
   (board contract, scheduler, estimator, cost accounting, stage prompts).
-- `references/` — process docs (`PROCESS.md`, `PRINCIPLES.md`, `ESTIMATION.md`,
-  `ORCHESTRATOR.md`, sample transcripts) and the dev-loop diagrams; `rates.json`.
+- `references/` — `rates.json`, the per-model dollar rates for `z-estimate`/`z-cost`.
 - `evals/` — the paid, periodic lanes: `planner/` (graded `/z-plan` quality) and
   `e2e/` (the full-loop check). See [`evals/e2e/README.md`](evals/e2e/README.md).
 - `tests/` — deterministic gate tests, run via `bun test` (free, <2s).
-- `docs/user-guide/` — the pages linked above.
+- `docs/user-guide/` — the pages linked above, plus `spec/`: process docs
+  (`PROCESS.md`, `PRINCIPLES.md`, `ESTIMATION.md`, `ORCHESTRATOR.md`, sample
+  transcripts) and the dev-loop diagrams.
 
 ## Testing
 
-Two lanes, per `references/PRINCIPLES.md`:
+Two lanes, per `docs/user-guide/spec/PRINCIPLES.md`:
 
 - **Gate tests** — `bun test`. Deterministic, free, fast; run on every commit.
 - **Evals** — paid (LLM calls), run before ship and nightly. Every LLM call goes

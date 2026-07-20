@@ -82,8 +82,9 @@ model prices may have moved. Verify current rates and update `references/rates.j
 
 `~/.zstack/projects/<slug>/loop-counter` must be a single non-negative integer. If
 it is anything else, `endloop.ts` throws loudly instead of silently resetting to 0
-— a silent reset would re-run the 5th-loop `/cso` + `/health` audits on the wrong
-cadence. Fix the file by hand: set it to the number of loops actually completed
+— a silent reset would re-run the Nth-loop `/cso` + `/health` audits (config
+`auditEveryNLoops`, default 5) on the wrong cadence. Fix the file by hand: set it
+to the number of loops actually completed
 (a missing file correctly reads as 0). Never blank it to "skip" the audits.
 
 ## A permission prompt slips through right after choosing auto-approvals (A)

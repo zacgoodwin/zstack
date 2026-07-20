@@ -33,9 +33,11 @@ records the result. It never re-derives a scheduling decision in prose.
   merges happen one at a time in topological order (stacked chains retarget the
   base and delete branches only at batch end).
 - **No token burn.** Every ticket ends the run in Done, Questions, Blocked, or
-  Skipped. QA bugs bounce to a fresh builder (pass 2 runs `/investigate` first,
-  pass 3 blocks). A worker silent past the watchdog (default 10 min) is probed and
-  then Skipped with a note.
+  Skipped. QA bugs bounce to a fresh builder: from QA-bounce config
+  `qaInvestigateAfter` (default 2) onward, the rebuild runs `/investigate`
+  first; at config `maxQaPasses` (default 3), the ticket parks Blocked instead
+  of bouncing again. A worker silent past the watchdog (default 10 min) is
+  probed and then Skipped with a note.
 - **Actual per ticket.** After each stage the ticket's transcripts are priced with
   `bin/z-cost` (dedup by requestId) and written to the Actual field.
 
@@ -48,8 +50,12 @@ After the batch drains, the end-of-loop stage runs a regression on merged main
   file, and **no deploy skill runs**.
 - **Green** → `/land-and-deploy` → `/canary` → `/document-release`, in that order,
   each logged as it returns.
-- **Every 5th loop** (the persisted loop counter, red or green) → `/cso` +
-  `/health`, findings filed to Backlog.
+- **Every Nth loop** (the persisted loop counter, red or green) → `/cso` +
+  `/health`, findings filed to Backlog. `N` is the config knob
+  `auditEveryNLoops` (default 5) in `~/.zstack/projects/<slug>/config.json` —
+  set it lower (e.g. 3) for a high-churn repo, higher (e.g. 10) for a
+  docs-only one. Must be a positive integer; invalid values fail `loadConfig`
+  loudly rather than silently falling back.
 
 It writes `reports/loop-<ts>.md` and bumps `~/.zstack/projects/<slug>/loop-counter`.
 

@@ -8,7 +8,7 @@
 import { test, expect, describe, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 import { costOfFiles, expandGlob, main, parseLine, ZError } from "../lib/cost.ts";
 import type { RatesFile } from "../lib/estimate.ts";
 
@@ -123,6 +123,106 @@ describe("format-drift canary (AC4)", () => {
   });
 });
 
+// -- synthetic transcript entries (ticket #30) --------------------------------
+//
+// Hit live during a /z-loop drain: Claude Code itself writes an inline
+// synthetic assistant entry with `"model": "<synthetic>"` whenever an API
+// call fails transiently mid-session (isApiErrorMessage:true, apiErrorStatus
+// 429/500/529 -- rate limit or server error). Confirmed against 11/11 real
+// "<synthetic>" occurrences in ~/.claude/projects/ transcripts. It has a
+// full, validly-shaped usage object (that's why it reached resolveRate at
+// all instead of being filtered out by parseLine's assistant+usage check)
+// but carries nothing billable -- z-cost must skip it before the rate lookup
+// and count the skip, rather than raising the fail-loud unknown-model ZError
+// every OTHER unrecognized model string still must raise.
+describe("synthetic transcript entries are skipped, not priced (ticket #30)", () => {
+  const ZERO_USAGE = {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+  };
+  const syntheticLine = (requestId: string) =>
+    JSON.stringify({
+      type: "assistant",
+      requestId,
+      message: { model: "<synthetic>", role: "assistant", usage: ZERO_USAGE },
+    });
+  const realLine = (requestId: string, model: string) =>
+    JSON.stringify({
+      type: "assistant",
+      requestId,
+      message: {
+        model,
+        usage: { input_tokens: 100, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      },
+    });
+
+  test("AC1: mixed transcript prices the real entries and reports skippedSynthetic", () => {
+    // Real fixture (hand-computed total $0.09, 3 requests -- see AC3 above)
+    // plus one synthetic line appended: the total and request count must be
+    // unaffected, with exactly one skip counted.
+    const content = readFileSync(FIXTURE, "utf8").replace(/\n$/, "") + "\n" + syntheticLine("req_SYN") + "\n";
+    const file = tmpFile(content);
+    const result = costOfFiles([file], RATES);
+    expect(result.total).toBe(0.09); // unchanged from the real-only fixture
+    expect(result.requests).toBe(3); // synthetic entry does not count as a request
+    expect(result.skippedSynthetic).toBe(1);
+  });
+
+  test("AC2: an all-synthetic transcript yields total 0 with skippedSynthetic set, no unknown-model error", () => {
+    const content = [syntheticLine("req_SYN1"), syntheticLine("req_SYN2"), syntheticLine("req_SYN3")].join("\n") + "\n";
+    const file = tmpFile(content);
+    const result = costOfFiles([file], RATES);
+    expect(result.total).toBe(0);
+    expect(result.requests).toBe(0);
+    expect(result.by_model).toEqual([]);
+    expect(result.skippedSynthetic).toBe(3); // one per line, not deduped
+  });
+
+  test("AC3: a genuinely unknown model string still raises the fail-loud ZError", () => {
+    const file = tmpFile(realLine("req_UNKNOWN", "gpt-oss") + "\n");
+    expect(() => costOfFiles([file], RATES)).toThrow(ZError);
+    expect(() => costOfFiles([file], RATES)).toThrow(/No rate for model "gpt-oss"/);
+  });
+
+  test("--json surfaces skippedSynthetic for consumers (z-loop's Actual field-set)", async () => {
+    const content = readFileSync(FIXTURE, "utf8").replace(/\n$/, "") + "\n" + syntheticLine("req_SYN") + "\n";
+    const file = tmpFile(content);
+    const pattern = join(file, "..", "*.jsonl").replaceAll("\\", "/");
+    const ratesFile = tmpFile(JSON.stringify(RATES), "rates.json");
+
+    const logs: string[] = [];
+    const orig = console.log;
+    console.log = (...a: unknown[]) => void logs.push(a.join(" "));
+    let code: number;
+    try {
+      code = await main(["--json", pattern, "--rates", ratesFile]);
+    } finally {
+      console.log = orig;
+    }
+    expect(code).toBe(0);
+    const obj = JSON.parse(logs.join("\n"));
+    expect(obj.total).toBe(0.09);
+    expect(obj.skippedSynthetic).toBe(1);
+  });
+
+  test("human summary line surfaces the skip count when nonzero", async () => {
+    const file = tmpFile(syntheticLine("req_SYN") + "\n");
+    const logs: string[] = [];
+    const orig = console.log;
+    console.log = (...a: unknown[]) => void logs.push(a.join(" "));
+    let code: number;
+    try {
+      code = await main([file]);
+    } finally {
+      console.log = orig;
+    }
+    expect(code).toBe(0);
+    expect(logs.join("\n")).toMatch(/1 synthetic skipped/);
+  });
+});
+
 // -- glob expansion (native Bun.Glob, no new dependency) ---------------------
 describe("expandGlob", () => {
   test("matches jsonl files under a directory and returns readable paths", () => {
@@ -140,6 +240,164 @@ describe("expandGlob", () => {
     const dir = mkdtempSync(join(tmpdir(), "zcost-glob-empty-"));
     tmpPaths.push(dir);
     expect(expandGlob("*.jsonl", dir)).toEqual([]);
+  });
+});
+
+// -- absolute patterns (ticket #22: Bun.Glob drive-letter fix) ---------------
+//
+// Confirmed empirically (Windows, Bun 1.3.14): Bun.Glob.scanSync never
+// matches a pattern that is ITSELF a fully literal absolute path (no glob
+// metacharacter anywhere) regardless of `cwd` -- e.g. the exact live repro
+// `z-cost --json "C:/.../transcripts/ticket-17/builder.jsonl"` returned "No
+// files matched" even though the file existed, while the identical filename
+// used as a relative pattern from its own directory matched fine. The fix
+// splits an absolute pattern into its deepest glob-metacharacter-free
+// directory prefix and scans from there with only the (now relative) tail.
+describe("expandGlob: absolute patterns (ticket #22)", () => {
+  test("AC1: absolute Windows drive-letter pattern (forward slashes) matches", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-abs-win-fwd-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "transcript.jsonl"), readFileSync(FIXTURE, "utf8"));
+    const pattern = join(dir, "*.jsonl").replaceAll("\\", "/"); // "C:/.../*.jsonl"
+    const files = expandGlob(pattern);
+    expect(files.length).toBe(1);
+    expect(costOfFiles(files, RATES).total).toBe(0.09);
+  });
+
+  test("AC1: absolute Windows drive-letter pattern (native backslashes) matches", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-abs-win-back-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "transcript.jsonl"), readFileSync(FIXTURE, "utf8"));
+    const pattern = join(dir, "*.jsonl"); // native Windows join uses "\"
+    const files = expandGlob(pattern);
+    expect(files.length).toBe(1);
+    expect(costOfFiles(files, RATES).total).toBe(0.09);
+  });
+
+  test("absolute POSIX-style pattern (leading single slash, no drive letter) matches", () => {
+    // A driveless leading-slash path is drive-RELATIVE on Windows (it
+    // resolves onto whatever the current process's drive is), so the fixture
+    // has to live on that same drive -- os.tmpdir() is a different drive on
+    // this machine, so build under process.cwd() (the worktree) instead.
+    const dir = mkdtempSync(join(process.cwd(), ".zcost-abs-posix-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "transcript.jsonl"), readFileSync(FIXTURE, "utf8"));
+    // Strip the drive letter to simulate a POSIX-style absolute pattern
+    // ("/Users/.../*.jsonl") -- the leading-slash branch of ABSOLUTE_PATTERN.
+    const posixDir = "/" + dir.replace(/^[a-zA-Z]:[\\/]/, "").replaceAll("\\", "/");
+    const pattern = `${posixDir}/*.jsonl`;
+    const files = expandGlob(pattern);
+    expect(files.length).toBe(1);
+    expect(costOfFiles(files, RATES).total).toBe(0.09);
+  });
+
+  test("literal absolute path with NO glob metacharacter still matches (the exact live repro)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-abs-literal-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "builder.jsonl"), readFileSync(FIXTURE, "utf8"));
+    const pattern = join(dir, "builder.jsonl").replaceAll("\\", "/"); // no "*" anywhere
+    const files = expandGlob(pattern);
+    expect(files.length).toBe(1);
+    expect(costOfFiles(files, RATES).total).toBe(0.09);
+  });
+
+  test("AC2: relative pattern (cd T && z-cost \"*.jsonl\") gives the same total as AC1", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-rel-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "transcript.jsonl"), readFileSync(FIXTURE, "utf8"));
+    const files = expandGlob("*.jsonl", dir); // cwd = T, pattern relative -- unchanged behavior
+    expect(files.length).toBe(1);
+    expect(costOfFiles(files, RATES).total).toBe(0.09);
+  });
+
+  test("AC3: absolute pattern over an empty directory still yields no matches", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-abs-empty-"));
+    tmpPaths.push(dir);
+    const pattern = join(dir, "*.jsonl").replaceAll("\\", "/");
+    expect(expandGlob(pattern)).toEqual([]);
+  });
+
+  test("AC3: main() raises the existing ZError naming the pattern for an absolute no-match glob", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-abs-empty-cli-"));
+    tmpPaths.push(dir);
+    const pattern = join(dir, "*.jsonl").replaceAll("\\", "/");
+    const logs: string[] = [];
+    const origError = console.error;
+    console.error = (...a: unknown[]) => void logs.push(a.join(" "));
+    let code: number;
+    try {
+      code = await main(["--json", pattern]);
+    } finally {
+      console.error = origError;
+    }
+    expect(code).not.toBe(0);
+    expect(logs.join("\n")).toContain(pattern);
+    expect(logs.join("\n")).toMatch(/No files matched/);
+  });
+});
+
+// -- UNC patterns are refused, not silently mismatched (ticket #22 rework) --
+//
+// Adversarial review found that the fix above has a regression: a UNC path
+// (\\server\share\... or //server/share/...) matches ABSOLUTE_PATTERN's
+// driveless-leading-slash branch, but splitAbsoluteGlob's
+// `pattern.split(/[\\/]+/)` collapses the leading double separator into one
+// segment, so resolve() roots the (now single-slash) prefix onto the
+// CURRENT drive instead of the network host -- silently redirecting to a
+// same-named local directory if one happens to exist, instead of the loud
+// ENOENT a missing UNC share should give. That's a silent wrong answer
+// (priced!) where the pre-fix code merely failed loud on the literal UNC
+// path. Since z-cost's transcripts always live under the user's home
+// directory (no real UNC demand), UNC patterns are refused outright with a
+// ZError naming the limitation, preserving the fail-loud contract with the
+// smallest possible surface.
+describe("expandGlob: UNC patterns are refused (ticket #22 rework)", () => {
+  test("a //server/share/*.jsonl-style pattern throws naming UNC", () => {
+    expect(() => expandGlob("//myserver/share/*.jsonl")).toThrow(ZError);
+    expect(() => expandGlob("//myserver/share/*.jsonl")).toThrow(/UNC/);
+  });
+
+  test("a \\\\server\\share\\...-style pattern (native Windows UNC backslashes) throws naming UNC", () => {
+    expect(() => expandGlob("\\\\myserver\\share\\*.jsonl")).toThrow(ZError);
+    expect(() => expandGlob("\\\\myserver\\share\\*.jsonl")).toThrow(/UNC/);
+  });
+
+  test("main() exits 1 and prints the UNC error for a UNC pattern", async () => {
+    const logs: string[] = [];
+    const origError = console.error;
+    console.error = (...a: unknown[]) => void logs.push(a.join(" "));
+    let code: number;
+    try {
+      code = await main(["--json", "//myserver/share/*.jsonl"]);
+    } finally {
+      console.error = origError;
+    }
+    expect(code).toBe(1);
+    expect(logs.join("\n")).toMatch(/UNC/);
+  });
+
+  test("shadow-dir: a UNC pattern still throws even when a local dir mirrors its segments", () => {
+    // Reproduces the reviewer's exact regression scenario: build a REAL local
+    // directory at the drive root that splitAbsoluteGlob+resolve() would
+    // silently redirect the UNC pattern onto if the guard did not exist
+    // (confirmed empirically: path.resolve("/host/share") on this machine
+    // returns "<cwd's drive>:\host\share", i.e. the drive root -- not the
+    // network host), containing a real transcript file. Without the guard
+    // this local file would be the silent wrong match the reviewer found;
+    // with the guard, expandGlob must throw before ever reaching that path,
+    // never returning the local file.
+    const rand = Math.random().toString(36).slice(2);
+    const host = `zcost-shadow-host-${rand}`;
+    const share = `zcost-shadow-share-${rand}`;
+    const root = parse(process.cwd()).root; // e.g. "D:\\"
+    const shadowDir = join(root, host, share);
+    mkdirSync(shadowDir, { recursive: true });
+    tmpPaths.push(join(root, host));
+    writeFileSync(join(shadowDir, "local.jsonl"), readFileSync(FIXTURE, "utf8"));
+
+    const pattern = `//${host}/${share}/*.jsonl`;
+    expect(() => expandGlob(pattern)).toThrow(ZError);
+    expect(() => expandGlob(pattern)).toThrow(/UNC/);
   });
 });
 

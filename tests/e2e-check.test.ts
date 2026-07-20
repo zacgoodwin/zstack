@@ -134,6 +134,44 @@ describe("mutated runs: the checker catches the specific break", () => {
     expect(r.detail).toContain("not blinded");
   });
 
+  test("loop-counter respects a non-default auditEveryNLoops from fixture state (issue #18)", () => {
+    // sample-run is loop 3 under the default (every-5th-loop) cadence, so its
+    // invocation log correctly carries no cso/health. Configure a cadence of 3
+    // via state-initial.json and add the audit invocations a loop-3 run WOULD
+    // produce under that cadence -- this only passes if the assertion reads
+    // the fixture's cadence instead of a hardcoded `% 5`.
+    const results = checkMutated((dir) => {
+      const sp = join(dir, "state-initial.json");
+      const s = readJson(sp);
+      s.auditEveryNLoops = 3;
+      writeJson(sp, s);
+
+      const invPath = join(dir, "reports", "invocations-20260719-101500.jsonl");
+      const lines = readFileSync(invPath, "utf8").trim().split("\n");
+      lines.push(JSON.stringify({ skill: "cso", atMs: 4000 }), JSON.stringify({ skill: "health", atMs: 5000 }));
+      writeFileSync(invPath, lines.join("\n") + "\n");
+    });
+    const r = byName(results, "loop-counter");
+    expect(r.pass).toBe(true);
+    expect(r.detail).toContain("present");
+  });
+
+  test("loop-counter still fails when audits are missing under a non-default cadence that expects them", () => {
+    // Same cadence=3 config, but WITHOUT adding the cso/health invocations --
+    // proves the assertion's expectation actually flipped with the cadence
+    // (not just always-pass), since under the default cadence (5) loop 3
+    // correctly expects no audits, but under cadence 3 it does.
+    const results = checkMutated((dir) => {
+      const sp = join(dir, "state-initial.json");
+      const s = readJson(sp);
+      s.auditEveryNLoops = 3;
+      writeJson(sp, s);
+    });
+    const r = byName(results, "loop-counter");
+    expect(r.pass).toBe(false);
+    expect(r.detail).toContain("expected=true");
+  });
+
   test("a report total that disagrees with the board Actuals fails report", () => {
     const results = checkMutated((dir) => {
       const p = join(dir, "board-final.json");

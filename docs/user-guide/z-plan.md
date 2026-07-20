@@ -17,7 +17,45 @@ After `/z-setup`, whenever you have a spec to turn into tickets:
 /z-plan path/to/spec.md
 ```
 
-With no argument it defaults to the newest gstack CEO plan for the repo.
+An explicit path always wins unchanged (back-compat) -- exactly that file is
+used, no discovery run.
+
+**More than one explicit path is also supported**:
+
+```bash
+/z-plan path/to/a.md path/to/b.md path/to/c.md
+```
+
+The FIRST path given is the primary spec -- the source of the milestones and
+tickets, same as passing one path. Every path after it is mandatory grounding
+context: read in full, and scope named only in one of those other files still
+makes it into the plan, exactly like the no-argument discovery case below --
+nothing named on the command line is ever silently dropped. (Passing several
+paths used to silently keep only the last one; every named path now
+contributes.) Explicit paths, one or several, always bypass discovery -- it
+only runs with zero path arguments. Every named path must exist: if any one
+doesn't, `/z-plan` fails loud naming exactly which path is missing and makes
+no board writes -- it never falls back to planning from just the paths that
+do exist.
+
+With no argument it discovers and reads **every** gstack planning document for
+the repo, not just the newest one: `specs/*.md`, `ceo-plans/*.md`, loose
+`*-test-plan-*.md` files, and `checkpoints/*.md` under
+`~/.gstack/projects/<slug>/` (`lib/spec-sources.ts`, newest-first within each
+kind). The newest entry across just `specs`/`ceo-plans` becomes the primary
+spec -- the source of the milestones and tickets, same as a single-file run --
+and every other document returned is mandatory grounding context: scope named
+only in one of those other documents still makes it into the plan. If no
+planning documents exist in any searched directory, it fails loud, naming
+every directory it searched, instead of the old "No spec file found" dead end
+(no board writes on this path).
+
+There is a second, distinct failure mode: documents were found, but none of
+them live under `specs/` or `ceo-plans/` -- only `checkpoints/` and/or loose
+test-plan files exist. `/z-plan` never auto-plans from checkpoints or test
+plans alone; they are grounding context, not a substitute primary spec. In
+that case it stops with a separate error naming exactly what it found (kind
+and path for each) and asks you to pass an explicit spec path instead.
 
 Separately, whenever you want every ticket already sitting in Backlog —
 human brain-dumps, or the surfaced use cases the loop's completion flow files

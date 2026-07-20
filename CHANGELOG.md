@@ -6,6 +6,10 @@ All notable changes to zstack are documented here. Format follows [Keep a Change
 
 Installing zstack now actually surfaces the four skills. Also releases the issue #14 remediation (all 22 items closed) plus an adversarial hardening pass (OpenAI Codex challenge + independent refute review, every fix mutation-tested).
 
+### Added
+
+- Board shape (nine statuses, four custom fields, intended views) is data now (issue #20): the shipped `z-setup/board-template.json`, loaded and validated by `lib/board-template.ts` before any board mutation. The default is 1:1 with the previously hardcoded shape (same statuses in order, same fields + option colors). `z-setup-board plan|apply|verify --template <file>` ships a variant; the loader refuses a template whose status set is not the canonical nine or that drops/renames a required field (Model, Model Effort, Estimate, Actual), naming the field and the tool that breaks. GitHub's API has no view-creation mutation, so the template's views are printed as explicit manual steps rather than silently dropped.
+
 ### Fixed
 
 - `./setup` now registers each skill (`z-setup`, `z-plan`, `z-loop`, `z-status`) as its own top-level entry in the host's skills directory. Hosts discover `skills/<name>/SKILL.md` one level deep only, so registering just the pack directory left all four skills invisible — worst on the documented clone-straight-into-`~/.claude/skills/zstack` path, which early-returned before registering anything. Run `./setup` after every install or update, then restart Claude Code; on Windows run it from Git Bash (`cmd.exe` leaves a literal `~` folder).
@@ -28,7 +32,7 @@ Installing zstack now actually surfaces the four skills. Also releases the issue
 - `epicStyle "issue-type"` is rejected at config validation and z-setup until a sub-issue create path exists; epic style is always `milestones`.
 - `field-get` on a nonexistent issue throws the same not-found error as other subcommands (was a silent empty value), and never falls back to another project's same-named field.
 - Root strict `tsconfig` + `bun run typecheck` wired into the gate suite; shared CLI plumbing consolidated into `lib/cli.ts`; board statuses single-sourced in `lib/config.ts`.
-- 100+ new gate tests (481 total), each proven to bite via mutation testing.
+- 100+ new gate tests (658 total), each proven to bite via mutation testing.
 
 ## [0.1.0.0] - 2026-07-19
 

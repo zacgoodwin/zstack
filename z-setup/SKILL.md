@@ -109,6 +109,23 @@ To adopt a specific existing project instead of matching by title, add
 `--project-number <N>`. `apply` is idempotent: re-running plans and executes zero
 mutations once the board is correct.
 
+**Board shape is a template.** The nine statuses and four fields above are not
+hardcoded — they are the shipped `z-setup/board-template.json` (status name +
+color + description, field name + dataType + options, and the intended views),
+loaded and validated before any mutation. To ship a variant (e.g. different
+option colors), pass `--template <file>` to `plan` / `apply` / `verify`. The
+loader refuses a template whose status set is not the canonical nine, or that
+drops or renames any of the four required fields — Model, Model Effort, Estimate,
+Actual — the loop hard-depends on, so a bad template fails loudly naming the
+field, before the board is touched.
+
+**Board views are manual.** The template also describes board views (a Status
+kanban, a milestone cost table), but GitHub's GraphQL API exposes no
+view-creation mutation — only a read-only `ProjectV2View` object. So `plan` and
+`apply` print each view as an explicit manual step (open the project on
+github.com, add the view by hand) rather than silently dropping them. Set these
+views up after Step 4.
+
 **Destructive adopt guard.** Replacing the options of any single-select field
 (Status, Model, Model Effort) on an adopted board deletes every non-canonical
 option (e.g. GitHub's default Todo / In Progress), and items assigned to a
