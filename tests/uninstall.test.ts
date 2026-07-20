@@ -219,6 +219,11 @@ describe("#49 AC3 — a sentinel COPY running its own uninstall is a 'registered
     mkdirSync(copy, { recursive: true });
     cpSync(UNINSTALL_PATH, join(copy, "uninstall"));
     writeFileSync(join(copy, ".zstack-registered"), "Created by zstack ./setup.\n");
+    // The sweep list is derived from PACK_DIR/z-*/SKILL.md dirs (mirrors
+    // setup's register()), so a realistic copy fixture needs the skill's
+    // source dir present too, not just its registered copy below.
+    mkdirSync(join(copy, "z-setup"), { recursive: true });
+    writeFileSync(join(copy, "z-setup", "SKILL.md"), "# fixture\n");
     // A separately-registered per-skill copy that IS ours (and is NOT the running dir).
     const zsetup = sentinelCopy(skills, "z-setup");
 
