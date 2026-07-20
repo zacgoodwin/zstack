@@ -99,6 +99,11 @@ each defaulted by `loadConfig` when absent:
 - `qaInvestigateAfter` (default 2) — the QA-bounce count at/after which the
   rebuild runs `/investigate` first instead of patching straight from QA's
   notes (PROCESS.md step 15).
+- `quota.threshold` (default 100) — the GitHub GraphQL rate-limit guard trips
+  when remaining points fall below this before any board call.
+- `quota.mode` (default `"sleep"`) — `"sleep"` waits until the rate-limit window
+  resets (`resetAt`) and then proceeds; `"abort"` fails the call immediately
+  instead of waiting.
 
 `maxLanes` and `watchdogMinutes` can also be set at setup time with
 `--max-lanes` / `--watchdog-minutes`; the others are hand-edited in

@@ -10,6 +10,7 @@ All notable changes to zstack are documented here. Format follows [Keep a Change
 
 ### Changed
 
+- Default `quota.threshold` lowered from 200 to 100 for GitHub's GraphQL rate-limit guard, allowing the loop to run closer to budget while still maintaining a comfortable margin before hitting a hard 403. The knob is now documented in the `z-setup.md` config-knobs table alongside its `quota.mode` counterpart (both hand-editable in `config.json`, with defaults applied by `loadConfig`).
 - User docs are synced to the shipped surface. The skill count is corrected to the six shipped skills (adding `/z-uninstall` and `/z-update`); both configuration-reference tables list `maxQaPasses`, `qaInvestigateAfter`, and `auditEveryNLoops` with their defaults; the QA and audit prose names those knobs instead of hardcoding "second/third pass" or "every 5th loop"; the status table now shows a third failed QA pass parking Blocked (matching the reducer); the uninstall section leads with `/z-uninstall` and keeps the manual `rm -rf` only as a pre-sentinel fallback; and permission-undo points at `bin/z-setup-permissions --remove`.
 
 ### Fixed
