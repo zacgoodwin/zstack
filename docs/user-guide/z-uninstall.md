@@ -27,7 +27,12 @@ command executes from IS the registration, and it cannot delete itself. Each run
    pack entry and any `z-*` skill entry **only when it owns them**:
    - a **symlink whose target resolves into the pack** (the macOS/Linux install) —
      setup only ever links to the pack or a skill dir inside it, so a link that
-     lands there is provably ours; removing the link never touches its target;
+     lands there is provably ours; removing the link never touches its target.
+     Target resolution is portable across `readlink` flavors — it prefers
+     `readlink -f` (GNU coreutils, macOS 12.3+) and falls back to a POSIX resolve
+     loop where `-f` is unavailable (BSD `readlink` on macOS before 12.3), so an
+     owned link is swept on every supported platform. Any failure to resolve a
+     target falls to leave-and-name, never to deletion;
    - a **copy carrying the `.zstack-registered` sentinel** (the Windows install) —
      setup drops that marker into every copy so a copy is distinguishable from a
      user's own same-named directory.
