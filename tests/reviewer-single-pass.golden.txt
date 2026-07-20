@@ -27,7 +27,7 @@ Run the typecheck and the tests this diff touches here. Nothing you do in it lan
 - Security holes at trust boundaries; data-loss edges; error paths that swallow failures.
 
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
-REVIEW-APPROVE: <one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green
+REVIEW-APPROVE: confidence=<0-100> <one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green -- confidence is your certainty every criterion holds (aggregated per the super-truth pass above when it ran); a score below the project's configured floor will NOT merge
 REVIEW-FINDINGS: <numbered findings>          each with file:line and why it blocks the merge
 NEEDS-HUMAN: <the judgment call>              a genuine spec ambiguity a human must settle
 BLOCKED: <reason>                             the throwaway worktree is unusable -- can't check out or execute the diff at all

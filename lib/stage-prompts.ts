@@ -177,10 +177,11 @@ export function adversarialActive(mode: AdversarialMode, diffLineCount: number, 
 // `adversarial` is a SEPARATE scalar arg, never a fifth input key -- the
 // four-key blindness gate (assertReviewerInput) fires first and is unchanged, so
 // the mode/labels that decided `adversarial` never reach the reviewer as data,
-// only as a branch. false is the pre-#59 single pass, byte-for-byte; true folds
-// in the super-truth skeptic fan-out and stamps a confidence= token into the
-// exit markers (the signal #62 consumes -- it rides inside the marker's note, so
-// loop.ts's marker regex parses it unchanged; #59 only emits it).
+// only as a branch. false is the single pass, still carrying REVIEW-APPROVE's
+// unconditional confidence=<0-100> token (#62's safety gate reads it either
+// way); true additionally folds in the super-truth skeptic fan-out and stamps
+// the same token onto REVIEW-FINDINGS too. The token rides inside the marker's
+// note, so loop.ts's marker regex parses it unchanged regardless of branch.
 export function reviewerPrompt(input: ReviewerPromptInput, adversarial: boolean = false): string {
   assertReviewerInput(input);
   // ponytail: N=3 skeptics is a fixed ceiling (no config knob this ticket); a
@@ -192,8 +193,13 @@ This card's blast radius earned an adversarial review; do NOT trust your single 
 Reconcile the three verdicts into an aggregated confidence 0-100: the percentage of skeptics that could NOT refute the diff (3/3 unrefuted = 100, 2/3 = 67, 1/3 = 33, 0/3 = 0). A criterion any skeptic refutes with concrete evidence is a finding, not a vote to be outnumbered -- surface it. Report the confidence in your exit marker below.
 `
     : "";
-  // The confidence token rides inside the marker's note (#62 parses it there);
-  // absent on the single pass so the inactive prompt stays a strict no-op.
+  // REVIEW-FINDINGS' confidence token rides inside the marker's note only on
+  // the super-truth pass (#59's aggregation); findings already bounce to the
+  // builder regardless of any score, so parsing/logging it there is out of
+  // #62's scope. REVIEW-APPROVE is different: #62's safety gate reads it
+  // unconditionally, so that marker always carries the literal
+  // confidence=<0-100> token below -- self-assessed on a single pass,
+  // aggregated across skeptics when the super-truth pass ran.
   const conf = adversarial ? "confidence=<0-100> " : "";
   return `You are an ADVERSARIAL REVIEWER in a fresh context, running UNATTENDED inside the zstack dev loop. You are blinded by design: your ONLY inputs are the ticket, its acceptance criteria, the diff, and a throwaway worktree of the head commit. There is no PR description, no plan rationale, no builder or QA transcript -- and any claim you cannot verify from these inputs yourself is unverified. Your job is to find the reasons this diff should NOT merge.
 
@@ -217,7 +223,7 @@ Run the typecheck and the tests this diff touches here. Nothing you do in it lan
 - Security holes at trust boundaries; data-loss edges; error paths that swallow failures.
 ${superTruth}
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
-REVIEW-APPROVE: ${conf}<one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green
+REVIEW-APPROVE: confidence=<0-100> <one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green -- confidence is your certainty every criterion holds (aggregated per the super-truth pass above when it ran); a score below the project's configured floor will NOT merge
 REVIEW-FINDINGS: ${conf}<numbered findings>          each with file:line and why it blocks the merge
 NEEDS-HUMAN: <the judgment call>              a genuine spec ambiguity a human must settle
 BLOCKED: <reason>                             the throwaway worktree is unusable -- can't check out or execute the diff at all

@@ -36,8 +36,16 @@ records the result. It never re-derives a scheduling decision in prose.
   a pure function of the diff's changed-line count, the issue's labels, and the
   `adversarialMode` knob (default `non-trivial`: a ≥ 10-line diff OR a
   `security`/`migration`/`payments`/`auth` label; `off` never, `always` every
-  card). The confidence rides in the reviewer's exit marker; gating on it is a
-  later step.
+  card). The confidence rides in the reviewer's exit marker.
+- **A low-confidence approval does not merge.** The reviewer always reports a
+  self-assessed (or, on a super-truth pass, skeptic-aggregated) `confidence`
+  0–100 on its `REVIEW-APPROVE`. An approval below `minReviewerConfidence`
+  (default 70) never reaches the merge gate: per `reviewerBelowThresholdAction`
+  (default `block`) it parks the ticket Blocked with
+  `truth-check failed (confidence X/100)`, bounces it back to the builder
+  (`retry`), or is ignored entirely (`off`). A `REVIEW-APPROVE` with no
+  parseable confidence is treated the same as a sub-floor score — fail-closed,
+  never a silent merge — whenever the gate is on.
 - **Dependency-ordered, capped concurrency.** A dependent is not claimable until
   its dependencies are Done; at most `maxLanes` (default 3) lanes run at once;
   merges happen one at a time in topological order (stacked chains retarget the

@@ -70,7 +70,9 @@ export function happyOutcome(stage: Stage, ticket: number): string {
     case "qa":
       return "QA-PASS: functional and technical checks green.";
     case "reviewer":
-      return "REVIEW-APPROVE: every criterion verified against the diff.";
+      // confidence=100 clears the default 70 floor (issue #62) so the derived
+      // happy-path run still reaches Done instead of parking Blocked.
+      return "REVIEW-APPROVE: confidence=100 every criterion verified against the diff.";
     case "merge":
       return `MERGED: https://github.com/acme/fixture-app/pull/${ticket}`;
   }

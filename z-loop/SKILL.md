@@ -73,11 +73,12 @@ mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports" 
 2. **gh authenticated** with the project scope (`gh auth status` clean).
 3. **bun present:** `command -v bun`.
 4. Read the loop knobs from config (defaults 3 lanes / 10 minutes / audits
-   every 5th loop / 3 QA passes before Blocked / investigate from QA bounce 2):
+   every 5th loop / 3 QA passes before Blocked / investigate from QA bounce 2 /
+   reviewer-confidence floor 70, block a sub-floor approve):
 
 ```bash
-read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
-  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter)")"
+read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER MIN_REVIEWER_CONFIDENCE REVIEWER_BELOW_ACTION <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
+  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.minReviewerConfidence, c.reviewerBelowThresholdAction)")"
 ```
 
 5. **Startup orphan scan (C7).** A crashed prior loop leaves lane locks in
@@ -157,7 +158,8 @@ bun -e "import {readFileSync, readdirSync, writeFileSync} from 'node:fs';
   writeFileSync('$TMP/bodies.json', JSON.stringify(b));"
 bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" \
   --max-lanes "$MAX_LANES" --watchdog-minutes "$WATCHDOG" \
-  --max-qa-passes "$MAX_QA_PASSES" --qa-investigate-after "$QA_INVESTIGATE_AFTER"
+  --max-qa-passes "$MAX_QA_PASSES" --qa-investigate-after "$QA_INVESTIGATE_AFTER" \
+  --min-reviewer-confidence "$MIN_REVIEWER_CONFIDENCE" --reviewer-below-threshold-action "$REVIEWER_BELOW_ACTION"
 ```
 
 `ingest` preserves lanes and lost-claim flags across re-ingests, so re-running
@@ -250,7 +252,7 @@ only the transport and those two events.
 |---|---|
 | `builder` | `ticketNumber`, `ticketTitle`, `ticketBody` (fresh `gh issue view`), `worktreePath` (`.worktrees/ticket-<N>`), `branch`, `baseBranch`; on a bounce also `qaNotes`/`investigateFirst` or `reviewNotes` per the advance row above. |
 | `qa` | `ticketNumber`, `ticketBody`, `worktreePath`, `branch`, `qaPass` (the lane's `qaBounces` in the state file + 1), `webTarget` (true when the ticket changes a web-served surface — your judgment; QA then drives gstack /qa). |
-| `reviewer` | **BLINDED — exactly** `ticketBody`, `acceptanceCriteria` (the `### Acceptance Criteria` section: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' body.md`), `diff` (`git -C .worktrees/ticket-<N> diff "$BASE"...HEAD`), `worktreePath` = a THROWAWAY worktree of the head commit (`git worktree add "$TMP/review-<N>" <head-sha>`; remove it after the stage). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. **Adversarial control (#59):** build this stage's prompt with two extra flags — `MODE=$("$Z_BOARD" ... )` the project's `adversarialMode` (read it from `~/.zstack/projects/$SLUG/config.json`; `loadConfig` defaults it to `non-trivial`) and `LABELS=$(gh issue view <N> --json labels -q '[.labels[].name]')` (a JSON array — labels live on the GitHub issue, NOT on the board item, so `board.list` never fetched them; get them here). Then `bun "$PACK/lib/stage-prompts.ts" prompt reviewer "$TMP/input-<N>.json" --adversarial-mode "$MODE" --labels "$LABELS" > "$TMP/prompt-<N>.txt"`. The predicate (`adversarialActive`) reads the diff's own changed-line count from the blinded input — `always`/`non-trivial`-on-a-big-or-labeled diff spawns the skeptic fan-out and emits a `confidence=` token; `off`/small-unlabeled is the single pass. Mode + labels ride as FLAGS; the four-key input JSON is untouched. |
+| `reviewer` | **BLINDED — exactly** `ticketBody`, `acceptanceCriteria` (the `### Acceptance Criteria` section: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' body.md`), `diff` (`git -C .worktrees/ticket-<N> diff "$BASE"...HEAD`), `worktreePath` = a THROWAWAY worktree of the head commit (`git worktree add "$TMP/review-<N>" <head-sha>`; remove it after the stage). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. **Adversarial control (#59):** build this stage's prompt with two extra flags — `MODE=$("$Z_BOARD" ... )` the project's `adversarialMode` (read it from `~/.zstack/projects/$SLUG/config.json`; `loadConfig` defaults it to `non-trivial`) and `LABELS=$(gh issue view <N> --json labels -q '[.labels[].name]')` (a JSON array — labels live on the GitHub issue, NOT on the board item, so `board.list` never fetched them; get them here). Then `bun "$PACK/lib/stage-prompts.ts" prompt reviewer "$TMP/input-<N>.json" --adversarial-mode "$MODE" --labels "$LABELS" > "$TMP/prompt-<N>.txt"`. The predicate (`adversarialActive`) reads the diff's own changed-line count from the blinded input — `always`/`non-trivial`-on-a-big-or-labeled diff spawns the skeptic fan-out (and stamps a `confidence=` token onto `REVIEW-FINDINGS` too); `off`/small-unlabeled is the single pass. Either way `REVIEW-APPROVE` always carries a `confidence=` token (issue #62's safety gate reads it regardless) — see `/z-loop`'s reviewer-confidence-gate section for what a sub-floor score does. Mode + labels ride as FLAGS; the four-key input JSON is untouched. |
 | `merge` | `ticketNumber`, `prTitle` (the ticket title), `branch`, `baseBranch`, `worktreePath`, `stackedOn` (from the advance action — parents whose branches this PR stacks on; the prompt carries the PROCESS.md step 18 chain rules: parents first, no branch deletion mid-batch, retarget, delete last). |
 
 **Per-stage Actual (every stage, no exceptions):** when a stage agent finishes,
