@@ -13,6 +13,7 @@ import {
   DEFAULT_HUMAN_NEEDED_PERCENT,
   DEFAULT_MAX_LANES,
   DEFAULT_MAX_QA_PASSES,
+  DEFAULT_MAX_REVIEW_BOUNCES,
   DEFAULT_MIN_REVIEWER_CONFIDENCE,
   DEFAULT_QA_INVESTIGATE_AFTER,
   DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
@@ -93,6 +94,7 @@ export interface LaneState {
   stage: Stage;
   lastActivityMs: number; // last observed worker output (watchdog baseline)
   qaBounces: number; // completed QA passes that found bugs
+  reviewBounces: number; // completed reviewer->builder bounces (issue #76)
   workerDead?: boolean; // set by the orchestrator after an aliveness probe
   outcome?: StageOutcome; // set when the stage agent's final message is parsed
 }
@@ -114,6 +116,10 @@ export interface LoopState {
   // value (cfg -> preserved-from-prev -> DEFAULT_*).
   minReviewerConfidence?: number;
   reviewerBelowThresholdAction?: "block" | "retry" | "off";
+  // Reviewer->builder bounce cap (issue #76), same optional-with-fallback
+  // treatment as the gate knobs above (cfg -> preserved-from-prev ->
+  // DEFAULT_MAX_REVIEW_BOUNCES).
+  maxReviewBounces?: number;
   // Tickets whose PRs landed during THIS run. Their branches still exist
   // (stacked-chain rule: branches are deleted only after the whole batch), so a
   // dependent's merge stage must know to retarget onto the base branch.
@@ -240,6 +246,27 @@ interface QaBounceLimits {
 interface ReviewerGate {
   minConfidence: number;
   belowAction: "block" | "retry" | "off";
+  maxReviewBounces: number;
+}
+
+// Reviewer->builder bounce cap (issue #76): both routes that send a ticket
+// back to the builder from Review -- a REVIEW-FINDINGS, and a below-floor
+// confidence retry -- draw on the SAME lane.reviewBounces budget, capped by
+// reviewerGate.maxReviewBounces. Mirrors the qa-bugs cap below: without it, a
+// low-confidence-forever ticket in "retry" mode could loop
+// builder->QA->review indefinitely, burning tokens.
+function reviewerBounceAction(lane: LaneState, reviewerGate: ReviewerGate, note: string): Action {
+  const ticket = lane.ticket;
+  const pass = lane.reviewBounces + 1;
+  if (pass >= reviewerGate.maxReviewBounces) {
+    return {
+      kind: "park",
+      ticket,
+      status: "Blocked",
+      note: `review bounce cap reached (${pass}/${reviewerGate.maxReviewBounces})\n\n${note}`,
+    };
+  }
+  return { kind: "advance", ticket, to: "builder", note };
 }
 
 // What one lane's finished stage means for that lane. A PASSING review-approve
@@ -273,7 +300,7 @@ function resolveOutcome(lane: LaneState, qaLimits: QaBounceLimits, reviewerGate:
     case "qa-pass":
       return { kind: "advance", ticket, to: "reviewer" };
     case "review-findings":
-      return { kind: "advance", ticket, to: "builder", note: o.note };
+      return reviewerBounceAction(lane, reviewerGate, o.note);
     case "review-approve": {
       if (reviewerGate.belowAction === "off") return null; // gate disabled -> merge gate lands it
       const conf = o.confidence; // number | null
@@ -281,7 +308,7 @@ function resolveOutcome(lane: LaneState, qaLimits: QaBounceLimits, reviewerGate:
       const note = conf === null
         ? `truth-check failed (reviewer approved with no parseable confidence score)`
         : `truth-check failed (confidence ${conf}/100)`;
-      if (reviewerGate.belowAction === "retry") return { kind: "advance", ticket, to: "builder", note };
+      if (reviewerGate.belowAction === "retry") return reviewerBounceAction(lane, reviewerGate, note);
       return { kind: "park", ticket, status: "Blocked", note };
     }
     case "merged":
@@ -297,6 +324,7 @@ export interface LoopOpts {
   qaInvestigateAfter?: number;
   minReviewerConfidence?: number;
   reviewerBelowThresholdAction?: "block" | "retry" | "off";
+  maxReviewBounces?: number;
   mergedThisRun?: number[];
 }
 
@@ -324,6 +352,7 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
   const reviewerGate: ReviewerGate = {
     minConfidence: opts.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE,
     belowAction: opts.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
+    maxReviewBounces: opts.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES,
   };
   const byNumber = new Map(tickets.map((t) => [t.number, t]));
 
@@ -527,13 +556,14 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
     case "claim": {
       const t = findTicket(next, action.ticket);
       setStatus(t, STATUS_FOR_STAGE[action.stage]);
-      next.lanes.push({ ticket: action.ticket, stage: action.stage, lastActivityMs: nowMs, qaBounces: 0 });
+      next.lanes.push({ ticket: action.ticket, stage: action.stage, lastActivityMs: nowMs, qaBounces: 0, reviewBounces: 0 });
       return next;
     }
     case "advance": {
       const lane = next.lanes.find((l) => l.ticket === action.ticket);
       if (!lane) throw new ZError(`No lane holds #${action.ticket} to advance.`);
       if (action.to === "builder" && lane.stage === "qa") lane.qaBounces += 1;
+      if (action.to === "builder" && lane.stage === "reviewer") lane.reviewBounces += 1;
       lane.stage = action.to;
       lane.lastActivityMs = nowMs;
       delete lane.outcome;
@@ -636,6 +666,7 @@ export function ingestBoardItems(
     qaInvestigateAfter?: number;
     minReviewerConfidence?: number;
     reviewerBelowThresholdAction?: "block" | "retry" | "off";
+    maxReviewBounces?: number;
     humanNeededPercent?: number;
   }
 ): LoopState {
@@ -707,6 +738,7 @@ export function ingestBoardItems(
     minReviewerConfidence: cfg?.minReviewerConfidence ?? prev?.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE,
     reviewerBelowThresholdAction:
       cfg?.reviewerBelowThresholdAction ?? prev?.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
+    maxReviewBounces: cfg?.maxReviewBounces ?? prev?.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES,
     humanNeededPercent: cfg?.humanNeededPercent ?? prev?.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT,
     mergedThisRun: [...(prev?.mergedThisRun ?? [])],
     initialReadyCount: startingFreshBatch ? buildingCount : (prev!.initialReadyCount ?? 0),
@@ -728,6 +760,7 @@ const USAGE = `loop <command> [args]
   ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M]
                       [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N]
                       [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off]
+                      [--max-review-bounces N]
                                                      build/refresh the snapshot (creates state.json)
 
   --now defaults to the wall clock; tests pass it explicitly.`;
@@ -796,6 +829,7 @@ export function main(argv: string[]): number {
         qaInvestigateAfter: state.qaInvestigateAfter,
         minReviewerConfidence: state.minReviewerConfidence,
         reviewerBelowThresholdAction: state.reviewerBelowThresholdAction,
+        maxReviewBounces: state.maxReviewBounces,
         mergedThisRun: state.mergedThisRun,
       });
       console.log(JSON.stringify(action));
@@ -850,7 +884,7 @@ export function main(argv: string[]): number {
       return 0;
     }
     if (cmd === "ingest") {
-      if (!argv[2] || !argv[3]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off]");
+      if (!argv[2] || !argv[3]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off] [--max-review-bounces N]");
       const prev = readPrevState(statePath);
       const items = readJson(argv[2]) as BoardItemLike[];
       const bodies = readJson(argv[3]) as Record<string, string>;
@@ -861,6 +895,7 @@ export function main(argv: string[]): number {
       const humanNeededPercent = flagValue(argv, "--human-needed-percent");
       const minReviewerConfidence = flagValue(argv, "--min-reviewer-confidence");
       const reviewerBelowThresholdAction = flagValue(argv, "--reviewer-below-threshold-action");
+      const maxReviewBounces = flagValue(argv, "--max-review-bounces");
       if (
         reviewerBelowThresholdAction !== undefined &&
         !["block", "retry", "off"].includes(reviewerBelowThresholdAction)
@@ -875,6 +910,7 @@ export function main(argv: string[]): number {
         humanNeededPercent: humanNeededPercent === undefined ? undefined : Number(humanNeededPercent),
         minReviewerConfidence: minReviewerConfidence === undefined ? undefined : Number(minReviewerConfidence),
         reviewerBelowThresholdAction: reviewerBelowThresholdAction as "block" | "retry" | "off" | undefined,
+        maxReviewBounces: maxReviewBounces === undefined ? undefined : Number(maxReviewBounces),
       });
       atomicWrite(statePath, JSON.stringify(state, null, 2));
       console.log(`${state.tickets.length} ticket(s), ${state.lanes.length} lane(s)`);

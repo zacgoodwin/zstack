@@ -48,7 +48,7 @@ function ticket(number: number, status: TicketSnapshot["status"], dependsOn: num
 }
 
 function lane(ticketNumber: number, stage: Stage, over: Partial<LaneState> = {}): LaneState {
-  return { ticket: ticketNumber, stage, lastActivityMs: 0, qaBounces: 0, ...over };
+  return { ticket: ticketNumber, stage, lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, ...over };
 }
 
 function state(tickets: TicketSnapshot[], lanes: LaneState[] = [], maxLanes = 3, watchdogMinutes = 10): LoopState {
@@ -63,6 +63,7 @@ const OPTS = (s: LoopState, nowMs = 0) => ({
   qaInvestigateAfter: s.qaInvestigateAfter,
   minReviewerConfidence: s.minReviewerConfidence,
   reviewerBelowThresholdAction: s.reviewerBelowThresholdAction,
+  maxReviewBounces: s.maxReviewBounces,
   mergedThisRun: s.mergedThisRun,
 });
 
@@ -307,6 +308,7 @@ describe("stage transitions", () => {
     expect(a).toMatchObject({ kind: "advance", to: "builder", note: expect.stringContaining("AC3") });
     s = applyAction(s, a, 0);
     expect(s.lanes[0].qaBounces).toBe(0); // review bounces do not consume QA passes
+    expect(s.lanes[0].reviewBounces).toBe(1); // issue #76: this IS a review bounce
     expect(s.tickets[0].status).toBe("Building");
   });
 });
@@ -453,6 +455,133 @@ describe("reviewer confidence gate", () => {
       ticket: 1,
       status: "Blocked",
       note: "truth-check failed (reviewer approved with no parseable confidence score)",
+    });
+  });
+});
+
+// -- reviewer bounce cap (issue #76): maxReviewBounces ------------------------
+// #62 shipped reviewerBelowThresholdAction: "retry" with no cap on the
+// reviewer->builder bounce -- this closes it, mirroring the maxQaPasses gate
+// tests' fixture-then-nextAction shape above.
+
+describe("reviewer bounce cap (issue #76)", () => {
+  // AC1: a lane bouncing reviewer->builder repeatedly under action "retry"
+  // parks Blocked at the cap instead of bouncing forever.
+  test("AC1: repeated confidence-retry bounces park Blocked at maxReviewBounces with the cap note, instead of bouncing forever", () => {
+    let s = state([ticket(1, "Review")], [lane(1, "reviewer")]);
+    s.reviewerBelowThresholdAction = "retry";
+    s.minReviewerConfidence = 70;
+    s.maxReviewBounces = 2;
+    const bounceFromReview = (): Action => {
+      s = recordOutcome(s, 1, "REVIEW-APPROVE: confidence=10 not convinced", 0);
+      const a = nextAction(s.tickets, s.lanes, OPTS(s));
+      s = applyAction(s, a, 0);
+      return a;
+    };
+    const backToReview = () => {
+      s = recordOutcome(s, 1, HAPPY.builder, 0);
+      s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0); // builder -> qa
+      s = recordOutcome(s, 1, HAPPY.qa, 0);
+      s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0); // qa -> reviewer
+    };
+    // Pass 1: bounces back to the builder same as before the cap.
+    expect(bounceFromReview()).toMatchObject({ kind: "advance", to: "builder" });
+    expect(s.lanes[0].reviewBounces).toBe(1);
+    backToReview();
+    // Pass 2 hits maxReviewBounces=2: parks Blocked instead of bouncing again.
+    expect(bounceFromReview()).toEqual({
+      kind: "park",
+      ticket: 1,
+      status: "Blocked",
+      note: "review bounce cap reached (2/2)\n\ntruth-check failed (confidence 10/100)",
+    });
+    expect(s.tickets[0].status).toBe("Blocked");
+    expect(s.lanes).toEqual([]); // the lane is dropped, not left spinning
+  });
+
+  // AC2: one review bounce then an approve at/above the floor merges
+  // normally, and a fresh lane on a different ticket never inherits another
+  // ticket's bounce count.
+  test("AC2: one review bounce then an at-threshold approve merges normally; a fresh lane starts its own count at 0", () => {
+    let s = state([ticket(1, "Review")], [lane(1, "reviewer")]);
+    s.reviewerBelowThresholdAction = "retry";
+    s.minReviewerConfidence = 70;
+    s.maxReviewBounces = 2;
+
+    // One bounce.
+    s = recordOutcome(s, 1, "REVIEW-APPROVE: confidence=10 not convinced", 0);
+    s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+    expect(s.lanes[0].reviewBounces).toBe(1);
+    expect(s.tickets[0].status).toBe("Building");
+
+    // Builder + QA clear it back to Review, leaving the counter untouched.
+    s = recordOutcome(s, 1, HAPPY.builder, 0);
+    s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+    s = recordOutcome(s, 1, HAPPY.qa, 0);
+    s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+    expect(s.lanes[0].reviewBounces).toBe(1);
+
+    // An at-threshold approve merges normally -- the one prior bounce does
+    // not block it.
+    s = recordOutcome(s, 1, "REVIEW-APPROVE: confidence=70 now satisfied", 0);
+    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toMatchObject({ kind: "advance", ticket: 1, to: "merge" });
+
+    // A second ticket claimed fresh starts its own lane at reviewBounces: 0 --
+    // the counter lives on the lane, so it can never leak from #1's lane.
+    s.tickets.push(ticket(2, "Ready"));
+    s = applyAction(s, { kind: "claim", ticket: 2, stage: "builder" }, 0);
+    expect(s.lanes.find((l) => l.ticket === 2)!.reviewBounces).toBe(0);
+  });
+
+  // AC3 (loop.ts half; the config-schema half lives in tests/setup.test.ts):
+  // no maxReviewBounces set reproduces the default cap of 2.
+  test("AC3: maxReviewBounces absent defaults to 2", () => {
+    let s = state([ticket(9, "Review")], [lane(9, "reviewer")]);
+    s.reviewerBelowThresholdAction = "retry";
+    expect(s.maxReviewBounces).toBeUndefined();
+    const bounceFromReview = (): Action => {
+      s = recordOutcome(s, 9, "REVIEW-APPROVE: confidence=10 nope", 0);
+      const a = nextAction(s.tickets, s.lanes, OPTS(s));
+      s = applyAction(s, a, 0);
+      return a;
+    };
+    const backToReview = () => {
+      s = recordOutcome(s, 9, HAPPY.builder, 0);
+      s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+      s = recordOutcome(s, 9, HAPPY.qa, 0);
+      s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+    };
+    expect(bounceFromReview()).toMatchObject({ kind: "advance", to: "builder" });
+    backToReview();
+    expect(bounceFromReview()).toMatchObject({
+      kind: "park",
+      status: "Blocked",
+      note: expect.stringContaining("review bounce cap reached (2/2)"),
+    });
+  });
+
+  // A REVIEW-FINDINGS bounce draws on the SAME budget as a confidence retry --
+  // not a separate counter.
+  test("REVIEW-FINDINGS and a confidence retry share one budget: two REVIEW-FINDINGS then a retry hits the cap", () => {
+    let s = state([ticket(1, "Review")], [lane(1, "reviewer")]);
+    s.reviewerBelowThresholdAction = "retry";
+    s.minReviewerConfidence = 70;
+    s.maxReviewBounces = 2;
+    s = recordOutcome(s, 1, "REVIEW-FINDINGS: 1) missing test", 0);
+    s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+    expect(s.lanes[0].reviewBounces).toBe(1);
+    // Back to Review.
+    s = recordOutcome(s, 1, HAPPY.builder, 0);
+    s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+    s = recordOutcome(s, 1, HAPPY.qa, 0);
+    s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+    // A confidence-retry now, not another REVIEW-FINDINGS, still hits the cap
+    // this bounce carried over from the FINDINGS path.
+    s = recordOutcome(s, 1, "REVIEW-APPROVE: confidence=5 unconvinced", 0);
+    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toMatchObject({
+      kind: "park",
+      status: "Blocked",
+      note: expect.stringContaining("review bounce cap reached (2/2)"),
     });
   });
 });
@@ -697,21 +826,22 @@ describe("ingest drops a lane whose ticket vanished", () => {
 // -- fresh-stage guarantee (AC4): lane state carries no conversation id -------
 
 describe("fresh-stage lane state", () => {
-  test("LaneState carries exactly its six scheduling fields and no session/conversation id", () => {
+  test("LaneState carries exactly its seven scheduling fields and no session/conversation id", () => {
     // Compile-time half: this constant stops typechecking if LaneState's key
-    // set ever drifts from the six named here.
+    // set ever drifts from the seven named here (issue #76 added reviewBounces,
+    // mirroring qaBounces).
     type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
     const _laneKeysExact: Exact<
       keyof LaneState,
-      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "workerDead" | "outcome"
+      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "workerDead" | "outcome"
     > = true;
     void _laneKeysExact;
     // Runtime half: a fully-populated lane exposes exactly those keys, and none
     // of them smells like a carried conversation.
     const full: Required<LaneState> = {
-      ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, workerDead: false, outcome: { kind: "built" },
+      ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, workerDead: false, outcome: { kind: "built" },
     };
-    expect(Object.keys(full).sort()).toEqual(["lastActivityMs", "outcome", "qaBounces", "stage", "ticket", "workerDead"]);
+    expect(Object.keys(full).sort()).toEqual(["lastActivityMs", "outcome", "qaBounces", "reviewBounces", "stage", "ticket", "workerDead"]);
     for (const k of Object.keys(full)) {
       expect(k).not.toMatch(/conversation|session|context|transcript|agent/i);
     }
@@ -842,6 +972,26 @@ describe("ingestBoardItems", () => {
     const overridden = ingestBoardItems(custom, items, bodies, { maxQaPasses: 7, qaInvestigateAfter: 4 });
     expect(overridden.maxQaPasses).toBe(7);
     expect(overridden.qaInvestigateAfter).toBe(4);
+  });
+
+  // -- issue #76: maxReviewBounces threads through ingest, same fallback
+  //    chain (cfg -> preserved-from-prev -> DEFAULT_MAX_REVIEW_BOUNCES) as
+  //    maxQaPasses above.
+  test("maxReviewBounces: first ingest defaults to 2, a re-ingest with no cfg preserves the prior value, and an explicit cfg overrides it", () => {
+    const items = [{ number: 6, title: "B", fields: { Status: "Building" } }];
+    const bodies = { "6": "no deps" };
+
+    const first = ingestBoardItems(null, items, bodies);
+    expect(first.maxReviewBounces).toBe(2);
+
+    const custom = ingestBoardItems(null, items, bodies, { maxReviewBounces: 4 });
+    expect(custom.maxReviewBounces).toBe(4);
+
+    const reingested = ingestBoardItems(custom, items, bodies);
+    expect(reingested.maxReviewBounces).toBe(4);
+
+    const overridden = ingestBoardItems(custom, items, bodies, { maxReviewBounces: 7 });
+    expect(overridden.maxReviewBounces).toBe(7);
   });
 
   // -- issue #63: initialReadyCount / humanNeededNotified capture-once + reset -
