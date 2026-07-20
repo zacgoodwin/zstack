@@ -33,9 +33,11 @@ records the result. It never re-derives a scheduling decision in prose.
   merges happen one at a time in topological order (stacked chains retarget the
   base and delete branches only at batch end).
 - **No token burn.** Every ticket ends the run in Done, Questions, Blocked, or
-  Skipped. QA bugs bounce to a fresh builder (pass 2 runs `/investigate` first,
-  pass 3 blocks). A worker silent past the watchdog (default 10 min) is probed and
-  then Skipped with a note.
+  Skipped. QA bugs bounce to a fresh builder: from QA-bounce config
+  `qaInvestigateAfter` (default 2) onward, the rebuild runs `/investigate`
+  first; at config `maxQaPasses` (default 3), the ticket parks Blocked instead
+  of bouncing again. A worker silent past the watchdog (default 10 min) is
+  probed and then Skipped with a note.
 - **Actual per ticket.** After each stage the ticket's transcripts are priced with
   `bin/z-cost` (dedup by requestId) and written to the Actual field.
 

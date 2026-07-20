@@ -923,21 +923,45 @@ describe("contract enforcement", () => {
     );
   }
 
-  test("only lib/board.ts calls gh api graphql or gh issue directly", () => {
-    const files = trackedFiles().filter(
-      (f) =>
-        f !== "lib/board.ts" &&
-        !f.startsWith("tests/") &&
-        !f.startsWith("references/") &&
-        !f.endsWith(".md") &&
-        !f.endsWith(".png")
+  // Files this gate scans for direct gh invocations. `evals/` sits alongside
+  // `tests/` as a doubles-and-harnesses lane: the paid planner eval harness
+  // (evals/planner/board-double.ts, run.sh) quotes gh invocation strings in
+  // comments and prompts to describe what the double parses -- it never
+  // shells the real gh. #23 widened callsGhDirectly's regexes to catch the
+  // raw-endpoint and array-literal forms; #25 (based pre-#23) added that
+  // harness. Each passed its own gate in isolation; merged, the harness's
+  // documentation tripped the widened detector. The fix narrows the scanned
+  // set, not the detector -- see the canary below.
+  function gateScans(f: string): boolean {
+    return (
+      f !== "lib/board.ts" &&
+      !f.startsWith("tests/") &&
+      !f.startsWith("evals/") &&
+      !f.startsWith("references/") &&
+      !f.endsWith(".md") &&
+      !f.endsWith(".png")
     );
+  }
+
+  test("only lib/board.ts calls gh api graphql or gh issue directly", () => {
+    const files = trackedFiles().filter(gateScans);
     const offenders: string[] = [];
     for (const f of files) {
       const content = readFileSync(join(REPO_ROOT, f), "utf8");
       if (callsGhDirectly(content)) offenders.push(f);
     }
     expect(offenders).toEqual([]);
+  });
+
+  // Canary: proves the evals/ exclusion is scoped narrowly and stays wired.
+  // If a future change drops the evals/ exclusion while a doubles harness
+  // that quotes gh strings still exists, this fails pre-merge instead of the
+  // gate above silently flagging documentation as an offense.
+  test("gateScans excludes tests/ and evals/ doubles-and-harnesses, keeps lib/ and bin/ scanned", () => {
+    expect(gateScans("evals/planner/board-double.ts")).toBe(false);
+    expect(gateScans("tests/x.test.ts")).toBe(false);
+    expect(gateScans("lib/foo.ts")).toBe(true);
+    expect(gateScans("bin/z-board")).toBe(true);
   });
 
   test("lib/board.ts is in fact the caller (guards against the gate passing vacuously)", () => {
