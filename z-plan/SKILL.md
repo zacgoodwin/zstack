@@ -466,3 +466,17 @@ Report DONE only when all hold:
   Effort, and Estimate (Step 10). This step never promotes a ticket to Ready —
   the only path anywhere in this skill that ever moves a Backlog ticket to
   Ready remains Step 7.4's dependency pull.
+
+**Notify.** Once DONE, `send work-complete` through the shared notification edge
+(`lib/notify.ts`) so a `/z-plan` run pings the same Discord channel as the loop —
+a no-op when the project has no `notifications` config
+(docs/user-guide/z-loop.md). There is no drain loop here, so `loopCount` is `0`
+and `done` carries the count of tickets created/updated this run (the rest are
+`0`):
+
+```bash
+jq -n --arg slug "$SLUG" --argjson created "$CREATED" \
+  '{slug:$slug, loopCount:0, done:$created, questions:0, blocked:0, skipped:0, totalDollars:0}' \
+  > "$TMP/notify-plan.json"
+bun "$PACK/lib/notify.ts" send work-complete "$TMP/notify-plan.json" --slug "$SLUG"
+```
