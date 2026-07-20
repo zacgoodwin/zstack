@@ -26,7 +26,7 @@ invisible. `./setup` registers each skill as its own top-level entry
    instead, or replace it with this one:
    `rm -rf ~/.claude/skills/zstack`, then re-run `./setup` from your clone.
 
-Verify: `ls ~/.claude/skills/z-*/SKILL.md` should list four files.
+Verify: `ls ~/.claude/skills/z-*/SKILL.md` should list five files.
 
 ## gh: "missing required scopes [read:project]"
 

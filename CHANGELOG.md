@@ -45,12 +45,12 @@ Installing zstack now actually surfaces its skills. Also adds a `/z-uninstall` c
 
 ## [0.1.0.0] - 2026-07-19
 
-First release of the zstack dev-loop skill pack. Installs at `~/.claude/skills/zstack` alongside gstack (required) and runs the [PROCESS.md](references/PROCESS.md) development loop after planning, deploying at end of loop. GitHub Projects backed; solo-dev, any repo.
+First release of the zstack dev-loop skill pack. Installs at `~/.claude/skills/zstack` alongside gstack (required) and runs the [PROCESS.md](docs/user-guide/spec/PROCESS.md) development loop after planning, deploying at end of loop. GitHub Projects backed; solo-dev, any repo.
 
 ### Added
 
 - **`/z-setup`** — creates or adopts a GitHub Projects board with the nine PROCESS.md statuses (Backlog, Ready, Questions, Building, QA, Review, Blocked, Skipped, Done) and four fields (Model, Model Effort, Estimate, Actual), disables the auto-close workflow, and offers an optional auto-approvals step so the loop runs unattended.
-- **`/z-plan`** — turns a spec or plan into board-ready tickets: code-grounded plans with `### Acceptance Criteria`, dependency links, reproducible dollar estimates (per [ESTIMATION.md](references/ESTIMATION.md)), and a model/effort recommendation per ticket. Oversized tickets split at a 400K-token context gate.
+- **`/z-plan`** — turns a spec or plan into board-ready tickets: code-grounded plans with `### Acceptance Criteria`, dependency links, reproducible dollar estimates (per [ESTIMATION.md](docs/user-guide/spec/ESTIMATION.md)), and a model/effort recommendation per ticket. Oversized tickets split at a 400K-token context gate.
 - **`/z-loop`** — the development loop: per-ticket worktree lanes (max 3 concurrent), a fresh agent per stage (Build → QA → Adversarial Review → Merge) with the reviewer blinded to everything but the ticket, acceptance criteria, diff, and a throwaway worktree. Drains the Ready batch, then runs regression → `/land-and-deploy` → `/canary` → `/document-release`, with `/cso` + `/health` audits every fifth loop. Drain-and-exit; `--reconcile` recovers a crashed run.
 - **`/z-status`** — read-only board dashboard: status counts, in-flight lanes, last-loop verdict, and Estimate-vs-Actual totals.
 - **`bin/z-board`** — the single GitHub Projects contract every skill speaks through, with a built-in GraphQL quota guard.

@@ -4,7 +4,7 @@ The full walkthrough, from a bare machine to your first green loop. The
 [README](../../README.md) is the summary; this is the detail. Per-skill
 contracts live next to each skill (`z-setup/SKILL.md` etc.) and each has a
 shorter reference page here: [z-setup](z-setup.md) · [z-plan](z-plan.md) ·
-[z-loop](z-loop.md) · [z-status](z-status.md) ·
+[z-loop](z-loop.md) · [z-status](z-status.md) · [z-uninstall](z-uninstall.md) ·
 [troubleshooting](troubleshooting.md).
 
 ## The mental model
@@ -47,8 +47,8 @@ One GitHub ProjectV2 per repo, titled after the repo, with nine statuses:
 | **Building** | A builder lane is (or was) working it | The loop |
 | **QA** | The QA stage is verifying acceptance criteria | The loop |
 | **Review** | The blinded adversarial reviewer is on it | The loop |
-| **Blocked** | Parked: something external must clear first | The loop, or you mid-run |
-| **Skipped** | Parked: dead worker, third QA failure, or confusion | The loop |
+| **Blocked** | Parked: something external must clear first (e.g., unmet dependencies, third QA failure) | The loop, or you mid-run |
+| **Skipped** | Parked: dead worker or confusion | The loop |
 | **Done** | Merged and complete — left OPEN for you to review and close | The loop |
 
 And four custom fields per ticket:
@@ -95,14 +95,14 @@ so the clone lands in a literal `~` folder instead of your home directory.
 
 `./setup` verifies the three prerequisites (refusing with the exact fix command
 if one is missing), then registers the skills. Hosts discover skills at
-`skills/<name>/SKILL.md` exactly one level deep, so each of the four skills
+`skills/<name>/SKILL.md` exactly one level deep, so each of the five skills
 gets its own top-level entry — the pack directory alone is never enough,
 which is why running `./setup` is mandatory even when you cloned straight
 into `~/.claude/skills/zstack`:
 
 - **Claude Code**: the pack at `~/.claude/skills/zstack` (runtime assets:
   `bin/`, `lib/`) plus `~/.claude/skills/z-setup`, `z-plan`, `z-loop`,
-  `z-status` (symlinks on macOS/Linux, copies on Windows).
+  `z-status`, `z-uninstall` (symlinks on macOS/Linux, copies on Windows).
 - **Codex** (`~/.codex/skills`) and **Factory** (`~/.factory/skills`) are
   registered the same way when their binaries (`codex` / `droid`) are on PATH.
 
@@ -114,13 +114,22 @@ update for existing skills (symlinks). On Windows the registrations are copies,
 so re-run `./setup` after pulling. Either way, a pull that adds a NEW skill
 needs one `./setup` re-run to register it.
 
-**Uninstalling:** remove the pack and the four per-skill entries for every
-host setup registered (Codex/Factory only if their binaries were on PATH):
+**Uninstalling:** run `/z-uninstall` to reverse `./setup`: it removes the host
+registrations the pack created (symlinks on macOS/Linux, copies on Windows),
+leaves any directory it did not create, and strips the auto-approval settings
+when present. Confirm first; the GitHub board is remote and untouched:
 
 ```bash
-rm -rf ~/.claude/skills/zstack ~/.claude/skills/z-{setup,plan,loop,status}
-rm -rf ~/.codex/skills/zstack ~/.codex/skills/z-{setup,plan,loop,status}
-rm -rf ~/.factory/skills/zstack ~/.factory/skills/z-{setup,plan,loop,status}
+/z-uninstall           # reverse ./setup and remove host registrations
+/z-uninstall --purge   # also delete ~/.zstack (config, loop state, locks, reports)
+```
+
+For pre-sentinel installs (before z-uninstall existed), remove by hand:
+
+```bash
+rm -rf ~/.claude/skills/zstack ~/.claude/skills/z-{setup,plan,loop,status,uninstall}
+rm -rf ~/.codex/skills/zstack ~/.codex/skills/z-{setup,plan,loop,status,uninstall}
+rm -rf ~/.factory/skills/zstack ~/.factory/skills/z-{setup,plan,loop,status,uninstall}
 ```
 
 Only delete entries zstack created: symlinks into the pack, or copies carrying
@@ -208,11 +217,12 @@ Two things worth knowing after choosing A:
   the skip flags are read **at session startup only**. A session that was
   already running keeps prompting until restarted — that's a straggler, not a
   bug.
-- **Undo** is a hand-edit of `~/.claude/settings.json`: remove the
-  `hooks.PermissionRequest` entry whose command contains
-  `"permissionDecision":"allow"`, restore or delete `permissions.defaultMode`,
-  remove the two skip flags, and optionally drop the four allow rules.
-  Re-validate as JSON afterward.
+- **Undo** is atomic via `bin/z-setup-permissions --remove`, which strips the
+  auto-approval settings and validates JSON before writing. For hand-editing
+  (not recommended): remove the `hooks.PermissionRequest` entry whose command
+  contains `"permissionDecision":"allow"`, restore or delete
+  `permissions.defaultMode`, remove the two skip flags, and optionally drop the
+  five allow rules. Re-validate as JSON afterward.
 
 ### Done when
 
@@ -299,8 +309,9 @@ The next batch is the next invocation.
    - **Builder** implements the plan and makes the acceptance criteria pass as
      written. Runs on the ticket's Model field.
    - **QA** verifies each acceptance criterion. Findings bounce the ticket back
-     to a fresh builder; the second bounce runs `/investigate` first; a third
-     failure parks it Blocked.
+     to a fresh builder; from the `qaInvestigateAfter`-th bounce onward (default
+     2), the rebuild runs `/investigate` first; at `maxQaPasses` failures (default
+     3), the ticket parks Blocked instead of bouncing.
    - **Reviewer** is deliberately **blinded**: it sees exactly the ticket body,
      the acceptance criteria, the diff, and a throwaway worktree — no PR
      description, no plan rationale, no transcripts. Findings bounce to a fresh
@@ -335,8 +346,9 @@ cannot edit main).
   Backlog bug with a repro and first-suspect file. **No deploy skill runs.**
 - **Green**: `/land-and-deploy` → `/canary` → `/document-release`, in that
   order, each invocation logged as it returns.
-- **Every 5th loop** (red or green): `/cso` (security) + `/health` (quality)
-  run too, and their findings are filed to Backlog the same way.
+- **Every Nth loop** (red or green, driven by config `auditEveryNLoops`, default
+  5): `/cso` (security) + `/health` (quality) run too, and their findings are
+  filed to Backlog the same way.
 
 The run report lands at `~/.zstack/projects/<slug>/reports/loop-<timestamp>.md`:
 verdict and evidence per gate, every ticket's final status and Actual, the
@@ -412,6 +424,9 @@ are managed by setup; don't hand-edit them. The tunables:
 | `maxLanes` | `3` | Max concurrent lanes in a loop run. |
 | `watchdogMinutes` | `10` | Minutes of worker silence before the loop probes and, if dead, skips the lane. |
 | `lockStalenessMinutes` | `60` | Age past which a crashed loop's lock is judged stale (also stale immediately when its pid is dead on the same host). |
+| `maxQaPasses` | `3` | QA passes on a ticket before it parks Blocked instead of bouncing to a fresh builder. |
+| `qaInvestigateAfter` | `2` | QA-bounce count at/after which the rebuild runs `/investigate` first. |
+| `auditEveryNLoops` | `5` | How often (modulo loop count) the end-of-loop stage runs `/cso` + `/health` audits. Must be a positive integer. |
 
 Also on disk:
 
