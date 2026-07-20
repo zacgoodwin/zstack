@@ -62,7 +62,8 @@ The file has three sections:
   BLUE, GREEN, YELLOW, ORANGE, RED, PURPLE, PINK), and a `description`. The status
   set must equal the canonical nine (`lib/config.ts` `BOARD_STATUSES`); the loop's
   state machine only knows those, so extra or renamed statuses are refused.
-- **`fields`** — each with a `name`, a `dataType` (SINGLE_SELECT / NUMBER / TEXT),
+- **`fields`** — each with a `name`, a `dataType` (SINGLE_SELECT / NUMBER — the
+  only types `/z-setup` can create; any other type, e.g. `TEXT`, is refused),
   and, for single-select, an ordered `options` list. The four fields the loop and
   z-tools hard-depend on — Model, Model Effort, Estimate, Actual — must be present
   with their dataTypes; dropping or renaming any of them is refused loudly, naming

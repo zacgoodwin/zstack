@@ -72,7 +72,14 @@ export interface BoardShape {
 // single-select option may carry). Matches the palette the old position-cycling
 // emitted, so a color is inlined as a bare enum token safely.
 const VALID_OPTION_COLORS = ["GRAY", "BLUE", "GREEN", "YELLOW", "ORANGE", "RED", "PURPLE", "PINK"];
-const DATA_TYPES: FieldDataType[] = ["SINGLE_SELECT", "NUMBER", "TEXT"];
+// The field dataTypes /z-setup can actually CREATE. FieldDataType (lib/config.ts)
+// also carries "TEXT" -- real for reading/writing GitHub's built-in Title/Notes
+// fields via lib/board.ts -- but lib/setup-board.ts's create loop only branches
+// SINGLE_SELECT vs the NUMBER mutation, so a template "TEXT" field would be
+// silently created as NUMBER and verify would report DRIFT forever. Refuse it
+// here at load instead (issue #20 follow-up): a template may only ask for a type
+// setup can build.
+const DATA_TYPES: FieldDataType[] = ["SINGLE_SELECT", "NUMBER"];
 // GitHub's ProjectV2 view layouts.
 const VALID_VIEW_LAYOUTS = ["board", "table", "roadmap"];
 
@@ -136,7 +143,8 @@ function validateField(path: string, f: unknown): TemplateField {
   const dataType = field.dataType;
   if (typeof dataType !== "string" || !DATA_TYPES.includes(dataType as FieldDataType)) {
     throw new ZError(
-      `Board template "${path}.dataType" must be one of ${DATA_TYPES.join(", ")}, got ${JSON.stringify(dataType)}.`
+      `Board template field "${name}" (${path}.dataType) must be one of ${DATA_TYPES.join(", ")}, ` +
+        `got ${JSON.stringify(dataType)}; /z-setup can only create those field types.`
     );
   }
   if (dataType === "SINGLE_SELECT") {

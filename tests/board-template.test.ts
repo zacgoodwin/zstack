@@ -217,6 +217,29 @@ describe("option and view shape validation", () => {
     t.fields.find((f: any) => f.name === "Actual").options = [{ name: "x", color: "GRAY", description: "" }];
     expect(() => validateBoardTemplate(t)).toThrow(/only valid for a SINGLE_SELECT/);
   });
+
+  // A TEXT field is a real GitHub type (lib/config.ts FieldDataType keeps it for
+  // reading/writing built-in Title/Notes fields), but lib/setup-board.ts's create
+  // loop only special-cases SINGLE_SELECT and sends everything else through the
+  // NUMBER mutation -- so a template TEXT field would be silently created as
+  // NUMBER and verify would report DRIFT forever. The loader must refuse it up
+  // front, naming the field and the types /z-setup can build (issue #20 follow-up).
+  test("a TEXT field is refused, naming the field and the supported types", () => {
+    const t = cloneDefault() as any;
+    t.fields.push({ name: "Notes", dataType: "TEXT" });
+    let caught: unknown;
+    try {
+      validateBoardTemplate(t);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ZError);
+    const msg = (caught as ZError).message;
+    expect(msg).toContain("Notes"); // names the offending field
+    expect(msg).toContain("TEXT"); // the rejected type
+    expect(msg).toContain("SINGLE_SELECT"); // the types setup can build
+    expect(msg).toContain("NUMBER");
+  });
 });
 
 // -- file-level failures (ZError, never a raw throw) --------------------------
