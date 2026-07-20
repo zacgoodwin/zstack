@@ -18,8 +18,10 @@ afterAll(() => {
 // Scenario D1: skills/zstack holds a SEPARATE real clone (.git dir). That
 // checkout owns the host — every SKILL.md resolves PACK to this path, so
 // registering another pack's skills next to it would mix versions. setup must
-// refuse the whole host AND skip Codex/Factory (their skills would execute
-// the conflicting runtime too — a codex stub is on PATH to prove the skip).
+// refuse the whole host, exit non-zero (nothing was registered for the primary
+// host — the success banner would misreport a no-op), AND skip Codex/Factory
+// (their skills would execute the conflicting runtime too — a codex stub is on
+// PATH to prove the skip).
 const scenarioD1 = (async () => {
   const env = makeEnv(roots, "zstack-setup-edge-");
   writeFileSync(join(env.stubBin, "codex"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
@@ -108,9 +110,15 @@ const scenarioE = (async () => {
 })();
 
 describe("setup register edge branches", () => {
-  test("a separate clone (.git dir) refuses the host and skips Codex/Factory too", async () => {
+  test("a separate clone (.git dir) refuses the host, exits non-zero, and skips Codex/Factory too", async () => {
     const { env, separate, run } = await scenarioD1;
-    expect(run.code).toBe(0);
+    // A refused primary host registered NOTHING: setup must exit non-zero and
+    // NOT print the success banner. Printing "complete" over a no-op is the
+    // trap that reads as "setup ran fine" while the skills never appear (the
+    // reported Windows symptom when ./setup is run from outside the install).
+    expect(run.code).toBe(1);
+    expect(run.stdout).not.toContain("zstack setup complete.");
+    expect(run.stderr).toContain("did NOT complete");
     expect(run.stderr).toContain("separate zstack install");
     expect(readFileSync(join(separate, "marker"), "utf8")).toContain("other install");
     expect(existsSync(join(separate, ".git"))).toBe(true);
@@ -124,7 +132,8 @@ describe("setup register edge branches", () => {
 
   test("a worktree checkout (.git FILE) at skills/zstack is refused too, never rm -rf'd", async () => {
     const { env, worktree, run } = await scenarioD1b;
-    expect(run.code).toBe(0);
+    expect(run.code).toBe(1);
+    expect(run.stdout).not.toContain("zstack setup complete.");
     expect(run.stderr).toContain("separate zstack install");
     expect(readFileSync(join(worktree, "marker"), "utf8")).toContain("uncommitted work");
     expect(existsSync(join(env.skills, "z-alpha"))).toBe(false);
@@ -140,7 +149,8 @@ describe("setup register edge branches", () => {
 
   test("a manual install without sentinel or .git is refused, not misread as our copy", async () => {
     const { env, manual, run } = await scenarioD3;
-    expect(run.code).toBe(0);
+    expect(run.code).toBe(1);
+    expect(run.stdout).not.toContain("zstack setup complete.");
     expect(run.stderr).toContain("separate zstack install");
     expect(readFileSync(join(manual, "marker"), "utf8")).toContain("zip install");
     expect(existsSync(join(env.skills, "z-alpha"))).toBe(false);
