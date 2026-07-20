@@ -106,3 +106,32 @@ describe("M22: red-path parses the created bug number", () => {
     expect(md).not.toContain('"$Z_BOARD" move <N> Backlog'); // the ambiguous placeholder is gone
   });
 });
+
+// ============================================================================
+// Ticket #85 -- exclude lockfiles from the adversarial reviewer diff
+// ============================================================================
+describe("Ticket #85: lockfile exclusion in reviewer diff", () => {
+  // AC 1: z-loop/SKILL.md's reviewer input row carries all four exclude pathspecs exactly as written
+  test("AC 1: reviewer row includes all four lockfile exclusion pathspecs", () => {
+    const md = zLoop();
+    const reviewerRow = section(md, "| `reviewer` |");
+    expect(reviewerRow).not.toBe("");
+    // Check all four pathspecs are present exactly as specified
+    expect(reviewerRow).toContain("':(exclude)*.lock'");
+    expect(reviewerRow).toContain("':(exclude)package-lock.json'");
+    expect(reviewerRow).toContain("':(exclude)pnpm-lock.yaml'");
+    expect(reviewerRow).toContain("':(exclude)yarn.lock'");
+  });
+
+  // AC 3: the SKILL.md text instructs falling back to the unfiltered diff when filtered diff is empty
+  test("AC 3: reviewer row documents empty-diff fallback to unfiltered diff", () => {
+    const md = zLoop();
+    const reviewerRow = section(md, "| `reviewer` |");
+    expect(reviewerRow).not.toBe("");
+    // Check that the fallback pattern is documented
+    expect(reviewerRow).toContain("[ ! -s");
+    expect(reviewerRow).toContain("diff-<N>.txt"); // the temp file being checked
+    expect(reviewerRow).toContain("lockfile-only"); // rationale
+    expect(reviewerRow).toMatch(/fall.*back|fallback/i);
+  });
+});
