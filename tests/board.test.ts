@@ -908,8 +908,19 @@ describe("contract enforcement", () => {
   // issue #17), not the bare `graphql` subcommand. A regex that only matched
   // the bare form would let a future .ts file that shells to the raw endpoint
   // directly (a string like "gh api /graphql ...") evade this gate.
+  //
+  // Post-#17 QA bounce: the shell-string regex above only matches
+  // `gh api /graphql` written as one joined string. lib/board.ts's actual
+  // invocation is an ARRAY literal -- spawn(["gh", "api", "/graphql", ...]) --
+  // where "gh", "api", and "/graphql" are separate tokens with no `\bgh\s+api\b`
+  // substring anywhere in the source. A second pattern catches that array-of-
+  // string-literals shape directly (either quote style, whitespace-tolerant).
   function callsGhDirectly(content: string): boolean {
-    return /\bgh\s+api\s+\/?graphql\b/.test(content) || /\bgh\s+issue\b/.test(content);
+    return (
+      /\bgh\s+api\s+\/?graphql\b/.test(content) ||
+      /\bgh\s+issue\b/.test(content) ||
+      /["']gh["']\s*,\s*["']api["']\s*,\s*["']\/?graphql["']/.test(content)
+    );
   }
 
   test("only lib/board.ts calls gh api graphql or gh issue directly", () => {
@@ -931,16 +942,26 @@ describe("contract enforcement", () => {
 
   test("lib/board.ts is in fact the caller (guards against the gate passing vacuously)", () => {
     const content = readFileSync(join(REPO_ROOT, "lib", "board.ts"), "utf8");
-    expect(/\bgh\b/.test(content) && content.includes("api")).toBe(true);
+    // Must assert the actual detector predicate, not a weaker proxy (`/\bgh\b/`
+    // + `includes("api")`): that proxy stayed green even while callsGhDirectly
+    // failed to recognize lib/board.ts's own array-literal invocation, so the
+    // gate and the sanctioned file could drift apart without this test noticing.
+    expect(callsGhDirectly(content)).toBe(true);
   });
 
-  // Canary: proves the detector itself catches BOTH forms without needing a
-  // scratch file planted in the repo. A future narrowing of the regex back to
-  // the bare-only form (dropping the `\/?`) turns this red.
-  test("the offender detector catches both the bare and raw-endpoint gh api graphql forms", () => {
+  // Canary: proves the detector itself catches all known forms without needing
+  // a scratch file planted in the repo. A future narrowing of any of these
+  // regexes (e.g. dropping the `\/?`, or dropping the array-literal branch)
+  // turns this red.
+  test("the offender detector catches the bare, raw-endpoint, and array-literal gh api graphql forms", () => {
     expect(callsGhDirectly("exec(\"gh api graphql -f query='mutation { m }'\")")).toBe(true);
     expect(callsGhDirectly('exec("gh api /graphql --input -")')).toBe(true);
     expect(callsGhDirectly("gh issue edit 1 --body x")).toBe(true);
+    // Array-literal form (lib/board.ts's real shape), both quote styles and
+    // both the bare and raw-endpoint subcommand spellings.
+    expect(callsGhDirectly('spawn(["gh", "api", "/graphql", "--input", "-"], body)')).toBe(true);
+    expect(callsGhDirectly('spawn(["gh", "api", "graphql"], body)')).toBe(true);
+    expect(callsGhDirectly("spawn(['gh', 'api', '/graphql'], body)")).toBe(true);
     expect(callsGhDirectly("this file has nothing to do with any CLI")).toBe(false);
   });
 
