@@ -51,7 +51,7 @@ is missing.
                                    regression on merged main                               │
                                     ├─ RED  → file bugs to Backlog, NO deploy              │
                                     └─ GREEN→ land-and-deploy → canary → document-release  │
-                                              (+ cso + health every 5th loop)              │
+                                              (+ cso + health every Nth loop, default 5)   │
                                         write report · bump loop counter · exit            │
                                         └──────────────────────────────────────────────────┘
 

@@ -2,8 +2,9 @@
 // space. After the batch drains, the SKILL runs a regression on merged main and
 // hands the verdict here; endLoopPlan decides what happens next -- never in
 // prose. Red never deploys; green walks the deploy chain in a fixed order;
-// every 5th loop appends the security + quality audits. The report builder
-// turns the whole run into the markdown the SKILL writes to disk.
+// every Nth loop (config `auditEveryNLoops`, default 5 -- issue #18) appends
+// the security + quality audits. The report builder turns the whole run into
+// the markdown the SKILL writes to disk.
 //
 // Deliberately free of every gh/skill side effect: no z-board create, no Skill
 // tool call, no network. This file only plans (endLoopPlan), persists one
@@ -48,19 +49,30 @@ export type EndLoopActionKind =
   | "land-and-deploy" // green only, in this fixed order
   | "canary"
   | "document-release"
-  | "cso" // green + 5th loop only
-  | "health" // green + 5th loop only
+  | "cso" // green + Nth loop only (config auditEveryNLoops, default 5)
+  | "health" // green + Nth loop only (config auditEveryNLoops, default 5)
   | "report"; // always last
 
 // PROCESS.md steps 22-23 as one pure decision. Red regression: file every
 // finding, write the report, NO deploy action appears anywhere in the plan.
-// Green: the deploy chain in exactly this order, with the 5th-loop security +
-// quality audits appended before the report when loopCount % 5 === 0. loopCount
-// is the value AFTER this loop's increment (bumpLoopCounter's return), so
-// "loop 5" means loopCount === 5, not the pre-increment read.
-export function endLoopPlan(regression: RegressionResult, loopCount: number): EndLoopActionKind[] {
+// Green: the deploy chain in exactly this order, with the Nth-loop security +
+// quality audits appended before the report when
+// loopCount % auditEveryNLoops === 0. loopCount is the value AFTER this loop's
+// increment (bumpLoopCounter's return), so "loop 5" means loopCount === 5, not
+// the pre-increment read. auditEveryNLoops defaults to 5 (back-compat with the
+// old hardcoded cadence) -- the SKILL passes the project's config value
+// explicitly (issue #18); this function stays pure and never reads config
+// itself, so a caller that omits the arg keeps the exact old behavior.
+export function endLoopPlan(
+  regression: RegressionResult,
+  loopCount: number,
+  auditEveryNLoops = 5
+): EndLoopActionKind[] {
   if (!Number.isInteger(loopCount) || loopCount < 1) {
     throw new ZError(`loopCount must be a positive integer (the post-increment loop counter), got ${loopCount}.`);
+  }
+  if (!Number.isInteger(auditEveryNLoops) || auditEveryNLoops < 1) {
+    throw new ZError(`auditEveryNLoops must be a positive integer (>= 1), got ${auditEveryNLoops}.`);
   }
   if (regression.verdict === "red") {
     if (regression.findings.length === 0) {
@@ -69,7 +81,7 @@ export function endLoopPlan(regression: RegressionResult, loopCount: number): En
     return ["file-bugs", "report"];
   }
   const plan: EndLoopActionKind[] = ["land-and-deploy", "canary", "document-release"];
-  if (loopCount % 5 === 0) plan.push("cso", "health");
+  if (loopCount % auditEveryNLoops === 0) plan.push("cso", "health");
   plan.push("report");
   return plan;
 }
@@ -85,8 +97,8 @@ export function defaultLoopCounterPath(slug: string, home = homedir()): string {
 
 // Missing file reads as 0 (no loops completed yet). A present-but-unparseable
 // file is a loud error, never a silent reset -- a corrupt counter is exactly
-// the kind of bug that should stop the loop, not quietly re-run the 5th-loop
-// audits on the wrong cadence.
+// the kind of bug that should stop the loop, not quietly re-run the audits on
+// the wrong cadence.
 export function readLoopCounter(path: string): number {
   if (!existsSync(path)) return 0;
   const raw = readFileSync(path, "utf8").trim();
@@ -105,7 +117,7 @@ export function writeLoopCounter(path: string, value: number): void {
 // very end (after the report). Kept crash-safe by pairing with peekLoopCounter:
 // the loop computes its plan from the peek (no write) and only persists here, so
 // a crash before this point re-runs the same loop id rather than drifting the
-// 5th-loop cadence forward by one (issue #14 H17).
+// audit cadence forward by one (issue #14 H17).
 export function bumpLoopCounter(path: string): number {
   const next = readLoopCounter(path) + 1;
   writeLoopCounter(path, next);
@@ -114,7 +126,7 @@ export function bumpLoopCounter(path: string): number {
 
 // The prospective post-increment count WITHOUT persisting it (issue #14 H17). The
 // SKILL peeks this at the START of the end-of-loop stage to size the plan (the
-// 5th-loop cadence), does all its work, then calls bumpLoopCounter AFTER the
+// audit cadence), does all its work, then calls bumpLoopCounter AFTER the
 // report -- so peek and the later bump return the same value on a clean run, and a
 // crash in between leaves the counter untouched for a clean re-run (no drift).
 export function peekLoopCounter(path: string): number {
@@ -185,7 +197,7 @@ export function buildEndLoopReport(input: EndLoopReportInput): string {
   const deployLine =
     regression.verdict === "red"
       ? "NO deploy -- regression is red. Every finding below is filed to Backlog with repro + first-suspect file; fix and re-run before shipping."
-      : `land-and-deploy -> canary -> document-release completed, in that order.${auditsRan ? " 5th-loop audits (cso + health) also ran; findings below." : ""}`;
+      : `land-and-deploy -> canary -> document-release completed, in that order.${auditsRan ? " audits (cso + health) also ran this loop; findings below." : ""}`;
 
   const statusCounts = TERMINAL_STATUSES.map((s) => `- ${s}: ${tickets.filter((t) => t.status === s).length}`).join("\n");
 
@@ -230,7 +242,8 @@ ${bugLines}
 
 const USAGE = `endloop <command> [args]
 
-  plan <regression.json> <loopCount>              print the ordered EndLoopActionKind[] as JSON
+  plan <regression.json> <loopCount> [auditEveryNLoops]   print the ordered EndLoopActionKind[] as JSON
+                                                            (auditEveryNLoops: positive integer, default 5)
   counter read <path>                             print the current loop counter (0 if missing)
   counter peek <path>                             print the prospective next count (read+1), NO write
   counter bump <path>                             increment + persist atomically, print the new value
@@ -247,9 +260,16 @@ export function main(argv: string[]): number {
     if (cmd === "plan") {
       const path = argv[1];
       const loopCount = Number(argv[2]);
-      if (!path || !Number.isInteger(loopCount)) throw new ZError(`Usage: endloop plan <regression.json> <loopCount>`);
+      // argv[3] is optional: omitted entirely (undefined) lets endLoopPlan's
+      // default (5) apply; present-but-bad values (e.g. "0", "2.5") are still
+      // passed through so endLoopPlan's own integer >= 1 check is the single
+      // point that rejects them, with one consistent error message.
+      const auditEveryNLoops = argv[3] === undefined ? undefined : Number(argv[3]);
+      if (!path || !Number.isInteger(loopCount)) {
+        throw new ZError(`Usage: endloop plan <regression.json> <loopCount> [auditEveryNLoops]`);
+      }
       const regression = readJson(path) as RegressionResult;
-      console.log(JSON.stringify(endLoopPlan(regression, loopCount)));
+      console.log(JSON.stringify(endLoopPlan(regression, loopCount, auditEveryNLoops)));
       return 0;
     }
     if (cmd === "counter") {
