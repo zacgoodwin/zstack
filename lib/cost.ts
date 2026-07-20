@@ -33,7 +33,7 @@ import { readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { handleCliError } from "./cli.ts";
 import { ZError } from "./config.ts";
-import { loadRates, priceTokens, ratesPath, resolveRate, roundCents, type RatesFile } from "./estimate.ts";
+import { loadRates, priceTokens, priceTokensUnrounded, ratesPath, resolveRate, roundCents, type RatesFile } from "./estimate.ts";
 
 export { ZError } from "./config.ts";
 export { loadRates, ratesPath } from "./estimate.ts";
@@ -72,9 +72,20 @@ export interface ModelSpend {
   dollars: number;
 }
 
+// One input file's slice of the total (ticket #83): which stage/transcript
+// spent what, so "which stage eats the money" is answerable without
+// eyeballing a directory of jsonl files.
+export interface FileSpend {
+  file: string;
+  dollars: number;
+  requests: number; // unique, first-seen-in-this-file API calls (post-dedup)
+  tokens: TokenTotals; // cross-model aggregate for this file (informational)
+}
+
 export interface CostResult {
   total: number; // dollars, rounded to the cent
   by_model: ModelSpend[];
+  by_file?: FileSpend[]; // only present when costOfFiles is called with { byFile: true }
   requests: number; // unique API calls counted (post-dedup)
   lines_parsed: number; // assistant+usage lines seen (pre-dedup)
   skippedSynthetic: number; // synthetic ("<synthetic>") lines skipped, not priced
@@ -143,9 +154,85 @@ export function parseLine(line: string, where: string): ParsedUsageLine | null {
   return { dedupKeys, model, usage };
 }
 
-export function costOfFiles(paths: string[], rates: RatesFile): CostResult {
+// Apportions `targetCents` (integer cents) across `rawDollars` (each file's
+// unrounded dollar share) via the largest-remainder method (Hamilton
+// apportionment): floor every share to whole cents, then hand out the
+// leftover cents to the shares with the largest fractional remainder first
+// (or, if the floors overshot the target, take cents away from the smallest
+// remainder first) until the sum matches EXACTLY. Review bounce #83 finding
+// 1: rounding each file independently (roundCents per entry, the previous
+// implementation) does not generally sum to `total` -- total rounds once per
+// model across every file combined, so two files that each round DOWN
+// individually can still round UP once their tokens are combined (e.g. two
+// files at $0.004998 each round to $0.00 + $0.00 = $0.00, while the combined
+// $0.009996 rounds to $0.01). Apportionment makes AC1 hold for any input, not
+// just a fixture where the numbers happen to land on the same cent both ways.
+// Ties (equal remainders) break by array index so the result is deterministic
+// given the caller's already-sorted file order.
+//
+// Second review bounce (#83 finding 1): `targetCents` (from `result.total`,
+// which rounds each MODEL independently -- priceTokens, cost.ts:258-263 --
+// then sums those already-rounded dollars) and `base` (the floor of each
+// FILE's raw combined-model dollars, cost.ts:280-292) come from two different
+// rounding bases. A single file that mixes several model rate keys which each
+// round DOWN individually can have base overshoot target by more than that
+// file's own floor -- the old blind round-robin removal picked the smallest
+// remainder first with no regard for whether that file had any floor cents
+// left to give, driving its cents (and so its by_file.dollars) negative even
+// though it genuinely spent money. Fix: only take a cent from a file that
+// still has one (floor > 0), cycling to the next-smallest remainder
+// otherwise. This always terminates: -leftover = base - target, and target
+// (a real dollar total) is never negative, so -leftover <= base = the sum of
+// every floor -- there is always at least one file left with cents > 0 while
+// any are still owed.
+function apportionCents(rawDollars: number[], targetCents: number): number[] {
+  // Round to 1e-6-cent precision first to kill float noise (e.g.
+  // 45.000000000001) before flooring, so an exact cent amount floors to itself.
+  const rawCents = rawDollars.map((d) => Math.round(d * 100 * 1e6) / 1e6);
+  const floors = rawCents.map(Math.floor);
+  const remainders = rawCents.map((c, i) => c - floors[i]);
+  const base = floors.reduce((a, b) => a + b, 0);
+  const leftover = targetCents - base;
+
+  const byRemainderDesc = remainders.map((_, i) => i).sort((a, b) => remainders[b] - remainders[a] || a - b);
+
+  const cents = [...floors];
+  if (leftover > 0) {
+    for (let k = 0; k < leftover; k++) cents[byRemainderDesc[k % byRemainderDesc.length]] += 1;
+  } else if (leftover < 0) {
+    // Smallest remainder loses a cent first (reverse of the above order),
+    // skipping any file already at 0 -- it has nothing left to give.
+    const order = byRemainderDesc.slice().reverse();
+    let need = -leftover;
+    let guard = 0;
+    const maxIterations = order.length * (need + 1) + 1; // generous bound; see proof above
+    for (let idx = 0; need > 0; idx = (idx + 1) % order.length) {
+      if (++guard > maxIterations) {
+        throw new ZError(
+          `apportionCents: could not remove ${-leftover} cent(s) from ${order.length} file(s) without going negative -- ` +
+            `targetCents=${targetCents} is less than 0, which should never happen for a real dollar total.`
+        );
+      }
+      const i = order[idx];
+      if (cents[i] > 0) {
+        cents[i] -= 1;
+        need--;
+      }
+    }
+  }
+  return cents;
+}
+
+export function costOfFiles(paths: string[], rates: RatesFile, opts?: { byFile?: boolean }): CostResult {
+  const byFile = opts?.byFile === true;
   const seenKeys = new Set<string>();
   const perModel = new Map<string, TokenTotals>();
+  // Per-file tracking only allocated when requested, so the default path
+  // (no --by-file) does zero extra work and stays byte-identical to today
+  // (AC2). Two maps: per-file per-model tokens (needed to price each file at
+  // the correct rate) and per-file request counts.
+  const perFileModel = byFile ? new Map<string, Map<string, TokenTotals>>() : undefined;
+  const perFileRequests = byFile ? new Map<string, number>() : undefined;
   let linesParsed = 0;
   let requests = 0;
   let skippedSynthetic = 0;
@@ -172,7 +259,7 @@ export function costOfFiles(paths: string[], rates: RatesFile): CostResult {
       // id its earlier sibling lacked (F14: mixed-id lines of one response).
       const duplicate = parsed.dedupKeys.some((k) => seenKeys.has(k));
       for (const k of parsed.dedupKeys) seenKeys.add(k);
-      if (duplicate) continue; // duplicate content-block line
+      if (duplicate) continue; // duplicate content-block line -- also never re-attributed to a later file
       requests++;
 
       const { key } = resolveRate(parsed.model, rates);
@@ -181,6 +268,21 @@ export function costOfFiles(paths: string[], rates: RatesFile): CostResult {
       bucket.cached_input_tokens += parsed.usage.cache_read_input_tokens;
       bucket.output_tokens += parsed.usage.output_tokens;
       perModel.set(key, bucket);
+
+      if (perFileModel && perFileRequests) {
+        // Reached only on a first-seen (non-duplicate) line, so a requestId
+        // shared across files is attributed to exactly the file it was first
+        // seen in -- the sorted-path-order file, since callers pass paths
+        // pre-sorted (expandGlob sorts its matches).
+        const fModels = perFileModel.get(path) ?? new Map<string, TokenTotals>();
+        const fBucket = fModels.get(key) ?? { fresh_input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 };
+        fBucket.fresh_input_tokens += parsed.usage.input_tokens + parsed.usage.cache_creation_input_tokens;
+        fBucket.cached_input_tokens += parsed.usage.cache_read_input_tokens;
+        fBucket.output_tokens += parsed.usage.output_tokens;
+        fModels.set(key, fBucket);
+        perFileModel.set(path, fModels);
+        perFileRequests.set(path, (perFileRequests.get(path) ?? 0) + 1);
+      }
     }
   }
 
@@ -193,7 +295,71 @@ export function costOfFiles(paths: string[], rates: RatesFile): CostResult {
     total += dollars;
   }
 
-  return { total: roundCents(total), by_model, requests, lines_parsed: linesParsed, skippedSynthetic };
+  const result: CostResult = {
+    total: roundCents(total),
+    by_model,
+    requests,
+    lines_parsed: linesParsed,
+    skippedSynthetic,
+  };
+
+  if (perFileModel && perFileRequests) {
+    // `paths` order is the caller's sorted glob-expansion order (AC1/AC6);
+    // a file that never had a first-seen request (empty, synthetic-only, or
+    // entirely duplicate content already priced under another file)
+    // contributes nothing and is left out rather than padded with a $0 row.
+    const files = paths.filter((p) => perFileModel!.has(p));
+    const perFileTokens = new Map<string, TokenTotals>();
+    const rawDollars = files.map((path) => {
+      const fModels = perFileModel!.get(path)!;
+      let dollarsUnrounded = 0;
+      const tokens: TokenTotals = { fresh_input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 };
+      for (const [key, t] of fModels) {
+        dollarsUnrounded += priceTokensUnrounded(t.fresh_input_tokens, t.cached_input_tokens, t.output_tokens, rates.rates[key]);
+        tokens.fresh_input_tokens += t.fresh_input_tokens;
+        tokens.cached_input_tokens += t.cached_input_tokens;
+        tokens.output_tokens += t.output_tokens;
+      }
+      perFileTokens.set(path, tokens);
+      return dollarsUnrounded;
+    });
+    // Apportion `total`'s cents across files by largest remainder (see
+    // apportionCents above) instead of rounding each file independently, so
+    // sum(by_file.dollars) === total to the cent for ANY input (AC1).
+    const cents = apportionCents(rawDollars, Math.round(result.total * 100));
+    result.by_file = files.map((path, i) => ({
+      file: path,
+      dollars: cents[i] / 100,
+      requests: perFileRequests!.get(path)!,
+      tokens: perFileTokens.get(path)!,
+    }));
+  }
+
+  return result;
+}
+
+// Buckets by_file entries by the stage encoded in each file's name
+// (`<stage>-<attempt>.jsonl`, z-loop/SKILL.md Step 4's per-stage transcript
+// copy): the segment of the basename before its first "-". A name that
+// doesn't match a KNOWN_STAGE (no "-" at all, or a prefix that isn't one of
+// the four real stages -- e.g. a manually-dropped "notes.jsonl" or
+// "manual-drop.jsonl") goes to "other" rather than being dropped -- every
+// dollar the batch spent must show up somewhere in the end-of-loop
+// spend-by-stage table (lib/endloop.ts SPEND_STAGE_ORDER only ever renders
+// these five row names; anything else would silently vanish from the report,
+// review bounce #83 finding 2).
+const STAGE_PREFIX = /^([^-]+)-/;
+const KNOWN_STAGES = new Set(["builder", "qa", "reviewer", "merge"]);
+
+export function sumByStage(byFile: FileSpend[]): { stage: string; dollars: number }[] {
+  const totals = new Map<string, number>();
+  for (const f of byFile) {
+    const base = f.file.replace(/\\/g, "/").split("/").pop()!.replace(/\.jsonl$/i, "");
+    const prefix = STAGE_PREFIX.exec(base)?.[1];
+    const stage = prefix && KNOWN_STAGES.has(prefix) ? prefix : "other";
+    totals.set(stage, (totals.get(stage) ?? 0) + f.dollars);
+  }
+  return [...totals.entries()].map(([stage, dollars]) => ({ stage, dollars: roundCents(dollars) }));
 }
 
 // Native glob (Bun.Glob is already part of the runtime -- no new dependency).
@@ -273,14 +439,18 @@ export function expandGlob(pattern: string, cwd: string = process.cwd()): string
 }
 
 // -- CLI ---------------------------------------------------------------------
-const USAGE = `z-cost <glob-pattern> [--rates <path>] [--json]
+const USAGE = `z-cost <glob-pattern> [--rates <path>] [--json] [--by-file]
 
   glob-pattern: Claude Code transcript jsonl files for a ticket's agents,
                 e.g. "$HOME/.claude/projects/*/*.jsonl"
   --json:       emit the CostResult object (total, by_model with tokens and
                 dollars, requests, lines_parsed, skippedSynthetic) so
                 consumers like z-loop's Actual field-set parse JSON, never
-                prose`;
+                prose
+  --by-file:    also attribute spend per input file (CostResult.by_file:
+                file, dollars, requests, tokens), sorted by path -- feeds
+                z-loop's end-of-loop spend-by-stage rollup (lib/endloop.ts
+                sumByStage / "spend-by-stage")`;
 
 export async function main(argv: string[]): Promise<number> {
   if (!argv[0]) {
@@ -296,9 +466,11 @@ export async function main(argv: string[]): Promise<number> {
     let pattern: string | undefined;
     let ratesFilePath = ratesPath();
     let jsonOut = false;
+    let byFile = false;
     for (let i = 0; i < argv.length; i++) {
       if (argv[i] === "--rates") ratesFilePath = argv[++i];
       else if (argv[i] === "--json") jsonOut = true;
+      else if (argv[i] === "--by-file") byFile = true;
       else pattern = argv[i];
     }
     if (!pattern) throw new ZError(`Usage: ${USAGE}`);
@@ -307,11 +479,18 @@ export async function main(argv: string[]): Promise<number> {
     if (files.length === 0) throw new ZError(`No files matched "${pattern}".`);
 
     const rates = loadRates(ratesFilePath);
-    const result = costOfFiles(files, rates);
+    const result = costOfFiles(files, rates, { byFile });
 
     if (jsonOut) {
       console.log(JSON.stringify(result));
       return 0;
+    }
+    // by-file lines print above the total (--by-file only; today's output is
+    // unchanged without the flag -- AC2).
+    if (result.by_file) {
+      for (const f of result.by_file) {
+        console.log(`${f.file}  $${f.dollars.toFixed(2)}  (${f.requests} requests)`);
+      }
     }
     // Skip is always visible when nonzero (never silent) -- omitted at zero
     // to keep the common case's summary line unchanged.

@@ -17,10 +17,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { atomicWrite, handleCliError, readJson } from "./cli.ts";
 import { TERMINAL_STATUSES, ZError, projectsDir } from "./config.ts";
+import { sumByStage, type FileSpend } from "./cost.ts";
 import type { CompletionEdge } from "./stage-prompts.ts";
 
 export { ZError } from "./config.ts";
 export type { CompletionEdge } from "./stage-prompts.ts";
+export { sumByStage } from "./cost.ts";
 
 // -- regression result ---------------------------------------------------------
 
@@ -180,9 +182,20 @@ export interface EndLoopReportInput {
   tickets: TicketOutcome[];
   edges: TicketEdges[];
   bugsFiled: BugFiled[];
+  // Per-stage spend rollup (ticket #83), from sumByStage() over
+  // `z-cost --by-file` across the whole batch's transcripts. Optional so
+  // every existing report (built before this field existed) renders
+  // byte-identically -- the section only appears when this is present.
+  spendByStage?: { stage: string; dollars: number }[];
 }
 
 // Report row order = the canonical terminal set's order (lib/config.ts).
+
+// Fixed row order for the "## Spend by stage" table (ticket #83 plan item 3):
+// every row renders, including $0.00 ones, so a run with no reviewer bounces
+// still shows the shape rather than a shrinking table. "other" catches any
+// transcript file whose name doesn't match `<stage>-<attempt>.jsonl`.
+const SPEND_STAGE_ORDER = ["builder", "qa", "reviewer", "merge", "other"] as const;
 
 // Pure markdown render of the whole loop's outcome (issue #9 AC4): verdict with
 // evidence, dollars (summed here from the Actuals passed in -- never re-priced
@@ -190,9 +203,21 @@ export interface EndLoopReportInput {
 // aggregated across every ticket's completion note, and every bug filed this
 // stage. The SKILL writes the return value to reports/loop-<ts>.md verbatim.
 export function buildEndLoopReport(input: EndLoopReportInput): string {
-  const { regression, loopCount, auditsRan, tickets, edges, bugsFiled } = input;
+  const { regression, loopCount, auditsRan, tickets, edges, bugsFiled, spendByStage } = input;
 
   const totalDollars = tickets.reduce((sum, t) => sum + t.actualDollars, 0);
+
+  // Empty string when spendByStage is absent -- the two blank-line-bounded
+  // template slot below then collapses to the exact same single blank line
+  // today's report has, so an input without this field renders
+  // byte-identically to before (AC5).
+  const spendByStageSection = spendByStage
+    ? (() => {
+        const lookup = new Map(spendByStage.map((s) => [s.stage, s.dollars]));
+        const rows = SPEND_STAGE_ORDER.map((stage) => `| ${stage} | $${(lookup.get(stage) ?? 0).toFixed(2)} |`).join("\n");
+        return `## Spend by stage\n\n| Stage | Spend |\n|---|---|\n${rows}\n`;
+      })()
+    : "";
 
   const deployLine =
     regression.verdict === "red"
@@ -219,7 +244,7 @@ export function buildEndLoopReport(input: EndLoopReportInput): string {
 **Deploy:** ${deployLine}
 
 **Total spend:** $${totalDollars.toFixed(2)} (sum of ticket Actuals)
-
+${spendByStageSection}
 ## Tickets by final status
 
 ${statusCounts}
@@ -248,6 +273,9 @@ const USAGE = `endloop <command> [args]
   counter peek <path>                             print the prospective next count (read+1), NO write
   counter bump <path>                             increment + persist atomically, print the new value
   bug <finding.json> <regression|cso|health> <loopCount>   print a BugTicketDraft {title, body} as JSON
+  spend-by-stage <cost-result.json>               print sumByStage(costResult.by_file) as JSON --
+                                                    feeds "z-cost --json --by-file"'s output into
+                                                    the report's spendByStage field
   report <input.json>                             print the markdown end-of-loop report (EndLoopReportInput)`;
 
 export function main(argv: string[]): number {
@@ -289,6 +317,16 @@ export function main(argv: string[]): number {
       }
       const finding = readJson(path) as Finding;
       console.log(JSON.stringify(buildBugTicket(finding, source, loopCount)));
+      return 0;
+    }
+    if (cmd === "spend-by-stage") {
+      const path = argv[1];
+      if (!path) throw new ZError(`Usage: endloop spend-by-stage <cost-result.json>`);
+      const costResult = readJson(path) as { by_file?: FileSpend[] };
+      if (!costResult.by_file) {
+        throw new ZError(`${path} has no "by_file" -- run z-cost with --json --by-file first.`);
+      }
+      console.log(JSON.stringify(sumByStage(costResult.by_file)));
       return 0;
     }
     if (cmd === "report") {

@@ -28,6 +28,7 @@ import {
   writeLoopCounter,
   ZError,
   type EndLoopActionKind,
+  type EndLoopReportInput,
   type Finding,
   type RegressionResult,
 } from "../lib/endloop.ts";
@@ -460,5 +461,154 @@ describe("AC4: final report -- verdict, dollars, tickets by status, edges rollup
     expect(report).toContain("None surfaced.");
     expect(report).toContain("None filed.");
     expect(report).toContain("$0.00");
+  });
+});
+
+// ============================================================================
+// ticket #83, AC5 -- spend-by-stage table in the end-of-loop report
+// ============================================================================
+describe("AC5 (ticket #83): '## Spend by stage' table", () => {
+  const BASE_INPUT: EndLoopReportInput = {
+    regression: GREEN,
+    loopCount: 1,
+    auditsRan: false,
+    tickets: [],
+    edges: [],
+    bugsFiled: [],
+  };
+
+  test("without spendByStage, the report is byte-identical to the pre-existing (no-tickets) fixture", () => {
+    const report = buildEndLoopReport(BASE_INPUT);
+    expect(report).not.toContain("## Spend by stage");
+    // Golden string captured from buildEndLoopReport BEFORE the spendByStage
+    // field existed -- pins that adding the optional field changes nothing
+    // when it's absent (AC5's second clause).
+    expect(report).toBe(
+      "# End-of-loop report -- loop 1\n\n" +
+        `**Verdict:** GREEN -- ${GREEN.evidence}\n\n` +
+        "**Deploy:** land-and-deploy -> canary -> document-release completed, in that order.\n\n" +
+        "**Total spend:** $0.00 (sum of ticket Actuals)\n\n" +
+        "## Tickets by final status\n\n" +
+        "- Done: 0\n- Questions: 0\n- Blocked: 0\n- Skipped: 0\n\n" +
+        "| # | Title | Status | Actual |\n|---|---|---|---|\n| -- | (no tickets in this batch) | -- | -- |\n\n" +
+        "## Edges a human must validate\n\n- None surfaced.\n\n" +
+        "## Bugs filed to Backlog\n\n- None filed.\n"
+    );
+  });
+
+  test("with spendByStage, renders the table in fixed order builder/qa/reviewer/merge/other, $0.00 rows included", () => {
+    const report = buildEndLoopReport({
+      ...BASE_INPUT,
+      spendByStage: [
+        { stage: "qa", dollars: 1.5 },
+        { stage: "builder", dollars: 3.25 },
+      ],
+    });
+    expect(report).toContain("## Spend by stage");
+    const section = report.slice(report.indexOf("## Spend by stage"), report.indexOf("## Tickets by final status"));
+
+    // fixed row order regardless of input order
+    const order = ["builder", "qa", "reviewer", "merge", "other"];
+    const rowIndexes = order.map((s) => section.indexOf(`| ${s} |`));
+    expect(rowIndexes.every((i) => i >= 0)).toBe(true);
+    for (let i = 1; i < rowIndexes.length; i++) expect(rowIndexes[i]).toBeGreaterThan(rowIndexes[i - 1]);
+
+    expect(section).toContain("| builder | $3.25 |");
+    expect(section).toContain("| qa | $1.50 |");
+    expect(section).toContain("| reviewer | $0.00 |"); // no reviewer bounces this loop -- still shown (the shape)
+    expect(section).toContain("| merge | $0.00 |");
+    expect(section).toContain("| other | $0.00 |");
+  });
+
+  test("an unrecognized stage name in spendByStage is ignored by the fixed-row render (never crashes)", () => {
+    const report = buildEndLoopReport({ ...BASE_INPUT, spendByStage: [{ stage: "mystery", dollars: 9.99 }] });
+    expect(report).toContain("| builder | $0.00 |");
+    expect(report).not.toContain("mystery");
+  });
+});
+
+// ============================================================================
+// ticket #83 -- `endloop spend-by-stage <cost-result.json>` CLI: feeds
+// "z-cost --json --by-file"'s output through sumByStage for the report.
+// ============================================================================
+describe("ticket #83: endloop CLI `spend-by-stage <cost-result.json>`", () => {
+  let logs: ReturnType<typeof spyOn>;
+  let errs: ReturnType<typeof spyOn>;
+  beforeEach(() => {
+    logs = spyOn(console, "log").mockImplementation(() => {});
+    errs = spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    logs.mockRestore();
+    errs.mockRestore();
+  });
+
+  test("reads a z-cost --by-file result and prints sumByStage's output as JSON", () => {
+    const costResultPath = join(tmp(), "cost-result.json");
+    writeFileSync(
+      costResultPath,
+      JSON.stringify({
+        total: 0.45,
+        by_model: [],
+        by_file: [
+          { file: "qa-1.jsonl", dollars: 0.3, requests: 1, tokens: { fresh_input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } },
+          { file: "qa-2.jsonl", dollars: 0.15, requests: 1, tokens: { fresh_input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } },
+        ],
+        requests: 2,
+        lines_parsed: 2,
+        skippedSynthetic: 0,
+      })
+    );
+    expect(main(["spend-by-stage", costResultPath])).toBe(0);
+    const printed = JSON.parse(logs.mock.calls.at(-1)![0] as string);
+    expect(printed).toEqual([{ stage: "qa", dollars: 0.45 }]);
+  });
+
+  test("a cost-result.json with no by_file key exits 1 with a named error, no crash", () => {
+    const costResultPath = join(tmp(), "cost-result.json");
+    writeFileSync(costResultPath, JSON.stringify({ total: 0, by_model: [], requests: 0, lines_parsed: 0, skippedSynthetic: 0 }));
+    expect(main(["spend-by-stage", costResultPath])).toBe(1);
+    expect(errs.mock.calls.flat().join(" ")).toMatch(/by_file/);
+  });
+
+  // Review bounce #83 finding 2, end to end: a manually-dropped transcript
+  // file (hyphenated name, no recognized stage prefix) must NOT mint its own
+  // fake stage row -- it has to land in "other" so its dollars still show up
+  // once fed into buildEndLoopReport's fixed-row table, instead of silently
+  // vanishing (the bug: sumByStage produced {stage:"manual",...}, and
+  // buildEndLoopReport's SPEND_STAGE_ORDER lookup only ever renders the five
+  // known rows, so that entry was dropped with no error anywhere).
+  test("a manually-dropped transcript file's dollars survive into the 'other' row, not a dropped made-up stage", () => {
+    const costResultPath = join(tmp(), "cost-result.json");
+    writeFileSync(
+      costResultPath,
+      JSON.stringify({
+        total: 6,
+        by_model: [],
+        by_file: [
+          { file: "manual-drop.jsonl", dollars: 5, requests: 1, tokens: { fresh_input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } },
+          { file: "builder-1.jsonl", dollars: 1, requests: 1, tokens: { fresh_input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } },
+        ],
+        requests: 2,
+        lines_parsed: 2,
+        skippedSynthetic: 0,
+      })
+    );
+    expect(main(["spend-by-stage", costResultPath])).toBe(0);
+    const spendByStage = JSON.parse(logs.mock.calls.at(-1)![0] as string) as { stage: string; dollars: number }[];
+    expect(spendByStage.find((s) => s.stage === "manual")).toBeUndefined();
+    expect(spendByStage.find((s) => s.stage === "other")!.dollars).toBe(5);
+
+    const report = buildEndLoopReport({
+      regression: GREEN,
+      loopCount: 1,
+      auditsRan: false,
+      tickets: [],
+      edges: [],
+      bugsFiled: [],
+      spendByStage,
+    });
+    expect(report).toContain("| other | $5.00 |"); // the $5 shows up, not silently dropped
+    expect(report).not.toContain("manual");
   });
 });
