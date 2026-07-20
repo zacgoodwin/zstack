@@ -46,10 +46,17 @@ done
 
 PACK_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 
-# setup registers the pack as "zstack"; the five skills live inside it. We also
-# sweep the individual z-* names so a hand-made per-skill registration is cleaned
-# too -- each removed only when owned, exactly like the pack entry.
-ENTRIES=(zstack z-setup z-plan z-loop z-status z-uninstall)
+# setup registers the pack as "zstack"; the shipped z-* skills live inside it.
+# We also sweep the individual z-* names so a hand-made per-skill registration
+# is cleaned too -- each removed only when owned, exactly like the pack entry.
+# Derived the same way setup's register() finds them (setup:143 -- PACK_DIR/z-*/
+# dirs carrying SKILL.md), not hand-listed: a hardcoded array here previously
+# went stale the moment #36 added z-update, orphaning it on every uninstall.
+ENTRIES=(zstack)
+for skill_dir in "$PACK_DIR"/z-*/; do
+  [ -f "$skill_dir/SKILL.md" ] || continue
+  ENTRIES+=("$(basename "$skill_dir")")
+done
 
 removed=0
 left=0
