@@ -265,4 +265,4 @@ gone. See [z-uninstall](docs/user-guide/z-uninstall.md). Board statuses are the
 recoverable state; worktrees are disposable; locks clear via `/z-loop --reconcile`.
 
 ## Credits
-Designed and maintained by Zac Goodwin. Skill structure inspired by ErichTech's [super-board](https://github.com/EricTechPro/super-board)
+Designed and maintained by Zac Goodwin. Skill inspired by ErichTech's [super-board](https://github.com/EricTechPro/super-board)
