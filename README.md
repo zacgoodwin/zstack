@@ -40,25 +40,31 @@ On Windows, run both commands from **Git Bash** — `cmd.exe` doesn't expand `~`
 so the clone lands in a literal `~` folder instead of your home directory.
 
 `./setup` checks every precondition (bun, gstack, gh) and refuses with the exact
-fix command if one is missing. It then registers each of the five skills
-(`/z-setup`, `/z-plan`, `/z-loop`, `/z-status`, `/z-uninstall`) as its own
-top-level entry in the host's skills directory — hosts discover
+fix command if one is missing. It then registers each of the six skills
+(`/z-setup`, `/z-plan`, `/z-loop`, `/z-status`, `/z-uninstall`, `/z-update`) as
+its own top-level entry in the host's skills directory — hosts discover
 `skills/<name>/SKILL.md` exactly one level deep, so the pack directory alone is
 never enough:
 
 - **Claude Code** — the pack at `~/.claude/skills/zstack` (runtime assets)
-  plus `~/.claude/skills/z-setup`, `z-plan`, `z-loop`, `z-status`, `z-uninstall`.
-  Running `./setup` is mandatory even when you cloned straight into place.
+  plus `~/.claude/skills/z-setup`, `z-plan`, `z-loop`, `z-status`, `z-uninstall`,
+  `z-update`. Running `./setup` is mandatory even when you cloned straight into place.
 - **Codex / Factory** — auto-detected by binary on PATH (`codex` / `droid`) and
   registered the same way under `~/.codex/skills` / `~/.factory/skills`.
-  `--team` prints the team-mode note; the five skills need no session hooks.
+  `--team` prints the team-mode note; the six skills need no session hooks.
 
 Restart Claude Code after install — the skill list is scanned at session start.
 
-On macOS/Linux registration is a symlink, so `git pull` is the whole update for
-existing skills. On Windows it is a copy (symlinks need Developer Mode), so
-re-run `./setup` after each pull to refresh the copies. Either way, a pull that
-adds a NEW skill needs one `./setup` re-run to register it.
+Run `/z-update` (or `bin/z-update` at the pack root) to update — it resolves
+the git clone behind your install, `git pull --ff-only`s it, and re-runs
+`./setup` to refresh every registration in one step. Refuses with reinstall
+instructions when no git source can be resolved (ZIP/manual installs), and
+stops before touching setup if the pull itself fails (e.g. diverged local
+commits). Manual equivalent: `git pull` in the pack directory, then re-run
+`./setup` — required on Windows, where registrations are copies, not
+symlinks (symlinks need Developer Mode); either way, a pull that adds a NEW
+skill needs one `./setup` re-run to register it. Details:
+[z-update](docs/user-guide/z-update.md).
 
 Installing the pack changes nothing else — no repo is touched until you run
 `/z-setup` inside one.
@@ -126,6 +132,7 @@ What it **asks** — exactly two questions:
 | **`/z-loop`** | Drain the Ready batch: plan → build → QA → adversarial review → merge in dependency order, then end-of-loop regression + deploy (green) or bug-filing (red), report, exit. No daemon. | `--reconcile` clears a crashed run's locks/worktrees, parks its tickets back to Ready, then starts. Never clears a live loop's lock. |
 | **`/z-status`** | Read-only dashboard: status counts, Questions/Blocked waiting on you, in-flight lanes with age, last loop's verdict, Estimate vs Actual totals. | — |
 | **`/z-uninstall`** | Reverse `./setup`: remove the host registrations it owns (a symlink into the pack, or a copy carrying `.zstack-registered`), leaving any dir — or a symlink pointing outside the pack — it did not create; strip `/z-setup`'s auto-approval settings when present. Confirms first; the GitHub board is remote and untouched. | `--purge` also deletes `~/.zstack` (config, loop state, locks, reports). |
+| **`/z-update`** | Update the install: resolve the git clone backing it, `git pull --ff-only`, re-run `./setup` to refresh every registration. Refuses with reinstall instructions when no git source resolves; stops before touching setup if the pull fails. | — |
 
 Tunables live in `~/.zstack/projects/<slug>/config.json`: `maxLanes` (default 3),
 `watchdogMinutes` (default 10), `lockStalenessMinutes` (default 60),
@@ -204,13 +211,15 @@ clears it and restarts. See [troubleshooting](docs/user-guide/troubleshooting.md
 - Per-skill pages: [z-setup](docs/user-guide/z-setup.md) ·
   [z-plan](docs/user-guide/z-plan.md) · [z-loop](docs/user-guide/z-loop.md) ·
   [z-status](docs/user-guide/z-status.md) ·
+  [z-update](docs/user-guide/z-update.md) ·
   [z-uninstall](docs/user-guide/z-uninstall.md) ·
   [troubleshooting](docs/user-guide/troubleshooting.md)
 
 ## Layout
 
-- `z-setup/`, `z-plan/`, `z-loop/`, `z-status/`, `z-uninstall/` — the five skills
-  (`SKILL.md`). `setup` registers the pack; `uninstall` (its sibling) reverses it.
+- `z-setup/`, `z-plan/`, `z-loop/`, `z-status/`, `z-update/`, `z-uninstall/` —
+  the six skills (`SKILL.md`). `setup` registers the pack; `uninstall` (its
+  sibling) reverses it.
 - `bin/` — bash entry shims; `lib/` — the bun TypeScript deterministic core
   (board contract, scheduler, estimator, cost accounting, stage prompts).
 - `references/` — `rates.json`, the per-model dollar rates for `z-estimate`/`z-cost`.
