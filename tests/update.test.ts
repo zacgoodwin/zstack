@@ -87,6 +87,20 @@ function setVersion(dir: string, version: string) {
   writeFileSync(join(dir, "VERSION"), `${version}\n`);
 }
 
+// Appends harmless padding to bin/z-update itself, so the "ahead" commit's
+// `git pull` rewrites the running script's OWN bytes mid-run (69 -> 269
+// lines, shifting every downstream byte offset) instead of only bumping
+// VERSION -- the exact self-replacement hazard the main(){...}; main "$@"
+// wrapper (bin/z-update:5-14/56-69) exists to defend against. 200 lines
+// matches the scale a hand-built fixture already confirmed the wrapper
+// survives (pull rewrites bin/z-update mid-run, script still completes:
+// version bump printed, setup exec'd, exit 0).
+function padSelf(dir: string) {
+  const path = join(dir, "bin", "z-update");
+  const padding = Array.from({ length: 200 }, (_, i) => `# padding ${i}`).join("\n");
+  writeFileSync(path, `${readFileSync(path, "utf8")}\n${padding}\n`);
+}
+
 // A commit carrying the real `setup`, a real `bin/z-update`, a VERSION file,
 // and a fixture skill -- the minimum a `git pull` + re-exec'd setup needs.
 function seedPackCommit(dir: string, version: string, message: string) {
@@ -121,6 +135,7 @@ function makeAheadClone(): AheadFixture {
   git(tmpdir(), ["clone", "-q", origin, srcDir]);
 
   setVersion(seed, "0.2.0");
+  padSelf(seed); // exercise the self-replacement hazard, not just a VERSION bump
   git(seed, ["add", "-A"]);
   git(seed, ["commit", "-q", "-m", "v0.2.0"]);
   git(seed, ["push", "-q", origin, "HEAD:main"]);
