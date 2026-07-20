@@ -6,7 +6,7 @@
 import { test, expect, describe, afterAll } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import {
   adversarialActive,
   builderPrompt,
@@ -62,6 +62,11 @@ const MERGE_INPUT: MergePromptInput = {
   stackedOn: [],
 };
 
+// Pointer prompts (ticket #57) reference the stage's input-<N>.json by ABSOLUTE
+// path; the worker reads ticketBody/diff/acceptanceCriteria from there instead
+// of the orchestrator inlining them. Tests pass a representative absolute path.
+const INPUT_PATH = join(REPO_ROOT, "loop", "tmp", "input-42.json");
+
 // -- reviewer blindness (AC3) -------------------------------------------------
 
 describe("reviewer blindness", () => {
@@ -78,22 +83,38 @@ describe("reviewer blindness", () => {
 
   test("a smuggled extra field is rejected at runtime", () => {
     const leaky = { ...REVIEWER_INPUT, prDescription: "trust me, it works" };
-    expect(() => reviewerPrompt(leaky as ReviewerPromptInput)).toThrow(ZError);
+    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH)).toThrow(ZError);
     const rationale = { ...REVIEWER_INPUT, planRationale: "we chose X because..." };
-    expect(() => reviewerPrompt(rationale as ReviewerPromptInput)).toThrow(ZError);
+    expect(() => reviewerPrompt(rationale as ReviewerPromptInput, INPUT_PATH)).toThrow(ZError);
   });
 
   test("a missing or empty input is rejected -- a blinded reviewer with no diff is no reviewer", () => {
     const { diff: _dropped, ...missing } = REVIEWER_INPUT;
-    expect(() => reviewerPrompt(missing as ReviewerPromptInput)).toThrow(ZError);
-    expect(() => reviewerPrompt({ ...REVIEWER_INPUT, diff: "" })).toThrow(ZError);
+    expect(() => reviewerPrompt(missing as ReviewerPromptInput, INPUT_PATH)).toThrow(ZError);
+    expect(() => reviewerPrompt({ ...REVIEWER_INPUT, diff: "" }, INPUT_PATH)).toThrow(ZError);
   });
 
-  test("the prompt embeds all four inputs and states the blindness contract", () => {
-    const p = reviewerPrompt(REVIEWER_INPUT);
-    expect(p).toContain(REVIEWER_INPUT.ticketBody);
-    expect(p).toContain(REVIEWER_INPUT.acceptanceCriteria);
-    expect(p).toContain(REVIEWER_INPUT.diff);
+  // AC2: the new `inputPath` param is a plain second argument, NOT a key of the
+  // input object, so the exact-four-key gate is untouched -- the input still
+  // carries exactly {ticketBody, acceptanceCriteria, diff, worktreePath} and
+  // reviewerPrompt still rejects a fifth key even with inputPath supplied.
+  test("adding inputPath does not add a fifth key: the input stays exactly the four blinded keys", () => {
+    expect(Object.keys(REVIEWER_INPUT).sort()).toEqual(["acceptanceCriteria", "diff", "ticketBody", "worktreePath"]);
+    // A valid input + inputPath builds fine...
+    expect(() => reviewerPrompt(REVIEWER_INPUT, INPUT_PATH)).not.toThrow();
+    // ...but a fifth key is still rejected regardless of inputPath.
+    const leaky = { ...REVIEWER_INPUT, builderTranscript: "..." };
+    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH)).toThrow(/blinded by design/);
+  });
+
+  test("the prompt is a POINTER: it references the input file, omits body/AC/diff, keeps the blindness contract", () => {
+    const p = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH);
+    // The large payload is read from the file, NOT inlined into the prompt.
+    expect(p).toContain(INPUT_PATH);
+    expect(p).not.toContain(REVIEWER_INPUT.ticketBody);
+    expect(p).not.toContain(REVIEWER_INPUT.acceptanceCriteria);
+    expect(p).not.toContain(REVIEWER_INPUT.diff);
+    // The throwaway worktree path is small/fixed and stays inline.
     expect(p).toContain(REVIEWER_INPUT.worktreePath);
     expect(p).toContain("no PR description, no plan rationale, no builder or QA transcript");
     expect(p).toContain("REVIEW-APPROVE:");
@@ -110,18 +131,18 @@ describe("reviewer blindness", () => {
   // OUTPUT contract, never a fifth input key -- not even one literally named
   // "confidence".
   test("the REVIEW-APPROVE contract requires a confidence= token and the four-key blindness is unchanged", () => {
-    const p = reviewerPrompt(REVIEWER_INPUT);
+    const p = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH);
     expect(p).toContain("REVIEW-APPROVE: confidence=<0-100>");
     expect([...REVIEWER_INPUT_KEYS].sort()).toEqual(["acceptanceCriteria", "diff", "ticketBody", "worktreePath"]);
     const leaky = { ...REVIEWER_INPUT, confidence: 90 };
-    expect(() => reviewerPrompt(leaky as ReviewerPromptInput)).toThrow(ZError);
+    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH)).toThrow(ZError);
   });
 
-  // AC6: the four-key gate is unchanged by the new SECOND parameter -- it fires
+  // AC6: the four-key gate is unchanged by the new THIRD parameter -- it fires
   // regardless of what `adversarial` is, because it is a scalar arg, never a key.
   test("the four-key gate holds with the adversarial param present", () => {
     // A clean input still builds and its key set is untouched by the true branch.
-    expect(typeof reviewerPrompt(REVIEWER_INPUT, true)).toBe("string");
+    expect(typeof reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true)).toBe("string");
     expect(Object.keys(REVIEWER_INPUT).sort()).toEqual([
       "acceptanceCriteria",
       "diff",
@@ -131,8 +152,8 @@ describe("reviewer blindness", () => {
     // A smuggled fifth key throws EVEN with the adversarial flag on -- the gate
     // is not bypassed by the branch.
     const leaky = { ...REVIEWER_INPUT, prDescription: "x" };
-    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, true)).toThrow(ZError);
-    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, false)).toThrow(ZError);
+    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH, true)).toThrow(ZError);
+    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH, false)).toThrow(ZError);
   });
 });
 
@@ -189,36 +210,76 @@ describe("prompt constructor purity", () => {
   test("every constructor is a pure function of its input: identical input, identical prompt, no carried state", () => {
     // Interleave calls with different inputs; the repeats must be byte-identical,
     // proving no hidden state leaks between spawns.
-    const b1 = builderPrompt(BUILDER_INPUT);
-    const q1 = qaPrompt(QA_INPUT);
-    const r1 = reviewerPrompt(REVIEWER_INPUT);
-    const ra1 = reviewerPrompt(REVIEWER_INPUT, true); // the adversarial branch is pure too
-    const m1 = mergePrompt(MERGE_INPUT);
-    builderPrompt({ ...BUILDER_INPUT, ticketNumber: 99, qaNotes: "1) broken" });
-    reviewerPrompt({ ...REVIEWER_INPUT, diff: "other diff" });
-    reviewerPrompt({ ...REVIEWER_INPUT, diff: "other diff" }, true);
-    expect(builderPrompt(BUILDER_INPUT)).toBe(b1);
-    expect(qaPrompt(QA_INPUT)).toBe(q1);
-    expect(reviewerPrompt(REVIEWER_INPUT)).toBe(r1);
-    expect(reviewerPrompt(REVIEWER_INPUT, true)).toBe(ra1);
-    expect(mergePrompt(MERGE_INPUT)).toBe(m1);
+    const b1 = builderPrompt(BUILDER_INPUT, INPUT_PATH);
+    const q1 = qaPrompt(QA_INPUT, INPUT_PATH);
+    const r1 = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH);
+    const ra1 = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true); // the adversarial branch is pure too
+    const m1 = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    builderPrompt({ ...BUILDER_INPUT, ticketNumber: 99, qaNotes: "1) broken" }, INPUT_PATH);
+    reviewerPrompt({ ...REVIEWER_INPUT, diff: "other diff" }, INPUT_PATH);
+    reviewerPrompt({ ...REVIEWER_INPUT, diff: "other diff" }, INPUT_PATH, true);
+    expect(builderPrompt(BUILDER_INPUT, INPUT_PATH)).toBe(b1);
+    expect(qaPrompt(QA_INPUT, INPUT_PATH)).toBe(q1);
+    expect(reviewerPrompt(REVIEWER_INPUT, INPUT_PATH)).toBe(r1);
+    expect(reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true)).toBe(ra1);
+    expect(mergePrompt(MERGE_INPUT, INPUT_PATH)).toBe(m1);
   });
+});
+
+// -- pointer-prompt size-invariance (AC1) -------------------------------------
+
+describe("pointer prompts are size-invariant to the payload (AC1)", () => {
+  const HUGE = "X".repeat(100_000); // 100 KB ticketBody / diff
+  const AC = "Y".repeat(100_000);
+
+  // The builder/qa injection carries the huge body; the reviewer additionally
+  // carries a huge diff + acceptance criteria. Every stage's input-<N>.json is
+  // referenced by absolute path; the built prompt must not embed the payload.
+  const CASES: { stage: string; build: () => string; payloads: string[] }[] = [
+    { stage: "builder", build: () => builderPrompt({ ...BUILDER_INPUT, ticketBody: HUGE }, INPUT_PATH), payloads: [HUGE] },
+    { stage: "qa", build: () => qaPrompt({ ...QA_INPUT, ticketBody: HUGE }, INPUT_PATH), payloads: [HUGE] },
+    { stage: "reviewer", build: () => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: HUGE, diff: HUGE, acceptanceCriteria: AC }, INPUT_PATH), payloads: [HUGE, AC] },
+    // The adversarial reviewer branch fans out skeptics but STILL points at the
+    // file for its payload -- it must stay size-invariant too.
+    { stage: "reviewer (adversarial)", build: () => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: HUGE, diff: HUGE, acceptanceCriteria: AC }, INPUT_PATH, true), payloads: [HUGE, AC] },
+    { stage: "merge", build: () => mergePrompt(MERGE_INPUT, INPUT_PATH), payloads: [] },
+  ];
+
+  for (const c of CASES) {
+    test(`${c.stage}: 100 KB payload -> < 4 KB prompt, omits the payload, contains the absolute input path`, () => {
+      const p = c.build();
+      expect(p.length).toBeLessThan(4096);
+      for (const payload of c.payloads) expect(p).not.toContain(payload);
+      expect(isAbsolute(INPUT_PATH)).toBe(true);
+      expect(p).toContain(INPUT_PATH);
+    });
+  }
 });
 
 // -- adversarial reviewer prompt (AC7) ----------------------------------------
 
+// A fixed, checkout-independent input path used ONLY for the byte-pinned golden
+// file below. Post-#57 the reviewer prompt is a POINTER, so it embeds
+// ${inputPath}; pinning that path to a literal keeps reviewer-single-pass.golden
+// byte-stable across machines (INPUT_PATH is absolute and machine-specific). What
+// the golden pins is the shared reviewer body; the path value is immaterial.
+const GOLDEN_INPUT_PATH = "/loop/tmp/input-42.json";
+
 describe("adversarial reviewer prompt", () => {
-  // The single-pass prompt baseline, pinned byte-for-byte. Post-#62,
-  // REVIEW-APPROVE always carries a literal confidence=<0-100> token (the
-  // safety gate reads it whether or not the super-truth pass ran); only the
-  // skeptic fan-out and REVIEW-FINDINGS' confidence stay adversarial-only
-  // (#59, out of #62's scope). If either branch drifts,
-  // reviewerPrompt(REVIEWER_INPUT, false) stops matching this and the test
-  // fails.
+  // The reconciled single-pass (pointer) prompt, pinned byte-for-byte. Post-#62,
+  // REVIEW-APPROVE always carries a literal confidence=<0-100> token (the safety
+  // gate reads it whether or not the super-truth pass ran); only the skeptic
+  // fan-out and REVIEW-FINDINGS' confidence stay adversarial-only (#59, out of
+  // #62's scope). If either branch drifts, reviewerPrompt(REVIEWER_INPUT,
+  // GOLDEN_INPUT_PATH, false) stops matching this and the test fails -- the
+  // non-adversarial path is a strict no-op superset by contract: active ==
+  // inactive + exactly the super-truth block and REVIEW-FINDINGS' confidence
+  // token (REVIEW-APPROVE's confidence, present in both, is part of the shared,
+  // unchanged body).
   const SINGLE_PASS_BASELINE = readFileSync(join(import.meta.dir, "reviewer-single-pass.golden.txt"), "utf8");
 
   test("active prompt fans out skeptics and emits confidence; inactive prompt is still the single pass", () => {
-    const active = reviewerPrompt(REVIEWER_INPUT, true);
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
     expect(active).toContain("skeptic");
     expect(active).toContain("Agent tool");
     expect(active).toContain("Super-truth pass");
@@ -227,7 +288,7 @@ describe("adversarial reviewer prompt", () => {
     expect(active).toContain("REVIEW-APPROVE: confidence=<0-100>");
     expect(active).toContain("REVIEW-FINDINGS: confidence=<0-100>");
 
-    const inactive = reviewerPrompt(REVIEWER_INPUT, false);
+    const inactive = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false);
     expect(inactive).not.toContain("skeptic");
     expect(inactive).not.toContain("Super-truth");
     // The single pass still carries REVIEW-APPROVE's confidence (#62 is
@@ -235,15 +296,15 @@ describe("adversarial reviewer prompt", () => {
     expect(inactive).toContain("REVIEW-APPROVE: confidence=<0-100>");
     expect(inactive).not.toContain("REVIEW-FINDINGS: confidence=");
     // default arg: omitting the flag is the single pass.
-    expect(reviewerPrompt(REVIEWER_INPUT)).toBe(inactive);
+    expect(reviewerPrompt(REVIEWER_INPUT, INPUT_PATH)).toBe(inactive);
   });
 
   test("inactive prompt is byte-identical to the pinned single-pass baseline", () => {
-    expect(reviewerPrompt(REVIEWER_INPUT, false)).toBe(SINGLE_PASS_BASELINE);
+    expect(reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, false)).toBe(SINGLE_PASS_BASELINE);
     // And the active prompt is the single pass PLUS exactly the super-truth
     // block and REVIEW-FINDINGS' confidence token -- REVIEW-APPROVE's
     // confidence (present in both) is part of the shared, unchanged body.
-    const active = reviewerPrompt(REVIEWER_INPUT, true);
+    const active = reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, true);
     const stripped = active
       .replace(/\n## Super-truth pass[\s\S]*?below\.\n/, "")
       .replace("REVIEW-FINDINGS: confidence=<0-100> ", "REVIEW-FINDINGS: ");
@@ -254,10 +315,13 @@ describe("adversarial reviewer prompt", () => {
 // -- builder prompt -----------------------------------------------------------
 
 describe("builder prompt", () => {
-  test("carries the ticket, worktree discipline, ponytail, and the exit contract", () => {
-    const p = builderPrompt(BUILDER_INPUT);
+  test("points at the ticket file, carries worktree discipline, ponytail, and the exit contract", () => {
+    const p = builderPrompt(BUILDER_INPUT, INPUT_PATH);
     expect(p).toContain('#42: "Add CSV export"');
-    expect(p).toContain(BUILDER_INPUT.ticketBody);
+    // Pointer prompt: the body is read from the input file, not inlined.
+    expect(p).not.toContain(BUILDER_INPUT.ticketBody);
+    expect(p).toContain(INPUT_PATH);
+    expect(p).toContain("field `ticketBody`");
     expect(p).toContain(".worktrees/ticket-42");
     expect(p).toContain("z/ticket-42-add-csv-export");
     expect(p).toContain("Ponytail ladder");
@@ -267,50 +331,61 @@ describe("builder prompt", () => {
     expect(p).toContain("never ask a question");
   });
 
-  test("QA bounce includes the notes; second bounce demands /investigate first", () => {
-    const p1 = builderPrompt({ ...BUILDER_INPUT, qaNotes: "1) header row missing" });
-    expect(p1).toContain("1) header row missing");
+  test("QA bounce points at qaNotes and (from the 2nd bounce) demands /investigate; review bounce points at reviewNotes", () => {
+    const p1 = builderPrompt({ ...BUILDER_INPUT, qaNotes: "1) header row missing" }, INPUT_PATH);
+    // The findings themselves live in the input file (payload-independent), so
+    // the section names the field + path rather than inlining the note text.
+    expect(p1).toContain("QA findings from the previous pass");
+    expect(p1).toContain("`qaNotes`");
+    expect(p1).toContain(INPUT_PATH);
+    expect(p1).not.toContain("1) header row missing");
     expect(p1).not.toContain("/investigate");
-    const p2 = builderPrompt({ ...BUILDER_INPUT, qaNotes: "1) header row missing", investigateFirst: true });
+    const p2 = builderPrompt({ ...BUILDER_INPUT, qaNotes: "1) header row missing", investigateFirst: true }, INPUT_PATH);
     expect(p2).toContain("/investigate");
-    const pr = builderPrompt({ ...BUILDER_INPUT, reviewNotes: "1) AC weakened" });
+    const pr = builderPrompt({ ...BUILDER_INPUT, reviewNotes: "1) AC weakened" }, INPUT_PATH);
     expect(pr).toContain("Reviewer findings");
-    expect(pr).toContain("1) AC weakened");
+    expect(pr).toContain("`reviewNotes`");
+    expect(pr).not.toContain("1) AC weakened");
   });
 });
 
 // -- QA prompt ----------------------------------------------------------------
 
 describe("qa prompt", () => {
-  test("functional + technical checks, pass number, exit contract", () => {
-    const p = qaPrompt(QA_INPUT);
+  test("functional + technical checks, pass number, ticket-file pointer, exit contract", () => {
+    const p = qaPrompt(QA_INPUT, INPUT_PATH);
     expect(p).toContain("QA pass 1");
     expect(p).toContain("Functional");
     expect(p).toContain("Technical");
     expect(p).toContain("QA-PASS:");
     expect(p).toContain("QA-BUGS:");
+    // Pointer prompt: the body is read from the input file, not inlined.
+    expect(p).not.toContain(QA_INPUT.ticketBody);
+    expect(p).toContain(INPUT_PATH);
+    expect(p).toContain("field `ticketBody`");
     expect(p).not.toContain("/qa");
   });
 
   test("web targets are told to drive gstack /qa", () => {
-    expect(qaPrompt({ ...QA_INPUT, webTarget: true })).toContain("gstack /qa");
+    expect(qaPrompt({ ...QA_INPUT, webTarget: true }, INPUT_PATH)).toContain("gstack /qa");
   });
 });
 
 // -- merge prompt -------------------------------------------------------------
 
 describe("merge prompt", () => {
-  test("plain merge: PR steps, conflict gauntlet, no branch deletion mid-batch", () => {
-    const p = mergePrompt(MERGE_INPUT);
+  test("plain merge: PR steps, conflict gauntlet, no branch deletion mid-batch, input pointer", () => {
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
     expect(p).toContain("gh pr create --base main");
     expect(p).toContain("full gauntlet");
     expect(p).toContain("Never pass --delete-branch");
     expect(p).toContain("MERGED:");
+    expect(p).toContain(INPUT_PATH); // AC1: every stage references its input file
     expect(p).not.toContain("Stacked chain");
   });
 
   test("stacked chain: parent first, no deletion, retarget, delete last", () => {
-    const p = mergePrompt({ ...MERGE_INPUT, stackedOn: [40, 41] });
+    const p = mergePrompt({ ...MERGE_INPUT, stackedOn: [40, 41] }, INPUT_PATH);
     expect(p).toContain("Stacked chain");
     expect(p).toContain("#40, #41");
     expect(p).toContain("WITHOUT deleting its branch");
@@ -332,7 +407,7 @@ describe("merge prompt", () => {
 
   test("a shell-metachar PR title is quoted inertly, never as an injectable double-quoted string", () => {
     const evil = "Fix $(rm -rf ~) and `whoami` in O'Brien's parser";
-    const p = mergePrompt({ ...MERGE_INPUT, prTitle: evil });
+    const p = mergePrompt({ ...MERGE_INPUT, prTitle: evil }, INPUT_PATH);
     // The title appears only inside the single-quoted literal shSingleQuote built.
     expect(p).toContain(`--title ${shSingleQuote(evil)}`);
     // ...and NOT via JSON.stringify, whose double quotes let bash expand $()/backticks.
