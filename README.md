@@ -290,5 +290,9 @@ labels are remote data — never touched; delete them yourself if you want them
 gone. See [z-uninstall](docs/user-guide/z-uninstall.md). Board statuses are the
 recoverable state; worktrees are disposable; locks clear via `/z-loop --reconcile`.
 
+## AI Disclosure
+
+Written by AI, for AI with Zac co-driving 
+
 ## Credits
 Designed and maintained by Zac Goodwin. Skill inspired by ErichTech's [super-board](https://github.com/EricTechPro/super-board)
