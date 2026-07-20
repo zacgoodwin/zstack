@@ -11,6 +11,7 @@ import {
   FieldDataType,
   ZError,
 } from "./config.ts";
+import { EVENT_KEYS } from "./notify.ts";
 
 const DATA_TYPES: FieldDataType[] = ["SINGLE_SELECT", "NUMBER", "TEXT"];
 
@@ -135,6 +136,46 @@ export function validateConfig(cfg: unknown): BoardConfig {
     }
     if (c.quota.mode !== undefined && c.quota.mode !== "sleep" && c.quota.mode !== "abort") {
       throw new ZError(`Config "quota.mode" must be "sleep" or "abort", got ${JSON.stringify(c.quota.mode)}.`);
+    }
+  }
+
+  // notifications (#60): validated only when present (absent = off). The
+  // discordWebhookUrl is a SECRET, so its error text names the field ONLY and
+  // never echoes the value -- a pasted bare token or a leaked URL must not land
+  // in a log line. This is the single enforcement point: z-setup writes through
+  // it, loadConfig reads through it.
+  if (c.notifications !== undefined) {
+    const n = c.notifications;
+    if (typeof n !== "object" || n === null) {
+      throw new ZError(`Config "notifications" must be an object.`);
+    }
+    if (n.enabled !== undefined && typeof n.enabled !== "boolean") {
+      throw new ZError(`Config "notifications.enabled" must be a boolean.`);
+    }
+    // A bare token (no scheme) is the classic paste error; require https:// so it
+    // is rejected loudly. Value is never interpolated into the message.
+    if (
+      n.discordWebhookUrl !== undefined &&
+      (typeof n.discordWebhookUrl !== "string" || !n.discordWebhookUrl.startsWith("https://"))
+    ) {
+      throw new ZError(
+        `Config "notifications.discordWebhookUrl" must be a non-empty string beginning with "https://" (a bare token is not a webhook URL).`
+      );
+    }
+    if (n.events !== undefined) {
+      if (typeof n.events !== "object" || n.events === null) {
+        throw new ZError(`Config "notifications.events" must be an object of {event: boolean}.`);
+      }
+      for (const [k, v] of Object.entries(n.events)) {
+        if (!(EVENT_KEYS as readonly string[]).includes(k)) {
+          throw new ZError(
+            `Config "notifications.events.${k}" is not a known event. Valid: ${EVENT_KEYS.join(", ")}`
+          );
+        }
+        if (typeof v !== "boolean") {
+          throw new ZError(`Config "notifications.events.${k}" must be a boolean.`);
+        }
+      }
     }
   }
 
