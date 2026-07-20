@@ -179,6 +179,80 @@ export function mergeSettings(input: any, mode: PermissionsMode): MergeResult {
   return { settings, changed: changes.length > 0, changes };
 }
 
+// Inverse of mergeSettings: strip EXACTLY the entries the apply path writes and
+// nothing else, so `--remove` is a clean undo for either tier. Keyed off the same
+// detectors the merge/check use -- the ALLOW_RULES allowlist, the bypass keys, and
+// the PermissionRequest hook carrying HOOK_REASON -- so a foreign allow rule, a
+// user's own defaultMode, or a foreign PermissionRequest hook survives untouched.
+// Containers this file itself creates (permissions, permissions.allow, hooks,
+// hooks.PermissionRequest) are deleted only when removal leaves them empty, so a
+// full merge followed by a remove round-trips an empty settings object back to
+// empty. Idempotent: a second call reports changed: false.
+export function removeSettings(input: any): MergeResult {
+  const settings = structuredClone(input ?? {});
+  const changes: string[] = [];
+
+  const perms = settings.permissions;
+  if (perms && typeof perms === "object" && !Array.isArray(perms)) {
+    if (Array.isArray(perms.allow)) {
+      for (const rule of ALLOW_RULES) {
+        const i = perms.allow.indexOf(rule);
+        if (i !== -1) {
+          perms.allow.splice(i, 1);
+          changes.push(`- permissions.allow: ${rule}`);
+        }
+      }
+      if (perms.allow.length === 0) delete perms.allow;
+    }
+    if (perms.defaultMode === "bypassPermissions") {
+      delete perms.defaultMode;
+      changes.push(`- permissions.defaultMode: bypassPermissions`);
+    }
+    if (Object.keys(perms).length === 0) delete settings.permissions;
+  }
+
+  if (settings.skipDangerousModePermissionPrompt === true) {
+    delete settings.skipDangerousModePermissionPrompt;
+    changes.push(`- skipDangerousModePermissionPrompt: true`);
+  }
+  if (settings.skipAutoPermissionPrompt === true) {
+    delete settings.skipAutoPermissionPrompt;
+    changes.push(`- skipAutoPermissionPrompt: true`);
+  }
+
+  // Hook removal is per-hook, not per-group: drop only the command carrying our
+  // reason marker, keep every other hook in the same group, then drop a group
+  // emptied by that removal. A foreign group (SessionStart, or a deny-hook, or a
+  // differently-worded allow-hook) is preserved.
+  const groups = settings?.hooks?.PermissionRequest;
+  if (Array.isArray(groups)) {
+    let removedHook = false;
+    const kept: any[] = [];
+    for (const g of groups) {
+      if (!g || !Array.isArray(g.hooks)) {
+        kept.push(g);
+        continue;
+      }
+      const keptHooks = g.hooks.filter(
+        (h: any) => !(h?.type === "command" && typeof h.command === "string" && h.command.includes(HOOK_REASON)),
+      );
+      if (keptHooks.length !== g.hooks.length) removedHook = true;
+      if (keptHooks.length > 0) kept.push({ ...g, hooks: keptHooks });
+    }
+    if (removedHook) {
+      changes.push(`- hooks.PermissionRequest: allow hook`);
+      if (kept.length === 0) {
+        delete settings.hooks.PermissionRequest;
+        if (settings.hooks && Object.keys(settings.hooks).length === 0) delete settings.hooks;
+      } else {
+        settings.hooks.PermissionRequest = kept;
+      }
+    }
+  }
+
+  return { settings, changed: changes.length > 0, changes };
+}
+
 // -- file I/O ------------------------------------------------------------------
 
 // A settings.json that does not exist yet (first run on a fresh machine) and
@@ -276,12 +350,32 @@ export function applySettings(path: string, mode: PermissionsMode): ApplyResult 
   return { path, changed: true, changes };
 }
 
+// Read -> remove (the inverse merge) -> atomic write -> re-read to verify, the
+// same pipeline as applySettings. A file carrying none of our entries is a no-op
+// that never touches disk (removal idempotence: a second `--remove` is zero-diff).
+export function applyRemove(path: string): ApplyResult {
+  const input = readSettingsFile(path);
+  const { settings, changed, changes } = removeSettings(input);
+  if (!changed) return { path, changed: false, changes: [] };
+
+  const serialized = JSON.stringify(settings, null, 2) + "\n";
+  try {
+    JSON.parse(serialized);
+  } catch (e) {
+    throw new ZError(`Internal error: settings for ${path} failed to validate as JSON after removal: ${(e as Error).message}`);
+  }
+
+  atomicWrite(path, serialized);
+  verifyWrite(path, serialized);
+  return { path, changed: true, changes };
+}
+
 export function checkSettings(path: string): CheckReport {
   return checkLayers(readSettingsFile(path));
 }
 
 // -- CLI -----------------------------------------------------------------------
-const USAGE = `z-setup-permissions <full|allowlist|--check> [--path PATH]
+const USAGE = `z-setup-permissions <full|allowlist|--check|--remove> [--path PATH]
 
   full       merge the PermissionRequest allow hook + bypassPermissions +
              skip flags + the allow rules into PATH (grants everything via the
@@ -290,10 +384,13 @@ const USAGE = `z-setup-permissions <full|allowlist|--check> [--path PATH]
              defaultMode/skip-flag changes, no bash/claude/Edit/Write blanket
   --check    report each of the three layers (hook, bypassMode, allowlist)
              independently present/absent; makes no changes
+  --remove   strip EXACTLY the entries the full/allowlist path writes -- the
+             allow rules, the bypass keys, and our PermissionRequest hook --
+             leaving every other setting intact (the /z-uninstall undo)
 
 PATH defaults to ~/.claude/settings.json. Read-modify-write merge: every
 existing key and rule is preserved. Re-running once everything is configured
-makes zero changes and says so.`;
+(or once nothing of ours remains, for --remove) makes zero changes and says so.`;
 
 function defaultSettingsPath(): string {
   return join(homedir(), ".claude", "settings.json");
@@ -306,7 +403,8 @@ export async function main(argv: string[]): Promise<number> {
     return cmd ? 0 : 1;
   }
   if (cmd === "--check") cmd = "check";
-  if (!["full", "allowlist", "check"].includes(cmd)) {
+  if (cmd === "--remove") cmd = "remove";
+  if (!["full", "allowlist", "check", "remove"].includes(cmd)) {
     console.error(`Unknown command "${cmd}".\n\n${USAGE}`);
     return 1;
   }
@@ -322,6 +420,17 @@ export async function main(argv: string[]): Promise<number> {
       }
       const ok = report.hook.present && report.bypassMode.present && report.allowlist.present;
       return ok ? 0 : 1;
+    }
+
+    if (cmd === "remove") {
+      const result = applyRemove(path);
+      if (!result.changed) {
+        console.log(`${path} carries none of zstack's permission entries; zero changes.`);
+        return 0;
+      }
+      console.log(`Removed ${result.changes.length} zstack entr${result.changes.length === 1 ? "y" : "ies"} from ${path}:`);
+      for (const c of result.changes) console.log(`  ${c}`);
+      return 0;
     }
 
     const result = applySettings(path, cmd as PermissionsMode);

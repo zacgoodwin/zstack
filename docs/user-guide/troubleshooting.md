@@ -77,3 +77,29 @@ That is intended. The loop never calls `gh issue close`; it leaves Done tickets
 OPEN with a completion note so a human validates the edges the note names, then
 closes them. If you want them to auto-close, that fights the loop — leave the
 "close issue on Done" workflow OFF (see `/z-setup` Step 4).
+
+## setup: "already exists as a separate install; skipping" — and its uninstall mirror
+
+Both ends of install honor one rule: **never touch a directory we did not
+create.** `./setup` refuses to register when `~/.claude/skills/zstack` is already
+a real (non-symlink) directory pointing at a different install — it prints
+"already exists as a separate install; skipping … registration" and leaves your
+directory alone rather than clobbering it.
+
+`/z-uninstall` is the mirror. It removes a host registration only when it can
+prove ownership — a **symlink**, or a **copy carrying the `.zstack-registered`
+sentinel** setup drops into every copied install. A same-named directory with
+neither is **left in place and named**:
+
+```text
+  left /…/.claude/skills/zstack -- not created by zstack (no symlink, no .zstack-registered); left untouched.
+```
+
+If that directory really is a stale or unwanted zstack copy you want gone, remove
+it yourself: `rm -rf ~/.claude/skills/zstack`. The tool won't do it for you
+because it cannot tell your directory apart from a same-named one it never made.
+
+One special case: when the pack **is** the git clone at `~/.claude/skills/zstack`
+(you cloned straight into the skills dir), `/z-uninstall` leaves the clone — it may
+be your only copy — and prints the exact `rm -rf` command for you to run by hand.
+Run it only if you have another copy or don't need the source.

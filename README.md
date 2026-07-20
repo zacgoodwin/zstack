@@ -71,10 +71,12 @@ Questions / Blocked / Skipped with a comment — never a silent guess, never a s
 | **`/z-plan [spec]`** | Turn a spec into milestones + board-ready tickets: grounded plans, `### Acceptance Criteria`, Model/Effort, a reproducible dollar Estimate, dependencies linked both ways. Idempotent by title slug. | `--dry-run` emits tickets to stdout with no board writes (used by `evals/planner/`). |
 | **`/z-loop`** | Drain the Ready batch: plan → build → QA → adversarial review → merge in dependency order, then end-of-loop regression + deploy (green) or bug-filing (red), report, exit. No daemon. | `--reconcile` clears a crashed run's locks/worktrees and parks its tickets back to Ready, then starts (C7). |
 | **`/z-status`** | Read-only dashboard: status counts, Questions/Blocked waiting on you, in-flight lanes with age, last loop's verdict, Estimate vs Actual totals. | — |
+| **`/z-uninstall`** | Reverse `./setup`: remove the host registrations it owns (symlink, or copy carrying `.zstack-registered`), leaving any dir it did not create; strip `/z-setup`'s auto-approval settings when present. Confirms first; the GitHub board is remote and untouched. | `--purge` also deletes `~/.zstack` (config, loop state, locks, reports). |
 
 Per-skill detail: [`docs/user-guide/`](docs/user-guide/) — one page each for
 [z-setup](docs/user-guide/z-setup.md), [z-plan](docs/user-guide/z-plan.md),
-[z-loop](docs/user-guide/z-loop.md), [z-status](docs/user-guide/z-status.md), and
+[z-loop](docs/user-guide/z-loop.md), [z-status](docs/user-guide/z-status.md),
+[z-uninstall](docs/user-guide/z-uninstall.md), and
 [troubleshooting](docs/user-guide/troubleshooting.md).
 
 ## Quickstart
@@ -113,7 +115,8 @@ clears it and restarts. See [troubleshooting](docs/user-guide/troubleshooting.md
 
 ## Layout
 
-- `z-setup/`, `z-plan/`, `z-loop/`, `z-status/` — the four skills (`SKILL.md`).
+- `z-setup/`, `z-plan/`, `z-loop/`, `z-status/`, `z-uninstall/` — the five skills
+  (`SKILL.md`). `setup` registers the pack; `uninstall` (its sibling) reverses it.
 - `bin/` — bash entry shims; `lib/` — the bun TypeScript deterministic core
   (board contract, scheduler, estimator, cost accounting, stage prompts).
 - `references/` — process docs (`PROCESS.md`, `PRINCIPLES.md`, `ESTIMATION.md`,
@@ -136,5 +139,22 @@ Two lanes, per `references/PRINCIPLES.md`:
 
 ## Uninstall
 
-Local tooling only: `rm -rf ~/.claude/skills/zstack`. Board statuses are the
+Run `/z-uninstall` (or the `uninstall` script at the pack root directly). It
+reverses `./setup`, honoring the same ownership rule: it removes only the host
+registrations it can prove it created — a symlink, or a copy carrying the
+`.zstack-registered` sentinel — and leaves any same-named directory it did not
+create, naming it. If the pack IS the git clone at `~/.claude/skills/zstack`, it
+leaves the clone (it may be your only copy) and prints the exact `rm -rf` command.
+
+```bash
+"$HOME/.claude/skills/zstack/uninstall"           # remove registrations, keep ~/.zstack
+"$HOME/.claude/skills/zstack/uninstall" --purge   # also delete ~/.zstack (config, loop state)
+```
+
+`--purge` additionally removes `~/.zstack` (per-project config, loop counter,
+locks, reports); without it, that path and the purge command are printed. The
+skill also runs `bin/z-setup-permissions --remove` to strip the auto-approval
+settings `/z-setup` Step 7 wrote, when present. The GitHub board, milestones, and
+labels are remote data — never touched; delete them yourself if you want them
+gone. See [z-uninstall](docs/user-guide/z-uninstall.md). Board statuses are the
 recoverable state; worktrees are disposable; locks clear via `/z-loop --reconcile`.
