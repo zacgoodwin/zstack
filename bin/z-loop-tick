@@ -10,6 +10,13 @@
 # from `z-board snapshot` (which fetches them through lib/board.ts, the sole
 # sanctioned GitHub caller), so this wrapper stays free of any direct GitHub
 # call and the caller gate in tests/board.test.ts keeps holding.
+#
+# It also runs the human-needed safety control (issue #63) every tick: writes
+# the parked-tickets breakdown to $TMP/human-needed.json and, the moment it
+# first crosses BoardConfig.humanNeededPercent, fires the one-time mid-run
+# notification through lib/notify.ts -- same reasoning as above, a periodic
+# per-tick check belongs in this wrapper, not a second bash block in
+# z-loop/SKILL.md re-entering the orchestrator's context every iteration.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
@@ -46,5 +53,20 @@ bun "$PACK/lib/throttle.ts" wait --slug "$SLUG" >/dev/null
 # 2. Ingest: refresh ticket statuses; preserves lanes + lost-claim flags (no
 #    config flags here -- Step 3's first ingest already set maxLanes/watchdog).
 bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" >/dev/null
+# 2b. Human-needed safety control (issue #63): recompute the parked-tickets
+# breakdown every tick (read-only) and fire the ONE-TIME mid-run breakdown
+# notification the instant it first crosses BoardConfig.humanNeededPercent.
+# Lives here -- not lib/loop.ts (which stays pure/network-free) and not a
+# second per-tick block back in z-loop/SKILL.md -- so the check rides the same
+# single-call-per-iteration cadence #57 already collapsed the drain loop into.
+# The fire-once flag is set ONLY after notify.ts reports "sent": an
+# unconfigured project or a down webhook must never wedge the ack, so the real
+# notification still fires once it can actually be delivered. Never aborts the
+# tick (`|| true`): a safety-control hiccup must not block the drain.
+bun "$PACK/lib/loop.ts" human-needed "$STATE" > "$TMP/human-needed.json"
+if [ "$(jq -r .tripped "$TMP/human-needed.json")" = "true" ] && [ "$(jq -r .alreadyNotified "$TMP/human-needed.json")" != "true" ]; then
+  SENT=$(bun "$PACK/lib/notify.ts" send human-needed "$TMP/human-needed.json" --slug "$SLUG" 2>/dev/null) || SENT="error"
+  [ "$SENT" = "sent" ] && bun "$PACK/lib/loop.ts" human-needed-ack "$STATE" >/dev/null || true
+fi
 # 3. Next: print exactly one Action JSON line -- the only thing the caller reads.
 bun "$PACK/lib/loop.ts" next "$STATE"

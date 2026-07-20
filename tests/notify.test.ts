@@ -6,7 +6,7 @@
 // line or a rendered message; and config-schema's notifications branch is checked
 // good-and-bad, including that a bad value never leaks into the error.
 //
-// No eval suite (AC9): the six messages are fully templated and deterministic --
+// No eval suite (AC9): the seven messages are fully templated and deterministic --
 // there is no latent/LLM step and no quality dimension to measure -- so per
 // CLAUDE.md's latent-vs-deterministic split these gate tests are the complete
 // verification. A future free-text notification (e.g. an LLM-summarized digest)
@@ -78,6 +78,16 @@ const PARK: PayloadByEvent["ticket-parked"] = {
   note: "stage-blocked: build failed",
 };
 const PAUSE: PayloadByEvent["human-pause"] = { ticket: 9, title: "Auth flow", note: "which OAuth provider?" };
+const HUMAN_NEEDED: PayloadByEvent["human-needed"] = {
+  tripped: true,
+  alreadyNotified: false,
+  blocked: 2,
+  skipped: 1,
+  questions: 1,
+  initialReadyCount: 10,
+  percent: 30,
+  tickets: { blocked: [1, 2], skipped: [3], questions: [4] },
+};
 
 // -- renderNotification (pure) -----------------------------------------------
 describe("renderNotification", () => {
@@ -127,6 +137,20 @@ describe("renderNotification", () => {
     expect(renderNotification("token-burn", { detail: "dependency deadlock", ticket: 8 })).toContain(
       "token-burn guard on #8"
     );
+  });
+
+  test("human-needed formats the parked-tickets breakdown (issue #63)", () => {
+    const s = renderNotification("human-needed", HUMAN_NEEDED);
+    expect(s).toContain("4/10 parked"); // 2 blocked + 1 skipped + 1 questions
+    expect(s).toContain("> 30%");
+    expect(s).toContain("Blocked #1, #2");
+    expect(s).toContain("Skipped #3");
+    expect(s).toContain("Questions #4");
+  });
+
+  test("human-needed lists 'none' for an empty parked category", () => {
+    const s = renderNotification("human-needed", { ...HUMAN_NEEDED, skipped: 0, tickets: { ...HUMAN_NEEDED.tickets, skipped: [] } });
+    expect(s).toContain("Skipped none");
   });
 
   test("identical input is byte-identical (deterministic)", () => {
@@ -325,9 +349,17 @@ describe("validateConfig: notifications block shapes", () => {
     ).toThrow(/notifications\.events\.work-complete/);
   });
 
-  test("EVENT_KEYS enumerates exactly the six events", () => {
+  test("EVENT_KEYS enumerates exactly the seven events", () => {
     expect(([...EVENT_KEYS] as string[]).sort()).toEqual(
-      ["human-pause", "plan-complete", "safety-violation", "ticket-parked", "token-burn", "work-complete"].sort()
+      [
+        "human-needed",
+        "human-pause",
+        "plan-complete",
+        "safety-violation",
+        "ticket-parked",
+        "token-burn",
+        "work-complete",
+      ].sort()
     );
   });
 });
