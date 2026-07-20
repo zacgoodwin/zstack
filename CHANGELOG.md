@@ -9,6 +9,8 @@ Remediation of issue #14 (all 22 items now closed) plus an adversarial hardening
 ### Added
 
 - Board shape (nine statuses, four custom fields, intended views) is data now (issue #20): the shipped `z-setup/board-template.json`, loaded and validated by `lib/board-template.ts` before any board mutation. The default is 1:1 with the previously hardcoded shape (same statuses in order, same fields + option colors). `z-setup-board plan|apply|verify --template <file>` ships a variant; the loader refuses a template whose status set is not the canonical nine or that drops/renames a required field (Model, Model Effort, Estimate, Actual), naming the field and the tool that breaks. GitHub's API has no view-creation mutation, so the template's views are printed as explicit manual steps rather than silently dropped.
+- **`/z-uninstall`** — you can now remove everything `./setup` created with one command (#37). The pack-root `uninstall` script removes the pack and each `z-*` skill entry from every host (Claude Code, Codex, Factory) only when ownership is proven: a symlink, or the `.zstack-registered` sentinel that `setup` now stamps into every copied registration. `--purge` also removes `~/.zstack` state; `bin/z-setup-permissions --remove` strips exactly the permission entries the auto-approvals step wrote, preserving everything else. A clone at `~/.claude/skills/zstack` is never deleted; the exact removal command is printed instead. GitHub-side artifacts (board, milestones, labels) are never touched.
+- Two QA-loop knobs are per-project config now (#41): `maxQaPasses` (default 3 — QA passes before a still-buggy ticket parks Blocked) and `qaInvestigateAfter` (default 2 — the QA pass from which builder bounces carry `investigateFirst`). Set them in `~/.zstack/projects/<slug>/config.json` beside `maxLanes`; defaults reproduce the old hardcoded behavior exactly.
 
 ### Fixed
 
@@ -21,6 +23,7 @@ Remediation of issue #14 (all 22 items now closed) plus an adversarial hardening
 - Lock/report reads distinguish "missing" from "unreadable": I/O failures raise errors instead of rendering a false idle dashboard.
 - `atomicWrite` hardened for Windows: exclusive tmp create, bounded retry on transient rename errors, tmp cleanup on failure.
 - The two skill-file grep gates scan the real `*/SKILL.md` targets with canary assertions and an exact allowlist; the scanner joins backslash continuations and covers all `gh` invocations (both proven evasions now self-tested).
+- The gh-direct-call code gate no longer scans `evals/` (#40): the planner eval harness quotes `gh` invocations in comments without ever shelling the real gh, and the widened detector from #23 flagged it after a cross-branch merge left main red. The gate's file filter is now a named `gateScans` predicate with a canary test pinning exactly which surfaces are excluded, so dropping the exclusion (or adding a new double) fails pre-merge instead of after the next merge collision.
 
 ### Changed
 
