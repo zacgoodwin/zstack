@@ -101,6 +101,17 @@ planning new specs.
    writes (idempotent). A genuine ambiguity still goes to Questions, same as
    step 7. Runs as the final step of every spec run, and alone via
    `/z-plan --backlog`.
+9. **Cost-saving suggestions.** A terminal, batch-specific report for the human
+   running `/z-plan` — the ticket numbers, real dollar figures, and shared files
+   from *this run's own batch* (every ticket this run filed, updated, or drafted
+   a body for in the Backlog scan, excluding tickets the scan left untouched or
+   parked to Questions). It flags the most expensive ticket, any file touched by
+   several tickets worth sequencing, and mechanical work cheap enough to batch
+   in one lane. Advisory only — never a board write, a comment, or a
+   notification. A run whose batch is empty (e.g. a `--backlog` run where every
+   ticket already passed and was already fielded) prints nothing. The
+   arithmetic (`lib/cost-suggest.ts`, `bin/z-cost-suggest`) is computed, never
+   eyeballed; only the wording is written by the run itself.
 
 ## Dry-run / eval mode
 
@@ -120,4 +131,6 @@ Every filed ticket passes the lint gate, carries Model/Effort/Estimate via
 gate, parks open questions, and a re-run creates zero duplicates. Every ticket
 still in Backlog after the scan — i.e., not moved to Questions by a genuine
 ambiguity — passes the same lint gate and carries the same three fields; this
-step never promotes a ticket to Ready.
+step never promotes a ticket to Ready. A run that plants at least one Estimate
+this run also ends with the cost-saving report above, printed once, after
+everything else is written.

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Thin entry for the cost-suggestion contract: everything lives in
+# lib/cost-suggest.ts under bun. This wrapper only resolves its own location
+# and hands off.
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+exec bun "$HERE/../lib/cost-suggest.ts" "$@"
