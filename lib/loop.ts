@@ -12,7 +12,9 @@ import {
   BOARD_STATUSES,
   DEFAULT_MAX_LANES,
   DEFAULT_MAX_QA_PASSES,
+  DEFAULT_MIN_REVIEWER_CONFIDENCE,
   DEFAULT_QA_INVESTIGATE_AFTER,
+  DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
   DEFAULT_WATCHDOG_MINUTES,
   ZError,
   type BoardStatus,
@@ -106,6 +108,11 @@ export interface LoopState {
   // both.
   maxQaPasses?: number;
   qaInvestigateAfter?: number;
+  // Reviewer-confidence safety gate (issue #62), same optional-with-fallback
+  // treatment as the QA knobs above: ingestBoardItems always fills a concrete
+  // value (cfg -> preserved-from-prev -> DEFAULT_*).
+  minReviewerConfidence?: number;
+  reviewerBelowThresholdAction?: "block" | "retry" | "off";
   // Tickets whose PRs landed during THIS run. Their branches still exist
   // (stacked-chain rule: branches are deleted only after the whole batch), so a
   // dependent's merge stage must know to retarget onto the base branch.
@@ -119,12 +126,26 @@ export type StageOutcome =
   | { kind: "needs-input"; note: string }
   | { kind: "qa-pass" }
   | { kind: "qa-bugs"; note: string }
-  | { kind: "review-approve" }
+  | { kind: "review-approve"; confidence: number | null }
   | { kind: "review-findings"; note: string }
   | { kind: "human-question"; note: string }
   | { kind: "stage-blocked"; note: string }
   | { kind: "confused"; note: string }
   | { kind: "merged"; note: string };
+
+// Confidence token off a REVIEW-APPROVE marker note: `confidence=NN` where NN
+// is 0-100 (issue #62's safety gate). `\d{1,3}` matched at a FIXED position
+// right after the literal "confidence=" backtracks over 3/2/1 digits, so the
+// trailing `(?!\d)` rejects every length at that position when a 4th digit
+// follows -- `confidence=1000` has no match, not a truncated 100. A missing
+// token or a value outside 0-100 both return null; the caller (the gate)
+// decides what null means, never a parse-time throw on user-authored prose.
+export function parseReviewerConfidence(note: string): number | null {
+  const m = note.match(/\bconfidence=(\d{1,3})(?!\d)/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return n >= 0 && n <= 100 ? n : null;
+}
 
 // The machine-parsed exit contract every stage prompt ends with
 // (lib/stage-prompts.ts). Marker -> outcome, per stage; a final message that
@@ -145,7 +166,7 @@ const MARKERS: Record<Stage, Record<string, (note: string) => StageOutcome>> = {
     "CONFUSED": (note) => ({ kind: "confused", note }),
   },
   reviewer: {
-    "REVIEW-APPROVE": () => ({ kind: "review-approve" }),
+    "REVIEW-APPROVE": (note) => ({ kind: "review-approve", confidence: parseReviewerConfidence(note) }),
     "REVIEW-FINDINGS": (note) => ({ kind: "review-findings", note }),
     "NEEDS-HUMAN": (note) => ({ kind: "human-question", note }),
     "BLOCKED": (note) => ({ kind: "stage-blocked", note }),
@@ -203,10 +224,21 @@ interface QaBounceLimits {
   qaInvestigateAfter: number;
 }
 
-// What one lane's finished stage means for that lane. review-approve returns
-// null: merging is a cross-lane decision (dependency order, one merge at a
-// time) resolved by nextAction's merge gate below, not per-lane.
-function resolveOutcome(lane: LaneState, qaLimits: QaBounceLimits): Action | null {
+// The reviewer-confidence safety gate resolveOutcome needs (issue #62): the
+// floor a REVIEW-APPROVE's confidence must clear to merge, and what a
+// sub-floor (or unparseable) approve does. Threaded in by nextAction, same as
+// QaBounceLimits, so the reducer stays a pure function of its inputs.
+interface ReviewerGate {
+  minConfidence: number;
+  belowAction: "block" | "retry" | "off";
+}
+
+// What one lane's finished stage means for that lane. A PASSING review-approve
+// (or a disabled gate) returns null: merging is a cross-lane decision
+// (dependency order, one merge at a time) resolved by nextAction's merge gate
+// below, not per-lane. A FAILING approve is resolved right here, same as any
+// other terminal outcome.
+function resolveOutcome(lane: LaneState, qaLimits: QaBounceLimits, reviewerGate: ReviewerGate): Action | null {
   const o = lane.outcome!;
   const ticket = lane.ticket;
   switch (o.kind) {
@@ -233,8 +265,16 @@ function resolveOutcome(lane: LaneState, qaLimits: QaBounceLimits): Action | nul
       return { kind: "advance", ticket, to: "reviewer" };
     case "review-findings":
       return { kind: "advance", ticket, to: "builder", note: o.note };
-    case "review-approve":
-      return null;
+    case "review-approve": {
+      if (reviewerGate.belowAction === "off") return null; // gate disabled -> merge gate lands it
+      const conf = o.confidence; // number | null
+      if (conf !== null && conf >= reviewerGate.minConfidence) return null; // passes -> merge gate
+      const note = conf === null
+        ? `truth-check failed (reviewer approved with no parseable confidence score)`
+        : `truth-check failed (confidence ${conf}/100)`;
+      if (reviewerGate.belowAction === "retry") return { kind: "advance", ticket, to: "builder", note };
+      return { kind: "park", ticket, status: "Blocked", note };
+    }
     case "merged":
       return { kind: "complete", ticket, note: o.note };
   }
@@ -246,6 +286,8 @@ export interface LoopOpts {
   watchdogMinutes?: number;
   maxQaPasses?: number;
   qaInvestigateAfter?: number;
+  minReviewerConfidence?: number;
+  reviewerBelowThresholdAction?: "block" | "retry" | "off";
   mergedThisRun?: number[];
 }
 
@@ -270,6 +312,10 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
     maxQaPasses: opts.maxQaPasses ?? DEFAULT_MAX_QA_PASSES,
     qaInvestigateAfter: opts.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER,
   };
+  const reviewerGate: ReviewerGate = {
+    minConfidence: opts.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE,
+    belowAction: opts.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
+  };
   const byNumber = new Map(tickets.map((t) => [t.number, t]));
 
   // 1. Wave reconciliation + finished stages, in lane order. A human who moved a
@@ -289,8 +335,10 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
         note: `A human moved #${lane.ticket} to ${byNumber.get(lane.ticket)!.status} during the run; stopping its lane cleanly at the ${lane.stage} boundary (other lanes continue).`,
       };
     }
-    if (lane.outcome.kind === "review-approve") continue;
-    const action = resolveOutcome(lane, qaLimits);
+    // A PASSING review-approve (or a disabled gate) resolves to null here and
+    // falls through to the merge gate below, exactly as before #62; a FAILING
+    // approve is resolved right here, same as any other terminal outcome.
+    const action = resolveOutcome(lane, qaLimits, reviewerGate);
     if (action) return action;
   }
 
@@ -504,7 +552,14 @@ export function ingestBoardItems(
   prev: LoopState | null,
   items: BoardItemLike[],
   bodies: Record<string, string>,
-  cfg?: { maxLanes?: number; watchdogMinutes?: number; maxQaPasses?: number; qaInvestigateAfter?: number }
+  cfg?: {
+    maxLanes?: number;
+    watchdogMinutes?: number;
+    maxQaPasses?: number;
+    qaInvestigateAfter?: number;
+    minReviewerConfidence?: number;
+    reviewerBelowThresholdAction?: "block" | "retry" | "off";
+  }
 ): LoopState {
   const prevByNumber = new Map((prev?.tickets ?? []).map((t) => [t.number, t]));
   const tickets = items.map((it) => {
@@ -540,6 +595,9 @@ export function ingestBoardItems(
     watchdogMinutes: cfg?.watchdogMinutes ?? prev?.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES,
     maxQaPasses: cfg?.maxQaPasses ?? prev?.maxQaPasses ?? DEFAULT_MAX_QA_PASSES,
     qaInvestigateAfter: cfg?.qaInvestigateAfter ?? prev?.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER,
+    minReviewerConfidence: cfg?.minReviewerConfidence ?? prev?.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE,
+    reviewerBelowThresholdAction:
+      cfg?.reviewerBelowThresholdAction ?? prev?.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
     mergedThisRun: [...(prev?.mergedThisRun ?? [])],
   };
 }
@@ -555,6 +613,7 @@ const USAGE = `loop <command> [args]
   claim-lost <state.json> <ticket>                   mark a ticket claimed by another session
   ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M]
                       [--max-qa-passes N] [--qa-investigate-after N]
+                      [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off]
                                                      build/refresh the snapshot (creates state.json)
 
   --now defaults to the wall clock; tests pass it explicitly.`;
@@ -621,6 +680,8 @@ export function main(argv: string[]): number {
         watchdogMinutes: state.watchdogMinutes,
         maxQaPasses: state.maxQaPasses,
         qaInvestigateAfter: state.qaInvestigateAfter,
+        minReviewerConfidence: state.minReviewerConfidence,
+        reviewerBelowThresholdAction: state.reviewerBelowThresholdAction,
         mergedThisRun: state.mergedThisRun,
       });
       console.log(JSON.stringify(action));
@@ -664,7 +725,7 @@ export function main(argv: string[]): number {
       return 0;
     }
     if (cmd === "ingest") {
-      if (!argv[2] || !argv[3]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N]");
+      if (!argv[2] || !argv[3]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off]");
       const prev = readPrevState(statePath);
       const items = readJson(argv[2]) as BoardItemLike[];
       const bodies = readJson(argv[3]) as Record<string, string>;
@@ -672,11 +733,21 @@ export function main(argv: string[]): number {
       const watchdogMinutes = flagValue(argv, "--watchdog-minutes");
       const maxQaPasses = flagValue(argv, "--max-qa-passes");
       const qaInvestigateAfter = flagValue(argv, "--qa-investigate-after");
+      const minReviewerConfidence = flagValue(argv, "--min-reviewer-confidence");
+      const reviewerBelowThresholdAction = flagValue(argv, "--reviewer-below-threshold-action");
+      if (
+        reviewerBelowThresholdAction !== undefined &&
+        !["block", "retry", "off"].includes(reviewerBelowThresholdAction)
+      ) {
+        throw new ZError(`--reviewer-below-threshold-action must be "block", "retry", or "off", got ${JSON.stringify(reviewerBelowThresholdAction)}.`);
+      }
       const state = ingestBoardItems(prev, items, bodies, {
         maxLanes: maxLanes === undefined ? undefined : Number(maxLanes),
         watchdogMinutes: watchdogMinutes === undefined ? undefined : Number(watchdogMinutes),
         maxQaPasses: maxQaPasses === undefined ? undefined : Number(maxQaPasses),
         qaInvestigateAfter: qaInvestigateAfter === undefined ? undefined : Number(qaInvestigateAfter),
+        minReviewerConfidence: minReviewerConfidence === undefined ? undefined : Number(minReviewerConfidence),
+        reviewerBelowThresholdAction: reviewerBelowThresholdAction as "block" | "retry" | "off" | undefined,
       });
       atomicWrite(statePath, JSON.stringify(state, null, 2));
       console.log(`${state.tickets.length} ticket(s), ${state.lanes.length} lane(s)`);

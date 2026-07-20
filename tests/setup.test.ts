@@ -681,6 +681,10 @@ describe("writeConfig", () => {
     // issue #59 AC8: same for adversarialMode -- SetupBoard never writes it, so
     // loadConfig must default an omitting config to "non-trivial".
     expect(loaded.adversarialMode).toBe("non-trivial");
+    // issue #62 AC10: same pattern for the reviewer-confidence gate -- SetupBoard
+    // never writes either knob, so loadConfig must default them to 70 / "block".
+    expect(loaded.minReviewerConfidence).toBe(70);
+    expect(loaded.reviewerBelowThresholdAction).toBe("block");
   });
 });
 
@@ -938,6 +942,39 @@ describe("validateConfig", () => {
         expect(() => validateConfig(cfg)).not.toThrow();
       }
       delete cfg.adversarialMode;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+  });
+
+  // -- issue #62: the reviewer-confidence safety gate knobs --------------------
+  describe("reviewer confidence gate (issue #62)", () => {
+    // AC10: minReviewerConfidence is an integer 0-100 -- unlike
+    // requirePositiveNumber's knobs, 0 is valid and anything > 100 is not.
+    test("minReviewerConfidence must be an integer 0-100", () => {
+      for (const bad of [150, -1, 2.5, "70"]) {
+        const cfg = goodConfig() as any;
+        cfg.minReviewerConfidence = bad;
+        expect(() => validateConfig(cfg)).toThrow(/minReviewerConfidence.*integer 0-100/);
+      }
+      const cfg = goodConfig() as any;
+      cfg.minReviewerConfidence = 0;
+      expect(() => validateConfig(cfg)).not.toThrow();
+      cfg.minReviewerConfidence = 100;
+      expect(() => validateConfig(cfg)).not.toThrow();
+      delete cfg.minReviewerConfidence;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    // AC10: reviewerBelowThresholdAction is one of block|retry|off.
+    test("reviewerBelowThresholdAction must be one of block|retry|off", () => {
+      const cfg = goodConfig() as any;
+      cfg.reviewerBelowThresholdAction = "nope";
+      expect(() => validateConfig(cfg)).toThrow(/reviewerBelowThresholdAction.*block.*retry.*off/);
+      for (const ok of ["block", "retry", "off"]) {
+        cfg.reviewerBelowThresholdAction = ok;
+        expect(() => validateConfig(cfg)).not.toThrow();
+      }
+      delete cfg.reviewerBelowThresholdAction;
       expect(() => validateConfig(cfg)).not.toThrow();
     });
   });

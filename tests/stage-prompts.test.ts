@@ -124,6 +124,20 @@ describe("reviewer blindness", () => {
     expect(p).toContain("BLOCKED:");
   });
 
+  // AC11 (issue #62): the REVIEW-APPROVE contract carries the exact
+  // confidence=<0-100> token the loop.ts parser reads, UNCONDITIONALLY -- the
+  // plain default call (no adversarial flag), not just the super-truth branch.
+  // The four-key blindness gate is untouched: confidence lives in the reviewer's
+  // OUTPUT contract, never a fifth input key -- not even one literally named
+  // "confidence".
+  test("the REVIEW-APPROVE contract requires a confidence= token and the four-key blindness is unchanged", () => {
+    const p = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH);
+    expect(p).toContain("REVIEW-APPROVE: confidence=<0-100>");
+    expect([...REVIEWER_INPUT_KEYS].sort()).toEqual(["acceptanceCriteria", "diff", "ticketBody", "worktreePath"]);
+    const leaky = { ...REVIEWER_INPUT, confidence: 90 };
+    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH)).toThrow(ZError);
+  });
+
   // AC6: the four-key gate is unchanged by the new THIRD parameter -- it fires
   // regardless of what `adversarial` is, because it is a scalar arg, never a key.
   test("the four-key gate holds with the adversarial param present", () => {
@@ -252,39 +266,49 @@ describe("pointer prompts are size-invariant to the payload (AC1)", () => {
 const GOLDEN_INPUT_PATH = "/loop/tmp/input-42.json";
 
 describe("adversarial reviewer prompt", () => {
-  // The reconciled single-pass (pointer) prompt, pinned byte-for-byte. If the
-  // inactive branch ever drifts, reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH,
-  // false) stops matching this and the test fails -- the non-adversarial path is
-  // a strict no-op superset by contract: active == inactive + exactly the two
-  // adversarial additions (the Super-truth block and the confidence= tokens).
-  const PRE_59_SINGLE_PASS = readFileSync(join(import.meta.dir, "reviewer-single-pass.golden.txt"), "utf8");
+  // The reconciled single-pass (pointer) prompt, pinned byte-for-byte. Post-#62,
+  // REVIEW-APPROVE always carries a literal confidence=<0-100> token (the safety
+  // gate reads it whether or not the super-truth pass ran); only the skeptic
+  // fan-out and REVIEW-FINDINGS' confidence stay adversarial-only (#59, out of
+  // #62's scope). If either branch drifts, reviewerPrompt(REVIEWER_INPUT,
+  // GOLDEN_INPUT_PATH, false) stops matching this and the test fails -- the
+  // non-adversarial path is a strict no-op superset by contract: active ==
+  // inactive + exactly the super-truth block and REVIEW-FINDINGS' confidence
+  // token (REVIEW-APPROVE's confidence, present in both, is part of the shared,
+  // unchanged body).
+  const SINGLE_PASS_BASELINE = readFileSync(join(import.meta.dir, "reviewer-single-pass.golden.txt"), "utf8");
 
-  test("active prompt fans out skeptics and emits confidence; inactive prompt is the single pass", () => {
+  test("active prompt fans out skeptics and emits confidence; inactive prompt is still the single pass", () => {
     const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
     expect(active).toContain("skeptic");
     expect(active).toContain("Agent tool");
     expect(active).toContain("Super-truth pass");
-    // The confidence token rides in BOTH exit markers (#62's signal).
+    // REVIEW-APPROVE always carries confidence (#62); REVIEW-FINDINGS only
+    // when the super-truth pass ran (#59's unchanged behavior).
     expect(active).toContain("REVIEW-APPROVE: confidence=<0-100>");
     expect(active).toContain("REVIEW-FINDINGS: confidence=<0-100>");
 
     const inactive = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false);
     expect(inactive).not.toContain("skeptic");
     expect(inactive).not.toContain("Super-truth");
-    expect(inactive).not.toContain("confidence=");
+    // The single pass still carries REVIEW-APPROVE's confidence (#62 is
+    // unconditional there) but never REVIEW-FINDINGS'.
+    expect(inactive).toContain("REVIEW-APPROVE: confidence=<0-100>");
+    expect(inactive).not.toContain("REVIEW-FINDINGS: confidence=");
     // default arg: omitting the flag is the single pass.
     expect(reviewerPrompt(REVIEWER_INPUT, INPUT_PATH)).toBe(inactive);
   });
 
-  test("inactive prompt is byte-identical to the pinned single-pass constant", () => {
-    expect(reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, false)).toBe(PRE_59_SINGLE_PASS);
-    // And the active prompt is the single pass PLUS exactly the two adversarial
-    // additions -- nothing in the shared body changed.
+  test("inactive prompt is byte-identical to the pinned single-pass baseline", () => {
+    expect(reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, false)).toBe(SINGLE_PASS_BASELINE);
+    // And the active prompt is the single pass PLUS exactly the super-truth
+    // block and REVIEW-FINDINGS' confidence token -- REVIEW-APPROVE's
+    // confidence (present in both) is part of the shared, unchanged body.
     const active = reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, true);
     const stripped = active
       .replace(/\n## Super-truth pass[\s\S]*?below\.\n/, "")
-      .replaceAll("confidence=<0-100> ", "");
-    expect(stripped).toBe(PRE_59_SINGLE_PASS);
+      .replace("REVIEW-FINDINGS: confidence=<0-100> ", "REVIEW-FINDINGS: ");
+    expect(stripped).toBe(SINGLE_PASS_BASELINE);
   });
 });
 
@@ -467,7 +491,10 @@ describe("stage-prompts CLI", () => {
     const plain = run("prompt", "reviewer", ok);
     expect(plain.exitCode).toBe(0);
     expect(plain.stdout.toString()).not.toContain("skeptic");
-    expect(plain.stdout.toString()).not.toContain("confidence=");
+    // REVIEW-APPROVE still carries confidence unconditionally (#62); only the
+    // super-truth fan-out and REVIEW-FINDINGS' confidence are adversarial-gated.
+    expect(plain.stdout.toString()).toContain("REVIEW-APPROVE: confidence=<0-100>");
+    expect(plain.stdout.toString()).not.toContain("REVIEW-FINDINGS: confidence=");
 
     // off never fans out, even with a trigger label present.
     const off = run("prompt", "reviewer", ok, "--adversarial-mode", "off", "--labels", '["security"]');

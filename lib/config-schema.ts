@@ -132,6 +132,30 @@ export function validateConfig(cfg: unknown): BoardConfig {
       `Config "adversarialMode" must be one of "off", "non-trivial", "always", got ${JSON.stringify(c.adversarialMode)}.`
     );
   }
+  // minReviewerConfidence / reviewerBelowThresholdAction (issue #62): the
+  // reviewer-confidence safety gate. minReviewerConfidence is an integer
+  // percentage 0-100, so requirePositiveNumber (which rejects 0 and accepts
+  // fractions/150) is the wrong guard -- this mirrors auditEveryNLoops' own
+  // isInteger + bounds check above but adds the upper bound a percentage needs.
+  if (
+    c.minReviewerConfidence !== undefined &&
+    (typeof c.minReviewerConfidence !== "number" ||
+      !Number.isInteger(c.minReviewerConfidence) ||
+      c.minReviewerConfidence < 0 ||
+      c.minReviewerConfidence > 100)
+  ) {
+    throw new ZError(
+      `Config "minReviewerConfidence" must be an integer 0-100, got ${JSON.stringify(c.minReviewerConfidence)}.`
+    );
+  }
+  if (
+    c.reviewerBelowThresholdAction !== undefined &&
+    !["block", "retry", "off"].includes(c.reviewerBelowThresholdAction)
+  ) {
+    throw new ZError(
+      `Config "reviewerBelowThresholdAction" must be "block", "retry", or "off", got ${JSON.stringify(c.reviewerBelowThresholdAction)}.`
+    );
+  }
   if (c.quota !== undefined) {
     if (typeof c.quota !== "object" || c.quota === null) {
       throw new ZError(`Config "quota" must be an object.`);

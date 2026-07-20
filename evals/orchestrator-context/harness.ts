@@ -113,7 +113,9 @@ export const AFTER_TICK = `ACTION=$("$PACK/bin/z-loop-tick" --slug "$SLUG" --sta
 const HAPPY: Record<Stage, string> = {
   builder: "BUILT: ok",
   qa: "QA-PASS: ok",
-  reviewer: "REVIEW-APPROVE: ok",
+  // confidence=100 clears the default 70 floor (issue #62) so the happy-path
+  // drain actually reaches merge instead of fail-closing to Blocked.
+  reviewer: "REVIEW-APPROVE: confidence=100 ok",
   merge: "MERGED: https://pr/1",
 };
 
