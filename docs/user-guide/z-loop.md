@@ -84,6 +84,13 @@ records the result. It never re-derives a scheduling decision in prose.
   via PR state and ends Merged or Blocked, never Skipped.
 - **Actual per ticket.** After each stage the ticket's transcripts are priced with
   `bin/z-cost` (dedup by requestId) and written to the Actual field.
+- **Per-stage transcript layout.** Each stage's copy lands at
+  `~/.zstack/projects/<slug>/state/transcripts/ticket-<N>/<stage>-<attempt>.jsonl`
+  — `<stage>` is `builder`/`qa`/`reviewer`/`merge`, `<attempt>` is that lane's
+  1-based spawn count for the stage (a QA bounce or a reviewer bounce, either
+  one, re-spawns builder — so `builder-3.jsonl` might follow one bounce of
+  each kind, not necessarily three QA passes). This naming is what lets the
+  end-of-loop report break spend down by stage instead of only by ticket.
 
 ## End of loop
 
@@ -102,6 +109,37 @@ After the batch drains, the end-of-loop stage runs a regression on merged main
   loudly rather than silently falling back.
 
 It writes `reports/loop-<ts>.md` and bumps `~/.zstack/projects/<slug>/loop-counter`.
+
+### Reading the spend-by-stage table
+
+The report's `## Spend by stage` section answers "which stage ate the money"
+for the batch just drained, not just "how much did each ticket cost":
+
+```text
+## Spend by stage
+
+| Stage | Spend |
+|---|---|
+| builder | $12.40 |
+| qa | $3.10 |
+| reviewer | $0.85 |
+| merge | $0.20 |
+| other | $0.00 |
+```
+
+It's built from `bin/z-cost --json --by-file` over every stage transcript in
+the batch (`state/transcripts/*/*.jsonl`), folded per-stage by
+`lib/endloop.ts`'s `sumByStage`. All five rows always render, `$0.00`
+included — a run with no reviewer bounces still shows the full shape instead
+of a table that grows and shrinks between loops. `other` catches any
+transcript file whose name doesn't match `<stage>-<attempt>.jsonl` (e.g. a
+manually-dropped file). A loop run's report predating this feature simply has
+no `## Spend by stage` section at all — the field is optional and the rest of
+the report is unaffected.
+
+Every other cost-cutting change (stage model routing, trimming the Files
+section, tighter diff hygiene) can point at this table before/after to prove
+it actually moved the needle, instead of eyeballing the total.
 
 ## Notifications
 

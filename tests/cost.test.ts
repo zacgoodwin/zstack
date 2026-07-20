@@ -9,7 +9,8 @@ import { test, expect, describe, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
-import { costOfFiles, expandGlob, main, parseLine, ZError } from "../lib/cost.ts";
+import { costOfFiles, expandGlob, main, parseLine, sumByStage, ZError } from "../lib/cost.ts";
+import type { FileSpend } from "../lib/cost.ts";
 import type { RatesFile } from "../lib/estimate.ts";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "transcript.jsonl");
@@ -577,5 +578,165 @@ describe("costOfFiles across multiple files", () => {
     expect(result.requests).toBe(2);
     const haiku = result.by_model.find((m) => m.model === "haiku")!;
     expect(haiku.tokens).toEqual({ fresh_input_tokens: 200, cached_input_tokens: 0, output_tokens: 200 });
+  });
+});
+
+// -- --by-file attribution (ticket #83) ---------------------------------------
+//
+// Per-file spend attribution feeds z-loop's end-of-loop spend-by-stage table:
+// the loop copies one transcript per stage spawn (<stage>-<attempt>.jsonl),
+// and z-cost --by-file prices each one so lib/endloop.ts's sumByStage can
+// bucket them. Dedup stays GLOBAL (unchanged total) -- only attribution is
+// per-file.
+describe("--by-file attribution (ticket #83)", () => {
+  const usage = (input: number, output: number) => ({
+    input_tokens: input,
+    output_tokens: output,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+  });
+  const line = (requestId: string, model: string, input: number, output: number) =>
+    JSON.stringify({ type: "assistant", requestId, message: { model, usage: usage(input, output) } });
+
+  // AC1: a directory of two fixture transcripts -- by_file's dollars sum to
+  // the cent-equal total.
+  test("AC1: by_file dollars sum equals total to the cent, over two fixture files", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-byfile-"));
+    tmpPaths.push(dir);
+    // Sonnet rate: input $3/1M, output $15/1M. Round token counts so the
+    // file-level rounding and the model-level rounding this fixture happens
+    // to land on the same cent (a pin, not a general rounding proof -- see
+    // costOfFiles' by_file comment).
+    writeFileSync(join(dir, "builder-1.jsonl"), line("req_A", "claude-sonnet-4-5", 100000, 10000) + "\n"); // $0.30 + $0.15 = $0.45
+    writeFileSync(join(dir, "qa-1.jsonl"), line("req_B", "claude-sonnet-4-5", 100000, 0) + "\n"); // $0.30
+
+    const files = expandGlob("*.jsonl", dir);
+    const result = costOfFiles(files, RATES, { byFile: true });
+    expect(result.total).toBe(0.75);
+    expect(result.by_file).toBeDefined();
+    const sum = result.by_file!.reduce((s, f) => s + f.dollars, 0);
+    expect(Math.round(sum * 100) / 100).toBe(result.total);
+    expect(result.by_file!.find((f) => f.file.endsWith("builder-1.jsonl"))!.dollars).toBe(0.45);
+    expect(result.by_file!.find((f) => f.file.endsWith("qa-1.jsonl"))!.dollars).toBe(0.3);
+  });
+
+  // AC2: without --by-file, output is byte-identical to today -- no by_file
+  // key anywhere, not even as `undefined` leaking into JSON.
+  test("AC2: without --by-file, CostResult has no by_file key at all", () => {
+    const result = costOfFiles([FIXTURE], RATES);
+    expect("by_file" in result).toBe(false);
+  });
+
+  test("AC2: --json output without --by-file has no by_file key (byte-identical to today)", async () => {
+    const file = tmpFile(readFileSync(FIXTURE, "utf8"));
+    const pattern = join(file, "..", "*.jsonl").replaceAll("\\", "/");
+    const ratesFile = tmpFile(JSON.stringify(RATES), "rates.json");
+    const logs: string[] = [];
+    const orig = console.log;
+    console.log = (...a: unknown[]) => void logs.push(a.join(" "));
+    let code: number;
+    try {
+      code = await main(["--json", pattern, "--rates", ratesFile]);
+    } finally {
+      console.log = orig;
+    }
+    expect(code).toBe(0);
+    expect(logs.join("\n")).not.toContain("by_file");
+    expect(JSON.parse(logs.join("\n")).by_file).toBeUndefined();
+  });
+
+  // AC3: a requestId duplicated across two files is priced once in total,
+  // attributed to exactly one by_file entry (the first-seen file).
+  test("AC3: a requestId duplicated across two files is priced once, attributed to exactly one file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-byfile-dup-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "builder-1.jsonl"), line("req_DUP", "claude-sonnet-4-5", 100000, 0) + "\n");
+    // Same requestId again -- pure duplicate, no other content in this file.
+    writeFileSync(join(dir, "builder-2.jsonl"), line("req_DUP", "claude-sonnet-4-5", 100000, 0) + "\n");
+
+    const files = expandGlob("*.jsonl", dir); // sorted: builder-1.jsonl, builder-2.jsonl
+    const result = costOfFiles(files, RATES, { byFile: true });
+    expect(result.requests).toBe(1); // priced once in total, not twice
+    expect(result.total).toBe(0.3);
+
+    expect(result.by_file).toHaveLength(1); // the duplicate-only file contributed nothing
+    expect(result.by_file![0].file.endsWith("builder-1.jsonl")).toBe(true); // attributed to first-seen, in sorted order
+    expect(result.by_file![0].dollars).toBe(0.3);
+    expect(result.by_file![0].requests).toBe(1);
+
+    const totalFromFiles = result.by_file!.reduce((s, f) => s + f.dollars, 0);
+    expect(Math.round(totalFromFiles * 100) / 100).toBe(result.total);
+  });
+
+  test("by_file entries appear in lexicographically sorted path order, not insertion order", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-byfile-order-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "reviewer-1.jsonl"), line("req_R", "claude-haiku-4-5", 100, 0) + "\n");
+    writeFileSync(join(dir, "builder-1.jsonl"), line("req_B", "claude-haiku-4-5", 100, 0) + "\n");
+    writeFileSync(join(dir, "qa-1.jsonl"), line("req_Q", "claude-haiku-4-5", 100, 0) + "\n");
+
+    const files = expandGlob("*.jsonl", dir); // expandGlob already sorts
+    const result = costOfFiles(files, RATES, { byFile: true });
+    const names = result.by_file!.map((f) => f.file.replace(/\\/g, "/").split("/").pop());
+    expect(names).toEqual(["builder-1.jsonl", "qa-1.jsonl", "reviewer-1.jsonl"]);
+  });
+
+  test("--by-file text mode prints one line per file above the total line", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-byfile-text-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "builder-1.jsonl"), line("req_A", "claude-sonnet-4-5", 100000, 0) + "\n");
+    const ratesFile = tmpFile(JSON.stringify(RATES), "rates.json");
+    const pattern = join(dir, "*.jsonl").replaceAll("\\", "/");
+
+    const logs: string[] = [];
+    const orig = console.log;
+    console.log = (...a: unknown[]) => void logs.push(a.join(" "));
+    let code: number;
+    try {
+      code = await main(["--by-file", pattern, "--rates", ratesFile]);
+    } finally {
+      console.log = orig;
+    }
+    expect(code).toBe(0);
+    expect(logs.length).toBeGreaterThanOrEqual(2);
+    expect(logs[0]).toContain("builder-1.jsonl");
+    expect(logs[0]).toContain("$0.30");
+    expect(logs[0]).toContain("(1 requests)");
+    // total line comes AFTER the per-file line(s), i.e. "above the total" (plan item 1)
+    const totalLineIndex = logs.findIndex((l) => l.startsWith("$0.30 total across"));
+    expect(totalLineIndex).toBeGreaterThan(0);
+  });
+});
+
+// -- sumByStage (ticket #83, AC6) ----------------------------------------------
+describe("sumByStage", () => {
+  const fileSpend = (file: string, dollars: number): FileSpend => ({
+    file,
+    dollars,
+    requests: 1,
+    tokens: { fresh_input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 },
+  });
+
+  test("AC6: buckets qa-1.jsonl and qa-2.jsonl into one qa row; notes.jsonl goes to other", () => {
+    const byFile = [
+      fileSpend("/state/transcripts/ticket-12/qa-1.jsonl", 0.1),
+      fileSpend("/state/transcripts/ticket-12/qa-2.jsonl", 0.05),
+      fileSpend("/state/transcripts/ticket-12/notes.jsonl", 0.02),
+    ];
+    const stages = sumByStage(byFile);
+    expect(stages).toHaveLength(2); // only stages actually present
+    expect(stages.find((s) => s.stage === "qa")!.dollars).toBe(0.15);
+    expect(stages.find((s) => s.stage === "other")!.dollars).toBe(0.02);
+  });
+
+  test("recognizes builder/reviewer/merge stage prefixes too", () => {
+    const byFile = [fileSpend("builder-1.jsonl", 1), fileSpend("reviewer-1.jsonl", 2), fileSpend("merge-1.jsonl", 3)];
+    const stages = sumByStage(byFile);
+    expect(stages.map((s) => s.stage).sort()).toEqual(["builder", "merge", "reviewer"]);
+  });
+
+  test("a Windows-style path (backslashes) still resolves to the basename's stage", () => {
+    const byFile = [fileSpend("C:\\state\\transcripts\\ticket-9\\qa-1.jsonl", 0.5)];
+    expect(sumByStage(byFile)).toEqual([{ stage: "qa", dollars: 0.5 }]);
   });
 });

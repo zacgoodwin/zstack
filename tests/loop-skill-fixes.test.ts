@@ -106,3 +106,31 @@ describe("M22: red-path parses the created bug number", () => {
     expect(md).not.toContain('"$Z_BOARD" move <N> Backlog'); // the ambiguous placeholder is gone
   });
 });
+
+// ============================================================================
+// ticket #83 AC4 -- stage-named transcript copies + --by-file in the
+// end-of-loop report assembly
+// ============================================================================
+describe("ticket #83 AC4: stage-named transcript copies, --by-file in report assembly", () => {
+  test("Step 4 names transcript copies <stage>-<attempt>.jsonl, not an unnamed file", () => {
+    const step4 = section(zLoop(), "## Step 4");
+    expect(step4).not.toBe("");
+    expect(step4).toContain("<stage>-<attempt>.jsonl");
+    expect(step4).toContain("builder`/`qa`/`reviewer`/`merge`");
+  });
+
+  test("Step 7a's report assembly calls z-cost --by-file over every stage's transcripts", () => {
+    const step7a = section(zLoop(), "## Step 7a");
+    expect(step7a).not.toBe("");
+    expect(step7a).toContain("--by-file");
+    expect(step7a).toContain('"$STATE_DIR/transcripts/*/*.jsonl"');
+  });
+
+  test("Step 7a feeds the --by-file result through endloop.ts spend-by-stage, into spendByStage", () => {
+    const step7a = section(zLoop(), "## Step 7a");
+    expect(step7a).toContain("lib/endloop.ts\" spend-by-stage");
+    expect(step7a).toContain("spendByStage");
+    // --by-file's cost result is produced BEFORE it's fed through spend-by-stage.
+    expect(step7a.indexOf("--by-file")).toBeLessThan(step7a.indexOf("spend-by-stage"));
+  });
+});

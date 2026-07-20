@@ -301,11 +301,22 @@ the input file, never through your context; ticket #57, Leak 1):
 | `merge` | `ticketNumber`, `prTitle` (the ticket title), `branch`, `baseBranch`, `worktreePath`, `stackedOn` (from the advance action — parents whose branches this PR stacks on; the prompt carries the PROCESS.md step 18 chain rules: parents first, no branch deletion mid-batch, retarget, delete last). |
 
 **Per-stage Actual (every stage, no exceptions):** when a stage agent finishes,
-copy its transcript jsonl into `"$STATE_DIR/transcripts/ticket-<N>/"` (the
-harness writes session transcripts under `~/.claude/projects/`; take the file
-for that spawn). Then price the ticket's whole directory — the glob accumulates
-every stage so far, and z-cost dedupes by requestId, so its total IS the
-cumulative and you never add dollars in prose:
+copy its transcript jsonl into
+`"$STATE_DIR/transcripts/ticket-<N>/<stage>-<attempt>.jsonl"` (the harness
+writes session transcripts under `~/.claude/projects/`; take the file for that
+spawn) — never an unnamed/default filename. `<stage>` is one of
+`builder`/`qa`/`reviewer`/`merge`; `<attempt>` is that lane's 1-based spawn
+count for the stage, taken from the SAME state-file bounce counters this step
+already reads elsewhere: `qa` and `reviewer` are `qaBounces`/`reviewBounces` + 1
+(the `qa` row above already computes this as `qaPass` — reuse it, don't
+recompute), `builder` is `qaBounces + reviewBounces + 1` (either bounce type
+re-spawns builder, so its attempt count is the sum + the initial spawn), and
+`merge` is always `1` (it never bounces back to builder). This deterministic
+naming is what lets the end-of-loop spend-by-stage table (Step 7a item 5)
+attribute dollars per stage instead of only per ticket. Then price the
+ticket's whole directory — the glob accumulates every stage so far, and z-cost
+dedupes by requestId, so its total IS the cumulative and you never add dollars
+in prose:
 
 ```bash
 ACTUAL=$("$Z_COST" --json "$STATE_DIR/transcripts/ticket-<N>/*.jsonl" | jq -r .total)
@@ -487,6 +498,19 @@ bug for everything found — step 23 has no exceptions.
   files (the per-ticket surfaced use cases), plus every bug this stage just
   filed in 3a/4 (`"$TMP/endloop-bugs.json"`) — the full picture of what this
   run added to Backlog.
+- `spendByStage`: price the WHOLE batch's transcripts per-file, then fold
+  per-file into per-stage — this is what answers "which stage eats the
+  money" instead of just "how much did the ticket cost":
+
+  ```bash
+  "$Z_COST" --json --by-file "$STATE_DIR/transcripts/*/*.jsonl" > "$TMP/cost-by-file.json"
+  bun "$PACK/lib/endloop.ts" spend-by-stage "$TMP/cost-by-file.json" > "$TMP/spend-by-stage.json"
+  ```
+
+  Splice `"$TMP/spend-by-stage.json"`'s array into `report-input.json` as
+  `spendByStage` verbatim — omit the key entirely on a batch with zero
+  drained tickets (no transcripts glob to price) rather than pricing an
+  empty pattern.
 
 ```bash
 bun "$PACK/lib/endloop.ts" report "$TMP/report-input.json" \

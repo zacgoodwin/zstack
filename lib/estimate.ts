@@ -82,6 +82,23 @@ export function roundCents(dollars: number): number {
   return Math.round(dollars * 100) / 100;
 }
 
+// The dollar formula with NO rounding -- the unrounded intermediate lib/cost.ts
+// needs to sum several files' worth of tokens (each possibly spanning several
+// models) before rounding once per output row, instead of compounding
+// per-model rounding error into a per-file total.
+export function priceTokensUnrounded(
+  freshInputTokens: number,
+  cachedInputTokens: number,
+  outputTokens: number,
+  rate: ModelRate
+): number {
+  return (
+    (freshInputTokens / PER_MILLION) * rate.input +
+    (cachedInputTokens / PER_MILLION) * rate.cached_input +
+    (outputTokens / PER_MILLION) * rate.output
+  );
+}
+
 // Prices three token buckets against a rate row, rounded once to the cent.
 // Shared by estimate() and lib/cost.ts so the dollar formula lives in exactly
 // one place.
@@ -91,11 +108,7 @@ export function priceTokens(
   outputTokens: number,
   rate: ModelRate
 ): number {
-  return roundCents(
-    (freshInputTokens / PER_MILLION) * rate.input +
-      (cachedInputTokens / PER_MILLION) * rate.cached_input +
-      (outputTokens / PER_MILLION) * rate.output
-  );
+  return roundCents(priceTokensUnrounded(freshInputTokens, cachedInputTokens, outputTokens, rate));
 }
 
 // Fractional days between checked_at and `now` (injected -- see file header).
