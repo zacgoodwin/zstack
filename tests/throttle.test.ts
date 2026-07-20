@@ -5,7 +5,7 @@ import { test, expect, describe, afterEach } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultLoopDir, readLastTick, throttleDelayMs, writeLastTick } from "../lib/throttle.ts";
+import { defaultLoopDir, main, readLastTick, throttleDelayMs, writeLastTick } from "../lib/throttle.ts";
 
 describe("throttleDelayMs", () => {
   // AC5: no prior tick recorded -> never delay the very first tick.
@@ -72,4 +72,112 @@ describe("readLastTick / writeLastTick", () => {
     expect(() => readLastTick(loopDir)).toThrow(/not a parseable timestamp/);
     expect(() => readLastTick(loopDir)).toThrow(new RegExp(loopDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   });
+});
+
+// ============================================================================
+// Review-bounce fix (issue #58): main()'s "wait" handler -- the ONLY
+// production path that reads a project's real tickThrottleSeconds off
+// loadConfig() and threads it into throttleTick -- previously had zero test
+// coverage of its own. Every other test either drives throttleDelayMs/
+// throttleTick directly (bypassing main() entirely) or spawns the real CLI
+// with tickThrottleSeconds omitted (defaulting to 0, so a mutant that
+// hardcodes the handler's config read to 0 stayed invisible). These two tests
+// close that gap: one deterministic (injected clock + spy Sleep, proves the
+// config VALUE flows), one a cheap real-elapsed smoke (proves the real
+// Date.now()/setTimeout defaults are wired the same way).
+// ============================================================================
+describe('main("wait"): config-to-CLI wiring (review fix, issue #58)', () => {
+  const homes: string[] = [];
+  afterEach(() => {
+    while (homes.length) rmSync(homes.pop()!, { recursive: true, force: true });
+  });
+
+  // A fake $HOME/$USERPROFILE carrying a minimal, valid config.json for slug
+  // "demo" with an explicit, nonzero tickThrottleSeconds -- same shape as
+  // tests/z-loop-tick.test.ts's makeConfigHome, trimmed to this file's needs.
+  function makeConfigHome(tickThrottleSeconds: number): string {
+    const home = mkdtempSync(join(tmpdir(), "zstack-throttle-main-home-"));
+    homes.push(home);
+    const dir = join(home, ".zstack", "projects", "demo");
+    mkdirSync(dir, { recursive: true });
+    const cfg = {
+      slug: "demo",
+      owner: "acme",
+      repo: "demo",
+      projectNumber: 1,
+      projectId: "PVT_1",
+      repositoryId: "R_1",
+      statusField: {
+        id: "F_status",
+        dataType: "SINGLE_SELECT",
+        options: { Backlog: "o1", Ready: "o2", Done: "o3" },
+      },
+      fields: {},
+      tickThrottleSeconds,
+    };
+    writeFileSync(join(dir, "config.json"), JSON.stringify(cfg));
+    return home;
+  }
+
+  // loadConfig() resolves the OS home via node:os homedir(), which reads
+  // HOME/USERPROFILE at call time -- the same seam tests/z-loop-tick.test.ts
+  // sets on a spawned subprocess's env. Setting it on THIS process for the
+  // duration of one main() call (then restoring it) is the in-process
+  // equivalent, and is what lets this test drive the REAL loadConfig() without
+  // a subprocess.
+  async function withHome<T>(home: string, fn: () => Promise<T>): Promise<T> {
+    const prevHome = process.env.HOME;
+    const prevProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    try {
+      return await fn();
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = prevProfile;
+    }
+  }
+
+  test("the project's real tickThrottleSeconds (not a hardcoded value) reaches throttleTick's delay math", async () => {
+    const home = makeConfigHome(120);
+    let fakeNow = 1_000_000;
+    const now = () => fakeNow;
+    const sleepCalls: number[] = [];
+    const spySleep = async (ms: number) => {
+      sleepCalls.push(ms);
+    };
+
+    // First "wait": no prior tick recorded -> delay 0 either way (AC5); this
+    // call only exists to stamp a last-tick to pace the second call against.
+    await withHome(home, () => main(["wait", "--slug", "demo"], now, spySleep));
+    expect(sleepCalls.length === 0 || sleepCalls[0] === 0).toBe(true);
+
+    // Second "wait", fake clock advanced by only 10s: with the fixture's real
+    // 120s config value flowing through main() -> throttleTick, the remaining
+    // delay is exactly 110_000ms. The mutation the review found (main()'s
+    // handler hardcoding its throttleSeconds read to 0) would instead sleep 0
+    // here -- this assertion is what makes that mutation fail the suite.
+    fakeNow += 10_000;
+    sleepCalls.length = 0;
+    await withHome(home, () => main(["wait", "--slug", "demo"], now, spySleep));
+    expect(sleepCalls).toEqual([110_000]);
+  });
+
+  test("real-elapsed smoke: main(\"wait\") with true (uninjected) defaults actually delays for a nonzero tickThrottleSeconds", async () => {
+    const home = makeConfigHome(1); // 1s throttle -- keeps this well under the 2s gate budget
+    const t0 = Date.now();
+    // No now/sleep args: exercises the exact defaults `if (import.meta.main)`
+    // uses for the real CLI entrypoint (Date.now() + a real setTimeout sleep).
+    await withHome(home, () => main(["wait", "--slug", "demo"]));
+    await withHome(home, () => main(["wait", "--slug", "demo"]));
+    const elapsed = Date.now() - t0;
+    // Combined elapsed spans the mandatory ~1s real sleep between the two
+    // ticks. A hardcoded-0 mutation of main()'s handler would finish near
+    // 0ms instead; a generous floor (700ms) absorbs normal timer/OS jitter
+    // without weakening what the mutation needs to fail.
+    expect(elapsed).toBeGreaterThanOrEqual(700);
+    expect(elapsed).toBeLessThan(2000);
+  }, 3000);
 });

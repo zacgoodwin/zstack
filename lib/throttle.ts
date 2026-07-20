@@ -98,7 +98,19 @@ const USAGE = `throttle wait --slug S
   start time under ~/.zstack/projects/<slug>/loop/last-tick. Called once at the
   top of bin/z-loop-tick's per-tick flow, before its first board call.`;
 
-export async function main(argv: string[]): Promise<number> {
+// now/sleep default to the real clock/timer -- identical to throttleTick's own
+// defaults (line 84-85) -- so the CLI entrypoint below is unaffected. Threading
+// the same injected seam through main() (review fix, issue #58) lets a test
+// pin a fake clock + spy Sleep around the REAL "wait" handler that reads
+// cfg.tickThrottleSeconds, instead of only around throttleTick called
+// directly: that handler line is the one production path a config typo,
+// dropped `?? 0`, or refactor could silently break while every other test
+// (which exercises throttleTick directly) stays green.
+export async function main(
+  argv: string[],
+  now: () => number = () => Date.now(),
+  sleep: Sleep = defaultSleep
+): Promise<number> {
   const cmd = argv[0];
   if (!cmd || cmd === "help" || cmd === "-h" || cmd === "--help") {
     console.log(USAGE);
@@ -108,7 +120,7 @@ export async function main(argv: string[]): Promise<number> {
     if (cmd === "wait") {
       const { flags } = parseFlags(argv.slice(1));
       const cfg = loadConfig(requireFlag(flags, "slug"));
-      await throttleTick(defaultLoopDir(cfg.slug), cfg.tickThrottleSeconds ?? 0);
+      await throttleTick(defaultLoopDir(cfg.slug), cfg.tickThrottleSeconds ?? 0, now, sleep);
       return 0;
     }
     console.error(`Unknown command "${cmd}".\n\n${USAGE}`);
