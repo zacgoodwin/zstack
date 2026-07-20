@@ -169,6 +169,22 @@ export function parseLine(line: string, where: string): ParsedUsageLine | null {
 // just a fixture where the numbers happen to land on the same cent both ways.
 // Ties (equal remainders) break by array index so the result is deterministic
 // given the caller's already-sorted file order.
+//
+// Second review bounce (#83 finding 1): `targetCents` (from `result.total`,
+// which rounds each MODEL independently -- priceTokens, cost.ts:258-263 --
+// then sums those already-rounded dollars) and `base` (the floor of each
+// FILE's raw combined-model dollars, cost.ts:280-292) come from two different
+// rounding bases. A single file that mixes several model rate keys which each
+// round DOWN individually can have base overshoot target by more than that
+// file's own floor -- the old blind round-robin removal picked the smallest
+// remainder first with no regard for whether that file had any floor cents
+// left to give, driving its cents (and so its by_file.dollars) negative even
+// though it genuinely spent money. Fix: only take a cent from a file that
+// still has one (floor > 0), cycling to the next-smallest remainder
+// otherwise. This always terminates: -leftover = base - target, and target
+// (a real dollar total) is never negative, so -leftover <= base = the sum of
+// every floor -- there is always at least one file left with cents > 0 while
+// any are still owed.
 function apportionCents(rawDollars: number[], targetCents: number): number[] {
   // Round to 1e-6-cent precision first to kill float noise (e.g.
   // 45.000000000001) before flooring, so an exact cent amount floors to itself.
@@ -184,8 +200,25 @@ function apportionCents(rawDollars: number[], targetCents: number): number[] {
   if (leftover > 0) {
     for (let k = 0; k < leftover; k++) cents[byRemainderDesc[k % byRemainderDesc.length]] += 1;
   } else if (leftover < 0) {
-    // Smallest remainder loses a cent first (reverse of the above order).
-    for (let k = 0; k < -leftover; k++) cents[byRemainderDesc[byRemainderDesc.length - 1 - (k % byRemainderDesc.length)]] -= 1;
+    // Smallest remainder loses a cent first (reverse of the above order),
+    // skipping any file already at 0 -- it has nothing left to give.
+    const order = byRemainderDesc.slice().reverse();
+    let need = -leftover;
+    let guard = 0;
+    const maxIterations = order.length * (need + 1) + 1; // generous bound; see proof above
+    for (let idx = 0; need > 0; idx = (idx + 1) % order.length) {
+      if (++guard > maxIterations) {
+        throw new ZError(
+          `apportionCents: could not remove ${-leftover} cent(s) from ${order.length} file(s) without going negative -- ` +
+            `targetCents=${targetCents} is less than 0, which should never happen for a real dollar total.`
+        );
+      }
+      const i = order[idx];
+      if (cents[i] > 0) {
+        cents[i] -= 1;
+        need--;
+      }
+    }
   }
   return cents;
 }

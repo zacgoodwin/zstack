@@ -646,6 +646,41 @@ describe("--by-file attribution (ticket #83)", () => {
     expect(result.by_file!.find((f) => f.file.endsWith("qa-1.jsonl"))!.dollars).toBe(0);
   });
 
+  // Second review bounce (#83 finding 1): a file that mixes several distinct
+  // model rate keys, each rounding DOWN individually, can make the file's own
+  // floor smaller than what blind round-robin cent-removal tried to take from
+  // it -- driving that file's by_file.dollars negative even though every file
+  // here genuinely spent money (never zero, never negative). Exact repro from
+  // the finding: builder-1.jsonl mixes haiku (4999 tokens) + sonnet (1666) +
+  // opus (999) -- each model's own dollars round to $0.00 -- and qa-1.jsonl
+  // has fable (100 tokens, also $0.00). total rounds to $0.00, but builder-1's
+  // raw combined dollars floor to 1 cent while qa-1 floors to 0 -- the old
+  // code took the "extra" cent from qa-1 (already at floor 0) and went to -1.
+  test("apportionment (second review bounce #83 finding 1): a file mixing several model rate keys never gets a negative by_file.dollars", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-byfile-multimodel-"));
+    tmpPaths.push(dir);
+    const lines = [
+      line("req_haiku", "claude-haiku-4-5", 4999, 0),
+      line("req_sonnet", "claude-sonnet-4-5", 1666, 0),
+      line("req_opus", "claude-opus-4-5", 999, 0),
+    ].join("\n");
+    writeFileSync(join(dir, "builder-1.jsonl"), lines + "\n");
+    writeFileSync(join(dir, "qa-1.jsonl"), line("req_fable", "claude-fable-1", 100, 0) + "\n");
+
+    const files = expandGlob("*.jsonl", dir); // sorted: builder-1.jsonl, qa-1.jsonl
+    const result = costOfFiles(files, RATES, { byFile: true });
+    expect(result.total).toBe(0); // every model's global dollars individually round to $0.00
+
+    for (const f of result.by_file!) {
+      expect(f.dollars).toBeGreaterThanOrEqual(0); // the actual bug: this used to be -0.01 for qa-1.jsonl
+    }
+    const sum = result.by_file!.reduce((s, f) => s + f.dollars, 0);
+    expect(Math.round(sum * 100) / 100).toBe(result.total); // AC1 still holds
+
+    const stages = sumByStage(result.by_file!);
+    for (const s of stages) expect(s.dollars).toBeGreaterThanOrEqual(0); // never surfaces negative spend in the report
+  });
+
   // AC2: without --by-file, output is byte-identical to today -- no by_file
   // key anywhere, not even as `undefined` leaking into JSON.
   test("AC2: without --by-file, CostResult has no by_file key at all", () => {
