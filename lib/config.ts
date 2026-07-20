@@ -108,7 +108,7 @@ export interface BoardConfig {
   };
 }
 
-export const DEFAULT_QUOTA: QuotaConfig = { threshold: 200, mode: "sleep" };
+export const DEFAULT_QUOTA: QuotaConfig = { threshold: 100, mode: "sleep" };
 export const DEFAULT_EPIC_STYLE: EpicStyle = "milestones";
 export const DEFAULT_MAX_LANES = 3;
 export const DEFAULT_WATCHDOG_MINUTES = 10;
