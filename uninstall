@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# zstack uninstall: reverse what ./setup created, honoring the SAME ownership
+# rule setup uses -- never remove anything we cannot prove we created.
+#
+#   owned    := a symlink under one of our managed names (self-evidently ours; it
+#               points into the pack), OR a directory carrying the
+#               .zstack-registered sentinel setup drops into every COPIED
+#               registration (the Windows install path).
+#   not-ours := a same-named directory with neither -> left untouched, and named.
+#
+# Removes the "zstack" pack registration (and, defensively, any separately
+# registered z-* skill entry) from each host skills dir that exists. When a
+# host's "zstack" IS the git clone this script runs from (the parent-match case,
+# mirrors setup's), the clone is LEFT in place -- it may be your only copy -- and
+# the exact `rm -rf` command is printed for you to run by hand.
+#
+# Order: other hosts first, the running host (Claude Code) last, so the command
+# deletes its own registration as its final act.
+#
+# --purge additionally removes ~/.zstack (project configs, loop state, locks,
+# reports, loop-counter). Without it, ~/.zstack is left and its path plus the
+# purge command are printed.
+#
+# HOME-scoped throughout ($HOME/.claude, $HOME/.zstack, ...): a test can point
+# HOME at a fixture dir and this script never touches the real ones.
+set -e
+
+SENTINEL=".zstack-registered"   # kept in sync with the same literal in ./setup
+
+PURGE=0
+for arg in "$@"; do
+  case "$arg" in
+    --purge) PURGE=1 ;;
+    -h|--help)
+      echo "Usage: uninstall [--purge]"
+      echo "  Remove the zstack registrations we own from each host skills dir."
+      echo "  --purge   also delete ~/.zstack (project configs, loop state, locks, reports)."
+      exit 0
+      ;;
+    *) echo "uninstall: unknown argument '$arg' (expected --purge)." >&2; exit 2 ;;
+  esac
+done
+
+PACK_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+
+# setup registers the pack as "zstack"; the five skills live inside it. We also
+# sweep the individual z-* names so a hand-made per-skill registration is cleaned
+# too -- each removed only when owned, exactly like the pack entry.
+ENTRIES=(zstack z-setup z-plan z-loop z-status z-uninstall)
+
+removed=0
+left=0
+clone_left=()
+
+# Remove one named entry from a host skills dir if -- and only if -- we own it.
+remove_entry() {
+  local skills_dir="$1" name="$2"
+  local path="$skills_dir/$name"
+
+  # Absent (and not a dangling symlink) -> nothing to do.
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    return 0
+  fi
+
+  # A symlink under our managed name is ours; removing the link never touches its
+  # target (which may be the pack itself). Checked before -d, which follows links.
+  if [ -L "$path" ]; then
+    rm -f "$path"
+    echo "  removed $path (symlink)"
+    removed=$((removed + 1))
+    return 0
+  fi
+
+  if [ -d "$path" ]; then
+    local real
+    real="$(cd "$path" && pwd -P)"
+
+    # (a) The running clone itself (parent-match): never delete -- it may be the
+    #     only copy. Leave it, remember it, print the exact rm -rf at the end.
+    if [ "$real" = "$PACK_DIR" ]; then
+      echo "  left $path -- this is the zstack clone itself (may be your only copy); not deleted."
+      clone_left+=("$path")
+      left=$((left + 1))
+      return 0
+    fi
+
+    # (b) A copy carrying our sentinel is ours.
+    if [ -f "$path/$SENTINEL" ]; then
+      rm -rf "$path"
+      echo "  removed $path (zstack-created copy)"
+      removed=$((removed + 1))
+      return 0
+    fi
+
+    # (c) No proof of ownership -> leave it, name it.
+    echo "  left $path -- not created by zstack (no symlink, no $SENTINEL); left untouched."
+    left=$((left + 1))
+    return 0
+  fi
+
+  # A non-directory, non-symlink file under the name: not something we make.
+  echo "  left $path -- unexpected file (not a zstack registration); left untouched."
+  left=$((left + 1))
+  return 0
+}
+
+# Other hosts first, Claude Code (the running host) last.
+HOST_DIRS=("$HOME/.codex/skills" "$HOME/.factory/skills" "$HOME/.claude/skills")
+HOST_LABELS=("Codex" "Factory" "Claude Code")
+
+for i in "${!HOST_DIRS[@]}"; do
+  skills_dir="${HOST_DIRS[$i]}"
+  [ -d "$skills_dir" ] || continue
+  echo "${HOST_LABELS[$i]} ($skills_dir):"
+  for name in "${ENTRIES[@]}"; do
+    remove_entry "$skills_dir" "$name"
+  done
+done
+
+# ~/.zstack: per-project state. Removed only under --purge.
+ZSTACK_DIR="$HOME/.zstack"
+if [ -d "$ZSTACK_DIR" ]; then
+  if [ "$PURGE" -eq 1 ]; then
+    rm -rf "$ZSTACK_DIR"
+    echo "purged $ZSTACK_DIR (project configs, loop state, locks, reports, loop-counter)."
+    removed=$((removed + 1))
+  else
+    echo "left $ZSTACK_DIR (project configs, loop state, locks, reports, loop-counter)."
+    echo "  to remove it too: rm -rf \"$ZSTACK_DIR\"   (or re-run: \"$PACK_DIR/uninstall\" --purge)"
+    left=$((left + 1))
+  fi
+fi
+
+# Clones we refused to delete: print the exact command the human can run.
+if [ "${#clone_left[@]}" -gt 0 ]; then
+  echo ""
+  echo "Left the zstack clone in place (deleting it may remove your only copy). To remove it too:"
+  for p in "${clone_left[@]}"; do
+    echo "  rm -rf \"$p\""
+  done
+fi
+
+# GitHub-side artifacts (board, milestones, labels) are remote data. This script
+# never reaches the network; the z-uninstall skill reminds you they persist.
+
+if [ "$removed" -eq 0 ] && [ "$left" -eq 0 ]; then
+  echo "Nothing to remove -- no zstack registrations found."
+fi
+
+echo "zstack uninstall complete."
+exit 0

@@ -41,6 +41,12 @@ case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*|Windows_NT) IS_WINDOWS=1 ;;
 esac
 
+# Ownership sentinel: dropped into a COPIED registration so `uninstall` can prove
+# we created it before deleting it. A symlink is self-evidently ours (it points
+# into the pack); a copy is indistinguishable from a user's own same-named dir
+# without this marker. Kept in sync with the same literal in `uninstall`.
+SENTINEL=".zstack-registered"
+
 # Symlink on macOS/Linux. On Windows without Developer Mode, a plain `ln -snf`
 # silently creates a frozen copy that doesn't refresh after `git pull`, so we
 # copy explicitly there instead (same tradeoff gstack's setup makes).
@@ -49,14 +55,20 @@ _link_or_copy() {
   if [ "$IS_WINDOWS" -eq 1 ]; then
     rm -rf "$dst"
     cp -R "$src" "$dst"
+    # Mark the copy as zstack-created (see SENTINEL note above) so `uninstall`
+    # will remove it. Never written into a symlinked registration, and never
+    # into the git clone itself -- register()'s parent-match check returns
+    # before reaching here -- so a clone we don't own is never mistaken for a
+    # removable copy.
+    printf '%s\n' "Created by zstack ./setup. Safe to remove with ./uninstall (or by deleting this directory)." > "$dst/$SENTINEL"
   else
     ln -snf "$src" "$dst"
   fi
 }
 
 # Register PACK_DIR under a host's skills directory as "zstack".
-# The pack ships four skills (z-setup, z-plan, z-loop, z-status); registering the
-# pack dir makes all of them discoverable to the host at once.
+# The pack ships five skills (z-setup, z-plan, z-loop, z-status, z-uninstall);
+# registering the pack dir makes all of them discoverable to the host at once.
 register() {
   local skills_dir="$1" label="$2"
   mkdir -p "$skills_dir"
@@ -100,7 +112,7 @@ if command -v droid >/dev/null 2>&1; then
 fi
 
 if [ "$TEAM_MODE" -eq 1 ]; then
-  echo "Team mode requested: no session hooks to register (the four shipped skills -- z-setup, z-plan, z-loop, z-status -- need none)."
+  echo "Team mode requested: no session hooks to register (the five shipped skills -- z-setup, z-plan, z-loop, z-status, z-uninstall -- need none)."
 fi
 
 echo "zstack setup complete."

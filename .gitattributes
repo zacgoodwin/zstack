@@ -5,6 +5,7 @@
 # Windows checkouts with core.autocrlf=true rewrite it to CRLF, which breaks
 # bash keywords ("fi\r", "then\r" aren't recognized). Same fix as gstack's setup.
 setup   text eol=lf
+uninstall text eol=lf
 bin/z-board text eol=lf
 bin/z-estimate text eol=lf
 bin/z-cost text eol=lf
