@@ -16,7 +16,7 @@ Something that is often overlooked is AI is only as good as the person running i
 
 What zstack aims to do is to put into focus the things humans are good at and let AI do the things it is good at. gstack is great in that way because it asks questions to get the most out of you, the expert in whatever it is you're looking to build. Not to go too deep into Plato's allegory of the cave but AI doesn't exist in the world. You do. In that spirit z-loop errors on the side of caution letting you make all the judgment calls about the "What" and "Why" while it sticks to the "How" of the code. 
 
-# My loop and myself know that what counts to executives is not the rounds we fire. We know it is the ticket count.
+# My loop and myself know that what counts to executives is not the lines we write. We know it is the ticket count.
 
 I am a recovering Product Manager; so having everything live in PRs and commit messages was unsettling to me. Thus the plan is broken into workable tickets and then the loop works those tickets as if I was a PM working with a development team. This helps traceability, searching, and leveraging other tools for planning. It can quantify In the future other ticket systems can be added like JIRA (Everyone loves to hate JIRA but when asked for what's better few can reply with anything).
 
