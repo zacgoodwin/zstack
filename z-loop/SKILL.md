@@ -192,14 +192,35 @@ Perform exactly that action, then record it. Action → side effects:
 |---|---|
 | `claim N` | 1. `"$Z_BOARD" claim <N> "$ME"` **before anything else**. Claim lost → `bun "$PACK/lib/loop.ts" claim-lost "$STATE" <N>` and re-run `next` (next ticket). 2. **Write the lane lock ONLY after the claim succeeds** (C7 — a claim loser never leaves a lock): `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <stage> --session "$SESSION"`. 3. Worktree (skip if it exists — a resume claim at stage qa/reviewer reuses it): `TSLUG=$(bun -e "import {slugifyTitle} from '$PACK/lib/ticket-schema.ts'; console.log(slugifyTitle(process.argv[1]))" "<title>")` then `git worktree add ".worktrees/ticket-<N>" -b "z/ticket-<N>-$TSLUG" "$BASE"`. 4. Apply: write the action JSON to a file, `bun "$PACK/lib/loop.ts" apply "$STATE" action.json`. 5. Spawn the action's stage (table below). |
 | `advance N to S` | **Re-stamp the lane lock** to the new stage: `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <S> --session "$SESSION"`. Apply, then spawn stage S fresh. Before applying, read the lane's CURRENT stage from the state file: an advance to `builder` from `qa` passes the action's `note` as `qaNotes` (+ `investigateFirst`); from `reviewer`, as `reviewNotes`. |
-| `park N Questions` | Comment the note as `## Needs input --` + the question, `"$Z_BOARD" move <N> Questions`, apply, then **remove the lane lock** (`bun "$PACK/lib/locks.ts" lane-remove --slug "$SLUG" <N>`). Tell the human in the comment which status to return the ticket to. Keep the worktree. |
-| `park N Blocked` | Comment the note (what was wrong + recommended next steps), `move <N> Blocked`, apply, remove the lane lock. |
-| `skip N` | Comment the note (the confusion or the dead-worker evidence), `move <N> Skipped`, apply, remove the lane lock. (PROCESS.md global rule.) |
+| `park N Questions` | Comment the note as `## Needs input --` + the question, `"$Z_BOARD" move <N> Questions`, apply, then **remove the lane lock** (`bun "$PACK/lib/locks.ts" lane-remove --slug "$SLUG" <N>`). Tell the human in the comment which status to return the ticket to. Keep the worktree. **Notify** `human-pause` (`{ticket,title,note}`; see the Notify block below). |
+| `park N Blocked` | Comment the note (what was wrong + recommended next steps), `move <N> Blocked`, apply, remove the lane lock. **Notify** `token-burn` (`{ticket,detail:note}`) when the note begins `Dependency deadlock:` (the step-6 deadlock break); otherwise `ticket-parked` (`{ticket,title,status:"Blocked",note}`). |
+| `skip N` | Comment the note (the confusion or the dead-worker evidence), `move <N> Skipped`, apply, remove the lane lock. (PROCESS.md global rule.) **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:note}`) when the note begins `Worker died mid-` (a watchdog dead-worker skip); otherwise `ticket-parked` (`{ticket,title,status:"Skipped",note}`). |
 | `stop-lane N` | A human moved #N to a stop status (Blocked/Questions/Skipped/Done) mid-run; the board already reflects it — do NOT move or comment it. Tear down the lane's background agent, remove the lane lock (`lane-remove`), keep the worktree for inspection, and apply (drops the lane, leaves the human's status). Other lanes are unaffected. |
-| `check-worker N` | Is the lane's background agent still running (harness task list)? Alive → `bun "$PACK/lib/loop.ts" probe "$STATE" <N> alive`. Dead with no final message: **if the lane's stage is `merge`, do NOT probe-dead/skip** — verify PR state first (H9): `gh pr view <branch> --json state,url -q '.state'`. If `MERGED`, the PR landed before the worker died, so record it as merged (`printf 'MERGED: %s\n' "$prUrl" > msg.txt; bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`) → the reducer completes it and counts it in `mergedThisRun` (so a stacked child still retargets and the batch-end branch delete can't close its PR). If NOT merged, record `printf 'BLOCKED: merge worker died with the PR unmerged (%s)\n' "$state" > msg.txt; outcome ...` → parks it Blocked for a human. For any OTHER stage, dead with no final message → `probe "$STATE" <N> dead` (the next `next` returns the skip). |
+| `check-worker N` | Is the lane's background agent still running (harness task list)? Alive → `bun "$PACK/lib/loop.ts" probe "$STATE" <N> alive`. Dead with no final message: **if the lane's stage is `merge`, do NOT probe-dead/skip** — verify PR state first (H9): `gh pr view <branch> --json state,url -q '.state'`. If `MERGED`, the PR landed before the worker died, so record it as merged (`printf 'MERGED: %s\n' "$prUrl" > msg.txt; bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`) → the reducer completes it and counts it in `mergedThisRun` (so a stacked child still retargets and the batch-end branch delete can't close its PR). If NOT merged, record `printf 'BLOCKED: merge worker died with the PR unmerged (%s)\n' "$state" > msg.txt; outcome ...` → parks it Blocked for a human, and **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:"merge worker died with the PR unmerged"}`). For any OTHER stage, dead with no final message → `probe "$STATE" <N> dead` (the next `next` returns the skip). |
 | `complete N` | The completion flow — Step 6 — then apply, then **remove the lane lock**. |
 | `wait` | Block until a background stage agent finishes (the harness notifies you) or one minute passes, then re-run `next` — the watchdog only fires if `next` is called with a fresh clock. When an agent finishes: save its final message to a file and `bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`, then update Actual (below), then re-run `next`. |
 | `drain-complete` | Step 7. |
+
+**Notify (best-effort, one event per moment).** The park/skip/safety rows above
+each `send` exactly ONE Discord event through the single notification edge
+(`lib/notify.ts`) — build the payload JSON and post it:
+
+```bash
+jq -n --argjson t <N> --arg title "<title>" --arg note "<note>" \
+  '{ticket:$t, title:$title, note:$note}' > "$TMP/notify-<N>.json"
+bun "$PACK/lib/notify.ts" send <event> "$TMP/notify-<N>.json" --slug "$SLUG"   # prints sent/skipped
+```
+
+It is a **no-op** when the project has no `notifications` config
+(docs/user-guide/z-loop.md) and it NEVER blocks the drain — a failed post is
+logged and dropped, so the send outcome never changes what you do next; the
+webhook URL is a secret and is never logged. One more moment lives outside the
+table: any `z-board` call that aborts with `GraphQL quota exhausted` (quota mode
+`abort`, `lib/board.ts`) → `send safety-violation`
+`{control:"quota",detail:"<the error text>"}` before the loop exits.
+`safety-violation` and `token-burn` are the shared hooks the sibling
+safety-control tickets (#58/#59/#61/#62) and #63 emit through; this skill ships
+only the transport and those two events.
 
 **Spawning a stage** (all four the same way — the payload reaches the worker via
 the input file, never through your context; ticket #57, Leak 1):
@@ -229,7 +250,9 @@ the input file, never through your context; ticket #57, Leak 1):
    ABSOLUTE path of `input-<N>.json`. `prompt-<N>.txt` stays small (payload-
    independent), so reading it to spawn the Agent is cheap. The constructor is the
    contract; if it exits non-zero the input is wrong, fix the input, never
-   hand-write the prompt.
+   hand-write the prompt. The `reviewer` stage is the one exception that takes two
+   extra flags (`--adversarial-mode`, `--labels`) — see its row below; they decide
+   the super-truth fan-out and NEVER become input keys.
 3. Spawn a FRESH harness Agent (Agent tool), `run_in_background: true`, with
    that prompt and `model` = the ticket's Model field
    (`"$Z_BOARD" field-get <N> Model`; the Model Effort field selected the
@@ -240,7 +263,7 @@ the input file, never through your context; ticket #57, Leak 1):
 |---|---|
 | `builder` | `ticketNumber`, `ticketTitle`, `ticketBody` (fresh `gh issue view` → `"$TMP/body-<N>.md"`, injected `--rawfile`), `worktreePath` (`.worktrees/ticket-<N>`), `branch`, `baseBranch`; on a bounce also `qaNotes`/`investigateFirst` or `reviewNotes` per the advance row above. |
 | `qa` | `ticketNumber`, `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `worktreePath`, `branch`, `qaPass` (the lane's `qaBounces` in the state file + 1), `webTarget` (true when the ticket changes a web-served surface — your judgment; QA then drives gstack /qa). |
-| `reviewer` | **BLINDED — exactly** `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `acceptanceCriteria` (the `### Acceptance Criteria` section to a file: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$TMP/body-<N>.md" > "$TMP/ac-<N>.md"`, injected `--rawfile`), `diff` (`git -C .worktrees/ticket-<N> diff "$BASE"...HEAD > "$TMP/diff-<N>.txt"`, injected `--rawfile` so it never enters your context), `worktreePath` = a THROWAWAY worktree of the head commit (`git worktree add "$TMP/review-<N>" <head-sha>`; remove it after the stage). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. |
+| `reviewer` | **BLINDED — exactly** `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `acceptanceCriteria` (the `### Acceptance Criteria` section to a file: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$TMP/body-<N>.md" > "$TMP/ac-<N>.md"`, injected `--rawfile`), `diff` (`git -C .worktrees/ticket-<N> diff "$BASE"...HEAD > "$TMP/diff-<N>.txt"`, injected `--rawfile` so it never enters your context), `worktreePath` = a THROWAWAY worktree of the head commit (`git worktree add "$TMP/review-<N>" <head-sha>`; remove it after the stage). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. **Adversarial control (#59):** build this stage's prompt with two extra flags — `MODE=$("$Z_BOARD" ... )` the project's `adversarialMode` (read it from `~/.zstack/projects/$SLUG/config.json`; `loadConfig` defaults it to `non-trivial`) and `LABELS=$(gh issue view <N> --json labels -q '[.labels[].name]')` (a JSON array — labels live on the GitHub issue, NOT on the board item, so `board.list` never fetched them; get them here). Then `bun "$PACK/lib/stage-prompts.ts" prompt reviewer "$TMP/input-<N>.json" --adversarial-mode "$MODE" --labels "$LABELS" > "$TMP/prompt-<N>.txt"`. The predicate (`adversarialActive`) reads the diff's own changed-line count from the blinded input — `always`/`non-trivial`-on-a-big-or-labeled diff spawns the skeptic fan-out and emits a `confidence=` token; `off`/small-unlabeled is the single pass. Mode + labels ride as FLAGS; the four-key input JSON is untouched. |
 | `merge` | `ticketNumber`, `prTitle` (the ticket title), `branch`, `baseBranch`, `worktreePath`, `stackedOn` (from the advance action — parents whose branches this PR stacks on; the prompt carries the PROCESS.md step 18 chain rules: parents first, no branch deletion mid-batch, retarget, delete last). |
 
 **Per-stage Actual (every stage, no exceptions):** when a stage agent finishes,
@@ -437,6 +460,21 @@ bun "$PACK/lib/endloop.ts" report "$TMP/report-input.json" \
 ```
 
 That file is the loop's report — nothing else builds one.
+
+Then **Notify** `work-complete` with the SAME `EndLoopReportInput` numbers so the
+message can never disagree with the report — slug `$SLUG`, `loopCount`
+`$LOOP_COUNT`, the per-status counts (`done`/`questions`/`blocked`/`skipped`)
+from the drained state, `totalDollars` = the sum of ticket Actuals, and
+`verdict` = `regression.verdict`:
+
+```bash
+jq -n --arg slug "$SLUG" --argjson lc "$LOOP_COUNT" \
+  --argjson done "$DONE" --argjson q "$QUESTIONS" --argjson b "$BLOCKED" --argjson s "$SKIPPED" \
+  --argjson dollars "$TOTAL" --arg verdict "$VERDICT" \
+  '{slug:$slug, loopCount:$lc, done:$done, questions:$q, blocked:$b, skipped:$s, totalDollars:$dollars, verdict:$verdict}' \
+  > "$TMP/notify-work-complete.json"
+bun "$PACK/lib/notify.ts" send work-complete "$TMP/notify-work-complete.json" --slug "$SLUG"
+```
 
 **6. Persist the loop counter LAST** (H17) — only now that the report is written
 does the loop count actually advance, so a crash anywhere above re-runs this loop

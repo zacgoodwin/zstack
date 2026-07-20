@@ -4,16 +4,19 @@
 // functions of their typed input, so every spawn's context is rebuilt from
 // data), and the completion-note builder (AC7 -- edges + Actual present).
 import { test, expect, describe, afterAll } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import {
+  adversarialActive,
   builderPrompt,
   completionNote,
+  countDiffLines,
   mergePrompt,
   qaPrompt,
   reviewerPrompt,
   shSingleQuote,
+  ADVERSARIAL_TRIGGER_LABELS,
   REVIEWER_INPUT_KEYS,
   ZError,
   type BuilderPromptInput,
@@ -120,6 +123,71 @@ describe("reviewer blindness", () => {
     // parses BLOCKED:), so an unusable worktree parks instead of being Skipped.
     expect(p).toContain("BLOCKED:");
   });
+
+  // AC6: the four-key gate is unchanged by the new THIRD parameter -- it fires
+  // regardless of what `adversarial` is, because it is a scalar arg, never a key.
+  test("the four-key gate holds with the adversarial param present", () => {
+    // A clean input still builds and its key set is untouched by the true branch.
+    expect(typeof reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true)).toBe("string");
+    expect(Object.keys(REVIEWER_INPUT).sort()).toEqual([
+      "acceptanceCriteria",
+      "diff",
+      "ticketBody",
+      "worktreePath",
+    ]);
+    // A smuggled fifth key throws EVEN with the adversarial flag on -- the gate
+    // is not bypassed by the branch.
+    const leaky = { ...REVIEWER_INPUT, prDescription: "x" };
+    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH, true)).toThrow(ZError);
+    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH, false)).toThrow(ZError);
+  });
+});
+
+// -- adversarial activation (AC1-5) -------------------------------------------
+
+describe("adversarial activation", () => {
+  test("off never activates -- even a huge security diff (AC1)", () => {
+    expect(adversarialActive("off", 500, ["security", "payments"])).toBe(false);
+  });
+
+  test("always always activates -- even an empty diff with no labels (AC2)", () => {
+    expect(adversarialActive("always", 0, [])).toBe(true);
+  });
+
+  test("non-trivial: diff >= 10 is the inclusive boundary (AC3)", () => {
+    expect(adversarialActive("non-trivial", 10, [])).toBe(true);
+    expect(adversarialActive("non-trivial", 9, [])).toBe(false);
+  });
+
+  test("non-trivial: each trigger label activates, a non-trigger label does not (AC4)", () => {
+    // The full trigger set: each one activates a below-threshold diff on its own.
+    for (const label of ADVERSARIAL_TRIGGER_LABELS) {
+      expect(adversarialActive("non-trivial", 1, [label])).toBe(true);
+    }
+    expect(adversarialActive("non-trivial", 1, ["docs"])).toBe(false);
+    // a trigger label mixed with noise still fires; noise alone does not.
+    expect(adversarialActive("non-trivial", 1, ["docs", "auth"])).toBe(true);
+    expect(adversarialActive("non-trivial", 1, ["docs", "chore"])).toBe(false);
+  });
+
+  test("countDiffLines excludes +++/---/@@/diff headers (AC5)", () => {
+    const diff = [
+      "diff --git a/x b/x",
+      "index 111..222 100644",
+      "--- a/x",
+      "+++ b/x",
+      "@@ -1,2 +1,3 @@",
+      " context line",
+      "+added one",
+      "+added two",
+      "-removed one",
+    ].join("\n");
+    // Three +/- content lines; the +++/---/@@/diff/index/context lines excluded.
+    expect(countDiffLines(diff)).toBe(3);
+    // CRLF diffs count the same (split tolerates \r\n).
+    expect(countDiffLines(diff.replace(/\n/g, "\r\n"))).toBe(3);
+    expect(countDiffLines("")).toBe(0);
+  });
 });
 
 // -- fresh-context purity (AC4) -----------------------------------------------
@@ -131,12 +199,15 @@ describe("prompt constructor purity", () => {
     const b1 = builderPrompt(BUILDER_INPUT, INPUT_PATH);
     const q1 = qaPrompt(QA_INPUT, INPUT_PATH);
     const r1 = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH);
+    const ra1 = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true); // the adversarial branch is pure too
     const m1 = mergePrompt(MERGE_INPUT, INPUT_PATH);
     builderPrompt({ ...BUILDER_INPUT, ticketNumber: 99, qaNotes: "1) broken" }, INPUT_PATH);
     reviewerPrompt({ ...REVIEWER_INPUT, diff: "other diff" }, INPUT_PATH);
+    reviewerPrompt({ ...REVIEWER_INPUT, diff: "other diff" }, INPUT_PATH, true);
     expect(builderPrompt(BUILDER_INPUT, INPUT_PATH)).toBe(b1);
     expect(qaPrompt(QA_INPUT, INPUT_PATH)).toBe(q1);
     expect(reviewerPrompt(REVIEWER_INPUT, INPUT_PATH)).toBe(r1);
+    expect(reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true)).toBe(ra1);
     expect(mergePrompt(MERGE_INPUT, INPUT_PATH)).toBe(m1);
   });
 });
@@ -154,6 +225,9 @@ describe("pointer prompts are size-invariant to the payload (AC1)", () => {
     { stage: "builder", build: () => builderPrompt({ ...BUILDER_INPUT, ticketBody: HUGE }, INPUT_PATH), payloads: [HUGE] },
     { stage: "qa", build: () => qaPrompt({ ...QA_INPUT, ticketBody: HUGE }, INPUT_PATH), payloads: [HUGE] },
     { stage: "reviewer", build: () => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: HUGE, diff: HUGE, acceptanceCriteria: AC }, INPUT_PATH), payloads: [HUGE, AC] },
+    // The adversarial reviewer branch fans out skeptics but STILL points at the
+    // file for its payload -- it must stay size-invariant too.
+    { stage: "reviewer (adversarial)", build: () => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: HUGE, diff: HUGE, acceptanceCriteria: AC }, INPUT_PATH, true), payloads: [HUGE, AC] },
     { stage: "merge", build: () => mergePrompt(MERGE_INPUT, INPUT_PATH), payloads: [] },
   ];
 
@@ -166,6 +240,52 @@ describe("pointer prompts are size-invariant to the payload (AC1)", () => {
       expect(p).toContain(INPUT_PATH);
     });
   }
+});
+
+// -- adversarial reviewer prompt (AC7) ----------------------------------------
+
+// A fixed, checkout-independent input path used ONLY for the byte-pinned golden
+// file below. Post-#57 the reviewer prompt is a POINTER, so it embeds
+// ${inputPath}; pinning that path to a literal keeps reviewer-single-pass.golden
+// byte-stable across machines (INPUT_PATH is absolute and machine-specific). What
+// the golden pins is the shared reviewer body; the path value is immaterial.
+const GOLDEN_INPUT_PATH = "/loop/tmp/input-42.json";
+
+describe("adversarial reviewer prompt", () => {
+  // The reconciled single-pass (pointer) prompt, pinned byte-for-byte. If the
+  // inactive branch ever drifts, reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH,
+  // false) stops matching this and the test fails -- the non-adversarial path is
+  // a strict no-op superset by contract: active == inactive + exactly the two
+  // adversarial additions (the Super-truth block and the confidence= tokens).
+  const PRE_59_SINGLE_PASS = readFileSync(join(import.meta.dir, "reviewer-single-pass.golden.txt"), "utf8");
+
+  test("active prompt fans out skeptics and emits confidence; inactive prompt is the single pass", () => {
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
+    expect(active).toContain("skeptic");
+    expect(active).toContain("Agent tool");
+    expect(active).toContain("Super-truth pass");
+    // The confidence token rides in BOTH exit markers (#62's signal).
+    expect(active).toContain("REVIEW-APPROVE: confidence=<0-100>");
+    expect(active).toContain("REVIEW-FINDINGS: confidence=<0-100>");
+
+    const inactive = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false);
+    expect(inactive).not.toContain("skeptic");
+    expect(inactive).not.toContain("Super-truth");
+    expect(inactive).not.toContain("confidence=");
+    // default arg: omitting the flag is the single pass.
+    expect(reviewerPrompt(REVIEWER_INPUT, INPUT_PATH)).toBe(inactive);
+  });
+
+  test("inactive prompt is byte-identical to the pinned single-pass constant", () => {
+    expect(reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, false)).toBe(PRE_59_SINGLE_PASS);
+    // And the active prompt is the single pass PLUS exactly the two adversarial
+    // additions -- nothing in the shared body changed.
+    const active = reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, true);
+    const stripped = active
+      .replace(/\n## Super-truth pass[\s\S]*?below\.\n/, "")
+      .replaceAll("confidence=<0-100> ", "");
+    expect(stripped).toBe(PRE_59_SINGLE_PASS);
+  });
 });
 
 // -- builder prompt -----------------------------------------------------------
@@ -307,16 +427,62 @@ describe("stage-prompts CLI", () => {
   const dir = mkdtempSync(join(tmpdir(), "zstack-prompts-test-"));
   afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
+  const SP = join(REPO_ROOT, "lib", "stage-prompts.ts");
+  const run = (...args: string[]) => Bun.spawnSync(["bun", SP, ...args], { stdout: "pipe", stderr: "pipe" });
+
   test("prompt reviewer builds from an input file; a leaky input file fails loudly", () => {
     const ok = join(dir, "reviewer.json");
     writeFileSync(ok, JSON.stringify(REVIEWER_INPUT));
-    const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "stage-prompts.ts"), "prompt", "reviewer", ok], { stdout: "pipe", stderr: "pipe" });
+    const proc = run("prompt", "reviewer", ok);
     expect(proc.exitCode).toBe(0);
     expect(proc.stdout.toString()).toContain("ADVERSARIAL REVIEWER");
 
     const leaky = join(dir, "leaky.json");
     writeFileSync(leaky, JSON.stringify({ ...REVIEWER_INPUT, builderTranscript: "..." }));
-    const bad = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "stage-prompts.ts"), "prompt", "reviewer", leaky], { stdout: "pipe", stderr: "pipe" });
+    const bad = run("prompt", "reviewer", leaky);
+    expect(bad.exitCode).toBe(1);
+    expect(bad.stderr.toString()).toContain("blinded by design");
+  });
+
+  // AC10: the reviewer's --adversarial-mode / --labels flags select the branch
+  // deterministically from mode + the input's own diff size + labels; the leaky
+  // file still fails loudly regardless of flags.
+  test("--adversarial-mode / --labels select the super-truth branch (AC10)", () => {
+    // REVIEWER_INPUT.diff has ONE changed line (< 10), so under the default
+    // non-trivial mode with no labels it is the single pass.
+    const ok = join(dir, "reviewer-cli.json");
+    writeFileSync(ok, JSON.stringify(REVIEWER_INPUT));
+
+    const always = run("prompt", "reviewer", ok, "--adversarial-mode", "always");
+    expect(always.exitCode).toBe(0);
+    expect(always.stdout.toString()).toContain("skeptic");
+    expect(always.stdout.toString()).toContain("confidence=");
+
+    const labelled = run("prompt", "reviewer", ok, "--adversarial-mode", "non-trivial", "--labels", '["security"]');
+    expect(labelled.exitCode).toBe(0);
+    expect(labelled.stdout.toString()).toContain("skeptic");
+    expect(labelled.stdout.toString()).toContain("confidence=");
+
+    // No flags: default non-trivial, 1-line diff, no labels -> single pass.
+    const plain = run("prompt", "reviewer", ok);
+    expect(plain.exitCode).toBe(0);
+    expect(plain.stdout.toString()).not.toContain("skeptic");
+    expect(plain.stdout.toString()).not.toContain("confidence=");
+
+    // off never fans out, even with a trigger label present.
+    const off = run("prompt", "reviewer", ok, "--adversarial-mode", "off", "--labels", '["security"]');
+    expect(off.exitCode).toBe(0);
+    expect(off.stdout.toString()).not.toContain("skeptic");
+
+    // A bad mode is rejected loudly, before any prompt is printed.
+    const badMode = run("prompt", "reviewer", ok, "--adversarial-mode", "sometimes");
+    expect(badMode.exitCode).toBe(1);
+    expect(badMode.stderr.toString()).toContain("adversarial-mode");
+
+    // A leaky file still fails with the blindness error even under active flags.
+    const leaky = join(dir, "leaky-cli.json");
+    writeFileSync(leaky, JSON.stringify({ ...REVIEWER_INPUT, prDescription: "trust me" }));
+    const bad = run("prompt", "reviewer", leaky, "--adversarial-mode", "always");
     expect(bad.exitCode).toBe(1);
     expect(bad.stderr.toString()).toContain("blinded by design");
   });
