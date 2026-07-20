@@ -94,6 +94,11 @@ each defaulted by `loadConfig` when absent:
   (e.g. 3) for a high-churn repo, raise it (e.g. 10) for a docs-only one. Must
   be a positive integer — `/z-loop` refuses to start with a loud error
   otherwise, never a silent fallback.
+- `maxQaPasses` (default 3) — QA passes on a ticket before it parks Blocked
+  instead of bouncing back to the builder (PROCESS.md step 16).
+- `qaInvestigateAfter` (default 2) — the QA-bounce count at/after which the
+  rebuild runs `/investigate` first instead of patching straight from QA's
+  notes (PROCESS.md step 15).
 
 `maxLanes` and `watchdogMinutes` can also be set at setup time with
 `--max-lanes` / `--watchdog-minutes`; the others are hand-edited in

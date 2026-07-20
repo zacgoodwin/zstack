@@ -834,7 +834,7 @@ describe("validateConfig", () => {
 
   // -- issue #14 item 18: every numeric + quota guard branch ------------------
   describe("numeric + quota guards (item 18)", () => {
-    const NUMERIC_KEYS = ["maxLanes", "watchdogMinutes", "lockStalenessMinutes"] as const;
+    const NUMERIC_KEYS = ["maxLanes", "watchdogMinutes", "lockStalenessMinutes", "maxQaPasses", "qaInvestigateAfter"] as const;
 
     test.each(NUMERIC_KEYS.map((k) => [k] as [string]))(
       "%s rejects a string, NaN, zero, and a negative",
@@ -979,5 +979,35 @@ describe("loadConfig deep validation", () => {
   test("AC1: auditEveryNLoops 3 in config.json is honored through loadConfig, not overridden by the default", () => {
     const home = writeRaw("zstack", validRawConfig({ auditEveryNLoops: 3 }));
     expect(loadConfig("zstack", home).auditEveryNLoops).toBe(3);
+  });
+
+  // -- issue #41: maxQaPasses / qaInvestigateAfter end to end through loadConfig,
+  // same positive-number contract as maxLanes (AC4).
+  test("AC4: maxQaPasses 0, negative, or non-numeric fails loadConfig, naming the key (same as maxLanes)", () => {
+    for (const bad of [0, -1, "3"]) {
+      const home = writeRaw("zstack", validRawConfig({ maxQaPasses: bad }));
+      expect(() => loadConfig("zstack", home)).toThrow(/"maxQaPasses" must be a positive number/);
+    }
+  });
+
+  test("AC4: qaInvestigateAfter 0, negative, or non-numeric fails loadConfig, naming the key", () => {
+    for (const bad of [0, -1, "2"]) {
+      const home = writeRaw("zstack", validRawConfig({ qaInvestigateAfter: bad }));
+      expect(() => loadConfig("zstack", home)).toThrow(/"qaInvestigateAfter" must be a positive number/);
+    }
+  });
+
+  test("AC1: maxQaPasses/qaInvestigateAfter absent -> loadConfig defaults them to 3 / 2", () => {
+    const home = writeRaw("zstack", validRawConfig());
+    const cfg = loadConfig("zstack", home);
+    expect(cfg.maxQaPasses).toBe(3);
+    expect(cfg.qaInvestigateAfter).toBe(2);
+  });
+
+  test("explicit maxQaPasses/qaInvestigateAfter in config.json are honored through loadConfig, not overridden by the default", () => {
+    const home = writeRaw("zstack", validRawConfig({ maxQaPasses: 5, qaInvestigateAfter: 1 }));
+    const cfg = loadConfig("zstack", home);
+    expect(cfg.maxQaPasses).toBe(5);
+    expect(cfg.qaInvestigateAfter).toBe(1);
   });
 });
