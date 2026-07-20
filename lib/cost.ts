@@ -77,7 +77,16 @@ export interface CostResult {
   by_model: ModelSpend[];
   requests: number; // unique API calls counted (post-dedup)
   lines_parsed: number; // assistant+usage lines seen (pre-dedup)
+  skippedSynthetic: number; // harness-synthetic ("<synthetic>") lines skipped, not priced
 }
+
+// The harness (z-loop's watchdog) writes a synthetic assistant entry with
+// this exact model string when a session is killed by a usage limit and
+// later resumed -- it is not a real API response and carries nothing
+// billable. Must skip BEFORE the rate lookup below so it never trips the
+// fail-loud unknown-model ZError that every genuinely-unrecognized model
+// string should still raise (resolveRate in lib/estimate.ts).
+const SYNTHETIC_MODEL = "<synthetic>";
 
 function assertUsageShape(usage: any, where: string): RawUsage {
   const missing = REQUIRED_USAGE_KEYS.filter((k) => typeof usage?.[k] !== "number");
@@ -135,6 +144,7 @@ export function costOfFiles(paths: string[], rates: RatesFile): CostResult {
   const perModel = new Map<string, TokenTotals>();
   let linesParsed = 0;
   let requests = 0;
+  let skippedSynthetic = 0;
 
   for (const path of paths) {
     const text = readFileSync(path, "utf8");
@@ -143,6 +153,15 @@ export function costOfFiles(paths: string[], rates: RatesFile): CostResult {
       const parsed = parseLine(lines[i], `${path}:${i + 1}`);
       if (!parsed) continue;
       linesParsed++;
+
+      // Harness-synthetic entries carry nothing billable (see
+      // SYNTHETIC_MODEL) -- skip before dedup/rate lookup, counted rather
+      // than silently dropped, and never reaching resolveRate's fail-loud
+      // unknown-model check below.
+      if (parsed.model === SYNTHETIC_MODEL) {
+        skippedSynthetic++;
+        continue;
+      }
 
       // Duplicate if ANY of the line's ids was seen; register ALL of them
       // either way, so a line linking requestId<->message.id also claims the
@@ -170,7 +189,7 @@ export function costOfFiles(paths: string[], rates: RatesFile): CostResult {
     total += dollars;
   }
 
-  return { total: roundCents(total), by_model, requests, lines_parsed: linesParsed };
+  return { total: roundCents(total), by_model, requests, lines_parsed: linesParsed, skippedSynthetic };
 }
 
 // Native glob (Bun.Glob is already part of the runtime -- no new dependency).
@@ -255,8 +274,9 @@ const USAGE = `z-cost <glob-pattern> [--rates <path>] [--json]
   glob-pattern: Claude Code transcript jsonl files for a ticket's agents,
                 e.g. "$HOME/.claude/projects/*/*.jsonl"
   --json:       emit the CostResult object (total, by_model with tokens and
-                dollars, requests, lines_parsed) so consumers like z-loop's
-                Actual field-set parse JSON, never prose`;
+                dollars, requests, lines_parsed, skippedSynthetic) so
+                consumers like z-loop's Actual field-set parse JSON, never
+                prose`;
 
 export async function main(argv: string[]): Promise<number> {
   if (!argv[0]) {
@@ -289,7 +309,12 @@ export async function main(argv: string[]): Promise<number> {
       console.log(JSON.stringify(result));
       return 0;
     }
-    console.log(`$${result.total.toFixed(2)} total across ${result.requests} request(s), ${files.length} file(s)`);
+    // Skip is always visible when nonzero (never silent) -- omitted at zero
+    // to keep the common case's summary line unchanged.
+    const skipNote = result.skippedSynthetic > 0 ? `, ${result.skippedSynthetic} synthetic skipped` : "";
+    console.log(
+      `$${result.total.toFixed(2)} total across ${result.requests} request(s), ${files.length} file(s)${skipNote}`
+    );
     for (const m of result.by_model) {
       console.log(
         `  ${m.model}: $${m.dollars.toFixed(2)} ` +
