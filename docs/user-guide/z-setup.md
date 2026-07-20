@@ -48,6 +48,38 @@ does not exist yet, you need `/z-setup`.
    never clobbers existing keys). `z-setup-permissions --check` reports which of
    the three layers are present. Undo is a documented hand-edit (see the SKILL).
 
+## Board shape template
+
+The board shape — the nine statuses and four custom fields — is data, not code:
+it lives in the shipped `z-setup/board-template.json` and is loaded and validated
+by `lib/board-template.ts` before any board mutation runs. The default template is
+1:1 with the shape `/z-setup` created when it was hardcoded (same statuses in
+order, same fields and options, same option colors).
+
+The file has three sections:
+
+- **`statuses`** — each with a `name`, a GitHub option `color` (one of GRAY,
+  BLUE, GREEN, YELLOW, ORANGE, RED, PURPLE, PINK), and a `description`. The status
+  set must equal the canonical nine (`lib/config.ts` `BOARD_STATUSES`); the loop's
+  state machine only knows those, so extra or renamed statuses are refused.
+- **`fields`** — each with a `name`, a `dataType` (SINGLE_SELECT / NUMBER / TEXT),
+  and, for single-select, an ordered `options` list. The four fields the loop and
+  z-tools hard-depend on — Model, Model Effort, Estimate, Actual — must be present
+  with their dataTypes; dropping or renaming any of them is refused loudly, naming
+  the field and the tool that breaks.
+- **`views`** — the intended board views (a Status kanban, a milestone cost
+  table). Validated shape-only.
+
+**Override with `--template`.** Pass `--template <file>` to `z-setup-board plan`,
+`apply`, or `verify` to use a variant instead of the packaged default. It goes
+through the same validation, so an override that drops a required field or changes
+the status set fails before touching the board.
+
+**Views are manual.** GitHub's GraphQL API has no view-creation mutation (only a
+read-only `ProjectV2View`), so `plan`/`apply` print the template's views as
+explicit manual setup steps rather than creating them — never silently dropping
+them. Add them by hand on github.com after setup.
+
 ## Config knobs (hand-edit `config.json` after setup)
 
 Beyond the board IDs, `config.json` carries optional per-project tuning knobs,

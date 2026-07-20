@@ -6,6 +6,10 @@ All notable changes to zstack are documented here. Format follows [Keep a Change
 
 Remediation of issue #14 (all 22 items now closed) plus an adversarial hardening pass (OpenAI Codex challenge + independent refute review, every fix mutation-tested).
 
+### Added
+
+- Board shape (nine statuses, four custom fields, intended views) is data now (issue #20): the shipped `z-setup/board-template.json`, loaded and validated by `lib/board-template.ts` before any board mutation. The default is 1:1 with the previously hardcoded shape (same statuses in order, same fields + option colors). `z-setup-board plan|apply|verify --template <file>` ships a variant; the loader refuses a template whose status set is not the canonical nine or that drops/renames a required field (Model, Model Effort, Estimate, Actual), naming the field and the tool that breaks. GitHub's API has no view-creation mutation, so the template's views are printed as explicit manual steps rather than silently dropped.
+
 ### Fixed
 
 - `Board.list()` paginates past 100 items with cursor-loop hardening (empty/repeated cursor and missing `pageInfo` throw loudly); single-page ceilings (fieldValues, projectItems, milestones, labels) guard with loud throws.
