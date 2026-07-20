@@ -102,7 +102,7 @@ export function validateConfig(cfg: unknown): BoardConfig {
   if (c.epicStyle !== undefined && c.epicStyle !== "milestones") {
     throw new ZError(`Config "epicStyle" must be "milestones", got ${JSON.stringify(c.epicStyle)}.`);
   }
-  for (const k of ["maxLanes", "watchdogMinutes", "lockStalenessMinutes"]) {
+  for (const k of ["maxLanes", "watchdogMinutes", "lockStalenessMinutes", "maxQaPasses", "qaInvestigateAfter"]) {
     requirePositiveNumber(k, c[k]);
   }
   // auditEveryNLoops (issue #18): the /cso + /health end-of-loop cadence. One

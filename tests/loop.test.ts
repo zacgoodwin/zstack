@@ -55,6 +55,8 @@ const OPTS = (s: LoopState, nowMs = 0) => ({
   nowMs,
   maxLanes: s.maxLanes,
   watchdogMinutes: s.watchdogMinutes,
+  maxQaPasses: s.maxQaPasses,
+  qaInvestigateAfter: s.qaInvestigateAfter,
   mergedThisRun: s.mergedThisRun,
 });
 
@@ -298,6 +300,68 @@ describe("stage transitions", () => {
     s = applyAction(s, a, 0);
     expect(s.lanes[0].qaBounces).toBe(0); // review bounces do not consume QA passes
     expect(s.tickets[0].status).toBe("Building");
+  });
+});
+
+// -- QA bounce config knobs (issue #41): maxQaPasses / qaInvestigateAfter ----
+
+describe("QA bounce config knobs", () => {
+  test("AC2: maxQaPasses=5 bounces passes 1-4 (investigateFirst true at/after the default qaInvestigateAfter=2), parks Blocked naming limit 5 on pass 5", () => {
+    let s = state([ticket(3, "QA")], [lane(3, "qa")]);
+    s.maxQaPasses = 5;
+    const bounce = (): Action => {
+      s = recordOutcome(s, 3, "QA-BUGS: 1) save button 500s", 0);
+      const a = nextAction(s.tickets, s.lanes, OPTS(s));
+      s = applyAction(s, a, 0);
+      return a;
+    };
+    const backToQa = () => {
+      s = recordOutcome(s, 3, HAPPY.builder, 0);
+      s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+    };
+    for (let pass = 1; pass <= 4; pass++) {
+      const a = bounce();
+      expect(a).toMatchObject({ kind: "advance", to: "builder", investigateFirst: pass >= 2 });
+      expect(s.lanes[0].qaBounces).toBe(pass);
+      backToQa();
+    }
+    const final = bounce();
+    expect(final).toMatchObject({
+      kind: "park",
+      status: "Blocked",
+      note: expect.stringContaining("pass 5 (limit 5)"),
+    });
+    expect(s.tickets[0].status).toBe("Blocked");
+    expect(s.lanes).toEqual([]);
+  });
+
+  test("AC3: qaInvestigateAfter=1 makes the FIRST QA bounce carry investigateFirst: true", () => {
+    let s = state([ticket(4, "QA")], [lane(4, "qa")]);
+    s.qaInvestigateAfter = 1;
+    s = recordOutcome(s, 4, "QA-BUGS: 1) flaky spinner", 0);
+    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(a).toMatchObject({ kind: "advance", to: "builder", investigateFirst: true });
+  });
+
+  test("AC1: no knobs set reproduces today's ladder exactly (default 3 / 2, byte-identical to the unconfigured test above)", () => {
+    let s = state([ticket(9, "QA")], [lane(9, "qa")]);
+    expect(s.maxQaPasses).toBeUndefined();
+    expect(s.qaInvestigateAfter).toBeUndefined();
+    const bounce = (): Action => {
+      s = recordOutcome(s, 9, "QA-BUGS: x", 0);
+      const a = nextAction(s.tickets, s.lanes, OPTS(s));
+      s = applyAction(s, a, 0);
+      return a;
+    };
+    const backToQa = () => {
+      s = recordOutcome(s, 9, HAPPY.builder, 0);
+      s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+    };
+    expect(bounce()).toMatchObject({ kind: "advance", to: "builder", investigateFirst: false });
+    backToQa();
+    expect(bounce()).toMatchObject({ kind: "advance", to: "builder", investigateFirst: true });
+    backToQa();
+    expect(bounce()).toMatchObject({ kind: "park", status: "Blocked", note: expect.stringContaining("pass 3 (limit 3)") });
   });
 });
 
@@ -590,6 +654,34 @@ describe("ingestBoardItems", () => {
 
   test("an unknown board status fails loudly", () => {
     expect(() => ingestBoardItems(null, [{ number: 1, title: "x", fields: { Status: "Doing" } }], {})).toThrow(ZError);
+  });
+
+  // -- issue #41: maxQaPasses / qaInvestigateAfter thread through ingest, same
+  //    fallback chain (cfg -> preserved-from-prev -> DEFAULT_*) as maxLanes.
+  test("maxQaPasses/qaInvestigateAfter: first ingest defaults to 3/2, a re-ingest with no cfg preserves the prior values, and an explicit cfg overrides them", () => {
+    const items = [{ number: 6, title: "B", fields: { Status: "Building" } }];
+    const bodies = { "6": "no deps" };
+
+    // AC1: a genuinely first ingest (no prev, no cfg) carries the defaults.
+    const first = ingestBoardItems(null, items, bodies);
+    expect(first.maxQaPasses).toBe(3);
+    expect(first.qaInvestigateAfter).toBe(2);
+
+    // A project that set custom knobs at first ingest...
+    const custom = ingestBoardItems(null, items, bodies, { maxQaPasses: 5, qaInvestigateAfter: 1 });
+    expect(custom.maxQaPasses).toBe(5);
+    expect(custom.qaInvestigateAfter).toBe(1);
+
+    // ...keeps them on a re-ingest that passes no cfg (SKILL Step 4 never
+    // re-passes --max-qa-passes/--qa-investigate-after, only Step 3 does).
+    const reingested = ingestBoardItems(custom, items, bodies);
+    expect(reingested.maxQaPasses).toBe(5);
+    expect(reingested.qaInvestigateAfter).toBe(1);
+
+    // An explicit cfg on a later ingest still wins over the preserved value.
+    const overridden = ingestBoardItems(custom, items, bodies, { maxQaPasses: 7, qaInvestigateAfter: 4 });
+    expect(overridden.maxQaPasses).toBe(7);
+    expect(overridden.qaInvestigateAfter).toBe(4);
   });
 });
 

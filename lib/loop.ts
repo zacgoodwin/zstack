@@ -11,6 +11,8 @@ import { atomicWrite, handleCliError, readJson } from "./cli.ts";
 import {
   BOARD_STATUSES,
   DEFAULT_MAX_LANES,
+  DEFAULT_MAX_QA_PASSES,
+  DEFAULT_QA_INVESTIGATE_AFTER,
   DEFAULT_WATCHDOG_MINUTES,
   ZError,
   type BoardStatus,
@@ -97,6 +99,13 @@ export interface LoopState {
   lanes: LaneState[];
   maxLanes: number;
   watchdogMinutes: number;
+  // QA bounce knobs (issue #41). Optional on the type so hand-built fixtures
+  // that predate this ticket keep compiling; ingestBoardItems always fills a
+  // concrete value (cfg -> preserved-from-prev -> DEFAULT_*, same fallback
+  // chain as maxLanes/watchdogMinutes) so a real ingested state always carries
+  // both.
+  maxQaPasses?: number;
+  qaInvestigateAfter?: number;
   // Tickets whose PRs landed during THIS run. Their branches still exist
   // (stacked-chain rule: branches are deleted only after the whole batch), so a
   // dependent's merge stage must know to retarget onto the base branch.
@@ -181,12 +190,23 @@ export type Action =
   | { kind: "drain-complete" };
 
 // Maximum QA passes before the ticket parks in Blocked (PROCESS.md step 16).
-export const MAX_QA_PASSES = 3;
+// Kept exported as the default's named constant (issue #41): the cap is now a
+// per-project config knob (BoardConfig.maxQaPasses / DEFAULT_MAX_QA_PASSES),
+// but existing importers of MAX_QA_PASSES keep working, reading the default.
+export const MAX_QA_PASSES = DEFAULT_MAX_QA_PASSES;
+
+// The two config-driven QA bounce knobs resolveOutcome needs. Threaded in by
+// nextAction (already defaulted there) rather than read off a global, so the
+// reducer stays a pure function of its inputs.
+interface QaBounceLimits {
+  maxQaPasses: number;
+  qaInvestigateAfter: number;
+}
 
 // What one lane's finished stage means for that lane. review-approve returns
 // null: merging is a cross-lane decision (dependency order, one merge at a
 // time) resolved by nextAction's merge gate below, not per-lane.
-function resolveOutcome(lane: LaneState): Action | null {
+function resolveOutcome(lane: LaneState, qaLimits: QaBounceLimits): Action | null {
   const o = lane.outcome!;
   const ticket = lane.ticket;
   switch (o.kind) {
@@ -201,11 +221,13 @@ function resolveOutcome(lane: LaneState): Action | null {
       return { kind: "park", ticket, status: "Blocked", note: o.note };
     case "qa-bugs": {
       const pass = lane.qaBounces + 1; // the QA pass that just found these bugs
-      if (pass >= MAX_QA_PASSES) {
-        return { kind: "park", ticket, status: "Blocked", note: `Bugs on QA pass ${pass} (limit ${MAX_QA_PASSES}); stopping per PROCESS.md step 16.\n\n${o.note}` };
+      if (pass >= qaLimits.maxQaPasses) {
+        return { kind: "park", ticket, status: "Blocked", note: `Bugs on QA pass ${pass} (limit ${qaLimits.maxQaPasses}); stopping per PROCESS.md step 16.\n\n${o.note}` };
       }
-      // Pass 2 bugs -> the rebuild starts with /investigate (PROCESS.md step 15).
-      return { kind: "advance", ticket, to: "builder", note: o.note, investigateFirst: pass === 2 };
+      // A bounce at/past qaInvestigateAfter starts the rebuild with /investigate
+      // (PROCESS.md step 15) -- generalizes the old `pass === 2` so raising the
+      // cap still investigates every bounce past the configured threshold.
+      return { kind: "advance", ticket, to: "builder", note: o.note, investigateFirst: pass >= qaLimits.qaInvestigateAfter };
     }
     case "qa-pass":
       return { kind: "advance", ticket, to: "reviewer" };
@@ -222,6 +244,8 @@ export interface LoopOpts {
   nowMs: number;
   maxLanes?: number;
   watchdogMinutes?: number;
+  maxQaPasses?: number;
+  qaInvestigateAfter?: number;
   mergedThisRun?: number[];
 }
 
@@ -242,6 +266,10 @@ export interface LoopOpts {
 export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: LoopOpts): Action {
   const maxLanes = opts.maxLanes ?? DEFAULT_MAX_LANES;
   const wd = opts.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES;
+  const qaLimits: QaBounceLimits = {
+    maxQaPasses: opts.maxQaPasses ?? DEFAULT_MAX_QA_PASSES,
+    qaInvestigateAfter: opts.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER,
+  };
   const byNumber = new Map(tickets.map((t) => [t.number, t]));
 
   // 1. Wave reconciliation + finished stages, in lane order. A human who moved a
@@ -262,7 +290,7 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
       };
     }
     if (lane.outcome.kind === "review-approve") continue;
-    const action = resolveOutcome(lane);
+    const action = resolveOutcome(lane, qaLimits);
     if (action) return action;
   }
 
@@ -476,7 +504,7 @@ export function ingestBoardItems(
   prev: LoopState | null,
   items: BoardItemLike[],
   bodies: Record<string, string>,
-  cfg?: { maxLanes?: number; watchdogMinutes?: number }
+  cfg?: { maxLanes?: number; watchdogMinutes?: number; maxQaPasses?: number; qaInvestigateAfter?: number }
 ): LoopState {
   const prevByNumber = new Map((prev?.tickets ?? []).map((t) => [t.number, t]));
   const tickets = items.map((it) => {
@@ -510,6 +538,8 @@ export function ingestBoardItems(
     lanes: structuredClone(lanes),
     maxLanes: cfg?.maxLanes ?? prev?.maxLanes ?? DEFAULT_MAX_LANES,
     watchdogMinutes: cfg?.watchdogMinutes ?? prev?.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES,
+    maxQaPasses: cfg?.maxQaPasses ?? prev?.maxQaPasses ?? DEFAULT_MAX_QA_PASSES,
+    qaInvestigateAfter: cfg?.qaInvestigateAfter ?? prev?.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER,
     mergedThisRun: [...(prev?.mergedThisRun ?? [])],
   };
 }
@@ -524,6 +554,7 @@ const USAGE = `loop <command> [args]
   probe <state.json> <ticket> <alive|dead> [--now <ms>] record an aliveness probe
   claim-lost <state.json> <ticket>                   mark a ticket claimed by another session
   ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M]
+                      [--max-qa-passes N] [--qa-investigate-after N]
                                                      build/refresh the snapshot (creates state.json)
 
   --now defaults to the wall clock; tests pass it explicitly.`;
@@ -588,6 +619,8 @@ export function main(argv: string[]): number {
         nowMs,
         maxLanes: state.maxLanes,
         watchdogMinutes: state.watchdogMinutes,
+        maxQaPasses: state.maxQaPasses,
+        qaInvestigateAfter: state.qaInvestigateAfter,
         mergedThisRun: state.mergedThisRun,
       });
       console.log(JSON.stringify(action));
@@ -631,15 +664,19 @@ export function main(argv: string[]): number {
       return 0;
     }
     if (cmd === "ingest") {
-      if (!argv[2] || !argv[3]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M]");
+      if (!argv[2] || !argv[3]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N]");
       const prev = readPrevState(statePath);
       const items = readJson(argv[2]) as BoardItemLike[];
       const bodies = readJson(argv[3]) as Record<string, string>;
       const maxLanes = flagValue(argv, "--max-lanes");
       const watchdogMinutes = flagValue(argv, "--watchdog-minutes");
+      const maxQaPasses = flagValue(argv, "--max-qa-passes");
+      const qaInvestigateAfter = flagValue(argv, "--qa-investigate-after");
       const state = ingestBoardItems(prev, items, bodies, {
         maxLanes: maxLanes === undefined ? undefined : Number(maxLanes),
         watchdogMinutes: watchdogMinutes === undefined ? undefined : Number(watchdogMinutes),
+        maxQaPasses: maxQaPasses === undefined ? undefined : Number(maxQaPasses),
+        qaInvestigateAfter: qaInvestigateAfter === undefined ? undefined : Number(qaInvestigateAfter),
       });
       atomicWrite(statePath, JSON.stringify(state, null, 2));
       console.log(`${state.tickets.length} ticket(s), ${state.lanes.length} lane(s)`);

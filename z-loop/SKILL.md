@@ -73,11 +73,11 @@ mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports" 
 2. **gh authenticated** with the project scope (`gh auth status` clean).
 3. **bun present:** `command -v bun`.
 4. Read the loop knobs from config (defaults 3 lanes / 10 minutes / audits
-   every 5th loop):
+   every 5th loop / 3 QA passes before Blocked / investigate from QA bounce 2):
 
 ```bash
-read -r MAX_LANES WATCHDOG AUDIT_EVERY_N <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
-  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops)")"
+read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
+  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter)")"
 ```
 
 5. **Startup orphan scan (C7).** A crashed prior loop leaves lane locks in
@@ -156,7 +156,8 @@ bun -e "import {readFileSync, readdirSync, writeFileSync} from 'node:fs';
     const m = f.match(/^body-(\d+)\.md\$/); if (m) b[m[1]] = readFileSync('$TMP/' + f, 'utf8'); }
   writeFileSync('$TMP/bodies.json', JSON.stringify(b));"
 bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" \
-  --max-lanes "$MAX_LANES" --watchdog-minutes "$WATCHDOG"
+  --max-lanes "$MAX_LANES" --watchdog-minutes "$WATCHDOG" \
+  --max-qa-passes "$MAX_QA_PASSES" --qa-investigate-after "$QA_INVESTIGATE_AFTER"
 ```
 
 `ingest` preserves lanes and lost-claim flags across re-ingests, so re-running
