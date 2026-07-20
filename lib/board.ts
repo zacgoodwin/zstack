@@ -7,7 +7,7 @@
 // (GraphQLExecutor) so gate tests run against recorded fixtures with zero
 // network; production wires ghExecutor().
 import { readFileSync } from "node:fs";
-import { handleCliError, parseFlags, requireFlag, str } from "./cli.ts";
+import { atomicWrite, handleCliError, parseFlags, requireFlag, str } from "./cli.ts";
 import {
   BoardConfig,
   DEFAULT_QUOTA,
@@ -44,7 +44,7 @@ const Q_PROJECT_ITEMS = `query ProjectItems($project: ID!, $cursor: String) {
       items(first: 100, after: $cursor) {
         pageInfo { hasNextPage endCursor }
         nodes {
-          content { ... on Issue { number title url } }
+          content { ... on Issue { number title url body } }
           fieldValues(first: 20) {
             pageInfo { hasNextPage }
             nodes {
@@ -239,13 +239,16 @@ export class Board {
     return data.rateLimit as QuotaStatus;
   }
 
-  // status omitted = every item on the board (F0): the one-call atomic
-  // snapshot contract z-status consumes via `z-board list --json`.
-  async list(status?: string): Promise<BoardItem[]> {
-    if (status !== undefined) this.assertStatus(status);
+  // The cursor-paginated ProjectItems node list behind BOTH list() and
+  // snapshot(), with the F3 malformed-response guards. Returns the raw item
+  // nodes so each caller reads the fields it needs: list() -> BoardItem via
+  // toItem; snapshot() -> BoardItem + the issue body that rides on the same
+  // query (content.body). Single source of the pagination + guards so the two
+  // callers can never drift.
+  private async listNodes(): Promise<any[]> {
     // Cursor pagination (issue #14 item 1): the board WILL exceed 100 items
-    // (auto-archive is forced off and Done issues stay open), and list()
-    // filters client-side, so truncation here silently drops tickets.
+    // (auto-archive is forced off and Done issues stay open), so truncation
+    // here silently drops tickets.
     const nodes: any[] = [];
     let cursor: string | undefined;
     do {
@@ -281,12 +284,43 @@ export class Board {
         cursor = undefined;
       }
     } while (cursor !== undefined);
+    return nodes;
+  }
+
+  // status omitted = every item on the board (F0): the one-call atomic
+  // snapshot contract z-status consumes via `z-board list --json`.
+  async list(status?: string): Promise<BoardItem[]> {
+    if (status !== undefined) this.assertStatus(status);
+    const nodes = await this.listNodes();
     return nodes
       .map((n) => toItem(n))
       .filter(
         (it): it is BoardItem =>
           it !== null && (status === undefined || it.fields["Status"] === status)
       );
+  }
+
+  // One-call board snapshot for the /z-loop drain (ticket #57, Leak 2): every
+  // item across all nine statuses PLUS each ticket's issue body, from a SINGLE
+  // paginated ProjectItems pass (body rides on content.body, so this is one
+  // query, not an N+1 per-issue lookup). This keeps lib/board.ts the sole `gh`
+  // caller: bin/z-loop-tick reads bodies through here instead of shelling
+  // `gh issue view`, so the caller gate (tests/board.test.ts) stays satisfied.
+  // The bodies map is keyed by issue number (as a string), the exact shape
+  // loop.ts `ingest` consumes for dependency parsing.
+  async snapshot(): Promise<{ items: BoardItem[]; bodies: Record<string, string> }> {
+    const nodes = await this.listNodes();
+    const items: BoardItem[] = [];
+    const bodies: Record<string, string> = {};
+    for (const n of nodes) {
+      const it = toItem(n);
+      if (!it) continue;
+      items.push(it);
+      // A null/absent body (rare, but GitHub can return null) serializes as ""
+      // so ingest's parseDependsOn never sees undefined.
+      bodies[String(it.number)] = n.content?.body ?? "";
+    }
+    return { items, bodies };
   }
 
   async move(n: number, status: string): Promise<void> {
@@ -724,6 +758,7 @@ export function ghExecutor(spawn: GhSpawn = defaultGhSpawn): GraphQLExecutor {
 const USAGE = `z-board <command> [args]
 
   list [--status <S>] [--json]      board items with fields (all statuses unless --status)
+  snapshot --out-items <F> --out-bodies <F>   all-status items + each ticket's body, one pass (z-loop drain)
   move <N> <S>                      set an issue's Status
   comment <N> --body-file <F>       add a comment
   field-get <N> <Field>             read a custom field (${FIELD_HINT()})
@@ -742,6 +777,7 @@ function FIELD_HINT(): string {
 
 const COMMANDS = new Set([
   "list",
+  "snapshot",
   "move",
   "comment",
   "field-get",
@@ -800,6 +836,19 @@ export async function main(argv: string[]): Promise<number> {
             console.log(`#${it.number}  ${it.title}${extra ? "  [" + extra + "]" : ""}`);
           }
         }
+        return 0;
+      }
+      case "snapshot": {
+        // One-call drain snapshot (ticket #57): items + bodies to two files, so
+        // bin/z-loop-tick never shells to gh and the caller gate holds. Written
+        // atomically (tmp+rename) so a crash mid-write can't leave loop.ts
+        // ingest a truncated items/bodies file.
+        const outItems = requireFlag(flags, "out-items");
+        const outBodies = requireFlag(flags, "out-bodies");
+        const snap = await board.snapshot();
+        atomicWrite(outItems, JSON.stringify(snap.items, null, 2));
+        atomicWrite(outBodies, JSON.stringify(snap.bodies));
+        console.log(`${snap.items.length} item(s), ${Object.keys(snap.bodies).length} body/ies`);
         return 0;
       }
       case "move": {

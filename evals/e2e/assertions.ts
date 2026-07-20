@@ -213,8 +213,11 @@ export function assertReviewerBlindness(runDir: string, ticketNumbers: number[])
       return fail("reviewer-blindness", `no reviewer input for #${n} at ${path} (${(e as Error).message})`);
     }
     try {
-      // Throws if the key set is not exactly the four blinded keys.
-      reviewerPrompt(input as Parameters<typeof reviewerPrompt>[0]);
+      // Throws if the key set is not exactly the four blinded keys. The second
+      // arg (inputPath) is irrelevant to the blindness gate -- assertReviewerInput
+      // runs first and only inspects the input object's keys -- so pass the
+      // recorded input's own path.
+      reviewerPrompt(input as Parameters<typeof reviewerPrompt>[0], path);
       checked.push(n);
     } catch (e) {
       return fail("reviewer-blindness", `reviewer input for #${n} is not blinded: ${(e as Error).message}`);
