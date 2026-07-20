@@ -75,11 +75,11 @@ mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports" 
 4. Read the loop knobs from config (defaults 3 lanes / 10 minutes / audits
    every 5th loop / 3 QA passes before Blocked / investigate from QA bounce 2 /
    human-needed at 30% parked / reviewer-confidence floor 70, block a
-   sub-floor approve):
+   sub-floor approve / 2 reviewer->builder bounces before Blocked):
 
 ```bash
-read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMAN_NEEDED_PERCENT MIN_REVIEWER_CONFIDENCE REVIEWER_BELOW_ACTION <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
-  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.humanNeededPercent, c.minReviewerConfidence, c.reviewerBelowThresholdAction)")"
+read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMAN_NEEDED_PERCENT MIN_REVIEWER_CONFIDENCE REVIEWER_BELOW_ACTION MAX_REVIEW_BOUNCES <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
+  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.humanNeededPercent, c.minReviewerConfidence, c.reviewerBelowThresholdAction, c.maxReviewBounces)")"
 ```
 
 5. **Startup orphan scan (C7).** A crashed prior loop leaves lane locks in
@@ -174,7 +174,8 @@ bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" \
   --max-lanes "$MAX_LANES" --watchdog-minutes "$WATCHDOG" \
   --max-qa-passes "$MAX_QA_PASSES" --qa-investigate-after "$QA_INVESTIGATE_AFTER" \
   --human-needed-percent "$HUMAN_NEEDED_PERCENT" \
-  --min-reviewer-confidence "$MIN_REVIEWER_CONFIDENCE" --reviewer-below-threshold-action "$REVIEWER_BELOW_ACTION"
+  --min-reviewer-confidence "$MIN_REVIEWER_CONFIDENCE" --reviewer-below-threshold-action "$REVIEWER_BELOW_ACTION" \
+  --max-review-bounces "$MAX_REVIEW_BOUNCES"
 ```
 
 This is the ONE ingest call that captures `initialReadyCount` for the batch --
