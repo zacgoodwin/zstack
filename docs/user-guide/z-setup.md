@@ -99,6 +99,12 @@ each defaulted by `loadConfig` when absent:
 - `qaInvestigateAfter` (default 2) — the QA-bounce count at/after which the
   rebuild runs `/investigate` first instead of patching straight from QA's
   notes (PROCESS.md step 15).
+- `humanNeededPercent` (default 30, 0 disables) — the mid-run breakdown
+  notification's trip threshold: when `(Blocked + Skipped + Questions) /
+  initialReadyCount * 100` exceeds this percent, the batch is judged to be
+  going sideways and a human is paged once, through the same notify transport
+  as the other loop events (issue #63/#60). See
+  [z-loop.md → Human-needed safety control](z-loop.md#human-needed-safety-control).
 - `quota.threshold` (default 100) — the GitHub GraphQL rate-limit guard trips
   when remaining points fall below this before any board call.
 - `quota.mode` (default `"sleep"`) — `"sleep"` waits until the rate-limit window

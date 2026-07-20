@@ -73,11 +73,12 @@ mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports" 
 2. **gh authenticated** with the project scope (`gh auth status` clean).
 3. **bun present:** `command -v bun`.
 4. Read the loop knobs from config (defaults 3 lanes / 10 minutes / audits
-   every 5th loop / 3 QA passes before Blocked / investigate from QA bounce 2):
+   every 5th loop / 3 QA passes before Blocked / investigate from QA bounce 2 /
+   human-needed at 30% parked):
 
 ```bash
-read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
-  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter)")"
+read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMAN_NEEDED_PERCENT <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
+  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.humanNeededPercent)")"
 ```
 
 5. **Startup orphan scan (C7).** A crashed prior loop leaves lane locks in
@@ -157,8 +158,13 @@ bun -e "import {readFileSync, readdirSync, writeFileSync} from 'node:fs';
   writeFileSync('$TMP/bodies.json', JSON.stringify(b));"
 bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" \
   --max-lanes "$MAX_LANES" --watchdog-minutes "$WATCHDOG" \
-  --max-qa-passes "$MAX_QA_PASSES" --qa-investigate-after "$QA_INVESTIGATE_AFTER"
+  --max-qa-passes "$MAX_QA_PASSES" --qa-investigate-after "$QA_INVESTIGATE_AFTER" \
+  --human-needed-percent "$HUMAN_NEEDED_PERCENT"
 ```
+
+This is the ONE ingest call that captures `initialReadyCount` for the batch --
+Step 2 has already moved every workable Ready ticket to Building, so this is
+ingest-time-zero for the safety control below.
 
 `ingest` preserves lanes and lost-claim flags across re-ingests, so re-running
 it after board writes is always safe.
@@ -185,6 +191,18 @@ sole sanctioned gh caller), and its `ingest` preserves lanes + lost-claim flags
 (and drops a lane whose ticket left the board mid-run, H14). Run it before EVERY
 `next` — especially before any advance/park/complete, so no stage transition acts
 on a board the human has since changed.
+
+**Human-needed safety control (issue #63).** `z-loop-tick` also recomputes the
+parked-tickets breakdown every iteration and fires a ONE-TIME mid-run Discord
+notification (`human-needed` event) the moment `(Blocked + Skipped +
+Questions) / initialReadyCount * 100` first crosses `humanNeededPercent`
+(default 30, 0 disables) — the same per-call cadence as everything else in
+this step, so the check never re-enters your context as a second bash block.
+It marks the fire-once flag only after the send actually succeeds, so an
+unconfigured project or a down webhook never wedges it — the notification
+still fires once delivery is possible. See
+[z-loop.md → Human-needed safety control](../docs/user-guide/z-loop.md#human-needed-safety-control)
+for the full contract; nothing in this step re-derives it in prose.
 
 Perform exactly that action, then record it. Action → side effects:
 

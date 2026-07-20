@@ -22,7 +22,7 @@ import { loadConfig, ZError, type BoardConfig } from "./config.ts";
 export { ZError } from "./config.ts";
 
 // Per-event payload map: renderNotification is type-checked per event, and each
-// key is 1:1 with one of the ticket's five orchestrator triggers.
+// key is 1:1 with one of the orchestrator's trigger moments.
 export interface PayloadByEvent {
   "work-complete": {
     slug: string;
@@ -43,6 +43,21 @@ export interface PayloadByEvent {
   };
   "safety-violation": { control: string; ticket?: number; detail: string };
   "token-burn": { detail: string; ticket?: number };
+  // The mid-run breakdown safety control (issue #63): the exact
+  // lib/loop.ts HumanNeededStatus shape, sent verbatim as the payload file --
+  // duplicated here (not imported from loop.ts) for the same reason every
+  // other payload below is its own literal shape: notify.ts never depends on
+  // loop.ts at runtime.
+  "human-needed": {
+    tripped: boolean;
+    alreadyNotified: boolean;
+    blocked: number;
+    skipped: number;
+    questions: number;
+    initialReadyCount: number;
+    percent: number;
+    tickets: { blocked: number[]; skipped: number[]; questions: number[] };
+  };
 }
 export type EventKey = keyof PayloadByEvent;
 
@@ -55,6 +70,11 @@ const DISCORD_LIMIT = 2000;
 // here) and type-checks each renderer's payload against its own event. No
 // Date.now, no config read, no URL argument, so the message is reproducible and
 // the webhook can never appear in it.
+
+// Formats a ticket-number list for the human-needed template: "none" when
+// empty, "#N, #M" otherwise. Local to that one renderer.
+const fmtTickets = (nums: number[]): string => (nums.length ? nums.map((n) => `#${n}`).join(", ") : "none");
+
 const RENDERERS: { [K in EventKey]: (p: PayloadByEvent[K]) => string } = {
   "work-complete": (p) =>
     `zstack ${p.slug}: loop ${p.loopCount} complete. ` +
@@ -65,6 +85,9 @@ const RENDERERS: { [K in EventKey]: (p: PayloadByEvent[K]) => string } = {
   "safety-violation": (p) =>
     `zstack: safety control "${p.control}" tripped${p.ticket ? ` on #${p.ticket}` : ""}. ${p.detail}`,
   "token-burn": (p) => `zstack: token-burn guard${p.ticket ? ` on #${p.ticket}` : ""}. ${p.detail}`,
+  "human-needed": (p) =>
+    `zstack: human-needed threshold crossed. ${p.blocked + p.skipped + p.questions}/${p.initialReadyCount} parked (> ${p.percent}%). ` +
+    `Blocked ${fmtTickets(p.tickets.blocked)}. Skipped ${fmtTickets(p.tickets.skipped)}. Questions ${fmtTickets(p.tickets.questions)}.`,
 };
 
 // Every valid event, derived from the renderer map so there is one source of

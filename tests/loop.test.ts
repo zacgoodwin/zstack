@@ -13,8 +13,11 @@ import {
   applyAction,
   canTransition,
   drainComplete,
+  humanNeededStatus,
+  humanNeededTripped,
   ingestBoardItems,
   markClaimLost,
+  markHumanNeededNotified,
   nextAction,
   parseStageResult,
   recordOutcome,
@@ -443,6 +446,74 @@ describe("drain-complete", () => {
   });
 });
 
+// -- human-needed safety control (issue #63) ----------------------------------
+
+describe("humanNeededTripped", () => {
+  test("AC1: below threshold does not trip (1/10 = 10%)", () => {
+    expect(humanNeededTripped(1, 0, 0, 10, 30)).toBe(false);
+  });
+
+  test("AC2: exactly at threshold does not trip (strict >, 3/10 = 30%)", () => {
+    expect(humanNeededTripped(3, 0, 0, 10, 30)).toBe(false);
+  });
+
+  test("AC3: above threshold trips (4/10 = 40%)", () => {
+    expect(humanNeededTripped(4, 0, 0, 10, 30)).toBe(true);
+  });
+
+  test("AC4: percent 0 disables regardless of counts (100% parked)", () => {
+    expect(humanNeededTripped(10, 10, 10, 10, 0)).toBe(false);
+  });
+
+  test("AC5: initialReady 0 never trips (division-by-zero guarded)", () => {
+    expect(humanNeededTripped(5, 5, 5, 0, 30)).toBe(false);
+  });
+});
+
+describe("humanNeededStatus / markHumanNeededNotified", () => {
+  test("AC6: reports tripped + alreadyNotified + which tickets", () => {
+    const s = state(
+      [
+        ticket(1, "Blocked"),
+        ticket(2, "Blocked"),
+        ticket(3, "Skipped"),
+        ticket(4, "Questions"),
+        ...([5, 6, 7, 8, 9, 10].map((n) => ticket(n, "Building"))),
+      ],
+      []
+    );
+    s.initialReadyCount = 10;
+    s.humanNeededPercent = 30;
+    const status = humanNeededStatus(s);
+    expect(status.tripped).toBe(true); // 4/10 = 40% > 30%
+    expect(status.alreadyNotified).toBe(false);
+    expect(status.blocked).toBe(2);
+    expect(status.skipped).toBe(1);
+    expect(status.questions).toBe(1);
+    expect(status.initialReadyCount).toBe(10);
+    expect(status.percent).toBe(30);
+    expect(status.tickets.blocked).toEqual([1, 2]);
+    expect(status.tickets.skipped).toEqual([3]);
+    expect(status.tickets.questions).toEqual([4]);
+  });
+
+  test("AC7: markHumanNeededNotified flips alreadyNotified without clearing tripped (fire-once)", () => {
+    const s = state(
+      [ticket(1, "Blocked"), ticket(2, "Blocked"), ticket(3, "Skipped"), ticket(4, "Questions")],
+      []
+    );
+    s.initialReadyCount = 10;
+    s.humanNeededPercent = 30;
+    expect(humanNeededStatus(s).alreadyNotified).toBe(false);
+    const acked = markHumanNeededNotified(s);
+    const status = humanNeededStatus(acked);
+    expect(status.tripped).toBe(true); // still over threshold
+    expect(status.alreadyNotified).toBe(true); // fire-once flag now set
+    // pure: input untouched
+    expect(humanNeededStatus(s).alreadyNotified).toBe(false);
+  });
+});
+
 // -- deadlock breaker vs cross-session deps (issue #14 C7) --------------------
 
 describe("deadlock breaker excludes still-completable deps", () => {
@@ -683,6 +754,62 @@ describe("ingestBoardItems", () => {
     expect(overridden.maxQaPasses).toBe(7);
     expect(overridden.qaInvestigateAfter).toBe(4);
   });
+
+  // -- issue #63: initialReadyCount / humanNeededNotified capture-once + reset -
+  test("AC8: a genuinely first ingest captures initialReadyCount from Building tickets only, defaults humanNeededPercent, humanNeededNotified false", () => {
+    const items = [
+      { number: 1, title: "a", fields: { Status: "Building" } },
+      { number: 2, title: "b", fields: { Status: "Building" } },
+      { number: 3, title: "c", fields: { Status: "Building" } },
+      { number: 4, title: "d", fields: { Status: "Building" } },
+      { number: 5, title: "e", fields: { Status: "Done" } },
+      { number: 6, title: "f", fields: { Status: "Done" } },
+    ];
+    const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
+    const s = ingestBoardItems(null, items, bodies);
+    expect(s.initialReadyCount).toBe(4); // only the Building count
+    expect(s.humanNeededPercent).toBe(30); // default
+    expect(s.humanNeededNotified).toBe(false);
+  });
+
+  test("AC9: a mid-batch re-ingest (prev has a live lane) preserves initialReadyCount/humanNeededNotified unchanged", () => {
+    const prev: LoopState = {
+      tickets: [ticket(5, "QA"), ticket(7, "Building")],
+      lanes: [lane(5, "qa")],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      initialReadyCount: 7,
+      humanNeededNotified: true,
+    };
+    const items = [
+      { number: 5, title: "A", fields: { Status: "QA" } },
+      { number: 7, title: "B", fields: { Status: "Building" } },
+    ];
+    const bodies = { "5": "no deps", "7": "no deps" };
+    const s = ingestBoardItems(prev, items, bodies);
+    expect(s.initialReadyCount).toBe(7); // preserved, not recomputed
+    expect(s.humanNeededNotified).toBe(true); // preserved
+  });
+
+  test("AC10: a re-ingest after the prior batch fully drained resets initialReadyCount/humanNeededNotified (drainComplete is the boundary)", () => {
+    const prev: LoopState = {
+      tickets: [ticket(5, "Done"), ticket(7, "Blocked")],
+      lanes: [],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      initialReadyCount: 7,
+      humanNeededNotified: true,
+    };
+    expect(drainComplete(prev.tickets, prev.lanes)).toBe(true); // sanity: prev IS fully drained
+    const items = [
+      { number: 10, title: "New1", fields: { Status: "Building" } },
+      { number: 11, title: "New2", fields: { Status: "Building" } },
+    ];
+    const bodies = { "10": "no deps", "11": "no deps" };
+    const s = ingestBoardItems(prev, items, bodies);
+    expect(s.initialReadyCount).toBe(2); // recomputed from the NEW batch, not the stale 7
+    expect(s.humanNeededNotified).toBe(false); // reset
+  });
 });
 
 // -- CLI smoke ----------------------------------------------------------------
@@ -738,5 +865,41 @@ describe("loop CLI", () => {
     const { exitCode } = runIngest(statePath);
     expect(exitCode).toBe(0);
     expect(existsSync(statePath)).toBe(true);
+  });
+
+  // -- AC13: `human-needed` / `human-needed-ack` CLI verbs ---------------------
+  test("human-needed prints the breakdown without writing, matching AC6's shape", () => {
+    const statePath = join(dir, "human-needed-state.json");
+    const s = state(
+      [ticket(1, "Blocked"), ticket(2, "Blocked"), ticket(3, "Skipped"), ticket(4, "Questions")],
+      []
+    );
+    s.initialReadyCount = 10;
+    s.humanNeededPercent = 30;
+    writeFileSync(statePath, JSON.stringify(s));
+    const before = readFileSync(statePath, "utf8");
+
+    const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "human-needed", statePath], { stdout: "pipe", stderr: "pipe" });
+    expect(proc.exitCode).toBe(0);
+    const status = JSON.parse(proc.stdout.toString());
+    expect(status).toMatchObject({
+      tripped: true,
+      alreadyNotified: false,
+      blocked: 2,
+      skipped: 1,
+      questions: 1,
+      initialReadyCount: 10,
+      percent: 30,
+      tickets: { blocked: [1, 2], skipped: [3], questions: [4] },
+    });
+    // no writes: state.json is byte-identical after a `human-needed` call.
+    expect(readFileSync(statePath, "utf8")).toBe(before);
+
+    // human-needed-ack sets alreadyNotified on the next human-needed call.
+    const ack = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "human-needed-ack", statePath], { stdout: "pipe", stderr: "pipe" });
+    expect(ack.exitCode).toBe(0);
+    const proc2 = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "human-needed", statePath], { stdout: "pipe", stderr: "pipe" });
+    expect(proc2.exitCode).toBe(0);
+    expect(JSON.parse(proc2.stdout.toString())).toMatchObject({ tripped: true, alreadyNotified: true });
   });
 });

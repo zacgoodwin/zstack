@@ -941,6 +941,36 @@ describe("validateConfig", () => {
       expect(() => validateConfig(cfg)).not.toThrow();
     });
   });
+
+  // -- issue #63: the human-needed safety-control threshold knob --------------
+  describe("humanNeededPercent (issue #63)", () => {
+    // AC12: 0 is the documented "disable" value (unlike maxLanes/watchdogMinutes
+    // etc., which reject 0 via requirePositiveNumber) and must pass; a negative
+    // must throw naming the field and the non-negative rule.
+    test("0 passes (explicit disable value), a negative throws", () => {
+      const cfg = goodConfig() as any;
+      cfg.humanNeededPercent = 0;
+      expect(() => validateConfig(cfg)).not.toThrow();
+      cfg.humanNeededPercent = -5;
+      expect(() => validateConfig(cfg)).toThrow(/humanNeededPercent.*non-negative/);
+    });
+
+    test("rejects a string, NaN, and Infinity", () => {
+      for (const bad of ["30", NaN, Infinity]) {
+        const cfg = goodConfig() as any;
+        cfg.humanNeededPercent = bad;
+        expect(() => validateConfig(cfg)).toThrow(/"humanNeededPercent" must be a non-negative number/);
+      }
+    });
+
+    test("accepts a positive percent and is optional", () => {
+      const cfg = goodConfig() as any;
+      cfg.humanNeededPercent = 50;
+      expect(() => validateConfig(cfg)).not.toThrow();
+      delete cfg.humanNeededPercent;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+  });
 });
 
 // -- loadConfig surfaces schema errors (deep validation is wired in) ---------
