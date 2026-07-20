@@ -38,58 +38,25 @@ run ends `REVIEW-APPROVE:` (rubric.md). Pass the eval at ≥ 4/5.
 
 ## Running it
 
+`run.sh` (issue #71) is the runnable harness, extracted verbatim from this
+section's former inline bash to match `evals/planner/run.sh`'s shape. Every
+LLM call goes through `$CLAUDE_CMD` (default `claude -p`) — never a hosted API
+(PRINCIPLES.md "LLM access").
+
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-HERE="$(cd "$(dirname "$0")" && pwd -P)"
-REPO="$(cd "$HERE/../.." && pwd -P)"
-FIX="$HERE/fixtures/planted-defect"
-RUNS="${1:-5}"
-OUT="$(mktemp -d)"
+# The real (paid) run -- nightly, or before ship:
+evals/reviewer/run.sh 5
 
-# 1. Assemble the BLINDED four-key reviewer input from the fixture. The AC
-#    section is extracted exactly as z-loop/SKILL.md does (awk on the heading).
-AC="$(awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$FIX/ticket.md")"
-bun -e "import {readFileSync,writeFileSync} from 'node:fs';
-  writeFileSync(process.argv[4], JSON.stringify({
-    ticketBody: readFileSync(process.argv[1],'utf8'),
-    acceptanceCriteria: process.argv[2],
-    diff: readFileSync(process.argv[3],'utf8'),
-    worktreePath: '/tmp/review-throwaway-planted',
-  }));" "$FIX/ticket.md" "$AC" "$FIX/diff.patch" "$OUT/input.json"
-
-# 2. Build BOTH prompts via the CLI (the constructor is the contract). off = the
-#    single pass; always = the super-truth fan-out. Same input file, no key added.
-bun "$REPO/lib/stage-prompts.ts" prompt reviewer "$OUT/input.json" --adversarial-mode off    > "$OUT/single.txt"
-bun "$REPO/lib/stage-prompts.ts" prompt reviewer "$OUT/input.json" --adversarial-mode always  > "$OUT/adversarial.txt"
-
-pass=0
-for i in $(seq 1 "$RUNS"); do
-  # 3. Drive each prompt through a fresh live Agent (local Claude Code). The
-  #    adversarial run fans out skeptics via the Agent tool from inside this run.
-  claude -p "$(cat "$OUT/single.txt")"       --add-dir "$OUT" > "$OUT/single-$i.txt"
-  claude -p "$(cat "$OUT/adversarial.txt")"  --add-dir "$OUT" > "$OUT/adversarial-$i.txt"
-
-  # 4. Grade markers + defect-naming with a fresh local grader (deterministic
-  #    marker parse; the grader confirms the findings name criterion 3).
-  claude -p "Grade one reviewer trial against $HERE/rubric.md. The single-pass
-    reviewer output is $OUT/single-$i.txt and the adversarial output is
-    $OUT/adversarial-$i.txt. Return ONLY the JSON object rubric.md specifies:
-    {adversarialMarker, singlePassMarker, namesDefect, adversarialConfidence, pass}." \
-    --add-dir "$OUT" --add-dir "$HERE" > "$OUT/grade-$i.json"
-
-  if [ "$(bun -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).pass===true)" "$OUT/grade-$i.json")" = "true" ]; then
-    pass=$((pass+1))
-  fi
-done
-
-echo "adversarial surfaced the defect in $pass/$RUNS trials (pass threshold: 4/5)"
-[ "$pass" -ge 4 ] || { echo "FAIL: below threshold"; exit 1; }
-echo "PASS"
+# The free, structural smoke test (exercises every branch of run.sh's
+# plumbing -- both prompt shapes, the grade JSON parse, the >=4/5 threshold,
+# the exit code -- with a canned mock-claude.sh instead of real claude -p.
+# Says nothing about real model quality; see "## Results" below for that):
+CLAUDE_CMD="evals/reviewer/mock-claude.sh" evals/reviewer/run.sh 5
 ```
 
 Exit 0 = the fan-out beat single-pass on the planted defect in ≥ 4/5 trials;
-exit 1 = below threshold, with the per-trial grades in `$OUT` either way.
+exit 1 = below threshold, with the per-trial grades in the run's temp output
+dir (printed on stdout) either way.
 
 ## Verifying the harness offline (free)
 
@@ -116,3 +83,44 @@ Documentation only — the command; scheduling is the user's cron/routine:
 # Nightly, real claude -p, 5 trials:
 0 4 * * * cd /path/to/zstack-1 && evals/reviewer/run.sh 5
 ```
+
+## Results
+
+**2026-07-20, 5 trials, ticket #71.** Run from inside an unattended zstack-loop
+builder subagent, which has no `claude -p` CLI on `PATH` (nested headless
+`claude -p` is the exact pattern MEMORY documents as blocked on this machine)
+— per this file's own line above ("nested `claude -p` is denied by the
+classifier, so use the Agent tool"), each trial substituted the Agent tool for
+the "fresh live Agent" `run.sh` drives via `$CLAUDE_CMD`: the same prompts
+`stage-prompts.ts` builds (verbatim, unmodified) were each handed to a fresh
+`general-purpose` subagent (Agent-tool access lets the adversarial trials fan
+out their 3 skeptics exactly as the super-truth pass instructs) instead of a
+shelled `claude -p`. Grading was done directly against `rubric.md`'s per-trial
+contract rather than a separate grader call, since the marker prefix, the
+confidence token, and whether the findings name criterion 3 were all
+mechanically checkable from each trial's own final message.
+
+`worktreePath` in the shipped fixture input is a placeholder
+(`/tmp/review-throwaway-planted`) that is never materialized by this file's
+harness or by `run.sh` — both prompts ask the reviewer to "run the typecheck
+and the tests this diff touches" there regardless. To get a real signal
+rather than 5 `BLOCKED: worktree unusable` trials, a real throwaway directory
+was built by hand from `diff.patch`'s own added lines (`src/window.ts` +
+`src/window.test.ts`), confirmed green (`bun test` → 3 pass / 0 fail, matching
+rubric.md's description) before driving any trial.
+
+**Score: 0/5 by the rubric's strict per-trial contract** (adversarial finds
+it AND single-pass does not) — NOT because adversarial mode failed: all 5
+adversarial trials correctly ended `REVIEW-FINDINGS: confidence=0`, naming
+criterion 3's `<=`-vs-`<` boundary defect with file:line evidence, every
+time. The reason every trial is "inconclusive, not a pass" per rubric.md is
+that **single-pass ALSO caught the defect in all 5 trials**, ending
+`REVIEW-FINDINGS` (never `REVIEW-APPROVE`) every time — no delta between the
+two modes was ever observed, so no trial can satisfy the rubric's "measures
+the delta" contract. Below the ≥ 4/5 threshold either way. **Bug ticket
+filed per this file's own AC1 contract:
+[#88](https://github.com/zacgoodwin/zstack/issues/88)** — see that ticket for
+the two root causes found (the fixture's own AC3 prose narrates the defect's
+location, and `diff.patch`'s first hunk header miscounts its own added lines,
+so it is not a strictly valid patch either) plus the worktree-materialization
+gap.
