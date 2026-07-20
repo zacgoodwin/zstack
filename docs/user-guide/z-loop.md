@@ -166,19 +166,25 @@ first exceeds `humanNeededPercent`, the control trips.
 `human-needed` Discord notification — the exact parked counts and which
 ticket numbers — through the same `lib/notify.ts` transport as the other
 events above, then sets a fire-once flag so it never re-fires for the same
-crossing. A fresh batch (the next `/z-loop` invocation that commits new
-tickets to Building, once the prior batch has fully drained) resets both the
-committed-size baseline and the fire-once flag, so the control is live again
-from zero. The prior batch being drained is necessary but not sufficient: a
-tick that merely re-confirms the SAME drained batch (nothing new committed —
-e.g. the very tick right after that batch's own last ticket parks or
-completes, which is what first makes it "drained") is not a new batch, so it
-keeps that batch's baseline and fire-once flag rather than resetting them —
-otherwise the batch's highest-value crossing, its last ticket tipping it over
-the threshold, would reset to a zero baseline the instant it happens and never
-trip. It is **not** re-evaluated again within the same tick after that tick's
-one scheduling action applies — same once-per-iteration cadence as every
-other signal in the drain loop.
+crossing. A fresh batch resets both the committed-size baseline and the
+fire-once flag, so the control is live again from zero — but "fresh" is a
+two-part test, not just "the prior batch fully drained": there must be no
+prior state at all, OR the prior state was fully drained **and** the
+incoming board snapshot shows new, **unclaimed** Building tickets (the
+batch-commit step moves the whole new batch to Building before its first
+ingest, so any unclaimed Building ticket in a post-drain snapshot IS that new
+batch; a lingering `claimedByOther` Building ticket belongs to another
+session's batch and does not count). The prior batch being drained is
+necessary but not sufficient: a tick that merely re-confirms the SAME drained
+batch (no new, unclaimed tickets committed — e.g. the very tick right after
+that batch's own last ticket parks or completes, which is what first makes it
+"drained") is not a new batch, so it keeps that batch's baseline and
+fire-once flag rather than resetting them — otherwise the batch's
+highest-value crossing, its last ticket tipping it over the threshold, would
+reset to a zero baseline the instant it happens and never trip. It is **not**
+re-evaluated again within the same tick after that tick's one scheduling
+action applies — same once-per-iteration cadence as every other signal in the
+drain loop.
 
 **Depends on `notifications`.** Like the other five events, `human-needed` is
 governed by the `notifications` block above: absent/disabled/unconfigured means
