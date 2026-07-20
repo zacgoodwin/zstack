@@ -17,7 +17,6 @@ import { homedir } from "node:os";
 import { dirname } from "node:path";
 import { handleCliError, parseFlags, requireFlag, str } from "./cli.ts";
 import {
-  BOARD_STATUSES,
   BoardConfig,
   type BoardStatus,
   DEFAULT_EPIC_STYLE,
@@ -32,29 +31,47 @@ import {
 } from "./config.ts";
 import { requirePositiveNumber, validateConfig } from "./config-schema.ts";
 import { ghExecutor, type GraphQLData, type GraphQLExecutor } from "./board.ts";
+import {
+  type BoardShape,
+  type BoardTemplate,
+  type DesiredField,
+  type TemplateOption,
+  type TemplateView,
+  DEFAULT_SHAPE,
+  DEFAULT_TEMPLATE,
+  deriveShape,
+  loadBoardTemplate,
+} from "./board-template.ts";
 
 export { ZError } from "./config.ts";
+export type { DesiredField } from "./board-template.ts";
 
 // -- desired board shape (references/PROCESS.md + issue #1) -------------------
 export const STATUS_FIELD_NAME = "Status";
 
-// Canonical board columns, in order (single source: lib/config.ts
-// BOARD_STATUSES). Order is the contract: it's the left-to-right column order
-// on the board, and diffState compares it as a sequence.
-export const STATUS_OPTIONS: readonly BoardStatus[] = BOARD_STATUSES;
+// The board shape is data now (issue #20): the nine statuses and four custom
+// fields live in z-setup/board-template.json, loaded + validated by
+// lib/board-template.ts. These module constants expose the DEFAULT (packaged)
+// shape so callers and the USAGE banner keep a zero-arg view; a `--template`
+// override flows in as an explicit BoardShape (see SetupBoard, diffState). Order
+// is the contract: STATUS_OPTIONS is the left-to-right column order, and
+// diffState compares it as a sequence. BOARD_STATUSES (lib/config.ts) stays the
+// canonical type the loader validates every template's status set against.
+export const STATUS_OPTIONS: readonly BoardStatus[] = DEFAULT_SHAPE.statusOptions;
 
-export interface DesiredField {
-  name: string;
-  dataType: FieldDataType;
-  options?: string[]; // single-select only, in order
+export const CUSTOM_FIELDS: DesiredField[] = DEFAULT_SHAPE.customFields;
+
+// The desired option meta (name + color + description) for one field, for
+// inlining into the create/update mutation. Status draws from statusMeta; every
+// other single-select field from fieldMeta. An action referencing a field with
+// no meta is a template/derivation bug, so it throws rather than emit a
+// color-less literal.
+function optionMetaFor(shape: BoardShape, fieldName: string): TemplateOption[] {
+  if (fieldName === STATUS_FIELD_NAME) return shape.statusMeta;
+  const meta = shape.fieldMeta[fieldName];
+  if (!meta) throw new ZError(`Board template carries no option metadata for field "${fieldName}".`);
+  return meta;
 }
-
-export const CUSTOM_FIELDS: DesiredField[] = [
-  { name: "Model", dataType: "SINGLE_SELECT", options: ["haiku", "sonnet", "opus", "fable"] },
-  { name: "Model Effort", dataType: "SINGLE_SELECT", options: ["low", "medium", "high", "xhigh"] },
-  { name: "Estimate", dataType: "NUMBER" },
-  { name: "Actual", dataType: "NUMBER" },
-];
 
 // -- observed board state ----------------------------------------------------
 export interface OptionState {
@@ -86,9 +103,14 @@ function sameSequence(a: string[], b: readonly string[]): boolean {
 }
 
 // The whole idempotence contract in one pure function: given what exists and
-// what should exist, return the mutations to close the gap. Empty result = the
-// board is already correct = re-run does nothing.
-export function diffState(project: ProjectState | null, title: string): SetupAction[] {
+// what should exist (the DEFAULT shape unless a `--template` override is passed),
+// return the mutations to close the gap. Empty result = the board is already
+// correct = re-run does nothing.
+export function diffState(
+  project: ProjectState | null,
+  title: string,
+  shape: BoardShape = DEFAULT_SHAPE
+): SetupAction[] {
   const actions: SetupAction[] = [];
 
   if (!project) {
@@ -97,8 +119,8 @@ export function diffState(project: ProjectState | null, title: string): SetupAct
     // Progress/Done, never the canonical nine, so set-status-options always runs
     // on the create path.)
     actions.push({ kind: "create-project", title });
-    actions.push({ kind: "set-status-options", options: [...STATUS_OPTIONS] });
-    for (const f of CUSTOM_FIELDS) {
+    actions.push({ kind: "set-status-options", options: [...shape.statusOptions] });
+    for (const f of shape.customFields) {
       actions.push({ kind: "create-field", name: f.name, dataType: f.dataType, options: f.options });
     }
     return actions;
@@ -111,11 +133,11 @@ export function diffState(project: ProjectState | null, title: string): SetupAct
     );
   }
   const statusNames = (status.options ?? []).map((o) => o.name);
-  if (!sameSequence(statusNames, STATUS_OPTIONS)) {
-    actions.push({ kind: "set-status-options", options: [...STATUS_OPTIONS] });
+  if (!sameSequence(statusNames, shape.statusOptions)) {
+    actions.push({ kind: "set-status-options", options: [...shape.statusOptions] });
   }
 
-  for (const f of CUSTOM_FIELDS) {
+  for (const f of shape.customFields) {
     const existing = project.fields.find((pf) => pf.name === f.name);
     if (!existing) {
       actions.push({ kind: "create-field", name: f.name, dataType: f.dataType, options: f.options });
@@ -140,22 +162,22 @@ export interface VerifyReport {
   lines: string[];
 }
 
-export function verifyReport(project: ProjectState | null): VerifyReport {
+export function verifyReport(project: ProjectState | null, shape: BoardShape = DEFAULT_SHAPE): VerifyReport {
   if (!project) return { ok: false, lines: ["Project not found. Run /z-setup first."] };
 
-  const actions = diffState(project, project.title);
+  const actions = diffState(project, project.title, shape);
   const lines: string[] = [];
 
   const status = project.fields.find((f) => f.name === STATUS_FIELD_NAME);
   const statusNames = (status?.options ?? []).map((o) => o.name);
-  const missingStatus = STATUS_OPTIONS.filter((s) => !statusNames.includes(s));
+  const missingStatus = shape.statusOptions.filter((s) => !statusNames.includes(s));
   const statusDrift = actions.some((a) => a.kind === "set-status-options");
   lines.push(
-    `Status: ${statusDrift ? "DRIFT" : "OK"} (${statusNames.length}/${STATUS_OPTIONS.length}` +
+    `Status: ${statusDrift ? "DRIFT" : "OK"} (${statusNames.length}/${shape.statusOptions.length}` +
       `${missingStatus.length ? `, missing: ${missingStatus.join(", ")}` : ""})`
   );
 
-  for (const df of CUSTOM_FIELDS) {
+  for (const df of shape.customFields) {
     const f = project.fields.find((pf) => pf.name === df.name);
     const drift = actions.some(
       (a) => (a.kind === "create-field" || a.kind === "set-field-options") && a.name === df.name
@@ -180,15 +202,14 @@ export function verifyReport(project: ProjectState | null): VerifyReport {
 }
 
 // -- GraphQL operations ------------------------------------------------------
-// Single-select option lists are our own fixed constants, so they are inlined as
+// Single-select option lists come from the loaded board template, inlined as
 // GraphQL literals rather than passed as variables: that keeps every runtime
-// variable scalar. JSON.stringify escapes the (controlled) name safely;
-// color/description are literal enum/string tokens.
-const COLORS = ["GRAY", "BLUE", "GREEN", "YELLOW", "ORANGE", "RED", "PURPLE", "PINK"];
-
-function optionLiterals(options: string[]): string {
-  return options
-    .map((name, i) => `{name: ${JSON.stringify(name)}, color: ${COLORS[i % COLORS.length]}, description: ""}`)
+// variable scalar. The name/description are JSON-escaped; `color` is a bare
+// ProjectV2 enum token, safe to inline because the loader validated it against
+// the fixed enum set (lib/board-template.ts VALID_OPTION_COLORS).
+function optionLiterals(opts: TemplateOption[]): string {
+  return opts
+    .map((o) => `{name: ${JSON.stringify(o.name)}, color: ${o.color}, description: ${JSON.stringify(o.description)}}`)
     .join(", ");
 }
 
@@ -266,17 +287,17 @@ const M_CREATE_NUMBER_FIELD = `mutation CreateNumberField($project: ID!, $name: 
   }
 }`;
 
-function mCreateSingleSelectField(options: string[]): string {
+function mCreateSingleSelectField(opts: TemplateOption[]): string {
   return `mutation CreateSingleSelectField($project: ID!, $name: String!) {
-  createProjectV2Field(input: {projectId: $project, dataType: SINGLE_SELECT, name: $name, singleSelectOptions: [${optionLiterals(options)}]}) {
+  createProjectV2Field(input: {projectId: $project, dataType: SINGLE_SELECT, name: $name, singleSelectOptions: [${optionLiterals(opts)}]}) {
     projectV2Field { ... on ProjectV2SingleSelectField { id name } }
   }
 }`;
 }
 
-function mUpdateFieldOptions(options: string[]): string {
+function mUpdateFieldOptions(opts: TemplateOption[]): string {
   return `mutation UpdateFieldOptions($field: ID!) {
-  updateProjectV2Field(input: {fieldId: $field, singleSelectOptions: [${optionLiterals(options)}]}) {
+  updateProjectV2Field(input: {fieldId: $field, singleSelectOptions: [${optionLiterals(opts)}]}) {
     projectV2Field { ... on ProjectV2SingleSelectField { id name } }
   }
 }`;
@@ -321,7 +342,13 @@ function optionMap(options: OptionState[] | undefined): Record<string, string> {
 }
 
 export class SetupBoard {
-  constructor(private exec: GraphQLExecutor) {}
+  // `shape` is the DEFAULT (packaged) board shape unless a `--template` override
+  // is supplied; every diff/verify/apply path on this instance reads it, so a
+  // whole setup run honors exactly one shape.
+  constructor(
+    private exec: GraphQLExecutor,
+    private shape: BoardShape = DEFAULT_SHAPE
+  ) {}
 
   private async ownerId(login: string): Promise<string> {
     const data = await this.exec(Q_OWNER_ID, { login });
@@ -455,7 +482,7 @@ export class SetupBoard {
   // idempotence test asserts empty on an already-set-up board.
   async plan(owner: string, repo: string, opts: { number?: number; title: string }): Promise<SetupAction[]> {
     const state = await this.readState(owner, repo, opts);
-    return diffState(state, opts.title);
+    return diffState(state, opts.title, this.shape);
   }
 
   // Creates or adopts the project, executes exactly the planned mutations, then
@@ -481,7 +508,7 @@ export class SetupBoard {
     let state = await this.readFields(header.id);
     // Project now exists, so drop create-project; execute the rest against real
     // field ids from `state`.
-    const actions = diffState(state, opts.title).filter((a) => a.kind !== "create-project");
+    const actions = diffState(state, opts.title, this.shape).filter((a) => a.kind !== "create-project");
 
     // Destructive-adopt guard (issue #14 item 5, generalized by F7 to EVERY
     // single-select replace: Status, Model, Model Effort). Replacing a field's
@@ -546,29 +573,29 @@ export class SetupBoard {
     for (const a of actions) {
       if (a.kind === "set-status-options") {
         const fieldId = requireFieldId(state, STATUS_FIELD_NAME);
-        await this.exec(mUpdateFieldOptions(a.options), { field: fieldId });
+        await this.exec(mUpdateFieldOptions(optionMetaFor(this.shape, STATUS_FIELD_NAME)), { field: fieldId });
       } else if (a.kind === "create-field") {
         if (a.dataType === "SINGLE_SELECT") {
-          await this.exec(mCreateSingleSelectField(a.options!), { project: header.id, name: a.name });
+          await this.exec(mCreateSingleSelectField(optionMetaFor(this.shape, a.name)), { project: header.id, name: a.name });
         } else {
           await this.exec(M_CREATE_NUMBER_FIELD, { project: header.id, name: a.name });
         }
       } else if (a.kind === "set-field-options") {
         const fieldId = requireFieldId(state, a.name);
-        await this.exec(mUpdateFieldOptions(a.options), { field: fieldId });
+        await this.exec(mUpdateFieldOptions(optionMetaFor(this.shape, a.name)), { field: fieldId });
       }
     }
 
     // Re-read only if we changed something; a no-op run reuses the state it read.
     const finalState = actions.length ? await this.readFields(header.id) : state;
-    const config = buildConfig(finalState, { owner, repo, repositoryId, ...opts });
+    const config = buildConfig(finalState, { owner, repo, repositoryId, ...opts }, this.shape);
     validateConfig(config);
     return { config, actions, created, dropped };
   }
 
   async verify(owner: string, repo: string, opts: { number?: number; title: string }): Promise<VerifyReport> {
     const state = await this.readState(owner, repo, opts);
-    return verifyReport(state);
+    return verifyReport(state, this.shape);
   }
 }
 
@@ -611,13 +638,14 @@ function requireFieldId(state: ProjectState, name: string): string {
 
 function buildConfig(
   state: ProjectState,
-  ctx: { owner: string; repo: string; repositoryId: string } & ApplyOptions
+  ctx: { owner: string; repo: string; repositoryId: string } & ApplyOptions,
+  shape: BoardShape = DEFAULT_SHAPE
 ): BoardConfig {
   const status = state.fields.find((f) => f.name === STATUS_FIELD_NAME);
   if (!status) throw new ZError(`Status field missing on "${state.title}" after setup.`);
 
   const fields: Record<string, FieldConfig> = {};
-  for (const df of CUSTOM_FIELDS) {
+  for (const df of shape.customFields) {
     const f = state.fields.find((sf) => sf.name === df.name);
     if (!f) throw new ZError(`Field "${df.name}" missing on "${state.title}" after setup.`);
     fields[df.name] =
@@ -655,18 +683,49 @@ export function writeConfig(config: BoardConfig, home: string = homedir()): stri
 // -- CLI ---------------------------------------------------------------------
 const USAGE = `z-setup-board <command> [flags]
 
-  plan   --owner O --repo R --title T [--project-number N]
-         print the mutations needed to reach the canonical board (zero writes)
+  plan   --owner O --repo R --title T [--project-number N] [--template FILE]
+         print the mutations needed to reach the board shape (zero writes)
   apply  --owner O --repo R --slug S --title T [--project-number N] [--force]
-         [--epic-style milestones] [--max-lanes 3] [--watchdog-minutes 10]
+         [--epic-style milestones] [--max-lanes 3] [--watchdog-minutes 10] [--template FILE]
          create/adopt the project, run the mutations, write config.json
          (adopting a board whose non-canonical Status options still hold items
          refuses and lists them unless --force is given)
-  verify --owner O --repo R [--title T | --project-number N]
-         check the live board against the 9 statuses + 4 fields; non-zero on drift
+  verify --owner O --repo R [--title T | --project-number N] [--template FILE]
+         check the live board against the shape's statuses + fields; non-zero on drift
+
+  --template FILE  use a board-shape template instead of the packaged default
+                   (z-setup/board-template.json). The status set must equal the
+                   canonical nine and the four required fields (Model, Model
+                   Effort, Estimate, Actual) must be present, or it is refused.
 
 Statuses: ${STATUS_OPTIONS.join(", ")}
-Fields:   ${CUSTOM_FIELDS.map((f) => f.name).join(", ")}`;
+Fields:   ${CUSTOM_FIELDS.map((f) => f.name).join(", ")}
+
+Views (${DEFAULT_TEMPLATE.views.length}) are described in the template but GitHub's API
+cannot create them; apply prints them as manual steps.`;
+
+// GitHub's ProjectV2 GraphQL API exposes NO view-creation mutation (probed at
+// build time, 2026-07: 29 ProjectV2 mutations -- createProjectV2Field,
+// updateProjectV2Field, ... -- none for views; ProjectV2View is a read-only
+// object). So the template's views cannot be created programmatically. Rather
+// than silently drop them (issue #20 AC5), setup prints each as an explicit
+// manual step. If GitHub ever ships a createProjectV2View mutation, wire it into
+// apply() and gate this block on its absence.
+export function renderViewsBlock(views: TemplateView[]): string {
+  if (!views.length) return "";
+  const lines = [
+    "",
+    "Board views (manual -- GitHub's API cannot create ProjectV2 views):",
+    "  On github.com open the project, click + beside the view tabs, and add:",
+  ];
+  for (const v of views) {
+    const bits = [`layout: ${v.layout}`];
+    if (v.groupBy) bits.push(`group by: ${v.groupBy}`);
+    if (v.filter) bits.push(`filter: ${v.filter}`);
+    lines.push(`  - "${v.name}" (${bits.join(", ")})${v.description ? ` -- ${v.description}` : ""}`);
+  }
+  return lines.join("\n");
+}
 
 // Exported for the gate test: rejecting "issue-type" here keeps the CLI from
 // ever calling GraphQL with a config the loop cannot act on (issue #14 item 6).
@@ -704,7 +763,13 @@ export async function main(argv: string[]): Promise<number> {
     if (number !== undefined && !Number.isInteger(number)) {
       throw new ZError(`--project-number must be an integer, got "${projectNumberFlag}".`);
     }
-    const setup = new SetupBoard(ghExecutor());
+    // Board shape: the packaged default unless --template overrides it. Loaded +
+    // validated up front, before the first GraphQL op, so a bad template refuses
+    // without mutating anything.
+    const templatePath = str(flags, "template");
+    const template: BoardTemplate = templatePath ? loadBoardTemplate(templatePath) : DEFAULT_TEMPLATE;
+    const shape = templatePath ? deriveShape(template) : DEFAULT_SHAPE;
+    const setup = new SetupBoard(ghExecutor(), shape);
 
     switch (cmd) {
       case "plan": {
@@ -716,6 +781,8 @@ export async function main(argv: string[]): Promise<number> {
             ? `\n${actions.length} mutation(s) needed.`
             : "\nBoard already matches the desired shape; nothing to do."
         );
+        const views = renderViewsBlock(template.views);
+        if (views) console.log(views);
         return 0;
       }
       case "apply": {
@@ -744,6 +811,8 @@ export async function main(argv: string[]): Promise<number> {
           );
         }
         console.log(`Wrote ${path}`);
+        const views = renderViewsBlock(template.views);
+        if (views) console.log(views);
         return 0;
       }
       case "verify": {

@@ -1,0 +1,52 @@
+{
+  "$comment": "The shipped default board shape for the zstack dev loop. lib/board-template.ts loads and validates this; lib/setup-board.ts creates/adopts a ProjectV2 board from it. 1:1 with the shape /z-setup produced when it was hardcoded (issue #20): the same nine statuses in order and the same four custom fields, with the same option colors the old position-cycling emitted. The status set MUST equal lib/config.ts BOARD_STATUSES (the loop's state machine only knows those nine), and the four fields (Model, Model Effort, Estimate, Actual) MUST be present with these dataTypes -- the loader refuses a template that drops or renames them. Colors are the GitHub ProjectV2 single-select enum: GRAY, BLUE, GREEN, YELLOW, ORANGE, RED, PURPLE, PINK. The views section is descriptive: GitHub's GraphQL API exposes no view-creation mutation, so /z-setup prints these as manual steps rather than creating them.",
+  "statuses": [
+    { "name": "Backlog", "color": "GRAY", "description": "" },
+    { "name": "Ready", "color": "BLUE", "description": "" },
+    { "name": "Questions", "color": "GREEN", "description": "" },
+    { "name": "Building", "color": "YELLOW", "description": "" },
+    { "name": "QA", "color": "ORANGE", "description": "" },
+    { "name": "Review", "color": "RED", "description": "" },
+    { "name": "Blocked", "color": "PURPLE", "description": "" },
+    { "name": "Skipped", "color": "PINK", "description": "" },
+    { "name": "Done", "color": "GRAY", "description": "" }
+  ],
+  "fields": [
+    {
+      "name": "Model",
+      "dataType": "SINGLE_SELECT",
+      "options": [
+        { "name": "haiku", "color": "GRAY", "description": "" },
+        { "name": "sonnet", "color": "BLUE", "description": "" },
+        { "name": "opus", "color": "GREEN", "description": "" },
+        { "name": "fable", "color": "YELLOW", "description": "" }
+      ]
+    },
+    {
+      "name": "Model Effort",
+      "dataType": "SINGLE_SELECT",
+      "options": [
+        { "name": "low", "color": "GRAY", "description": "" },
+        { "name": "medium", "color": "BLUE", "description": "" },
+        { "name": "high", "color": "GREEN", "description": "" },
+        { "name": "xhigh", "color": "YELLOW", "description": "" }
+      ]
+    },
+    { "name": "Estimate", "dataType": "NUMBER" },
+    { "name": "Actual", "dataType": "NUMBER" }
+  ],
+  "views": [
+    {
+      "name": "Loop Board",
+      "layout": "board",
+      "groupBy": "Status",
+      "description": "Kanban grouped by Status, one column per canonical status; the loop's primary view."
+    },
+    {
+      "name": "Cost by Milestone",
+      "layout": "table",
+      "groupBy": "Milestone",
+      "description": "Table grouped by milestone (epic), surfacing Model, Model Effort, Estimate, and Actual for cost tracking."
+    }
+  ]
+}

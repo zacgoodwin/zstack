@@ -14,6 +14,7 @@ import {
   toEpicStyle,
   verifyReport,
   writeConfig,
+  renderViewsBlock,
   STATUS_OPTIONS,
   CUSTOM_FIELDS,
   type FieldState,
@@ -21,6 +22,7 @@ import {
 } from "../lib/setup-board.ts";
 import { loadConfig, type BoardConfig } from "../lib/config.ts";
 import { validateConfig } from "../lib/config-schema.ts";
+import { loadBoardTemplate, deriveShape, DEFAULT_TEMPLATE } from "../lib/board-template.ts";
 import type { GraphQLData, GraphQLExecutor } from "../lib/board.ts";
 
 // -- helpers -----------------------------------------------------------------
@@ -676,6 +678,85 @@ describe("writeConfig", () => {
     // omits it entirely -- loadConfig must still default it to 5 (AC2:
     // existing "every 5th loop" behavior unchanged for every already-set-up project).
     expect(loaded.auditEveryNLoops).toBe(5);
+  });
+});
+
+// -- board template override (issue #20 AC2 + AC5) ---------------------------
+describe("board template override", () => {
+  test("a custom template's status color + description is honored in the emitted mutation; names intact -> verify green (AC2)", async () => {
+    const t = structuredClone(loadBoardTemplate());
+    const backlog = t.statuses.find((s) => s.name === "Backlog")!;
+    backlog.color = "PURPLE";
+    backlog.description = "not yet planned";
+    const shape = deriveShape(t);
+
+    const backend = setupBackend();
+    const setup = new SetupBoard(backend.exec, shape);
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    expect(result.created).toBe(true);
+
+    // The Status field is set via UpdateFieldOptions on the create path; its
+    // inlined literal must carry the CUSTOM color + description.
+    const statusUpdate = backend.calls.find((c) => c.op === "UpdateFieldOptions")!;
+    expect(statusUpdate.query).toContain('{name: "Backlog", color: PURPLE, description: "not yet planned"}');
+    // A field left at the default still emits the default color -- no bleed.
+    const modelCreate = backend.calls.find((c) => c.op === "CreateSingleSelectField" && c.vars.name === "Model")!;
+    expect(modelCreate.query).toContain('{name: "haiku", color: GRAY, description: ""}');
+
+    // Names are unchanged, so the live board still verifies against this shape.
+    const report = await setup.verify("zacgoodwin", "zstack", { title: "zstack" });
+    expect(report.ok).toBe(true);
+  });
+
+  test("the default emitted status literal is byte-identical to the old position-cycled shape (1:1)", async () => {
+    const backend = setupBackend();
+    const setup = new SetupBoard(backend.exec); // default shape
+    await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    const statusUpdate = backend.calls.find((c) => c.op === "UpdateFieldOptions")!;
+    // Backlog=GRAY, Ready=BLUE, ... Done wraps back to GRAY; all descriptions "".
+    expect(statusUpdate.query).toContain('{name: "Backlog", color: GRAY, description: ""}');
+    expect(statusUpdate.query).toContain('{name: "Ready", color: BLUE, description: ""}');
+    expect(statusUpdate.query).toContain('{name: "Done", color: GRAY, description: ""}');
+  });
+
+  test("renderViewsBlock names every template view as a manual step, never dropping one (AC5)", () => {
+    const block = renderViewsBlock(DEFAULT_TEMPLATE.views);
+    expect(block).toMatch(/manual/i);
+    for (const v of DEFAULT_TEMPLATE.views) {
+      expect(block).toContain(`"${v.name}"`);
+      expect(block).toContain(v.layout);
+    }
+  });
+
+  test("renderViewsBlock is empty for a template with no views", () => {
+    expect(renderViewsBlock([])).toBe("");
+  });
+
+  // AC3: a template dropping a required field is refused at load, BEFORE the
+  // executor is touched -- the CLI loads + validates the template up front, so no
+  // board mutation is ever attempted on a bad template.
+  test("a template missing a required field refuses before any GraphQL op (AC3)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ztpl-ac3-"));
+    try {
+      const bad: any = structuredClone(loadBoardTemplate());
+      bad.fields = bad.fields.filter((f: any) => f.name !== "Estimate");
+      const badPath = join(dir, "bad.json");
+      require("node:fs").writeFileSync(badPath, JSON.stringify(bad));
+
+      const calls: string[] = [];
+      const exec: GraphQLExecutor = async (q) => {
+        calls.push(q);
+        return {} as GraphQLData;
+      };
+      // Mirrors main()'s order: load+validate, derive, only then construct.
+      expect(() => {
+        const shape = deriveShape(loadBoardTemplate(badPath));
+        new SetupBoard(exec, shape);
+      }).toThrow(/required field "Estimate"/);
+      expect(calls).toEqual([]); // executor never touched
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
