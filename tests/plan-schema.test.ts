@@ -24,6 +24,44 @@ import { estimate, loadRates, type Buckets } from "../lib/estimate.ts";
 const TICKETS = join(import.meta.dir, "fixtures", "tickets");
 const read = (name: string) => readFileSync(join(TICKETS, name), "utf8");
 const sections = (errs: TicketError[]) => errs.map((e) => e.section).sort();
+const REPO_ROOT = join(import.meta.dir, "..");
+
+// A minimal, otherwise-valid ticket body with a caller-supplied `## Files`
+// section, for the issue #84 optional-section tests below.
+function bodyWithFiles(filesSection: string): string {
+  return [
+    "## Context",
+    "",
+    "grounded.",
+    "",
+    "## Plan",
+    "",
+    "Steps:",
+    "",
+    "1. Do the thing.",
+    "",
+    "### Acceptance Criteria",
+    "",
+    "- Setup: x -> Action: y -> Expected: z.",
+    "",
+    "## Tests + evals",
+    "",
+    "a gate test.",
+    "",
+    "## Docs pages touched",
+    "",
+    "none.",
+    "",
+    "## Out of scope",
+    "",
+    "everything else.",
+    "",
+    "## Files",
+    "",
+    filesSection,
+    "",
+  ].join("\n");
+}
 
 // -- schema validation (AC1) -------------------------------------------------
 describe("validateTicketBody: mandatory sections present", () => {
@@ -122,6 +160,110 @@ describe("validateTicketBody: fence-awareness (a '#' inside a code fence is not 
   });
 });
 
+// -- optional `## Files` section (issue #84) ---------------------------------
+describe("validateTicketBody: optional `## Files` section", () => {
+  // AC1: a valid Files section passes; the same body without it also passes.
+  test("a body with a valid `## Files` section passes lint (AC1)", () => {
+    const r = validateTicketBody(read("good-with-files.md"));
+    expect(r.ok).toBe(true);
+    expect(r.errors).toEqual([]);
+  });
+
+  test("the same body minus its `## Files` section still passes -- the section is optional (AC1)", () => {
+    // good-with-files.md is good.md plus a `## Files` section appended; good.md
+    // itself (already covered above) is the literal "same body without it".
+    const r = validateTicketBody(read("good.md"));
+    expect(r.ok).toBe(true);
+    expect(r.errors).toEqual([]);
+  });
+
+  // AC2: present-but-empty, and a bullet with no backticked path.
+  test("`## Files` present but empty fails, naming the Files section (AC2)", () => {
+    const r = validateTicketBody(read("files-empty.md"));
+    expect(r.ok).toBe(false);
+    const f = r.errors.find((e) => e.section === "Files");
+    expect(f).toMatchObject({ code: "empty" });
+  });
+
+  test("a `## Files` bullet with no backticked path fails, naming the Files section (AC2)", () => {
+    const r = validateTicketBody(read("files-bad-bullet.md"));
+    expect(r.ok).toBe(false);
+    const f = r.errors.find((e) => e.section === "Files" && e.code === "malformed");
+    expect(f).toBeDefined();
+    expect(f?.message).toContain("lib/board.ts has no backticks");
+  });
+
+  test("nested (indented) bullets and non-bullet prose inside Files are ignored, not validated as paths", () => {
+    const body = bodyWithFiles(
+      ["prose before the list is fine.", "- `lib/board.ts` -- real.", "  - a nested bullet, ignored.", "more prose after."].join("\n")
+    );
+    expect(validateTicketBody(body).ok).toBe(true);
+  });
+
+  // AC3: bad-path (absolute / "..") always fails, flag-independent.
+  test('a Files path containing ".." fails with bad-path, even without --check-paths (AC3)', () => {
+    const r = validateTicketBody(bodyWithFiles("- `../escape.ts` -- traversal."));
+    expect(r.ok).toBe(false);
+    const f = r.errors.find((e) => e.section === "Files");
+    expect(f).toMatchObject({ code: "bad-path" });
+    expect(f?.message).toContain("../escape.ts");
+  });
+
+  test("an absolute Files path fails with bad-path, even without --check-paths (AC3)", () => {
+    const r = validateTicketBody(bodyWithFiles("- `/abs/path.ts` -- absolute."));
+    expect(r.ok).toBe(false);
+    const f = r.errors.find((e) => e.section === "Files");
+    expect(f).toMatchObject({ code: "bad-path" });
+  });
+
+  // AC3: --check-paths (repoRoot arg) existence gate, and the "(new)" exemption.
+  test("--check-paths: a bullet naming a nonexistent path fails, naming that exact path (AC3)", () => {
+    const r = validateTicketBody(bodyWithFiles("- `lib/does-not-exist.ts` -- ghost file."), REPO_ROOT);
+    expect(r.ok).toBe(false);
+    const f = r.errors.find((e) => e.section === "Files" && e.code === "missing");
+    expect(f?.message).toContain("lib/does-not-exist.ts");
+  });
+
+  test("--check-paths: the same bullet suffixed literally (new) is exempt and passes (AC3)", () => {
+    const r = validateTicketBody(bodyWithFiles("- `lib/does-not-exist.ts` -- ghost file (new)"), REPO_ROOT);
+    expect(r.ok).toBe(true);
+  });
+
+  test("--check-paths: a bullet naming a real, existing path passes (AC3)", () => {
+    const r = validateTicketBody(bodyWithFiles("- `lib/ticket-schema.ts` -- self."), REPO_ROOT);
+    expect(r.ok).toBe(true);
+  });
+
+  test("without --check-paths, a nonexistent-looking path is not checked for existence -- only bad-path is (AC3)", () => {
+    const r = validateTicketBody(bodyWithFiles("- `lib/does-not-exist.ts` -- ghost file."));
+    expect(r.ok).toBe(true);
+  });
+
+  test("duplicate Files paths are allowed", () => {
+    const r = validateTicketBody(
+      bodyWithFiles(["- `lib/ticket-schema.ts` -- one role.", "- `lib/ticket-schema.ts` -- another role."].join("\n")),
+      REPO_ROOT
+    );
+    expect(r.ok).toBe(true);
+  });
+});
+
+describe("z-ticket-lint CLI: --check-paths (issue #84 AC3)", () => {
+  test("a real body with real Files paths passes with --check-paths against the repo root", () => {
+    expect(main([join(TICKETS, "good-with-files.md"), "--check-paths", REPO_ROOT])).toBe(0);
+  });
+
+  test("--check-paths accepted before the path argument too (flag order is not fixed)", () => {
+    expect(main(["--check-paths", REPO_ROOT, join(TICKETS, "good-with-files.md")])).toBe(0);
+  });
+
+  test("--check-paths with no value errors loud and exits 1", () => {
+    const errs = spyOn(console, "error").mockImplementation(() => {});
+    expect(main([join(TICKETS, "good-with-files.md"), "--check-paths"])).toBe(1);
+    errs.mockRestore();
+  });
+});
+
 // -- slugify (SKILL.md Step 9 idempotent re-plan matching) --------------------
 describe("slugifyTitle", () => {
   test.each([
@@ -180,20 +322,25 @@ describe("needsSplit: the oversize-ticket gate is a deterministic comparison", (
 
 // -- shouldSplitForCost: the cost-based split gate (issue #78) --------------
 describe("shouldSplitForCost: splits only when children total strictly less than parent", () => {
-  test("split-true: two cheaper children beat one opus-high ticket (AC2)", () => {
-    // 0.23 + 1.64 = 1.87 < 4.36
-    const d = shouldSplitForCost("opus-high", ["haiku-low", "sonnet-medium"]);
+  // Post-recalibration (issue #81), sonnet-medium ($10.27) prices above
+  // opus-high ($9.44) -- the measured loop-run data really does show
+  // sonnet-medium tickets costing more than opus-high ones -- so the cheapest
+  // parent still pricier than haiku-low + sonnet-medium combined is
+  // opus-xhigh, not opus-high.
+  test("split-true: two cheaper children beat one opus-xhigh ticket (AC2)", () => {
+    // 1.86 + 10.27 = 12.13 < 15.77
+    const d = shouldSplitForCost("opus-xhigh", ["haiku-low", "sonnet-medium"]);
     expect(d.split).toBe(true);
-    expect(d.reason).toContain("1.87");
-    expect(d.reason).toContain("4.36");
+    expect(d.reason).toContain("12.13");
+    expect(d.reason).toContain("15.77");
   });
 
   test("split-false: two same-tier children cost more than one, no split (AC2)", () => {
-    // 1.64 + 1.64 = 3.28 >= 1.64
+    // 10.27 + 10.27 = 20.54 >= 10.27
     const d = shouldSplitForCost("sonnet-medium", ["sonnet-medium", "sonnet-medium"]);
     expect(d.split).toBe(false);
-    expect(d.reason).toContain("3.28");
-    expect(d.reason).toContain("1.64");
+    expect(d.reason).toContain("20.54");
+    expect(d.reason).toContain("10.27");
   });
 
   test("a tie (children total == parent) does not split -- strictly below only", () => {
@@ -275,15 +422,16 @@ describe("tier -> z-estimate is reproducible (issue #7 AC2)", () => {
   const rates = loadRates();
   const NOW = new Date("2026-07-19T00:00:00Z");
 
-  // These totals are the ones documented in z-plan/SKILL.md Step 6. If a rate in
+  // These totals are the ones documented in z-plan/SKILL.md Step 6, calibrated
+  // 2026-07-20 (issue #81) from measured loop-run actuals. If a rate in
   // references/rates.json or a bucket in z-plan/tiers.json changes, this pins the
   // drift here instead of letting the skill's table quietly go stale.
   const EXPECTED: Record<string, number> = {
-    "haiku-low": 0.23,
-    "sonnet-medium": 1.64,
-    "opus-high": 4.36,
-    "opus-xhigh": 7.15,
-    "fable-xhigh": 19.5,
+    "haiku-low": 1.86,
+    "sonnet-medium": 10.27,
+    "opus-high": 9.44,
+    "opus-xhigh": 15.77,
+    "fable-xhigh": 45.22,
   };
 
   test("every documented tier exists in tiers.json", () => {
@@ -296,6 +444,27 @@ describe("tier -> z-estimate is reproducible (issue #7 AC2)", () => {
       const second = estimate(tiers[name], rates, NOW);
       expect(first).toEqual(second);
       expect(first.total).toBe(total);
+    });
+  }
+
+  // Issue #81 AC: for the three tiers with real transcript data, the new
+  // estimate must land within 0.9x-1.6x of that tier's median ACTUAL on the
+  // 25-ticket dataset the recalibration was measured against -- the same
+  // range the ticket's own worked table lands in (~1.3x). Median actuals are
+  // hard-coded here (not re-derived) so a future bucket edit that silently
+  // regresses back toward the old ~3-5x undercount fails this test by name,
+  // instead of only showing up as a vague "board totals look off" months later.
+  const MEDIAN_ACTUALS: Record<string, number> = {
+    "haiku-low": 1.43, // n=2
+    "sonnet-medium": 8.12, // n=15
+    "opus-high": 7.39, // n=8
+  };
+
+  for (const [name, actual] of Object.entries(MEDIAN_ACTUALS)) {
+    test(`${name}: new estimate is within 0.9x-1.6x of its $${actual} measured median actual`, () => {
+      const ratio = EXPECTED[name] / actual;
+      expect(ratio).toBeGreaterThanOrEqual(0.9);
+      expect(ratio).toBeLessThanOrEqual(1.6);
     });
   }
 });
@@ -685,5 +854,41 @@ describe("z-plan/SKILL.md: Step 10 evaluates BOTH split gates before filing a dr
       fieldSet();
     }
     expect(fieldWrites).toBe(0);
+  });
+});
+
+// -- Step 4 `## Files` grounding gate (issue #84 AC4) ------------------------
+// The SKILL is executed by an agent, not this test suite (same rationale as
+// every other z-plan/SKILL.md doc canary above): this pins the exact contract
+// strings that make AC4 true -- the body template names the optional `##
+// Files` section and its `(new)` convention, and the lint invocation shown
+// runs with `--check-paths` -- so a future edit that silently drops either
+// fails loudly here instead of shipping unnoticed.
+describe("z-plan/SKILL.md: Step 4 `## Files` section + --check-paths (issue #84 AC4)", () => {
+  const zPlan = () => readFileSync(join(import.meta.dir, "..", "z-plan", "SKILL.md"), "utf8");
+
+  function section(md: string, heading: string): string {
+    const start = md.indexOf(heading);
+    if (start < 0) return "";
+    const rest = md.slice(start + heading.length);
+    const next = rest.indexOf("\n## ");
+    return next < 0 ? rest : rest.slice(0, next);
+  }
+
+  test("Step 4's body template names the optional `## Files` section and the (new) convention", () => {
+    const step4 = section(zPlan(), "## Step 4 —");
+    expect(step4).toContain("`## Files`");
+    expect(step4).toContain("optional");
+    expect(step4).toContain("`(new)`");
+    expect(step4).toMatch(/re-discovering the same files/);
+  });
+
+  test("Step 4's lint invocation runs with --check-paths", () => {
+    const step4 = section(zPlan(), "## Step 4 —");
+    expect(step4).toMatch(/"\$Z_LINT" \/path\/to\/ticket-body\.md --check-paths/);
+  });
+
+  test("REPO_ROOT is resolved once, alongside the other pack-relative bins", () => {
+    expect(zPlan()).toContain('REPO_ROOT="$(pwd -P)"');
   });
 });

@@ -43,6 +43,11 @@ export ZSTACK_SLUG="$SLUG"   # H13: so any z-board call that omits --slug still
                              # resolves the right project (resolveSlug honors
                              # ZSTACK_SLUG) instead of throwing "Multiple zstack
                              # projects" on a multi-project machine.
+REPO_ROOT="$(pwd -P)"        # the TARGET project repo (this skill always runs
+                             # from inside it, same dir `gh repo view` just
+                             # resolved) -- distinct from $PACK, the skill's own
+                             # install dir. Step 4's `## Files` grounding gate
+                             # checks paths against this root.
 ```
 
 ---
@@ -248,14 +253,24 @@ the rest are h2):
 - `## Docs pages touched` — the `docs/user-guide/` pages to update when the
   ticket changes what users see or do; "none (no user-facing change)" otherwise.
 - `## Out of scope` — what this ticket deliberately does not do.
+- `## Files` — optional; one top-level bullet per file the grounding pass
+  (Step 2) discovered, each a path like `lib/board.ts` in the bullet's FIRST
+  backticked span followed by a one-clause role (anything else in the bullet
+  is prose). This is the map the builder/QA/reviewer stages reuse instead of
+  re-discovering the same files with fresh glob/grep in every stage spawn — pay
+  the discovery cost once, here. A file this ticket will CREATE (does not
+  exist yet) gets its bullet suffixed literally `(new)`, exempting it from the
+  existence gate below.
 - `Depends on: #A, #B` — optional line; omit it when the ticket has no
   dependencies. When present it names the issues this ticket waits on.
 
 Gate every body before it touches the board — this is deterministic, so run the
-script, never eyeball it:
+script, never eyeball it. Always pass `--check-paths` with the repo root so a
+hallucinated or stale `## Files` path fails here, at plan time, not at build
+time in a fresh worktree:
 
 ```bash
-"$Z_LINT" /path/to/ticket-body.md   # exit 0 = valid; exit 1 prints each gap on stderr
+"$Z_LINT" /path/to/ticket-body.md --check-paths "$REPO_ROOT"   # exit 0 = valid; exit 1 prints each gap on stderr
 ```
 
 Do not file a ticket whose body does not pass `z-ticket-lint`. The gate is the
@@ -339,11 +354,16 @@ The chain that makes two runs on the same spec land on the same dollar figure:
 
    | Tier          | Model  | Effort | Buffer | Estimate |
    |---------------|--------|--------|--------|----------|
-   | `haiku-low`   | haiku  | low    | 30%    | $0.23    |
-   | `sonnet-medium` | sonnet | medium | 30%  | $1.64    |
-   | `opus-high`   | opus   | high   | 30%    | $4.36    |
-   | `opus-xhigh`  | opus   | xhigh  | 30%    | $7.15    |
-   | `fable-xhigh` | fable  | xhigh  | 50%    | $19.50   |
+   | `haiku-low`   | haiku  | low    | 30%    | $1.86    |
+   | `sonnet-medium` | sonnet | medium | 30%  | $10.27   |
+   | `opus-high`   | opus   | high   | 30%    | $9.44    |
+   | `opus-xhigh`  | opus   | xhigh  | 30%    | $15.77   |
+   | `fable-xhigh` | fable  | xhigh  | 50%    | $45.22   |
+
+   Calibrated 2026-07-20 (issue #81) from measured loop-run actuals — the
+   buckets behind these totals are per-tier medians from real ticket
+   transcripts (`z-plan/tiers.json`'s `_comment` has the derivation recipe),
+   not the directional guesses the tiers started from.
 
 2. Copy that tier's entry verbatim into a `buckets.json` and shell it to
    `z-estimate`. You produce the bucket **counts** by tier lookup (no
@@ -352,7 +372,7 @@ The chain that makes two runs on the same spec land on the same dollar figure:
    ```bash
    bun -e "require('fs').writeFileSync('/tmp/bk.json',
      JSON.stringify(require('$TIERS').tiers['opus-xhigh']))"
-   "$Z_ESTIMATE" /tmp/bk.json          # -> $7.15 (subtotal $5.50, buffer 30%, model opus)
+   "$Z_ESTIMATE" /tmp/bk.json          # -> $15.77 (subtotal $12.13, buffer 30%, model opus)
    ```
 
 **Why this is reproducible (issue #7 AC2):** the tier is a function of the
@@ -369,7 +389,7 @@ Write all three fields through the board contract — never hand-edit the board:
 ```bash
 "$Z_BOARD" field-set <N> Model "opus"        --slug "$SLUG"
 "$Z_BOARD" field-set <N> "Model Effort" xhigh --slug "$SLUG"
-"$Z_BOARD" field-set <N> Estimate 7.15        --slug "$SLUG"
+"$Z_BOARD" field-set <N> Estimate 15.77       --slug "$SLUG"
 ```
 
 ---
@@ -587,8 +607,8 @@ files, and dollar figures the JSON gave you; never generic advice the JSON
 does not support (no "write more efficient code", no boilerplate unconnected
 to this batch's actual numbers). Example shape (not literal wording):
 
-- total batch estimate is $28.75 across 5 tickets.
-- #105 ("...") is fable-xhigh ($19.50) — confirm the tier is warranted or
+- total batch estimate is $74.98 across 5 tickets.
+- #105 ("...") is fable-xhigh ($45.22) — confirm the tier is warranted or
   split it.
 - lib/config.ts is touched by 3 tickets (#103, #104, #105) — sequencing them
   reduces re-review churn.

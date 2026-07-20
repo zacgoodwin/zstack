@@ -12,22 +12,22 @@ import { costSuggestions, loadPlannedTickets, main, ZError, type PlannedTicket }
 const FIXTURE_PATH = join(import.meta.dir, "..", "evals", "cost-suggest", "fixture-batch.json");
 const FIXTURE: PlannedTicket[] = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));
 
-// -- cases 1-4: the 5-ticket fixture (#101/#102 haiku-low $0.23 each, #103
-// sonnet-medium $1.64 on lib/config.ts, #104 opus-xhigh $7.15 on
-// lib/config.ts+lib/loop.ts, #105 fable-xhigh $19.50 on lib/config.ts) -----
+// -- cases 1-4: the 5-ticket fixture (#101/#102 haiku-low $1.86 each, #103
+// sonnet-medium $10.27 on lib/config.ts, #104 opus-xhigh $15.77 on
+// lib/config.ts+lib/loop.ts, #105 fable-xhigh $45.22 on lib/config.ts) -----
 describe("costSuggestions: the 5-ticket fixture", () => {
   test("case 1: totalEstimate sums every estimate, rounded once", () => {
-    // 0.23 + 0.23 + 1.64 + 7.15 + 19.50 = 28.75
-    expect(costSuggestions(FIXTURE).totalEstimate).toBe(28.75);
+    // 1.86 + 1.86 + 10.27 + 15.77 + 45.22 = 74.98
+    expect(costSuggestions(FIXTURE).totalEstimate).toBe(74.98);
   });
 
   test("case 2: byTier groups by model-modelEffort, sorted subtotal desc", () => {
     const byTier = costSuggestions(FIXTURE).byTier;
     expect(byTier).toEqual([
-      { tier: "fable-xhigh", model: "fable", modelEffort: "xhigh", tickets: [105], subtotal: 19.5 },
-      { tier: "opus-xhigh", model: "opus", modelEffort: "xhigh", tickets: [104], subtotal: 7.15 },
-      { tier: "sonnet-medium", model: "sonnet", modelEffort: "medium", tickets: [103], subtotal: 1.64 },
-      { tier: "haiku-low", model: "haiku", modelEffort: "low", tickets: [101, 102], subtotal: 0.46 },
+      { tier: "fable-xhigh", model: "fable", modelEffort: "xhigh", tickets: [105], subtotal: 45.22 },
+      { tier: "opus-xhigh", model: "opus", modelEffort: "xhigh", tickets: [104], subtotal: 15.77 },
+      { tier: "sonnet-medium", model: "sonnet", modelEffort: "medium", tickets: [103], subtotal: 10.27 },
+      { tier: "haiku-low", model: "haiku", modelEffort: "low", tickets: [101, 102], subtotal: 3.72 },
     ]);
   });
 
@@ -41,7 +41,7 @@ describe("costSuggestions: the 5-ticket fixture", () => {
     expect(costSuggestions(FIXTURE).topCostTicket).toEqual({
       number: 105,
       title: "Redesign the config subsystem end to end",
-      estimate: 19.5,
+      estimate: 45.22,
     });
   });
 });
@@ -63,7 +63,7 @@ describe("costSuggestions: suggestions (case 6)", () => {
       {
         kind: "high-cost-ticket",
         tickets: [105],
-        fact: '#105 ("Redesign the config subsystem end to end") is fable-xhigh ($19.50).',
+        fact: '#105 ("Redesign the config subsystem end to end") is fable-xhigh ($45.22).',
       },
       {
         kind: "shared-file-cluster",

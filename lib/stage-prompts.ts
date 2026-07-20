@@ -62,6 +62,7 @@ Read your full ticket body (Context, Plan, Acceptance Criteria, Tests + evals, D
 ${bounce}${review}
 ## Discipline
 - Ponytail ladder before writing any code: does it need to exist at all; does this codebase already have it; does the stdlib/platform/an installed dep cover it; can it be one line -- only then write the minimum that works. Smallest correct diff, full scope.
+- If the ticket has a \`## Files\` section, it is the map -- start from those paths instead of searching.
 - The plan's "### Acceptance Criteria" cases are the contract: make each pass AS WRITTEN. Weakening, deleting, or skipping one is a spec question -- exit NEEDS-INPUT, never silently edit a case.
 - Ship the whole thing in this one diff: implementation + gate tests + evals (where the work is latent) + every docs page the ticket names.
 - Deterministic work (arithmetic, parsing, transforms, lookups) goes in scripts with tests, never in your prose.

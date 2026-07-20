@@ -91,6 +91,10 @@ records the result. It never re-derives a scheduling decision in prose.
   one, re-spawns builder — so `builder-3.jsonl` might follow one bounce of
   each kind, not necessarily three QA passes). This naming is what lets the
   end-of-loop report break spend down by stage instead of only by ticket.
+- **Per-stage model routing.** The merge stage is mechanical (`gh pr create`, a
+  conflict check, `gh pr merge`) and doesn't need the ticket's build-tier
+  model; the `stageModels` config knob (default `{"merge": "haiku"}`)
+  downshifts it for a direct cost cut. See below.
 
 ## End of loop
 
@@ -140,6 +144,39 @@ the report is unaffected.
 Every other cost-cutting change (stage model routing, trimming the Files
 section, tighter diff hygiene) can point at this table before/after to prove
 it actually moved the needle, instead of eyeballing the total.
+
+## Per-stage model routing
+
+Every stage spawn — builder, QA, reviewer, merge — normally runs at the
+ticket's board **Model** field. The merge stage is mechanical (`gh pr create`,
+a conflict check, `gh pr merge`) and never needs the builder's model tier; QA
+on a small ticket often doesn't either. The `stageModels` config knob lets a
+project override any stage's model, resolved once per spawn by
+`bun lib/loop.ts stage-model <stage> <ticketModel> --slug <s>`
+(`resolveStageModel` in `lib/loop.ts`) — never re-derived in prose.
+
+**Absent vs `{}` — the two states mean opposite things:**
+
+- **Key absent from `config.json` entirely** — the pack default applies:
+  `{"merge": "haiku"}`. Every other stage still resolves to the ticket's Model
+  field.
+- **Key present, even as `{}`** — used exactly as written, no default layered
+  on top. An empty object opts every stage back to the ticket's Model field.
+
+```json
+{ "stageModels": { "merge": "haiku" } }
+```
+
+Only `builder`, `qa`, `reviewer`, `merge` are valid keys. Each value must be a
+model rate key defined in `references/rates.json` (the same lookup
+`z-cost`/`z-estimate` use — `opus`, `sonnet`, `haiku`, `fable`, or a matching
+family substring); an unknown value fails `validateConfig` loudly, naming
+`stageModels.<stage>`, never silently at spawn time.
+
+`/z-setup` writes `{"merge": "haiku"}` into every newly-created project's
+config. An adopted or already-configured project keeps whatever it already
+has — add the key by hand to opt in (see
+[z-setup.md → Config knobs](z-setup.md#config-knobs-hand-edit-configjson-after-setup)).
 
 ## Notifications
 

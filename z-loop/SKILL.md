@@ -288,16 +288,28 @@ the input file, never through your context; ticket #57, Leak 1):
    extra flags (`--adversarial-mode`, `--labels`) — see its row below; they decide
    the super-truth fan-out and NEVER become input keys.
 3. Spawn a FRESH harness Agent (Agent tool), `run_in_background: true`, with
-   that prompt and `model` = the ticket's Model field
-   (`"$Z_BOARD" field-get <N> Model`; the Model Effort field selected the
-   estimate tier — the Agent call has no per-spawn effort knob, a known
-   ceiling).
+   that prompt and `model` resolved through the per-stage router (issue #82:
+   the merge stage is mechanical — a PR create, a conflict check, a PR merge —
+   and never needs the ticket's build-tier model, a direct, zero-quality-risk
+   cost cut):
+
+   ```bash
+   TICKET_MODEL=$("$Z_BOARD" field-get <N> Model)
+   MODEL=$(bun "$PACK/lib/loop.ts" stage-model <stage> "$TICKET_MODEL" --slug "$SLUG")
+   ```
+
+   Pass `$MODEL` as the Agent spawn's `model` param — never the raw
+   `TICKET_MODEL` directly. `stage-model` reads the project's `stageModels`
+   config (`lib/loop.ts resolveStageModel`): absent entirely, only `merge`
+   downshifts to `haiku`; present (even `{}`), used exactly as configured, no
+   default layered on. The Model Effort field selected the estimate tier —
+   the Agent call has no per-spawn effort knob, a known ceiling.
 
 | Stage | Input JSON fields |
 |---|---|
 | `builder` | `ticketNumber`, `ticketTitle`, `ticketBody` (fresh `gh issue view` → `"$TMP/body-<N>.md"`, injected `--rawfile`), `worktreePath` (`.worktrees/ticket-<N>`), `branch`, `baseBranch`; on a bounce also `qaNotes`/`investigateFirst` or `reviewNotes` per the advance row above. |
 | `qa` | `ticketNumber`, `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `worktreePath`, `branch`, `qaPass` (the lane's `qaBounces` in the state file + 1), `webTarget` (true when the ticket changes a web-served surface — your judgment; QA then drives gstack /qa). |
-| `reviewer` | **BLINDED — exactly** `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `acceptanceCriteria` (the `### Acceptance Criteria` section to a file: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$TMP/body-<N>.md" > "$TMP/ac-<N>.md"`, injected `--rawfile`), `diff` (`git -C .worktrees/ticket-<N> diff "$BASE"...HEAD > "$TMP/diff-<N>.txt"`, injected `--rawfile` so it never enters your context), `worktreePath` = a THROWAWAY worktree of the head commit (`git worktree add "$TMP/review-<N>" <head-sha>`; remove it after the stage). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. **Adversarial control (#59):** build this stage's prompt with two extra flags — `MODE=$("$Z_BOARD" ... )` the project's `adversarialMode` (read it from `~/.zstack/projects/$SLUG/config.json`; `loadConfig` defaults it to `non-trivial`) and `LABELS=$(gh issue view <N> --json labels -q '[.labels[].name]')` (a JSON array — labels live on the GitHub issue, NOT on the board item, so `board.list` never fetched them; get them here). Then `bun "$PACK/lib/stage-prompts.ts" prompt reviewer "$TMP/input-<N>.json" --adversarial-mode "$MODE" --labels "$LABELS" > "$TMP/prompt-<N>.txt"`. The predicate (`adversarialActive`) reads the diff's own changed-line count from the blinded input — `always`/`non-trivial`-on-a-big-or-labeled diff spawns the skeptic fan-out (and stamps a `confidence=` token onto `REVIEW-FINDINGS` too); `off`/small-unlabeled is the single pass. Either way `REVIEW-APPROVE` always carries a `confidence=` token (issue #62's safety gate reads it regardless) — see `/z-loop`'s reviewer-confidence-gate section for what a sub-floor score does. Mode + labels ride as FLAGS; the four-key input JSON is untouched. |
+| `reviewer` | **BLINDED — exactly** `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `acceptanceCriteria` (the `### Acceptance Criteria` section to a file: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$TMP/body-<N>.md" > "$TMP/ac-<N>.md"`, injected `--rawfile`), `diff` (exclude lockfiles to avoid flooding the reviewer with generated code: `git -C .worktrees/ticket-<N> diff "$BASE"...HEAD -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)pnpm-lock.yaml' ':(exclude)yarn.lock' > "$TMP/diff-<N>.txt"`; if the filtered diff is empty — a lockfile-only change — fall back to the unfiltered diff: `[ ! -s "$TMP/diff-<N>.txt" ] && git -C .worktrees/ticket-<N> diff "$BASE"...HEAD > "$TMP/diff-<N>.txt"`. Injected `--rawfile` so it never enters your context), `worktreePath` = a THROWAWAY worktree of the head commit (`git worktree add "$TMP/review-<N>" <head-sha>`; remove it after the stage). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. **Adversarial control (#59):** build this stage's prompt with two extra flags — `MODE=$("$Z_BOARD" ... )` the project's `adversarialMode` (read it from `~/.zstack/projects/$SLUG/config.json`; `loadConfig` defaults it to `non-trivial`) and `LABELS=$(gh issue view <N> --json labels -q '[.labels[].name]')` (a JSON array — labels live on the GitHub issue, NOT on the board item, so `board.list` never fetched them; get them here). Then `bun "$PACK/lib/stage-prompts.ts" prompt reviewer "$TMP/input-<N>.json" --adversarial-mode "$MODE" --labels "$LABELS" > "$TMP/prompt-<N>.txt"`. The predicate (`adversarialActive`) reads the diff's own changed-line count from the blinded input — `always`/`non-trivial`-on-a-big-or-labeled diff spawns the skeptic fan-out (and stamps a `confidence=` token onto `REVIEW-FINDINGS` too); `off`/small-unlabeled is the single pass. Either way `REVIEW-APPROVE` always carries a `confidence=` token (issue #62's safety gate reads it regardless) — see `/z-loop`'s reviewer-confidence-gate section for what a sub-floor score does. Mode + labels ride as FLAGS; the four-key input JSON is untouched. |
 | `merge` | `ticketNumber`, `prTitle` (the ticket title), `branch`, `baseBranch`, `worktreePath`, `stackedOn` (from the advance action — parents whose branches this PR stacks on; the prompt carries the PROCESS.md step 18 chain rules: parents first, no branch deletion mid-batch, retarget, delete last). |
 
 **Per-stage Actual (every stage, no exceptions):** when a stage agent finishes,

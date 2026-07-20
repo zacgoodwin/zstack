@@ -136,6 +136,16 @@ each defaulted by `loadConfig` when absent:
   bouncing again (issue #76). Both routes share one budget on the lane. Must
   be a positive integer — a fraction, zero, or a negative is a loud config
   error, never a silent fallback.
+- `stageModels` (default `{"merge": "haiku"}` on a brand-new project's
+  config; omitted entirely on an adopted/pre-existing one) — per-stage model
+  overrides for the loop's four stage spawns (builder/qa/reviewer/merge). Key
+  absent -> the default above applies; key present, even as `{}` -> used
+  exactly as written, no default layered on. Each value must be a model
+  rate key in `references/rates.json` (the same lookup `z-cost`/`z-estimate`
+  use), checked by `validateConfig`. An already-set-up project that predates
+  this knob (or was adopted) never gets it auto-added — add it to
+  `config.json` by hand to opt in. Full semantics:
+  [z-loop.md → Per-stage model routing](z-loop.md#per-stage-model-routing).
 - `notifications` (absent = off) — Discord notifications for the seven loop/plan
   events (including `human-needed` — issue #63). Shape: `{ "enabled": true, "discordWebhookUrl": "https://…",
   "events": { "human-pause": false } }`. `enabled` is the master switch; each

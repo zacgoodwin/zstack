@@ -274,14 +274,16 @@ What makes a zstack ticket different from a hand-filed issue:
 
   | Tier | Model | Effort | Estimate |
   | --- | --- | --- | --- |
-  | `haiku-low` | haiku | low | $0.23 |
-  | `sonnet-medium` | sonnet | medium | $1.64 |
-  | `opus-high` | opus | high | $4.36 |
-  | `opus-xhigh` | opus | xhigh | $7.15 |
-  | `fable-xhigh` | fable | xhigh | $19.50 |
+  | `haiku-low` | haiku | low | $1.86 |
+  | `sonnet-medium` | sonnet | medium | $10.27 |
+  | `opus-high` | opus | high | $9.44 |
+  | `opus-xhigh` | opus | xhigh | $15.77 |
+  | `fable-xhigh` | fable | xhigh | $45.22 |
 
   (Full-lifecycle: plan + build + QA + review + merge, with buffer. Rules of
-  thumb per tier are in `spec/ESTIMATION.md`.)
+  thumb per tier are in `spec/ESTIMATION.md`. Calibrated 2026-07-20 from
+  measured loop-run actuals, issue #81 — see `z-plan/tiers.json`'s `_comment`
+  for the derivation recipe.)
 - **Dependencies linked both directions.** "N Depends on #M" on the dependent,
   "M Blocks #N" on the dependency, existing tickets found by title slug so a
   reworded title doesn't create a duplicate.

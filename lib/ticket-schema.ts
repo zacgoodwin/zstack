@@ -6,10 +6,11 @@
 // dependency-free: parsing markdown headings is a regex match, not model work
 // (PRINCIPLES.md, latent vs deterministic), so it lives in a script with tests
 // and never in a prompt.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { roundCents } from "./estimate.ts";
 
-export type TicketErrorCode = "missing" | "malformed" | "empty";
+export type TicketErrorCode = "missing" | "malformed" | "empty" | "bad-path";
 
 export interface TicketError {
   section: string; // the schema section this error is about
@@ -95,11 +96,81 @@ function hasContent(headings: Heading[], idx: number, lines: string[]): boolean 
   return false;
 }
 
+// Optional `## Files` section (issue #84): when present it is the grounding
+// map z-plan discovered at plan time, so the builder/QA/reviewer stages stop
+// re-discovering the same files with fresh glob/grep. Absent stays valid --
+// existing board tickets and hand-filed backlog items keep passing.
+const FILES_BULLET = /^- (.*)$/; // top-level bullet only ("- " at column 0); nested/indented bullets and prose are ignored
+const BACKTICK_SPAN = /`([^`]+)`/; // first backticked span = the path; later spans are prose
+
+function validateFilesSection(headings: Heading[], lines: string[], repoRoot?: string): TicketError[] {
+  const errors: TicketError[] = [];
+  const idx = headings.findIndex((h) => normTitle(h.title) === "files");
+  if (idx === -1) return errors; // optional section; absent is valid
+
+  const h = headings[idx];
+  if (h.level !== 2) {
+    errors.push({
+      section: "Files",
+      code: "malformed",
+      message: `Section "Files" must be at heading level 2 (##), found level ${h.level}.`,
+    });
+    return errors;
+  }
+  if (!hasContent(headings, idx, lines)) {
+    errors.push({
+      section: "Files",
+      code: "empty",
+      message: `Section "Files" is present but has no content before the next heading.`,
+    });
+    return errors;
+  }
+
+  const start = h.line + 1;
+  const end = headings[idx + 1]?.line ?? lines.length;
+  for (let i = start; i < end; i++) {
+    const m = lines[i].match(FILES_BULLET);
+    if (!m) continue; // nested bullet or prose line -- not a path entry
+    const bullet = m[1];
+    const bt = bullet.match(BACKTICK_SPAN);
+    if (!bt) {
+      errors.push({
+        section: "Files",
+        code: "malformed",
+        message: `Files bullet has no backticked path: ${JSON.stringify(bullet.trim())}.`,
+      });
+      continue;
+    }
+    const p = bt[1];
+    // Always checked, flag-independent: an absolute path or a ".." segment
+    // can never resolve to a safe repo-relative location.
+    if (isAbsolute(p) || p.split(/[\\/]/).includes("..")) {
+      errors.push({
+        section: "Files",
+        code: "bad-path",
+        message: `Files path "${p}" is not a safe repo-relative path (must not be absolute or contain "..").`,
+      });
+      continue;
+    }
+    if (repoRoot && !bullet.trim().endsWith("(new)") && !existsSync(join(repoRoot, p))) {
+      errors.push({
+        section: "Files",
+        code: "missing",
+        message: `Files path does not exist under repo root: ${p}`,
+      });
+    }
+  }
+  return errors;
+}
+
 // Validates a ticket body against the schema. Returns every problem found (not
 // just the first) so a planner sees the whole gap in one pass. A `Depends on:`
 // line is optional -- a ticket with no dependencies has none -- but if present
 // it must name at least one `#N` (or say none/n/a), so an empty stub is caught.
-export function validateTicketBody(md: string): TicketValidation {
+// `repoRoot`, when given, additionally gates every `## Files` path's existence
+// (`--check-paths`, bin/z-ticket-lint) -- omit it and only the bad-path check
+// (absolute / "..") runs.
+export function validateTicketBody(md: string, repoRoot?: string): TicketValidation {
   const { headings, lines } = parse(md);
   const errors: TicketError[] = [];
 
@@ -131,6 +202,8 @@ export function validateTicketBody(md: string): TicketValidation {
       });
     }
   }
+
+  errors.push(...validateFilesSection(headings, lines, repoRoot));
 
   // Optional dependency line: only validated when present.
   const dep = lines.find((l) => /^\s*depends on:/i.test(l));
@@ -199,11 +272,11 @@ export function needsSplit(fileCount: number, stepCount: number): SplitDecision 
 // cross-checks this table against that chain so a rates.json/tiers.json
 // change can't silently desync this pure lookup.
 export const TIER_ESTIMATES: Record<string, number> = {
-  "haiku-low": 0.23,
-  "sonnet-medium": 1.64,
-  "opus-high": 4.36,
-  "opus-xhigh": 7.15,
-  "fable-xhigh": 19.5,
+  "haiku-low": 1.86,
+  "sonnet-medium": 10.27,
+  "opus-high": 9.44,
+  "opus-xhigh": 15.77,
+  "fable-xhigh": 45.22,
 };
 
 function tierEstimate(tier: string): number {
@@ -236,14 +309,31 @@ export function shouldSplitForCost(parentTier: string, childTiers: string[]): Sp
 }
 
 // -- CLI ---------------------------------------------------------------------
-const USAGE = `z-ticket-lint <ticket-body.md>
+const USAGE = `z-ticket-lint <ticket-body.md> [--check-paths <repoRoot>]
 
   Validates a ticket body file against the ticket schema (lib/ticket-schema.ts).
   Exit 0 = valid; exit 1 = invalid (errors on stderr) or a usage/read error.
-  Mandatory sections: ${REQUIRED_SECTIONS.map((s) => `${"#".repeat(s.level)} ${s.title}`).join(", ")}.`;
+  Mandatory sections: ${REQUIRED_SECTIONS.map((s) => `${"#".repeat(s.level)} ${s.title}`).join(", ")}.
+  Optional: a "## Files" section listing repo-relative paths, one per
+  top-level bullet ("- \`path\` ..."); an absolute path or one containing ".."
+  always fails (bad-path). --check-paths <repoRoot> additionally requires every
+  Files path to exist under repoRoot (a bullet ending "(new)" is exempt).`;
 
 export function main(argv: string[]): number {
-  const path = argv[0];
+  const rest: string[] = [];
+  let repoRoot: string | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--check-paths") {
+      repoRoot = argv[++i];
+      if (repoRoot === undefined) {
+        console.error("--check-paths requires a <repoRoot> argument.");
+        return 1;
+      }
+      continue;
+    }
+    rest.push(argv[i]);
+  }
+  const path = rest[0];
   if (!path || path === "-h" || path === "--help") {
     console.log(USAGE);
     return path ? 0 : 1;
@@ -257,7 +347,7 @@ export function main(argv: string[]): number {
     return 1;
   }
 
-  const result = validateTicketBody(md);
+  const result = validateTicketBody(md, repoRoot);
   if (result.ok) {
     console.log(`${path}: OK (all mandatory sections present)`);
     return 0;

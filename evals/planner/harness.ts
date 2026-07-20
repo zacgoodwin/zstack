@@ -85,15 +85,21 @@ export interface LintResult {
 
 // Writes `body` to a throwaway file under `tmpDir` and pipes it through the
 // real bin/z-ticket-lint (or an injected fake spawn for pure unit tests).
+// `checkPathsRoot`, when given, adds `--check-paths <checkPathsRoot>` --
+// issue #84's grounding gate: if the ticket carries a `## Files` section,
+// every path must exist under that root. No second lint implementation here;
+// this just threads the flag bin/z-ticket-lint already understands.
 export function lintTicketBody(
   body: string,
   tmpDir: string,
   lintBin: string,
-  spawn: Spawn = defaultSpawn
+  spawn: Spawn = defaultSpawn,
+  checkPathsRoot?: string
 ): LintResult {
   const file = join(tmpDir, `lint-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`);
   writeFileSync(file, body, "utf8");
-  const result = spawn(["bash", lintBin, file]);
+  const cmd = checkPathsRoot ? ["bash", lintBin, file, "--check-paths", checkPathsRoot] : ["bash", lintBin, file];
+  const result = spawn(cmd);
   return { ok: result.exitCode === 0, output: (result.stdout + result.stderr).trim() };
 }
 
@@ -232,7 +238,18 @@ export interface CheckReport {
   exitCode: number;
 }
 
-export function checkRun(outDir: string, runs: number, lintBin: string, spawn: Spawn = defaultSpawn): CheckReport {
+// The fixture app every planner-eval ticket is grounded against (evals/planner/
+// fixture-app) -- the repo root a ticket's `## Files` paths (if any) must
+// resolve under. Overridable so tests can point it at a throwaway fixture.
+export const DEFAULT_FILES_ROOT = join(import.meta.dir, "fixture-app");
+
+export function checkRun(
+  outDir: string,
+  runs: number,
+  lintBin: string,
+  spawn: Spawn = defaultSpawn,
+  filesRoot: string = DEFAULT_FILES_ROOT
+): CheckReport {
   const lintFailures: string[] = [];
   const scores: RubricScore[] = [];
   const estimatesPerRun: number[][] = [];
@@ -246,7 +263,11 @@ export function checkRun(outDir: string, runs: number, lintBin: string, spawn: S
       lintFailures.push(`run ${i}: no ticket found (no "## Context" heading in ${planPath}).`);
     }
     chunks.forEach((body, idx) => {
-      const { ok, output } = lintTicketBody(body, outDir, lintBin, spawn);
+      // --check-paths against filesRoot: this is the "did the planner ground
+      // correctly" half (issue #84) -- a ticket whose `## Files` section
+      // names a plausible-but-wrong path fails here, same as a missing
+      // mandatory section would.
+      const { ok, output } = lintTicketBody(body, outDir, lintBin, spawn, filesRoot);
       if (!ok) lintFailures.push(`run ${i} ticket ${idx + 1}: z-ticket-lint failed:\n${output}`);
     });
     scores.push(parseScore(readFileSync(scorePath, "utf8")));
