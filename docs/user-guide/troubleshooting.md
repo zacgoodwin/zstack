@@ -4,7 +4,7 @@ The failure modes zstack surfaces on purpose, and what to do about each. All of
 these are deliberate stops — the loop refuses to guess or to burn tokens while
 wedged.
 
-## Installed the pack but /z-setup, /z-plan, /z-loop, /z-status, /z-uninstall don't appear
+## Installed the pack but /z-setup, /z-plan, /z-loop, /z-status, /z-uninstall, /z-update don't appear
 
 Claude Code builds its skill list from `~/.claude/skills/<name>/SKILL.md`,
 exactly one level deep — SKILL.md files nested inside the pack directory are
@@ -26,7 +26,7 @@ invisible. `./setup` registers each skill as its own top-level entry
    instead, or replace it with this one:
    `rm -rf ~/.claude/skills/zstack`, then re-run `./setup` from your clone.
 
-Verify: `ls ~/.claude/skills/z-*/SKILL.md` should list five files.
+Verify: `ls ~/.claude/skills/z-*/SKILL.md` should list six files.
 
 ## gh: "missing required scopes [read:project]"
 
