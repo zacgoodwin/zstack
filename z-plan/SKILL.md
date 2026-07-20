@@ -36,6 +36,7 @@ PACK="$HOME/.claude/skills/zstack"
 Z_BOARD="$PACK/bin/z-board"
 Z_ESTIMATE="$PACK/bin/z-estimate"
 Z_LINT="$PACK/bin/z-ticket-lint"
+Z_COST_SUGGEST="$PACK/bin/z-cost-suggest"
 TIERS="$PACK/z-plan/tiers.json"
 SLUG=$(gh repo view --json name -q .name)   # one board per repo; matches /z-setup
 export ZSTACK_SLUG="$SLUG"   # H13: so any z-board call that omits --slug still
@@ -423,6 +424,53 @@ For each ticket number `<N>` in that list:
    Moving a ticket to Questions (this step's item 3, and the pre-existing
    Step 8) is a different, allowed movement; Step 10 does not claim
    exclusivity over that one, only over Ready.
+
+---
+
+## Step 11 — Cost-saving suggestions (terminal output)
+
+Every run that files/updates at least one ticket ends with a short cost-saving
+report for the human running /z-plan — advisory only, never a board write,
+never a comment, never routed through any notification transport.
+
+"The batch" for this step is exactly: every ticket Steps 4-9 filed or updated
+in this run, plus every ticket Step 10 drafted a body for (its "otherwise"
+branch) — explicitly EXCLUDING Step 10's untouched already-fielded tickets
+("nothing needed, nothing written") and any ticket this run parked to
+Questions (neither carries a fresh Estimate this run stands behind). A run
+whose batch is empty (a `--backlog` run where every ticket already passed and
+was already fielded) skips this step and prints nothing.
+
+Assemble one entry per batch ticket from data already in hand THIS run — no
+new field-get, no re-reading any body:
+
+- number, title: already known from filing/drafting it.
+- model, modelEffort, estimate: the exact values just written via Step 6's
+  `"$Z_BOARD"` field-set calls (or already-passing values Step 10 read).
+- files: the exact file list already assembled for THIS ticket's Step 5
+  needsSplit file count — reused, never re-derived.
+
+Write that array to a temp `planned-batch.json` and shell it to the
+deterministic helper — the arithmetic is computed, never eyeballed, same
+discipline as Step 6's tier → z-estimate chain:
+
+```bash
+"$Z_COST_SUGGEST" planned-batch.json   # -> one CostBreakdown JSON object on stdout
+```
+
+Only the WORDING below is your own prose. Turn `totalEstimate`, `byTier`,
+`sharedFileClusters`, `topCostTicket`, and each `suggestions[]` entry's `fact`
+into 3-6 short lines printed to the human — name the real ticket numbers,
+files, and dollar figures the JSON gave you; never generic advice the JSON
+does not support (no "write more efficient code", no boilerplate unconnected
+to this batch's actual numbers). Example shape (not literal wording):
+
+- total batch estimate is $28.75 across 5 tickets.
+- #105 ("...") is fable-xhigh ($19.50) — confirm the tier is warranted or
+  split it.
+- lib/config.ts is touched by 3 tickets (#103, #104, #105) — sequencing them
+  reduces re-review churn.
+- #101, #102 are haiku-low mechanical work — batch them in one lane.
 
 ---
 

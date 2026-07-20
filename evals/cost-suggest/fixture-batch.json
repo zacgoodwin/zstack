@@ -1,0 +1,42 @@
+[
+  {
+    "number": 101,
+    "title": "Rename legacy flag across bin scripts",
+    "model": "haiku",
+    "modelEffort": "low",
+    "estimate": 0.23,
+    "files": []
+  },
+  {
+    "number": 102,
+    "title": "Fix typo in installer README",
+    "model": "haiku",
+    "modelEffort": "low",
+    "estimate": 0.23,
+    "files": []
+  },
+  {
+    "number": 103,
+    "title": "Add a feature flag to loop config",
+    "model": "sonnet",
+    "modelEffort": "medium",
+    "estimate": 1.64,
+    "files": ["lib/config.ts"]
+  },
+  {
+    "number": 104,
+    "title": "Migrate config schema and rewire loop.ts",
+    "model": "opus",
+    "modelEffort": "xhigh",
+    "estimate": 7.15,
+    "files": ["lib/config.ts", "lib/loop.ts"]
+  },
+  {
+    "number": 105,
+    "title": "Redesign the config subsystem end to end",
+    "model": "fable",
+    "modelEffort": "xhigh",
+    "estimate": 19.5,
+    "files": ["lib/config.ts"]
+  }
+]

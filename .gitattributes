@@ -14,11 +14,15 @@ bin/z-setup-permissions text eol=lf
 bin/z-ticket-lint text eol=lf
 bin/z-update text eol=lf
 bin/z-loop-tick text eol=lf
+bin/z-cost-suggest text eol=lf
 # Extensionless bash in the eval fixture app; same CRLF hazard as setup.
 evals/fixture-app/scripts/deploy text eol=lf
 # Planner eval harness bash scripts (issue #25); same CRLF hazard as setup.
 evals/planner/run.sh text eol=lf
 evals/planner/mock-claude.sh text eol=lf
+# Cost-suggest eval harness bash scripts (issue #64); same CRLF hazard.
+evals/cost-suggest/run.sh text eol=lf
+evals/cost-suggest/mock-claude.sh text eol=lf
 *.ts    text eol=lf
 *.json  text eol=lf
 *.jsonl text eol=lf
