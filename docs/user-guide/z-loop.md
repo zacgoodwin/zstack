@@ -43,12 +43,23 @@ records the result. It never re-derives a scheduling decision in prose.
   a pure function of the diff's changed-line count, the issue's labels, and the
   `adversarialMode` knob (default `non-trivial`: a ≥ 10-line diff OR a
   `security`/`migration`/`payments`/`auth` label; `off` never, `always` every
-  card). The confidence rides in the reviewer's exit marker; gating on it is a
-  later step.
+  card). The confidence rides in the reviewer's exit marker.
+- **A low-confidence approval does not merge.** The reviewer always reports a
+  self-assessed (or, on a super-truth pass, skeptic-aggregated) `confidence`
+  0–100 on its `REVIEW-APPROVE`. An approval below `minReviewerConfidence`
+  (default 70) never reaches the merge gate: per `reviewerBelowThresholdAction`
+  (default `block`) it parks the ticket Blocked with
+  `truth-check failed (confidence X/100)`, bounces it back to the builder
+  (`retry`), or is ignored entirely (`off`). A `REVIEW-APPROVE` with no
+  parseable confidence is treated the same as a sub-floor score — fail-closed,
+  never a silent merge — whenever the gate is on.
 - **Dependency-ordered, capped concurrency.** A dependent is not claimable until
   its dependencies are Done; at most `maxLanes` (default 3) lanes run at once;
   merges happen one at a time in topological order (stacked chains retarget the
   base and delete branches only at batch end).
+- **Optional tick throttle.** `bin/z-loop-tick` sleeps out the remainder of
+  the `tickThrottleSeconds` config knob (default `0`, off) before starting its
+  next snapshot+ingest+`next` cycle, once the knob is set above its default.
 - **No token burn.** Every ticket ends the run in Done, Questions, Blocked, or
   Skipped. QA bugs bounce to a fresh builder: from QA-bounce config
   `qaInvestigateAfter` (default 2) onward, the rebuild runs `/investigate`
@@ -113,11 +124,13 @@ a secret — anyone holding it can post to your channel.
   `https://`; a pasted bare token is rejected by `loadConfig` (its error names the
   field only, never the value).
 
-**3. The events**, each posted once at the moment the state machine reaches it:
+**3. The seven events**, each posted once at the moment the state machine
+reaches it:
 
 | Event | Fires when |
 | --- | --- |
-| `work-complete` | a `/z-loop` (or `/z-plan`) run finishes — counts + spend + regression verdict |
+| `work-complete` | a `/z-loop` drain finishes — counts + spend + regression verdict |
+| `plan-complete` | a `/z-plan` run finishes — tickets created/updated, no loop counts or spend |
 | `human-pause` | a ticket parks to **Questions** waiting on your input |
 | `ticket-parked` | a ticket is moved to **Blocked** or **Skipped** by the work |
 | `safety-violation` | a safety control tripped (a wedged/dead worker; GraphQL quota exhausted) |
@@ -186,7 +199,7 @@ re-evaluated again within the same tick after that tick's one scheduling
 action applies — same once-per-iteration cadence as every other signal in the
 drain loop.
 
-**Depends on `notifications`.** Like the other five events, `human-needed` is
+**Depends on `notifications`.** Like the other six events, `human-needed` is
 governed by the `notifications` block above: absent/disabled/unconfigured means
 the send is a silent no-op, and because the fire-once flag is set only after a
 send actually reports delivered, the control keeps trying every tick without

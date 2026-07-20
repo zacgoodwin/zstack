@@ -19,6 +19,7 @@ import {
   markClaimLost,
   markHumanNeededNotified,
   nextAction,
+  parseReviewerConfidence,
   parseStageResult,
   recordOutcome,
   recordProbe,
@@ -60,14 +61,18 @@ const OPTS = (s: LoopState, nowMs = 0) => ({
   watchdogMinutes: s.watchdogMinutes,
   maxQaPasses: s.maxQaPasses,
   qaInvestigateAfter: s.qaInvestigateAfter,
+  minReviewerConfidence: s.minReviewerConfidence,
+  reviewerBelowThresholdAction: s.reviewerBelowThresholdAction,
   mergedThisRun: s.mergedThisRun,
 });
 
-// The happy-path final message per stage, for simulation.
+// The happy-path final message per stage, for simulation. The reviewer's
+// confidence=100 clears the default 70 floor (issue #62) so every existing
+// drain-to-Done flow below is unaffected by the gate.
 const HAPPY: Record<Stage, string> = {
   builder: "BUILT: all criteria pass",
   qa: "QA-PASS: functional + technical green",
-  reviewer: "REVIEW-APPROVE: diff satisfies every criterion",
+  reviewer: "REVIEW-APPROVE: confidence=100 diff satisfies every criterion",
   merge: "MERGED: https://github.com/x/y/pull/1",
 };
 
@@ -368,6 +373,90 @@ describe("QA bounce config knobs", () => {
   });
 });
 
+// -- reviewer confidence gate (issue #62) -------------------------------------
+
+describe("reviewer confidence gate", () => {
+  // AC1: a well-formed confidence= token parses off the REVIEW-APPROVE note.
+  test("parses a well-formed confidence off REVIEW-APPROVE", () => {
+    expect(parseStageResult("reviewer", "REVIEW-APPROVE: confidence=85 diff satisfies every criterion")).toEqual({
+      kind: "review-approve",
+      confidence: 85,
+    });
+  });
+
+  // AC2: no confidence= token at all parses to null, not a throw or a default.
+  test("treats a missing confidence token as null", () => {
+    expect(parseStageResult("reviewer", "REVIEW-APPROVE: looks good, all criteria met")).toEqual({
+      kind: "review-approve",
+      confidence: null,
+    });
+  });
+
+  // AC3: the boundary values and the (?!\d) 4th-digit rejection.
+  test("rejects out-of-range and >100 confidence", () => {
+    expect(parseReviewerConfidence("confidence=0")).toBe(0);
+    expect(parseReviewerConfidence("confidence=100")).toBe(100);
+    expect(parseReviewerConfidence("confidence=150")).toBeNull(); // out of range
+    expect(parseReviewerConfidence("confidence=1000")).toBeNull(); // (?!\d) rejects the 4th digit
+  });
+
+  // One lane, ticket in Review with no deps, stage reviewer, a review-approve
+  // outcome carrying `confidence`. Drives nextAction with the gate knobs under
+  // test -- mirrors the maxQaPasses gate tests' fixture-then-nextAction shape.
+  function reviewGate(confidence: number | null, minConfidence: number, belowAction: "block" | "retry" | "off"): Action {
+    const s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: { kind: "review-approve", confidence } })]);
+    s.minReviewerConfidence = minConfidence;
+    s.reviewerBelowThresholdAction = belowAction;
+    return nextAction(s.tickets, s.lanes, OPTS(s));
+  }
+
+  // AC4: at/above the floor, the gate passes the outcome through to the merge
+  // gate -- NOT a park.
+  test("an approve at or above the floor advances to merge", () => {
+    expect(reviewGate(85, 70, "block")).toMatchObject({ kind: "advance", to: "merge", ticket: 1 });
+  });
+
+  // AC5: the floor comparison is >=, so 70 merges and 69 does not.
+  test("the floor comparison is inclusive at the boundary", () => {
+    expect(reviewGate(70, 70, "block")).toMatchObject({ kind: "advance", to: "merge", ticket: 1 });
+    expect(reviewGate(69, 70, "block")).toMatchObject({ kind: "park", status: "Blocked", ticket: 1 });
+  });
+
+  // AC6: sub-floor + block parks Blocked with the EXACT truth-check note.
+  test("a sub-floor approve with action block parks Blocked with the exact truth-check note", () => {
+    expect(reviewGate(60, 70, "block")).toEqual({
+      kind: "park",
+      ticket: 1,
+      status: "Blocked",
+      note: "truth-check failed (confidence 60/100)",
+    });
+  });
+
+  // AC7: sub-floor + retry bounces to the builder, note starting with the same
+  // truth-check text.
+  test("a sub-floor approve with action retry bounces to the builder", () => {
+    const a = reviewGate(60, 70, "retry");
+    expect(a).toMatchObject({ kind: "advance", to: "builder", ticket: 1 });
+    expect((a as { note: string }).note).toMatch(/^truth-check failed \(confidence 60\/100\)/);
+  });
+
+  // AC8: "off" disables the gate entirely -- a very low score still merges.
+  test("action off approves regardless of a low score", () => {
+    expect(reviewGate(10, 70, "off")).toMatchObject({ kind: "advance", to: "merge", ticket: 1 });
+  });
+
+  // AC9: an approve with no parseable confidence is fail-closed when the gate
+  // is on -- an unverifiable approval never merges silently.
+  test("a malformed approve is fail-closed to Blocked", () => {
+    expect(reviewGate(null, 70, "block")).toEqual({
+      kind: "park",
+      ticket: 1,
+      status: "Blocked",
+      note: "truth-check failed (reviewer approved with no parseable confidence score)",
+    });
+  });
+});
+
 // -- merge ordering (stacked-chain aware) -------------------------------------
 
 describe("merge ordering", () => {
@@ -398,8 +487,8 @@ describe("merge ordering", () => {
     let s = state(
       [ticket(20, "Review"), ticket(21, "Review", [20])],
       [
-        lane(21, "reviewer", { outcome: { kind: "review-approve" } }),
-        lane(20, "reviewer", { outcome: { kind: "review-approve" } }),
+        lane(21, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+        lane(20, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
       ]
     );
     // The parent merges first even though the child's lane comes first in the array.
@@ -656,7 +745,7 @@ describe("parseStageResult", () => {
     expect(parseStageResult("builder", "BUILT: all green")).toEqual({ kind: "built" });
     expect(parseStageResult("builder", "NEEDS-INPUT: pick a currency")).toEqual({ kind: "needs-input", note: "pick a currency" });
     expect(parseStageResult("qa", "QA-BUGS: 1) x\n2) y")).toEqual({ kind: "qa-bugs", note: "1) x\n2) y" });
-    expect(parseStageResult("reviewer", "REVIEW-APPROVE: verified")).toEqual({ kind: "review-approve" });
+    expect(parseStageResult("reviewer", "REVIEW-APPROVE: verified")).toEqual({ kind: "review-approve", confidence: null });
     expect(parseStageResult("merge", "MERGED: https://pr/9")).toEqual({ kind: "merged", note: "https://pr/9" });
     expect(parseStageResult("merge", "BLOCKED: conflict gauntlet failed")).toEqual({ kind: "stage-blocked", note: "conflict gauntlet failed" });
   });

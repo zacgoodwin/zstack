@@ -41,6 +41,13 @@ if [ -z "$SLUG" ] || [ -z "$STATE" ] || [ -z "$TMP" ]; then
 fi
 
 mkdir -p "$TMP"
+# 0. Throttle (issue #58): sleep out the remainder of the project's
+#    tickThrottleSeconds (config.json, default 0 = off) since the last tick,
+#    then stamp this tick's start time. Proactive pacing that keeps
+#    ProjectsV2 GraphQL spend under GitHub's 5k/hr budget, complementing the
+#    reactive enforceQuota() backstop in lib/board.ts. No-op at the 0
+#    default -- today's behavior unchanged.
+bun "$PACK/lib/throttle.ts" wait --slug "$SLUG" >/dev/null
 # 1. Snapshot: all-status items + each ticket's body, one call, to files.
 "$Z_BOARD" snapshot --slug "$SLUG" --out-items "$TMP/items.json" --out-bodies "$TMP/bodies.json" >/dev/null
 # 2. Ingest: refresh ticket statuses; preserves lanes + lost-claim flags (no

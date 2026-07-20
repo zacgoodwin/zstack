@@ -122,6 +122,21 @@ export function validateConfig(cfg: unknown): BoardConfig {
       `Config "auditEveryNLoops" must be a positive integer (>= 1), got ${JSON.stringify(c.auditEveryNLoops)}.`
     );
   }
+  // tickThrottleSeconds (issue #58): the minimum wall-clock seconds between
+  // bin/z-loop-tick invocations. 0 (off, the default) is the required floor
+  // value, so this can't reuse requirePositiveNumber (which rejects v <= 0) --
+  // same shape as auditEveryNLoops's integer + floor check above, but the
+  // floor is >= 0 instead of >= 1.
+  if (
+    c.tickThrottleSeconds !== undefined &&
+    (typeof c.tickThrottleSeconds !== "number" ||
+      !Number.isInteger(c.tickThrottleSeconds) ||
+      c.tickThrottleSeconds < 0)
+  ) {
+    throw new ZError(
+      `Config "tickThrottleSeconds" must be a non-negative integer (0 = no throttling), got ${JSON.stringify(c.tickThrottleSeconds)}.`
+    );
+  }
   // adversarialMode (issue #59): the reviewer super-truth control. Single
   // enforcement point -- z-setup writes through it, loadConfig reads through it,
   // and stage-prompts trusts the loaded value is one of the three. Validated
@@ -130,6 +145,30 @@ export function validateConfig(cfg: unknown): BoardConfig {
   if (c.adversarialMode !== undefined && !ADVERSARIAL_MODES.includes(c.adversarialMode)) {
     throw new ZError(
       `Config "adversarialMode" must be one of "off", "non-trivial", "always", got ${JSON.stringify(c.adversarialMode)}.`
+    );
+  }
+  // minReviewerConfidence / reviewerBelowThresholdAction (issue #62): the
+  // reviewer-confidence safety gate. minReviewerConfidence is an integer
+  // percentage 0-100, so requirePositiveNumber (which rejects 0 and accepts
+  // fractions/150) is the wrong guard -- this mirrors auditEveryNLoops' own
+  // isInteger + bounds check above but adds the upper bound a percentage needs.
+  if (
+    c.minReviewerConfidence !== undefined &&
+    (typeof c.minReviewerConfidence !== "number" ||
+      !Number.isInteger(c.minReviewerConfidence) ||
+      c.minReviewerConfidence < 0 ||
+      c.minReviewerConfidence > 100)
+  ) {
+    throw new ZError(
+      `Config "minReviewerConfidence" must be an integer 0-100, got ${JSON.stringify(c.minReviewerConfidence)}.`
+    );
+  }
+  if (
+    c.reviewerBelowThresholdAction !== undefined &&
+    !["block", "retry", "off"].includes(c.reviewerBelowThresholdAction)
+  ) {
+    throw new ZError(
+      `Config "reviewerBelowThresholdAction" must be "block", "retry", or "off", got ${JSON.stringify(c.reviewerBelowThresholdAction)}.`
     );
   }
   if (c.quota !== undefined) {

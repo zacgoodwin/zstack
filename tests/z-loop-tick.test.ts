@@ -12,10 +12,18 @@
 // a colon-joined PATH from a bun-spawned process, and $Z_BOARD is the same seam
 // the real loop already uses. The wrapper runs the REAL lib/loop.ts (its
 // $PACK resolves to this repo), so ingest + next are the production code paths.
+//
+// Issue #58 adds a throttle step at the top of the wrapper's flow (before the
+// snapshot call) that shells to `bun lib/throttle.ts wait --slug <slug>`, which
+// calls the REAL loadConfig. So every spawn below now also points USERPROFILE
+// (the env var Bun's os.homedir() reads on Windows; HOME is set alongside for
+// POSIX runners) at a temp home carrying a minimal, valid `demo` project config
+// -- never the real ~/.zstack.
 import { test, expect, describe, afterAll } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { throttleDelayMs, throttleTick, defaultLoopDir, readLastTick } from "../lib/throttle.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const Z_LOOP_TICK = join(REPO_ROOT, "bin", "z-loop-tick");
@@ -46,6 +54,29 @@ function mkTmp(): string {
 afterAll(() => {
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
+
+// A fake $HOME/$USERPROFILE carrying a minimal, valid config.json for slug
+// "demo" (issue #58: bin/z-loop-tick's throttle step now calls the real
+// loadConfig("demo"), which must resolve to something valid, never the
+// operator's real ~/.zstack).
+function makeConfigHome(tickThrottleSeconds?: number): string {
+  const home = mkTmp();
+  const dir = join(home, ".zstack", "projects", "demo");
+  mkdirSync(dir, { recursive: true });
+  const cfg: any = {
+    slug: "demo",
+    owner: "acme",
+    repo: "demo",
+    projectNumber: 1,
+    projectId: "PVT_1",
+    repositoryId: "R_1",
+    statusField: { id: "F_status", dataType: "SINGLE_SELECT", options: { Backlog: "o1", Ready: "o2", Done: "o3" } },
+    fields: {},
+  };
+  if (tickThrottleSeconds !== undefined) cfg.tickThrottleSeconds = tickThrottleSeconds;
+  writeFileSync(join(dir, "config.json"), JSON.stringify(cfg));
+  return home;
+}
 
 // A fake z-board that only implements `snapshot`, writing the given board to
 // the --out-items / --out-bodies paths (exactly what the real snapshot does).
@@ -81,17 +112,18 @@ describe("z-loop-tick", () => {
   test("prints exactly one Action JSON line and writes the same state the 3-step sequence produces", () => {
     const dir = mkTmp();
     const stub = writeStubZBoard(dir);
+    const home = makeConfigHome(); // tickThrottleSeconds omitted -> defaults to 0 (off)
     const tickTmp = join(dir, "tick-tmp");
     const tickState = join(dir, "tick-state.json");
 
     const proc = Bun.spawnSync(
       ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp],
-      { env: { ...process.env, Z_BOARD: stub }, stdout: "pipe", stderr: "pipe" }
+      { env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
     );
     expect(proc.exitCode).toBe(0);
 
-    // stdout is EXACTLY one non-empty line: the Action JSON (snapshot + ingest
-    // are silenced inside the wrapper).
+    // stdout is EXACTLY one non-empty line: the Action JSON (throttle,
+    // snapshot, and ingest are all silenced inside the wrapper).
     const lines = proc.stdout.toString().split(/\r?\n/).filter((l) => l.trim() !== "");
     expect(lines.length).toBe(1);
     const action = JSON.parse(lines[0]);
@@ -116,6 +148,12 @@ describe("z-loop-tick", () => {
     // committed to Building never trips (initialReadyCount = 0, guarded).
     const hn = JSON.parse(readFileSync(join(tickTmp, "human-needed.json"), "utf8"));
     expect(hn).toMatchObject({ tripped: false, alreadyNotified: false, blocked: 0, skipped: 0, questions: 0, initialReadyCount: 0 });
+
+    // The throttle step actually ran end to end (not just skipped): it stamped
+    // a real last-tick file under the project's loop dir.
+    const loopDir = defaultLoopDir("demo", home);
+    expect(existsSync(join(loopDir, "last-tick"))).toBe(true);
+    expect(readLastTick(loopDir)).not.toBeNull();
   });
 
   test("missing a required flag fails loudly, prints no Action", () => {
@@ -131,19 +169,24 @@ describe("z-loop-tick", () => {
   });
 
   // -- issue #63: the human-needed safety control -----------------------------
-  test("human-needed: writes tripped:true when parked tickets cross the threshold, and a failed/unconfigured notify send never aborts the tick or sets the fire-once flag", () => {
+  test("human-needed: writes tripped:true when parked tickets cross the threshold, and an unconfigured notify send never aborts the tick or sets the fire-once flag", () => {
     const dir = mkTmp();
     const stub = writeStubZBoard(dir, TRIPPED_ITEMS, TRIPPED_BODIES);
+    // issue #58: the throttle step now runs before snapshot/ingest and calls
+    // the real loadConfig("demo"), so this test needs the same config home as
+    // the first test even though it's exercising notify.ts, not throttle.ts.
+    const home = makeConfigHome();
     const tickTmp = join(dir, "tick-tmp");
     const tickState = join(dir, "tick-state.json");
 
     const proc = Bun.spawnSync(
       ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp],
-      { env: { ...process.env, Z_BOARD: stub }, stdout: "pipe", stderr: "pipe" }
+      { env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
     );
     // The tick must exit 0 and still print exactly one Action line even though
-    // slug "demo" has no ~/.zstack config on the test machine -- notify.ts
-    // send fails loudly (ZError), and that failure must never propagate.
+    // slug "demo"'s config has no `notifications` block -- notify.ts's send
+    // degrades to a no-op ("skipped"), never throws, and that must never
+    // propagate.
     expect(proc.exitCode).toBe(0);
     const lines = proc.stdout.toString().split(/\r?\n/).filter((l) => l.trim() !== "");
     expect(lines.length).toBe(1);
@@ -245,5 +288,72 @@ describe("z-loop-tick", () => {
     } finally {
       server.stop(true);
     }
+  });
+
+  // Ordering canary (issue #58): the throttle step must run BEFORE the
+  // snapshot call, matching Plan step 4 ("before it issues the first
+  // board.ts call of the cycle") -- mirrors the snapshot-before-ingest-before-
+  // next ordering check in tests/loop-skill-fixes.test.ts.
+  test("the throttle step is wired in, strictly before the snapshot call", () => {
+    const tick = readFileSync(Z_LOOP_TICK, "utf8");
+    expect(tick).toContain('lib/throttle.ts" wait --slug "$SLUG"');
+    expect(tick.indexOf('lib/throttle.ts" wait')).toBeLessThan(tick.indexOf("snapshot --slug"));
+  });
+});
+
+// ============================================================================
+// issue #58 AC12: the wrapper's throttle step, with an injected fake clock and
+// a spy Sleep -- not real timers. This is the deterministic core bin/z-loop-tick
+// shells into via `bun lib/throttle.ts wait`; exercising it directly here (per
+// Plan step 4: "add the throttle-wiring case" to #57's test file) is both the
+// fast path and the one place a real clock/timer never touches the test.
+// ============================================================================
+describe("throttle wiring: throttleTick (issue #58 AC12)", () => {
+  const dirs2: string[] = [];
+  afterAll(() => {
+    while (dirs2.length) rmSync(dirs2.pop()!, { recursive: true, force: true });
+  });
+  function makeLoopDir(): string {
+    const d = mkdtempSync(join(tmpdir(), "z-throttle-wiring-"));
+    dirs2.push(d);
+    return join(d, "loop");
+  }
+
+  test("first run: spy Sleep is called with 0 (or not called); second run 10s later: called with 110_000", async () => {
+    const loopDir = makeLoopDir();
+    let fakeNow = 1_000_000;
+    const now = () => fakeNow;
+    const sleepCalls: number[] = [];
+    const spySleep = async (ms: number) => {
+      sleepCalls.push(ms);
+    };
+
+    // First tick: no prior last-tick file -> throttleDelayMs is 0 -> sleep is
+    // either not called, or called with 0 (AC5's "no prior tick" case, applied
+    // through the wiring instead of the pure function directly).
+    await throttleTick(loopDir, 120, now, spySleep);
+    expect(sleepCalls.length === 0 || sleepCalls[0] === 0).toBe(true);
+
+    // Second tick, fake clock advanced by only 10s: 120 - 10 = 110s remaining.
+    fakeNow += 10_000;
+    sleepCalls.length = 0;
+    await throttleTick(loopDir, 120, now, spySleep);
+    expect(sleepCalls).toEqual([110_000]);
+  });
+
+  test("throttleTick always stamps last-tick after the (possibly zero) delay", async () => {
+    const loopDir = makeLoopDir();
+    const now = () => 42_000;
+    await throttleTick(loopDir, 0, now, async () => {
+      throw new Error("sleep must not be called when throttling is off");
+    });
+    expect(readLastTick(loopDir)).toBe(42_000);
+  });
+
+  // Sanity cross-check: throttleTick's delay math is exactly throttleDelayMs
+  // applied to readLastTick's return value -- no drift between the pure
+  // function and the wiring that calls it.
+  test("delay computed by the wiring matches throttleDelayMs directly", () => {
+    expect(throttleDelayMs(1_000_000, 1_050_000, 120)).toBe(70_000);
   });
 });

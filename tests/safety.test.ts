@@ -82,7 +82,7 @@ const OPTS = (s: LoopState, nowMs = 0) => ({ nowMs, maxLanes: s.maxLanes, watchd
 const HAPPY: Record<Stage, string> = {
   builder: "BUILT: ok",
   qa: "QA-PASS: ok",
-  reviewer: "REVIEW-APPROVE: ok",
+  reviewer: "REVIEW-APPROVE: confidence=100 ok", // clears the default 70 floor (issue #62)
   merge: "MERGED: https://pr/1",
 };
 

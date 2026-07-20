@@ -1,4 +1,30 @@
-# zstack
+# zstack: The Part Gary Forgot
+
+zstack came about for two reason: 
+1. I am poor (but if you want to fix that Mr. Tan....). gstack is great at making a robust design but once I asked claude to "Make the thing" my usage shot through the roof.
+2. When I was learning the AI development loop I came across gstack but I kept wondering "How do I make the agent make the code in the best way possible?". gstack provided the skills, the design framework but after that left me guessing.
+
+## This is my loop. There are many like it, but this one is mine.
+
+The loop makes decisions in the way that I would make decisions. I've taken inspiration from many different places (Thanks EricTech) and baked in those opinions to the loop. If you like my opinions great! If not feel free to swipe them and use them to make your own.
+
+I left what I fed into the machine to generate this skill under doc/spec. All the changes I have made are filed as tickets under issues. 
+
+## My loop, without me, is useless. Without my loop, I am still useful
+
+Something that is often overlooked is AI is only as good as the person running it. You don't know what to ask, or how to ask it then you will never truly get what you're looking for out of it. A good portion of the "new" AI products out there are simply wrappers around the model APIs with a neat interface containing the founder's opinions baked it. Extremely useful for some people, but since you're here on github I assume you want more. 
+
+What zstack aims to do is to put into focus the things humans are good at and let AI do the things it is good at. gstack is great in that way because it asks questions to get the most out of you, the expert in whatever it is you're looking to build. Not to go too deep into Plato's allegory of the cave but AI doesn't exist in the world. You do. In that spirit z-loop errors on the side of caution letting you make all the judgment calls about the "What" and "Why" while it sticks to the "How" of the code. 
+
+## My loop and myself know that what counts to executives is not the lines we write. We know it is the ticket count.
+
+I am a recovering Product Manager; so having everything live in PRs and commit messages was unsettling to me. Thus the plan is broken into workable tickets and then the loop works those tickets as if I was a PM working with a development team. This helps traceability, searching, and leveraging other tools for planning. It can quantify In the future other ticket systems can be added like JIRA (Everyone loves to hate JIRA but when asked for what's better few can reply with anything).
+
+## Help me, Help you
+
+Got a suggestion? File a ticket. The neat part about that is it will show up in the attached project. Then next time I run a z-plan it will get speced and estimated. When I run the z-loop it will get built then GitHub will let you know. We take care of each other :)
+
+# AI Generated Read Me
 
 An installable Claude Code skill pack that runs the **Develop** and **Merge**
 stages of a dev loop unattended. gstack covers planning (`/office-hours` through
@@ -263,6 +289,10 @@ settings `/z-setup` Step 7 wrote, when present. The GitHub board, milestones, an
 labels are remote data — never touched; delete them yourself if you want them
 gone. See [z-uninstall](docs/user-guide/z-uninstall.md). Board statuses are the
 recoverable state; worktrees are disposable; locks clear via `/z-loop --reconcile`.
+
+## AI Disclosure
+
+Written by AI, for AI with Zac co-driving 
 
 ## Credits
 Designed and maintained by Zac Goodwin. Skill inspired by ErichTech's [super-board](https://github.com/EricTechPro/super-board)

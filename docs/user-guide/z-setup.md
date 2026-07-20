@@ -116,8 +116,22 @@ each defaulted by `loadConfig` when absent:
   ≥ 10 changed lines OR a `security` / `migration` / `payments` / `auth` label
   on the issue; `always` fans out on every card; `off` never does. An invalid
   value is a loud config error, never a silent fallback.
-- `notifications` (absent = off) — Discord notifications for the loop
-  events (six, including `human-needed` — issue #63). Shape: `{ "enabled": true, "discordWebhookUrl": "https://…",
+- `tickThrottleSeconds` (default `0`, off) — minimum wall-clock seconds
+  between `bin/z-loop-tick` invocations. Set it to `120` to keep ProjectsV2
+  GraphQL spend under GitHub's 5k/hr budget (~103 pts/tick × ~30 ticks/hr ≈
+  3.1k/hr). Complements the reactive `enforceQuota()` backstop, which only
+  intervenes once remaining points are already low. Hand-edited in
+  `config.json`, same as `auditEveryNLoops`/`maxQaPasses`/`qaInvestigateAfter`
+  — no `/z-setup` CLI flag.
+- `minReviewerConfidence` (default 70) — the aggregated reviewer confidence
+  (0–100) a `REVIEW-APPROVE` must clear to merge.
+- `reviewerBelowThresholdAction` (default `"block"`, values `block` | `retry`
+  | `off`) — what a sub-floor approval does: `block` parks Blocked with
+  `truth-check failed (confidence X/100)`; `retry` bounces it back to the
+  builder; `off` disables the gate entirely (a low-confidence or unparseable
+  approval merges, the pre-#62 behavior).
+- `notifications` (absent = off) — Discord notifications for the seven loop/plan
+  events (including `human-needed` — issue #63). Shape: `{ "enabled": true, "discordWebhookUrl": "https://…",
   "events": { "human-pause": false } }`. `enabled` is the master switch; each
   key under `events` toggles one event (all default on). The webhook URL is a
   **secret**: prefer the `ZSTACK_DISCORD_WEBHOOK` env var (it wins over the

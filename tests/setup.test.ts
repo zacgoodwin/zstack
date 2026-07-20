@@ -681,6 +681,10 @@ describe("writeConfig", () => {
     // issue #59 AC8: same for adversarialMode -- SetupBoard never writes it, so
     // loadConfig must default an omitting config to "non-trivial".
     expect(loaded.adversarialMode).toBe("non-trivial");
+    // issue #62 AC10: same pattern for the reviewer-confidence gate -- SetupBoard
+    // never writes either knob, so loadConfig must default them to 70 / "block".
+    expect(loaded.minReviewerConfidence).toBe(70);
+    expect(loaded.reviewerBelowThresholdAction).toBe("block");
   });
 });
 
@@ -942,6 +946,66 @@ describe("validateConfig", () => {
     });
   });
 
+  // -- issue #58: the tick-throttle pacing knob --------------------------------
+  describe("tickThrottleSeconds (issue #58)", () => {
+    // AC3: 0 -- the required "off" value -- must NOT be rejected the way
+    // requirePositiveNumber would reject it (that guard rejects v <= 0).
+    test("accepts 0 (off), the value requirePositiveNumber would wrongly reject", () => {
+      const cfg = goodConfig() as any;
+      cfg.tickThrottleSeconds = 0;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    test("accepts a positive integer and is optional", () => {
+      const cfg = goodConfig() as any;
+      cfg.tickThrottleSeconds = 120;
+      expect(() => validateConfig(cfg)).not.toThrow();
+      delete cfg.tickThrottleSeconds;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    // AC4: -1, 2.5, NaN, and "120" all fail, naming the field + the
+    // non-negative-integer rule.
+    test.each([-1, 2.5, NaN, "120"])("rejects %p, naming the field and the non-negative integer rule", (bad) => {
+      const cfg = goodConfig() as any;
+      cfg.tickThrottleSeconds = bad;
+      expect(() => validateConfig(cfg)).toThrow(/"tickThrottleSeconds" must be a non-negative integer/);
+    });
+  });
+
+  // -- issue #62: the reviewer-confidence safety gate knobs --------------------
+  describe("reviewer confidence gate (issue #62)", () => {
+    // AC10: minReviewerConfidence is an integer 0-100 -- unlike
+    // requirePositiveNumber's knobs, 0 is valid and anything > 100 is not.
+    test("minReviewerConfidence must be an integer 0-100", () => {
+      for (const bad of [150, -1, 2.5, "70"]) {
+        const cfg = goodConfig() as any;
+        cfg.minReviewerConfidence = bad;
+        expect(() => validateConfig(cfg)).toThrow(/minReviewerConfidence.*integer 0-100/);
+      }
+      const cfg = goodConfig() as any;
+      cfg.minReviewerConfidence = 0;
+      expect(() => validateConfig(cfg)).not.toThrow();
+      cfg.minReviewerConfidence = 100;
+      expect(() => validateConfig(cfg)).not.toThrow();
+      delete cfg.minReviewerConfidence;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    // AC10: reviewerBelowThresholdAction is one of block|retry|off.
+    test("reviewerBelowThresholdAction must be one of block|retry|off", () => {
+      const cfg = goodConfig() as any;
+      cfg.reviewerBelowThresholdAction = "nope";
+      expect(() => validateConfig(cfg)).toThrow(/reviewerBelowThresholdAction.*block.*retry.*off/);
+      for (const ok of ["block", "retry", "off"]) {
+        cfg.reviewerBelowThresholdAction = ok;
+        expect(() => validateConfig(cfg)).not.toThrow();
+      }
+      delete cfg.reviewerBelowThresholdAction;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+  });
+
   // -- issue #63: the human-needed safety-control threshold knob --------------
   describe("humanNeededPercent (issue #63)", () => {
     // AC12: 0 is the documented "disable" value (unlike maxLanes/watchdogMinutes
@@ -1063,5 +1127,16 @@ describe("loadConfig deep validation", () => {
     const cfg = loadConfig("zstack", home);
     expect(cfg.maxQaPasses).toBe(5);
     expect(cfg.qaInvestigateAfter).toBe(1);
+  });
+
+  // -- issue #58: tickThrottleSeconds default-and-override through loadConfig --
+  test("AC1: tickThrottleSeconds absent -> loadConfig defaults it to 0 (today's behavior unchanged)", () => {
+    const home = writeRaw("zstack", validRawConfig());
+    expect(loadConfig("zstack", home).tickThrottleSeconds).toBe(0);
+  });
+
+  test("AC2: tickThrottleSeconds 120 in config.json is honored through loadConfig, not overridden by the default", () => {
+    const home = writeRaw("zstack", validRawConfig({ tickThrottleSeconds: 120 }));
+    expect(loadConfig("zstack", home).tickThrottleSeconds).toBe(120);
   });
 });
