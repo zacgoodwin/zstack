@@ -6,7 +6,19 @@
 // the blindness contract itself: EXACTLY {ticketBody, acceptanceCriteria, diff,
 // worktreePath}, pinned at compile time (Exact assert below) and at runtime
 // (reviewerPrompt rejects any other key set).
+//
+// POINTER PROMPTS (ticket #57, Leak 1): each constructor takes a SECOND arg,
+// `inputPath` -- the absolute path of the stage's input-<N>.json -- and inlines
+// only the small/fixed fields (numbers, title, worktree, branch, flags) plus the
+// discipline/exit-contract boilerplate. The large payload (ticketBody, diff,
+// acceptanceCriteria) is NOT embedded; the prompt tells the worker to read those
+// fields FROM inputPath. So the printed prompt is size-invariant to the payload,
+// and the orchestrator reading it back to spawn the Agent never holds the
+// ticket's body/diff in its own context. `inputPath` is a plain function
+// parameter, NOT a key of the input object, so the reviewer's exact-four-key
+// blindness gate is untouched.
 import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { handleCliError } from "./cli.ts";
 import { ZError } from "./config.ts";
 
@@ -29,12 +41,12 @@ export interface BuilderPromptInput {
 // Derived from docs/user-guide/spec/WORKER SAMPLE.md (unattended discipline, exit
 // contract, anti-loophole) and PRINCIPLES.md (ponytail ladder, tests + evals +
 // docs in the same diff, latent vs deterministic).
-export function builderPrompt(i: BuilderPromptInput): string {
+export function builderPrompt(i: BuilderPromptInput, inputPath: string): string {
   const bounce = i.qaNotes
-    ? `\n## QA findings from the previous pass\n\n${i.investigateFirst ? "Bugs survived a rebuild once already. Run the /investigate skill on these findings FIRST and root-cause them before changing any code -- a symptom patch here earns a third strike and blocks the ticket.\n\n" : ""}${i.qaNotes}\n`
+    ? `\n## QA findings from the previous pass\n\n${i.investigateFirst ? "Bugs survived a rebuild once already. Run the /investigate skill on these findings FIRST and root-cause them before changing any code -- a symptom patch here earns a third strike and blocks the ticket.\n\n" : ""}Read the findings you must address from \`qaNotes\` in ${inputPath}.\n`
     : "";
   const review = i.reviewNotes
-    ? `\n## Reviewer findings to address\n\n${i.reviewNotes}\n`
+    ? `\n## Reviewer findings to address\n\nRead them from \`reviewNotes\` in ${inputPath}.\n`
     : "";
   return `You are the BUILDER for ticket #${i.ticketNumber}: "${i.ticketTitle}", running UNATTENDED inside the zstack dev loop. No user is available -- never ask a question, never wait for input; decide or exit via the contract below.
 
@@ -43,7 +55,7 @@ export function builderPrompt(i: BuilderPromptInput): string {
 - Branch: ${i.branch} (based on ${i.baseBranch}). Commit your work here. Never push, never merge, never touch ${i.baseBranch} or any other branch.
 
 ## Ticket
-${i.ticketBody}
+Read your full ticket body (Context, Plan, Acceptance Criteria, Tests + evals, Docs pages touched, Out of scope) from ${inputPath} -- field \`ticketBody\` -- before doing anything else. That body is the contract for this build.
 ${bounce}${review}
 ## Discipline
 - Ponytail ladder before writing any code: does it need to exist at all; does this codebase already have it; does the stdlib/platform/an installed dep cover it; can it be one line -- only then write the minimum that works. Smallest correct diff, full scope.
@@ -73,7 +85,7 @@ export interface QaPromptInput {
 
 // PROCESS.md steps 11-16: functional + technical, as a fresh context that
 // distrusts the builder's own claims.
-export function qaPrompt(i: QaPromptInput): string {
+export function qaPrompt(i: QaPromptInput, inputPath: string): string {
   const web = i.webTarget
     ? "\n- This ticket has a web-facing target: use the gstack /qa skill -- spin the site up and drive it as a real user. UI claims without a driven browser check do not count as verified."
     : "";
@@ -83,7 +95,7 @@ export function qaPrompt(i: QaPromptInput): string {
 - Worktree: ${i.worktreePath}, branch ${i.branch}. Execute here freely. Do NOT fix anything -- report; the rebuild is the builder's job in a fresh spawn.
 
 ## Ticket
-${i.ticketBody}
+Read the ticket body -- Context, Plan, and especially every "### Acceptance Criteria" case -- from ${inputPath}, field \`ticketBody\`, before you start.
 
 ## Check BOTH, in this order
 1. Functional: exercise the built behavior end to end as a user would. Verify every "### Acceptance Criteria" case (setup -> action -> expected outcome) AS WRITTEN -- a case the diff quietly weakened counts as a bug.${web}
@@ -140,18 +152,12 @@ function assertReviewerInput(input: ReviewerPromptInput): void {
   }
 }
 
-export function reviewerPrompt(input: ReviewerPromptInput): string {
+export function reviewerPrompt(input: ReviewerPromptInput, inputPath: string): string {
   assertReviewerInput(input);
   return `You are an ADVERSARIAL REVIEWER in a fresh context, running UNATTENDED inside the zstack dev loop. You are blinded by design: your ONLY inputs are the ticket, its acceptance criteria, the diff, and a throwaway worktree of the head commit. There is no PR description, no plan rationale, no builder or QA transcript -- and any claim you cannot verify from these inputs yourself is unverified. Your job is to find the reasons this diff should NOT merge.
 
-## Ticket
-${input.ticketBody}
-
-## Acceptance Criteria (the independent yardstick -- authored before the implementation)
-${input.acceptanceCriteria}
-
-## Diff
-${input.diff}
+## Your inputs (read from the file -- do not look anywhere else)
+Read \`ticketBody\`, \`acceptanceCriteria\`, and \`diff\` from ${inputPath}. That file holds EXACTLY those three fields plus this worktree path and nothing else -- no PR description, no plan rationale, no builder or QA transcript reaches you. The acceptance criteria are the independent yardstick, authored before the implementation; hold the diff to them as written.
 
 ## Throwaway worktree (head commit checked out; yours to execute)
 ${input.worktreePath}
@@ -194,7 +200,7 @@ export interface MergePromptInput {
   stackedOn: number[]; // parent tickets in this batch (PROCESS.md step 18)
 }
 
-export function mergePrompt(i: MergePromptInput): string {
+export function mergePrompt(i: MergePromptInput, inputPath: string): string {
   const stacked = i.stackedOn.length
     ? `\n## Stacked chain (PROCESS.md step 18 -- order is not optional)
 This branch stacks on ticket(s) #${i.stackedOn.join(", #")}. Their PRs merge FIRST, each WITHOUT deleting its branch (deleting a base branch closes every dependent PR). After each parent lands, retarget this PR to ${i.baseBranch} (gh pr edit --base ${i.baseBranch}). Delete branches only after the whole batch has landed.\n`
@@ -203,6 +209,7 @@ This branch stacks on ticket(s) #${i.stackedOn.join(", #")}. Their PRs merge FIR
 
 ## Workspace
 - Worktree: ${i.worktreePath}, branch ${i.branch}, base ${i.baseBranch}.
+- Full stage input (numbers, PR title, branch, base, worktree, stacked chain) is in ${inputPath} if you need to re-read any field.
 ${stacked}
 ## Steps
 1. Open the PR: gh pr create --base ${i.baseBranch} --head ${i.branch} --title ${shSingleQuote(i.prTitle)} with a body that links the ticket and summarizes what shipped.
@@ -290,7 +297,7 @@ export function main(argv: string[]): number {
       } catch (e) {
         throw new ZError(`Cannot read input JSON at ${path}: ${(e as Error).message}`);
       }
-      const builders: Record<string, (i: any) => string> = {
+      const builders: Record<string, (i: any, inputPath: string) => string> = {
         builder: builderPrompt,
         qa: qaPrompt,
         reviewer: reviewerPrompt,
@@ -298,7 +305,9 @@ export function main(argv: string[]): number {
       };
       const build = builders[stage];
       if (!build) throw new ZError(`Unknown stage "${stage}". Valid: builder, qa, reviewer, merge.`);
-      console.log(build(input));
+      // The pointer prompt references this input file by ABSOLUTE path, so the
+      // worker (a fresh Agent with its own CWD) resolves it unambiguously.
+      console.log(build(input, resolve(path)));
       return 0;
     }
     if (cmd === "note") {

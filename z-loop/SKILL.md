@@ -166,33 +166,23 @@ it after board writes is always safe.
 ## Step 4 — The drain loop
 
 Repeat until `next` returns `drain-complete`. **Re-read the board before every
-iteration** — this is what makes wave reconciliation reachable (C3 / issue #14):
+iteration** — this is what makes wave reconciliation reachable (C3 / issue #14).
+One `bin/z-loop-tick` call IS that iteration: it does snapshot → ingest → `next`
+and prints **only** the one-line Action JSON, so on a long drain's 100+ iterations
+the repeated bash command text never re-enters your context (ticket #57, Leak 2):
 
 ```bash
-# Re-run the Step 3 snapshot + ingest FIRST, every iteration, before `next`. This
-# refreshes each ticket's status from the board so a human's mid-loop move to
-# Blocked/Questions/Skipped/Done is seen by reconcileBoardMoves and turned into a
-# stop-lane at the next boundary. Skipping it makes `next` decide off a stale
-# snapshot and clobber the human's move (defeats C7 safety control #6).
-for S in Backlog Ready Questions Building QA Review Blocked Skipped Done; do
-  "$Z_BOARD" list --status "$S" --json --slug "$SLUG" > "$TMP/items-$S.json"
-done
-jq -s 'add' "$TMP"/items-*.json > "$TMP/items.json"
-jq -r '.[].number' "$TMP/items.json" | while read -r N; do
-  gh issue view "$N" --json body -q .body > "$TMP/body-$N.md"
-done
-bun -e "import {readFileSync, readdirSync, writeFileSync} from 'node:fs';
-  const b = {}; for (const f of readdirSync('$TMP')) {
-    const m = f.match(/^body-(\d+)\.md\$/); if (m) b[m[1]] = readFileSync('$TMP/' + f, 'utf8'); }
-  writeFileSync('$TMP/bodies.json', JSON.stringify(b));"
-bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json"   # preserves lanes + lost claims
-
-bun "$PACK/lib/loop.ts" next "$STATE"    # NOW ask: prints ONE Action as JSON
+ACTION=$("$PACK/bin/z-loop-tick" --slug "$SLUG" --state "$STATE" --tmp "$TMP")
 ```
 
-`ingest` preserves lanes and lost-claim flags, so re-running it every iteration is
-safe; it only refreshes ticket statuses (and drops a lane whose ticket was removed
-from the board mid-run, H14). Do this snapshot+ingest before EVERY
+`z-loop-tick` re-reads the board FIRST every iteration — refreshing each ticket's
+status so a human's mid-loop move to Blocked/Questions/Skipped/Done is seen by
+`reconcileBoardMoves` and turned into a `stop-lane` at the next boundary (skipping
+this would let `next` decide off a stale snapshot and clobber the human's move,
+defeating C7 safety control #6). It shells only `z-board` and `bun`, never gh:
+`z-board snapshot` fetches items + bodies in one call through `lib/board.ts` (the
+sole sanctioned gh caller), and its `ingest` preserves lanes + lost-claim flags
+(and drops a lane whose ticket left the board mid-run, H14). Run it before EVERY
 `next` — especially before any advance/park/complete, so no stage transition acts
 on a board the human has since changed.
 
@@ -211,12 +201,35 @@ Perform exactly that action, then record it. Action → side effects:
 | `wait` | Block until a background stage agent finishes (the harness notifies you) or one minute passes, then re-run `next` — the watchdog only fires if `next` is called with a fresh clock. When an agent finishes: save its final message to a file and `bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`, then update Actual (below), then re-run `next`. |
 | `drain-complete` | Step 7. |
 
-**Spawning a stage** (all four the same way):
+**Spawning a stage** (all four the same way — the payload reaches the worker via
+the input file, never through your context; ticket #57, Leak 1):
 
-1. Assemble the stage's typed input JSON (table below) into `"$TMP/input-<N>.json"`.
+1. **Assemble the input off-context (1a).** Build `"$TMP/input-<N>.json"` by
+   injecting the large fields FROM FILES with `jq --rawfile`, never by inlining
+   body/diff in a command whose text you read back. The body is on disk at
+   `"$TMP/body-<N>.md"` (the builder row's `gh issue view` redirect / the initial
+   snapshot); redirect the reviewer's diff and acceptance-criteria slice to files
+   too (see the reviewer row). Example (builder):
+
+   ```bash
+   jq -n --rawfile body "$TMP/body-<N>.md" \
+     --arg title "<title>" --arg branch "<branch>" \
+     '{ticketNumber: <N>, ticketTitle: $title, ticketBody: $body,
+       worktreePath: ".worktrees/ticket-<N>", branch: $branch, baseBranch: "'"$BASE"'"}' \
+     > "$TMP/input-<N>.json"
+   ```
+   The `git diff … > "$TMP/diff-<N>.txt"` redirect means the diff never enters
+   your context; `--rawfile diff "$TMP/diff-<N>.txt"` injects it. The reviewer's
+   `input-<N>.json` stays EXACTLY the four blinded keys `{ticketBody,
+   acceptanceCriteria, diff, worktreePath}` — `input-<N>.json`'s path is a
+   constructor argument, not a key, so blindness is untouched.
 2. `bun "$PACK/lib/stage-prompts.ts" prompt <stage> "$TMP/input-<N>.json" > "$TMP/prompt-<N>.txt"`
-   — the constructor is the contract; if it exits non-zero the input is wrong,
-   fix the input, never hand-write the prompt.
+   (1b) — the constructor prints a POINTER prompt: small/fixed fields inline plus
+   an instruction to read `ticketBody`/`diff`/`acceptanceCriteria` from the
+   ABSOLUTE path of `input-<N>.json`. `prompt-<N>.txt` stays small (payload-
+   independent), so reading it to spawn the Agent is cheap. The constructor is the
+   contract; if it exits non-zero the input is wrong, fix the input, never
+   hand-write the prompt.
 3. Spawn a FRESH harness Agent (Agent tool), `run_in_background: true`, with
    that prompt and `model` = the ticket's Model field
    (`"$Z_BOARD" field-get <N> Model`; the Model Effort field selected the
@@ -225,9 +238,9 @@ Perform exactly that action, then record it. Action → side effects:
 
 | Stage | Input JSON fields |
 |---|---|
-| `builder` | `ticketNumber`, `ticketTitle`, `ticketBody` (fresh `gh issue view`), `worktreePath` (`.worktrees/ticket-<N>`), `branch`, `baseBranch`; on a bounce also `qaNotes`/`investigateFirst` or `reviewNotes` per the advance row above. |
-| `qa` | `ticketNumber`, `ticketBody`, `worktreePath`, `branch`, `qaPass` (the lane's `qaBounces` in the state file + 1), `webTarget` (true when the ticket changes a web-served surface — your judgment; QA then drives gstack /qa). |
-| `reviewer` | **BLINDED — exactly** `ticketBody`, `acceptanceCriteria` (the `### Acceptance Criteria` section: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' body.md`), `diff` (`git -C .worktrees/ticket-<N> diff "$BASE"...HEAD`), `worktreePath` = a THROWAWAY worktree of the head commit (`git worktree add "$TMP/review-<N>" <head-sha>`; remove it after the stage). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. |
+| `builder` | `ticketNumber`, `ticketTitle`, `ticketBody` (fresh `gh issue view` → `"$TMP/body-<N>.md"`, injected `--rawfile`), `worktreePath` (`.worktrees/ticket-<N>`), `branch`, `baseBranch`; on a bounce also `qaNotes`/`investigateFirst` or `reviewNotes` per the advance row above. |
+| `qa` | `ticketNumber`, `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `worktreePath`, `branch`, `qaPass` (the lane's `qaBounces` in the state file + 1), `webTarget` (true when the ticket changes a web-served surface — your judgment; QA then drives gstack /qa). |
+| `reviewer` | **BLINDED — exactly** `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `acceptanceCriteria` (the `### Acceptance Criteria` section to a file: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$TMP/body-<N>.md" > "$TMP/ac-<N>.md"`, injected `--rawfile`), `diff` (`git -C .worktrees/ticket-<N> diff "$BASE"...HEAD > "$TMP/diff-<N>.txt"`, injected `--rawfile` so it never enters your context), `worktreePath` = a THROWAWAY worktree of the head commit (`git worktree add "$TMP/review-<N>" <head-sha>`; remove it after the stage). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. |
 | `merge` | `ticketNumber`, `prTitle` (the ticket title), `branch`, `baseBranch`, `worktreePath`, `stackedOn` (from the advance action — parents whose branches this PR stacks on; the prompt carries the PROCESS.md step 18 chain rules: parents first, no branch deletion mid-batch, retarget, delete last). |
 
 **Per-stage Actual (every stage, no exceptions):** when a stage agent finishes,

@@ -28,6 +28,13 @@ records the result. It never re-derives a scheduling decision in prose.
   pure prompt constructor (`lib/stage-prompts.ts`). Nothing latent travels between
   stages; the reviewer is blinded to exactly the ticket, its acceptance criteria,
   the diff, and a throwaway worktree.
+- **Bounded orchestrator context.** The orchestrator holds no ticket context. Each
+  stage's payload (body, diff) is assembled off-context into `input-<N>.json` and
+  the printed prompt is a *pointer* to that file — small and payload-independent —
+  so reading it to spawn the Agent stays cheap. And each drain iteration is a
+  single `bin/z-loop-tick` call (snapshot → ingest → `next`) that prints only the
+  one-line next Action, so the repeated bash never re-enters context. A long
+  batch drains in one session without tripping auto-compaction.
 - **Dependency-ordered, capped concurrency.** A dependent is not claimable until
   its dependencies are Done; at most `maxLanes` (default 3) lanes run at once;
   merges happen one at a time in topological order (stacked chains retarget the
