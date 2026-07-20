@@ -46,9 +46,10 @@ esac
 # silently creates a frozen copy that doesn't refresh after `git pull`, so we
 # copy explicitly there instead (same tradeoff gstack's setup makes).
 # Ownership sentinel: every copy this script creates carries this file, and it
-# is the ONLY proof a real dir is ours to refresh. Name-matching can't prove
-# ownership — a genuine third-party z-loop skill also declares `name: z-loop`.
-# Symlinks prove themselves (we only ever link into the pack).
+# is the ONLY proof a real dir is ours to refresh or for `uninstall` to remove.
+# Name-matching can't prove ownership — a genuine third-party z-loop skill also
+# declares `name: z-loop`. Symlinks prove themselves (we only ever link into the
+# pack). Kept in sync with the same literal in `uninstall`.
 MARKER=".zstack-registered"
 
 _owned() {
@@ -77,7 +78,9 @@ _link_or_copy() {
       case "$name" in .git|node_modules|.worktrees|.gstack) continue ;; esac
       cp -R "$entry" "$staging/$name"
     done
-    : > "$staging/$MARKER"
+    # Mark the copy as zstack-created so `uninstall` will remove it (existence
+    # is the only thing it checks; the text just orients a human who finds it).
+    printf '%s\n' "Created by zstack ./setup. Safe to remove with ./uninstall (or by deleting this directory)." > "$staging/$MARKER"
     if [ -e "$dst" ]; then mv "$dst" "$old"; fi
     mv "$staging" "$dst"
     rm -rf "$old" 2>/dev/null || true
@@ -179,7 +182,7 @@ else
 fi
 
 if [ "$TEAM_MODE" -eq 1 ]; then
-  echo "Team mode requested: no session hooks to register (the four shipped skills -- z-setup, z-plan, z-loop, z-status -- need none)."
+  echo "Team mode requested: no session hooks to register (the five shipped skills -- z-setup, z-plan, z-loop, z-status, z-uninstall -- need none)."
 fi
 
 echo "zstack setup complete."

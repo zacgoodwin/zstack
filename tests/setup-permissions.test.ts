@@ -11,6 +11,7 @@ import { join } from "node:path";
 import {
   ALLOW_RULES,
   PERMISSION_REQUEST_HOOK_COMMAND,
+  applyRemove,
   applySettings,
   checkSettings,
   hasBypassMode,
@@ -18,6 +19,7 @@ import {
   mergeSettings,
   missingAllowRules,
   readSettingsFile,
+  removeSettings,
   verifyWrite,
   type PermissionsMode,
 } from "../lib/setup-permissions.ts";
@@ -162,6 +164,143 @@ describe("mergeSettings", () => {
     const { settings, changes } = mergeSettings(input, "full");
     expect(settings.hooks.PermissionRequest).toHaveLength(2); // theirs + ours
     expect(changes.some((c) => c.includes("hooks.PermissionRequest"))).toBe(true);
+  });
+});
+
+// -- removeSettings (pure inverse: strip exactly what apply writes) ---------
+// Ticket #37 AC4: the /z-uninstall permissions undo. Every test asserts our
+// entries gone AND unrelated keys/rules intact.
+describe("removeSettings", () => {
+  test("a fully-configured object: all three layers stripped, changed true", () => {
+    const full = readJson(join(FIXTURES, "fully-configured.json"));
+    const { settings, changed } = removeSettings(full);
+    expect(changed).toBe(true);
+    expect(missingAllowRules(settings)).toEqual([...ALLOW_RULES]); // all four gone
+    expect(hasBypassMode(settings)).toBe(false);
+    expect(hasPermissionRequestAllowHook(settings)).toBe(false);
+    expect(settings.skipDangerousModePermissionPrompt).toBeUndefined();
+    expect(settings.skipAutoPermissionPrompt).toBeUndefined();
+  });
+
+  test("AC4: our entries removed, every unrelated key/rule/hook preserved", () => {
+    // fully-configured.json carries our 4 rules + an unrelated Bash(git add *),
+    // defaultMode/skip/our hook, PLUS unrelated model, effortLevel, and a
+    // foreign SessionStart hook -- the exact "ours + theirs" shape AC4 names.
+    const full = readJson(join(FIXTURES, "fully-configured.json"));
+    const { settings } = removeSettings(full);
+    // Unrelated allow rule kept; ours gone; the array survives (non-empty).
+    expect(settings.permissions.allow).toEqual(["Bash(git add *)"]);
+    // Unrelated top-level keys untouched.
+    expect(settings.model).toBe("claude-fable-5[1m]");
+    expect(settings.effortLevel).toBe("xhigh");
+    // Foreign hook family survives byte-for-byte; ours is gone from the tree.
+    expect(settings.hooks.SessionStart).toEqual(full.hooks.SessionStart);
+    expect(settings.hooks.PermissionRequest).toBeUndefined();
+  });
+
+  test("removing the merge's own output returns to the original empty object", () => {
+    const merged = mergeSettings({}, "full").settings;
+    const { settings } = removeSettings(merged);
+    expect(settings).toEqual({}); // containers we created are cleaned up
+  });
+
+  test("start-with-extras: allowlist merge then remove restores the extras exactly", () => {
+    // allowlist mode never touches defaultMode, so the user's own mode survives
+    // the round-trip. (full mode deliberately clobbers defaultMode to
+    // bypassPermissions -- a foreign mode is preserved only when we never wrote
+    // it, which the dedicated test below pins.)
+    const before = { model: "x", permissions: { allow: ["Read(/x/**)"], defaultMode: "acceptEdits" } };
+    const merged = mergeSettings(before, "allowlist").settings;
+    const { settings } = removeSettings(merged);
+    expect(settings.permissions.allow).toEqual(["Read(/x/**)"]);
+    expect(settings.permissions.defaultMode).toBe("acceptEdits");
+    expect(settings.model).toBe("x");
+    expect(missingAllowRules(settings)).toEqual([...ALLOW_RULES]);
+  });
+
+  test("a foreign defaultMode is never removed (only bypassPermissions is ours)", () => {
+    const { settings, changed } = removeSettings({ permissions: { defaultMode: "plan" } });
+    expect(changed).toBe(false);
+    expect(settings.permissions.defaultMode).toBe("plan");
+  });
+
+  test("a foreign PermissionRequest allow-hook (different reason) is preserved", () => {
+    const foreign = { hooks: { PermissionRequest: [{ hooks: [{ type: "command", command: 'echo \'{"permissionDecision":"allow","permissionDecisionReason":"some other wording"}\'' }] }] } };
+    const { settings, changed } = removeSettings(foreign);
+    expect(changed).toBe(false);
+    expect(settings.hooks.PermissionRequest).toHaveLength(1);
+  });
+
+  test("our hook colocated with a foreign hook in one group: only ours is dropped", () => {
+    const foreignCmd = 'echo \'{"permissionDecision":"deny"}\'';
+    const input = { hooks: { PermissionRequest: [{ hooks: [{ type: "command", command: foreignCmd }, { type: "command", command: PERMISSION_REQUEST_HOOK_COMMAND }] }] } };
+    const { settings, changed } = removeSettings(input);
+    expect(changed).toBe(true);
+    expect(settings.hooks.PermissionRequest).toHaveLength(1);
+    expect(settings.hooks.PermissionRequest[0].hooks).toEqual([{ type: "command", command: foreignCmd }]);
+  });
+
+  test("allowlist-only settings: rules removed, no hook/bypass churn", () => {
+    const input = readJson(join(FIXTURES, "allowlist-configured.json"));
+    const { settings, changed } = removeSettings(input);
+    expect(changed).toBe(true);
+    expect(missingAllowRules(settings)).toEqual([...ALLOW_RULES]);
+  });
+
+  test("empty settings: nothing to remove, changed false", () => {
+    const { changed, changes } = removeSettings({});
+    expect(changed).toBe(false);
+    expect(changes).toEqual([]);
+  });
+
+  test("removeSettings is idempotent: second pass reports zero changes", () => {
+    const full = readJson(join(FIXTURES, "fully-configured.json"));
+    const first = removeSettings(full).settings;
+    const second = removeSettings(first);
+    expect(second.changed).toBe(false);
+    expect(second.changes).toEqual([]);
+  });
+});
+
+// -- applyRemove (fs: read-remove-write, atomic, verified) -----------------
+describe("applyRemove", () => {
+  test("fully-configured fixture: writes back with our entries stripped, others intact", () => {
+    const path = tempPath("fully-configured.json");
+    const before = readJson(path);
+    const result = applyRemove(path);
+    expect(result.changed).toBe(true);
+    const after = readJson(path);
+    expect(missingAllowRules(after)).toEqual([...ALLOW_RULES]);
+    expect(hasBypassMode(after)).toBe(false);
+    expect(hasPermissionRequestAllowHook(after)).toBe(false);
+    expect(after.permissions.allow).toEqual(["Bash(git add *)"]);
+    expect(after.model).toBe(before.model);
+    expect(after.hooks.SessionStart).toEqual(before.hooks.SessionStart);
+  });
+
+  test("a file carrying none of our entries is a zero-diff no-op (removal idempotence)", () => {
+    const path = tempPath("existing-rules.json");
+    const before = readFileSync(path, "utf8");
+    const result = applyRemove(path);
+    expect(result.changed).toBe(false);
+    expect(readFileSync(path, "utf8")).toBe(before); // no write happened at all
+  });
+
+  test("apply full then applyRemove leaves the file byte-identical to the pre-apply state", () => {
+    const path = tempPath("empty.json");
+    const original = readFileSync(path, "utf8");
+    applySettings(path, "full");
+    applyRemove(path);
+    // empty.json is `{}` -> merge full -> remove == round-trips to `{}`.
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(JSON.parse(original));
+  });
+
+  test("re-running applyRemove reports zero changes the second time", () => {
+    const path = tempPath("fully-configured.json");
+    applyRemove(path);
+    const second = applyRemove(path);
+    expect(second.changed).toBe(false);
+    expect(second.changes).toEqual([]);
   });
 });
 

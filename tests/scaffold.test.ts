@@ -3,7 +3,7 @@
 // docs/user-guide/spec restructure. Deterministic, no network, must stay well
 // under the 2s gate budget.
 import { test, expect, describe, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, existsSync, readFileSync, lstatSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
@@ -122,6 +122,26 @@ describe("setup preconditions", () => {
     if (process.platform === "win32") {
       expect(existsSync(join(registered, "node_modules"))).toBe(false);
       expect(existsSync(join(registered, ".git"))).toBe(false);
+    }
+  }, SPAWN_TIMEOUT_MS);
+
+  // Ticket #37: uninstall proves ownership before deleting a registration. A
+  // symlink is self-evidently ours; a COPY (the Windows install path) needs the
+  // .zstack-registered sentinel setup drops into it. Without this marker a real
+  // Windows install would be indistinguishable from a user's own dir and
+  // uninstall would refuse to remove it -- so setup must write it.
+  test.skipIf(!GH_DIR)("registration is provably ours: sentinel on a copy, symlink otherwise", () => {
+    const home = makeTmpHome(true);
+    const result = runSetup({ path: `${BUN_DIR}:${GH_DIR}:${CORE_DIR}`, home });
+    expect(result.exitCode).toBe(0);
+    const registered = join(home, ".claude", "skills", "zstack");
+    const st = lstatSync(registered);
+    if (st.isSymbolicLink()) {
+      // POSIX path: the symlink is the ownership proof; no sentinel needed.
+      expect(existsSync(join(registered, ".zstack-registered"))).toBe(false);
+    } else {
+      // Windows copy path: the sentinel must be present inside the copy.
+      expect(existsSync(join(registered, ".zstack-registered"))).toBe(true);
     }
   }, SPAWN_TIMEOUT_MS);
 

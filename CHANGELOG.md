@@ -4,10 +4,11 @@ All notable changes to zstack are documented here. Format follows [Keep a Change
 
 ## [0.1.1.0] - 2026-07-19
 
-Installing zstack now actually surfaces the four skills. Also releases the issue #14 remediation (all 22 items closed) plus an adversarial hardening pass (OpenAI Codex challenge + independent refute review, every fix mutation-tested).
+Installing zstack now actually surfaces its skills. Also adds a `/z-uninstall` command, releases the issue #14 remediation (all 22 items closed), and includes an adversarial hardening pass (OpenAI Codex challenge + independent refute review, every fix mutation-tested).
 
 ### Added
 
+- `/z-uninstall` (and the `uninstall` script beside `setup`) reverses `./setup`, honoring the same ownership rule setup uses: it removes only the host registrations it can prove it created — a symlink, or a copy carrying the `.zstack-registered` sentinel — and leaves any same-named directory it did not create, naming it. It never deletes the git clone at `~/.claude/skills/zstack` itself (it may be your only copy) — the exact `rm -rf` is printed instead. `--purge` also removes `~/.zstack` (config, loop state, locks, reports); `bin/z-setup-permissions --remove` strips exactly the auto-approval settings `/z-setup` wrote, leaving foreign keys/rules/hooks intact. The GitHub board, milestones, and labels are remote data and are never touched.
 - Board shape (nine statuses, four custom fields, intended views) is data now (issue #20): the shipped `z-setup/board-template.json`, loaded and validated by `lib/board-template.ts` before any board mutation. The default is 1:1 with the previously hardcoded shape (same statuses in order, same fields + option colors). `z-setup-board plan|apply|verify --template <file>` ships a variant; the loader refuses a template whose status set is not the canonical nine or that drops/renames a required field (Model, Model Effort, Estimate, Actual), naming the field and the tool that breaks. GitHub's API has no view-creation mutation, so the template's views are printed as explicit manual steps rather than silently dropped.
 
 ### Fixed
@@ -32,7 +33,7 @@ Installing zstack now actually surfaces the four skills. Also releases the issue
 - `epicStyle "issue-type"` is rejected at config validation and z-setup until a sub-issue create path exists; epic style is always `milestones`.
 - `field-get` on a nonexistent issue throws the same not-found error as other subcommands (was a silent empty value), and never falls back to another project's same-named field.
 - Root strict `tsconfig` + `bun run typecheck` wired into the gate suite; shared CLI plumbing consolidated into `lib/cli.ts`; board statuses single-sourced in `lib/config.ts`.
-- 100+ new gate tests (658 total), each proven to bite via mutation testing.
+- 100+ new gate tests (682 total), each proven to bite via mutation testing.
 
 ## [0.1.0.0] - 2026-07-19
 
