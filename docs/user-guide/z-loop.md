@@ -28,6 +28,23 @@ records the result. It never re-derives a scheduling decision in prose.
   pure prompt constructor (`lib/stage-prompts.ts`). Nothing latent travels between
   stages; the reviewer is blinded to exactly the ticket, its acceptance criteria,
   the diff, and a throwaway worktree.
+- **Bounded orchestrator context.** The orchestrator holds no ticket context. Each
+  stage's payload (body, diff) is assembled off-context into `input-<N>.json` and
+  the printed prompt is a *pointer* to that file — small and payload-independent —
+  so reading it to spawn the Agent stays cheap. And each drain iteration is a
+  single `bin/z-loop-tick` call (snapshot → ingest → `next`) that prints only the
+  one-line next Action, so the repeated bash never re-enters context. A long
+  batch drains in one session without tripping auto-compaction.
+- **Adversarial review, when the card earns it.** When `adversarialMode` is
+  active for a card, the Review stage runs a super-truth pass: it fans out
+  independent skeptic sub-agents that each try to REFUTE the diff against the
+  acceptance criteria, then reconciles them into an aggregated `confidence`
+  (0–100). When inactive it is today's single pass. Activation is deterministic —
+  a pure function of the diff's changed-line count, the issue's labels, and the
+  `adversarialMode` knob (default `non-trivial`: a ≥ 10-line diff OR a
+  `security`/`migration`/`payments`/`auth` label; `off` never, `always` every
+  card). The confidence rides in the reviewer's exit marker; gating on it is a
+  later step.
 - **Dependency-ordered, capped concurrency.** A dependent is not claimable until
   its dependencies are Done; at most `maxLanes` (default 3) lanes run at once;
   merges happen one at a time in topological order (stacked chains retarget the
@@ -59,6 +76,69 @@ After the batch drains, the end-of-loop stage runs a regression on merged main
   loudly rather than silently falling back.
 
 It writes `reports/loop-<ts>.md` and bumps `~/.zstack/projects/<slug>/loop-counter`.
+
+## Notifications
+
+The loop can run for hours unattended. Point it at a Discord webhook and it posts
+a message the moment something needs you or the batch finishes — no more watching
+the terminal. Notifications are **off until configured**; an unconfigured project
+is a silent no-op.
+
+**1. Create a Discord webhook.** In Discord: **Server Settings → Integrations →
+Webhooks → New Webhook**, pick the channel, then **Copy Webhook URL**. That URL is
+a secret — anyone holding it can post to your channel.
+
+**2. Give the URL to zstack**, either way:
+
+- **Environment variable (recommended)** — keeps the secret out of every file:
+
+  ```bash
+  export ZSTACK_DISCORD_WEBHOOK="https://discord.com/api/webhooks/…"
+  ```
+
+  and turn notifications on in `~/.zstack/projects/<slug>/config.json`:
+
+  ```json
+  { "notifications": { "enabled": true } }
+  ```
+
+- **Config only** — put the URL directly in `config.json` (this file lives under
+  `~/.zstack`, outside your repo, so it is never committed):
+
+  ```json
+  { "notifications": { "enabled": true, "discordWebhookUrl": "https://discord.com/api/webhooks/…" } }
+  ```
+
+  When both are set, `ZSTACK_DISCORD_WEBHOOK` wins. The URL must begin with
+  `https://`; a pasted bare token is rejected by `loadConfig` (its error names the
+  field only, never the value).
+
+**3. The five events**, each posted once at the moment the state machine reaches
+it:
+
+| Event | Fires when |
+| --- | --- |
+| `work-complete` | a `/z-loop` (or `/z-plan`) run finishes — counts + spend + regression verdict |
+| `human-pause` | a ticket parks to **Questions** waiting on your input |
+| `ticket-parked` | a ticket is moved to **Blocked** or **Skipped** by the work |
+| `safety-violation` | a safety control tripped (a wedged/dead worker; GraphQL quota exhausted) |
+| `token-burn` | a spend/deadlock anomaly (no lane can make progress) |
+
+Every event defaults **on**. Toggle any of them under `notifications.events`
+(a missing key stays on):
+
+```json
+{ "notifications": { "enabled": true, "events": { "work-complete": false, "human-pause": true } } }
+```
+
+Set `"enabled": false` to mute everything without deleting the block.
+
+**Security.** `config.json` sits under `~/.zstack`, outside the repo, so the URL
+is never committed. zstack never writes the URL to a log line or into a message
+body. Treat the webhook like a password: anyone with it can post to your channel.
+To rotate or revoke, delete the webhook in Discord (Server Settings → Integrations
+→ Webhooks) and create a new one. A failed post is logged (event + error, never
+the URL) and dropped — a down webhook never stalls or crashes the loop.
 
 ## --reconcile (crash recovery)
 

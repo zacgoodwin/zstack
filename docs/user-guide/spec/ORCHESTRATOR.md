@@ -11,6 +11,7 @@ Build, test, review, or fix issues itself. All product work is delegated to clau
 Patch the dispatcher script or skill files mid-run, even if it sees a problem. Capture the symptom and tell the user; wait for explicit approval.
 Wait for workers. They write their evidence back to the GitHub issue + PR. The orchestrator's user-facing output is the dispatch confirmation, not the run result.
 Hold context for multi-card progress. State lives on the GitHub Project board + the inflight lockfiles, not in the orchestrator's session.
+Inline a stage's payload into its own context. Each stage spawn (builder/QA/reviewer/merge) is driven by a POINTER prompt: the orchestrator assembles the large fields (ticket body, diff, acceptance criteria) off-context into `input-<N>.json` (via `jq --rawfile` from files, never inlined in a command whose text it reads back), and the printed prompt only references that file's absolute path, telling the worker to read the payload from it. So the prompt the orchestrator reads back to spawn the Agent is small and payload-independent — the body/diff reaches the worker without transiting the orchestrator's context. The per-iteration drain tick is likewise a single `bin/z-loop-tick` call (snapshot → ingest → next) that prints only the one-line next Action, so a long drain's repeated bookkeeping never accumulates in-session.
 If a problem surfaces during the run, the orchestrator's reply is: "I saw X. Want me to dig in or stop the runner?" — not "I went ahead and fixed it."
 
 Worker rules

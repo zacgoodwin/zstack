@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# One per-iteration drain tick for /z-loop (ticket #57, Leak 2): snapshot the
+# board -> ingest it into the loop state -> ask the state machine for the next
+# Action, printing ONLY that one-line Action JSON on stdout. Collapsing the old
+# ~15-line snapshot+ingest+next block into this single wrapper stops the repeated
+# bash command TEXT from re-entering the orchestrator's context on every one of a
+# long drain's 100+ iterations.
+#
+# It shells only z-board and bun -- never the GitHub CLI directly. Bodies come
+# from `z-board snapshot` (which fetches them through lib/board.ts, the sole
+# sanctioned GitHub caller), so this wrapper stays free of any direct GitHub
+# call and the caller gate in tests/board.test.ts keeps holding.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+PACK="$(cd "$HERE/.." && pwd -P)"
+# z-board resolution: an explicit $Z_BOARD wins (the loop preamble exports it,
+# and the gate test injects a stub through it); otherwise prefer one on PATH,
+# then the sibling in this bin dir. Never resolves to anything but a z-board.
+Z_BOARD="${Z_BOARD:-$(command -v z-board 2>/dev/null || echo "$HERE/z-board")}"
+
+SLUG=""; STATE=""; TMP=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --slug) SLUG="$2"; shift 2 ;;
+    --state) STATE="$2"; shift 2 ;;
+    --tmp) TMP="$2"; shift 2 ;;
+    *) echo "z-loop-tick: unknown argument '$1'" >&2; exit 1 ;;
+  esac
+done
+if [ -z "$SLUG" ] || [ -z "$STATE" ] || [ -z "$TMP" ]; then
+  echo "usage: z-loop-tick --slug <slug> --state <state.json> --tmp <dir>" >&2
+  exit 1
+fi
+
+mkdir -p "$TMP"
+# 1. Snapshot: all-status items + each ticket's body, one call, to files.
+"$Z_BOARD" snapshot --slug "$SLUG" --out-items "$TMP/items.json" --out-bodies "$TMP/bodies.json" >/dev/null
+# 2. Ingest: refresh ticket statuses; preserves lanes + lost-claim flags (no
+#    config flags here -- Step 3's first ingest already set maxLanes/watchdog).
+bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" >/dev/null
+# 3. Next: print exactly one Action JSON line -- the only thing the caller reads.
+bun "$PACK/lib/loop.ts" next "$STATE"

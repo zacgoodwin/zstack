@@ -1,0 +1,33 @@
+diff --git a/src/window.ts b/src/window.ts
+new file mode 100644
+index 0000000..1a2b3c4
+--- /dev/null
++++ b/src/window.ts
+@@ -0,0 +1,10 @@
++// Membership test for a fixed rate-limit window that opens at `start` and lasts
++// `durationMs`. The window is half-open [start, start + durationMs): the start
++// tick is inside, the end tick belongs to the next window.
++export function withinWindow(now: number, start: number, durationMs: number): boolean {
++  if (durationMs <= 0) return false;
++  const end = start + durationMs;
++  // A request is in this window when it is at/after the open and before the end.
++  return now >= start && now <= end;
++}
+diff --git a/src/window.test.ts b/src/window.test.ts
+new file mode 100644
+index 0000000..5d6e7f8
+--- /dev/null
++++ b/src/window.test.ts
+@@ -0,0 +1,12 @@
++import { test, expect } from "bun:test";
++import { withinWindow } from "./window.ts";
++
++test("a request at the exact window open is inside", () => {
++  expect(withinWindow(1000, 1000, 500)).toBe(true);
++});
++test("a request one ms before the boundary is inside", () => {
++  expect(withinWindow(1499, 1000, 500)).toBe(true);
++});
++test("a request before the window is outside", () => {
++  expect(withinWindow(999, 1000, 500)).toBe(false);
++});

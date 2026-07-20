@@ -20,5 +20,5 @@
   // in evals/planner/fixture-app/ -- a separate package with its own
   // package.json, same as evals/fixture-app and deliberately not part of this
   // project either.
-  "include": ["lib", "tests", "evals/e2e", "evals/planner/harness.ts", "evals/planner/board-double.ts"]
+  "include": ["lib", "tests", "evals/e2e", "evals/planner/harness.ts", "evals/planner/board-double.ts", "evals/orchestrator-context/harness.ts"]
 }

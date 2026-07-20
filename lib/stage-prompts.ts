@@ -6,11 +6,26 @@
 // the blindness contract itself: EXACTLY {ticketBody, acceptanceCriteria, diff,
 // worktreePath}, pinned at compile time (Exact assert below) and at runtime
 // (reviewerPrompt rejects any other key set).
+//
+// POINTER PROMPTS (ticket #57, Leak 1): each constructor takes a SECOND arg,
+// `inputPath` -- the absolute path of the stage's input-<N>.json -- and inlines
+// only the small/fixed fields (numbers, title, worktree, branch, flags) plus the
+// discipline/exit-contract boilerplate. The large payload (ticketBody, diff,
+// acceptanceCriteria) is NOT embedded; the prompt tells the worker to read those
+// fields FROM inputPath. So the printed prompt is size-invariant to the payload,
+// and the orchestrator reading it back to spawn the Agent never holds the
+// ticket's body/diff in its own context. `inputPath` is a plain function
+// parameter, NOT a key of the input object, so the reviewer's exact-four-key
+// blindness gate is untouched.
 import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { handleCliError } from "./cli.ts";
-import { ZError } from "./config.ts";
+import { ADVERSARIAL_MODES, DEFAULT_ADVERSARIAL_MODE, ZError, type AdversarialMode } from "./config.ts";
 
 export { ZError } from "./config.ts";
+// Re-exported so importers of this module get the enum from the one file that
+// owns the prompt-side adversarial helpers (config.ts is the definitional home).
+export type { AdversarialMode } from "./config.ts";
 
 // -- builder ------------------------------------------------------------------
 
@@ -29,12 +44,12 @@ export interface BuilderPromptInput {
 // Derived from docs/user-guide/spec/WORKER SAMPLE.md (unattended discipline, exit
 // contract, anti-loophole) and PRINCIPLES.md (ponytail ladder, tests + evals +
 // docs in the same diff, latent vs deterministic).
-export function builderPrompt(i: BuilderPromptInput): string {
+export function builderPrompt(i: BuilderPromptInput, inputPath: string): string {
   const bounce = i.qaNotes
-    ? `\n## QA findings from the previous pass\n\n${i.investigateFirst ? "Bugs survived a rebuild once already. Run the /investigate skill on these findings FIRST and root-cause them before changing any code -- a symptom patch here earns a third strike and blocks the ticket.\n\n" : ""}${i.qaNotes}\n`
+    ? `\n## QA findings from the previous pass\n\n${i.investigateFirst ? "Bugs survived a rebuild once already. Run the /investigate skill on these findings FIRST and root-cause them before changing any code -- a symptom patch here earns a third strike and blocks the ticket.\n\n" : ""}Read the findings you must address from \`qaNotes\` in ${inputPath}.\n`
     : "";
   const review = i.reviewNotes
-    ? `\n## Reviewer findings to address\n\n${i.reviewNotes}\n`
+    ? `\n## Reviewer findings to address\n\nRead them from \`reviewNotes\` in ${inputPath}.\n`
     : "";
   return `You are the BUILDER for ticket #${i.ticketNumber}: "${i.ticketTitle}", running UNATTENDED inside the zstack dev loop. No user is available -- never ask a question, never wait for input; decide or exit via the contract below.
 
@@ -43,7 +58,7 @@ export function builderPrompt(i: BuilderPromptInput): string {
 - Branch: ${i.branch} (based on ${i.baseBranch}). Commit your work here. Never push, never merge, never touch ${i.baseBranch} or any other branch.
 
 ## Ticket
-${i.ticketBody}
+Read your full ticket body (Context, Plan, Acceptance Criteria, Tests + evals, Docs pages touched, Out of scope) from ${inputPath} -- field \`ticketBody\` -- before doing anything else. That body is the contract for this build.
 ${bounce}${review}
 ## Discipline
 - Ponytail ladder before writing any code: does it need to exist at all; does this codebase already have it; does the stdlib/platform/an installed dep cover it; can it be one line -- only then write the minimum that works. Smallest correct diff, full scope.
@@ -73,7 +88,7 @@ export interface QaPromptInput {
 
 // PROCESS.md steps 11-16: functional + technical, as a fresh context that
 // distrusts the builder's own claims.
-export function qaPrompt(i: QaPromptInput): string {
+export function qaPrompt(i: QaPromptInput, inputPath: string): string {
   const web = i.webTarget
     ? "\n- This ticket has a web-facing target: use the gstack /qa skill -- spin the site up and drive it as a real user. UI claims without a driven browser check do not count as verified."
     : "";
@@ -83,7 +98,7 @@ export function qaPrompt(i: QaPromptInput): string {
 - Worktree: ${i.worktreePath}, branch ${i.branch}. Execute here freely. Do NOT fix anything -- report; the rebuild is the builder's job in a fresh spawn.
 
 ## Ticket
-${i.ticketBody}
+Read the ticket body -- Context, Plan, and especially every "### Acceptance Criteria" case -- from ${inputPath}, field \`ticketBody\`, before you start.
 
 ## Check BOTH, in this order
 1. Functional: exercise the built behavior end to end as a user would. Verify every "### Acceptance Criteria" case (setup -> action -> expected outcome) AS WRITTEN -- a case the diff quietly weakened counts as a bug.${web}
@@ -140,18 +155,65 @@ function assertReviewerInput(input: ReviewerPromptInput): void {
   }
 }
 
-export function reviewerPrompt(input: ReviewerPromptInput): string {
+// The trigger labels the "non-trivial" mode escalates on regardless of diff
+// size (issue #59): a one-line change to any of these blast-radius surfaces
+// still earns the skeptic fan-out. Labels live on the GitHub issue and are
+// fetched at reviewer-spawn time (SKILL.md), never ingested into board state.
+export const ADVERSARIAL_TRIGGER_LABELS = ["security", "migration", "payments", "auth"] as const;
+
+// The "non-trivial" mode's diff-size threshold (>= this many changed lines fans
+// out). Named so the boundary is one constant, not a literal buried in a branch.
+export const ADVERSARIAL_DIFF_THRESHOLD = 10;
+
+// Changed-line count of a unified diff: lines added or removed, excluding the
+// +++/--- file headers. The blast-radius proxy the "non-trivial" mode gates on.
+// Deterministic space (PRINCIPLES.md): line-counting is code, never model work.
+export function countDiffLines(diff: string): number {
+  return diff.split(/\r?\n/).filter(
+    (l) => (l.startsWith("+") || l.startsWith("-")) && !l.startsWith("+++") && !l.startsWith("---")
+  ).length;
+}
+
+// Pure activation predicate: does this card's Review stage fan out skeptics?
+// off -> never; always -> always; non-trivial -> diff >= threshold OR any
+// trigger label. A pure function of (mode, size, labels) so it is gate-testable
+// with no live agent (AC1-5); set-intersection over labels is code, not model
+// work.
+export function adversarialActive(mode: AdversarialMode, diffLineCount: number, labels: string[]): boolean {
+  if (mode === "off") return false;
+  if (mode === "always") return true;
+  const trig = new Set<string>(ADVERSARIAL_TRIGGER_LABELS);
+  return diffLineCount >= ADVERSARIAL_DIFF_THRESHOLD || labels.some((l) => trig.has(l));
+}
+
+// Two independent SECOND/THIRD params, never input keys -- the four-key
+// blindness gate (assertReviewerInput) fires first and is unchanged, so neither
+// the pointer path nor the mode/labels that decided `adversarial` ever reach the
+// reviewer as data. `inputPath` (ticket #57) makes the prompt a pointer: the
+// large payload (ticketBody, acceptanceCriteria, diff) is read FROM the file,
+// never embedded, so the printed prompt is size-invariant. `adversarial` (#59):
+// false is the pre-#59 single pass, byte-for-byte; true folds in the super-truth
+// skeptic fan-out and stamps a confidence= token into the exit markers (the
+// signal #62 consumes -- it rides inside the marker's note, so loop.ts's marker
+// regex parses it unchanged; #59 only emits it).
+export function reviewerPrompt(input: ReviewerPromptInput, inputPath: string, adversarial: boolean = false): string {
   assertReviewerInput(input);
+  // ponytail: N=3 skeptics is a fixed ceiling (no config knob this ticket); a
+  // per-project skeptic count is a follow-on if 3 proves too few/many.
+  const superTruth = adversarial
+    ? `
+## Super-truth pass (adversarial mode active)
+This card's blast radius earned an adversarial review; do NOT trust your single read. Spawn 3 INDEPENDENT skeptic sub-agents with the Agent tool -- nested \`claude -p\` is denied by the classifier, so use the Agent tool, not headless claude. Give each skeptic ONLY the four inputs you were given (this ticket, the acceptance criteria, the diff, the throwaway worktree); they are blinded exactly as you are. Task each one to REFUTE that the diff satisfies the acceptance criteria: find the one criterion it violates, the edge it breaks, a test that passes without the change. They work in isolation -- no skeptic sees another's verdict.
+Reconcile the three verdicts into an aggregated confidence 0-100: the percentage of skeptics that could NOT refute the diff (3/3 unrefuted = 100, 2/3 = 67, 1/3 = 33, 0/3 = 0). A criterion any skeptic refutes with concrete evidence is a finding, not a vote to be outnumbered -- surface it. Report the confidence in your exit marker below.
+`
+    : "";
+  // The confidence token rides inside the marker's note (#62 parses it there);
+  // absent on the single pass so the inactive prompt stays a strict no-op.
+  const conf = adversarial ? "confidence=<0-100> " : "";
   return `You are an ADVERSARIAL REVIEWER in a fresh context, running UNATTENDED inside the zstack dev loop. You are blinded by design: your ONLY inputs are the ticket, its acceptance criteria, the diff, and a throwaway worktree of the head commit. There is no PR description, no plan rationale, no builder or QA transcript -- and any claim you cannot verify from these inputs yourself is unverified. Your job is to find the reasons this diff should NOT merge.
 
-## Ticket
-${input.ticketBody}
-
-## Acceptance Criteria (the independent yardstick -- authored before the implementation)
-${input.acceptanceCriteria}
-
-## Diff
-${input.diff}
+## Your inputs (read from the file -- do not look anywhere else)
+Read \`ticketBody\`, \`acceptanceCriteria\`, and \`diff\` from ${inputPath}. That file holds EXACTLY those three fields plus this worktree path and nothing else -- no PR description, no plan rationale, no builder or QA transcript reaches you. The acceptance criteria are the independent yardstick, authored before the implementation; hold the diff to them as written.
 
 ## Throwaway worktree (head commit checked out; yours to execute)
 ${input.worktreePath}
@@ -162,10 +224,10 @@ Run the typecheck and the tests this diff touches here. Nothing you do in it lan
 - Paths the diff adds but no test exercises; tests that pass without the change.
 - Scope creep, dead code, abstractions the ticket never asked for.
 - Security holes at trust boundaries; data-loss edges; error paths that swallow failures.
-
+${superTruth}
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
-REVIEW-APPROVE: <one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green
-REVIEW-FINDINGS: <numbered findings>          each with file:line and why it blocks the merge
+REVIEW-APPROVE: ${conf}<one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green
+REVIEW-FINDINGS: ${conf}<numbered findings>          each with file:line and why it blocks the merge
 NEEDS-HUMAN: <the judgment call>              a genuine spec ambiguity a human must settle
 BLOCKED: <reason>                             the throwaway worktree is unusable -- can't check out or execute the diff at all
 CONFUSED: <what makes no sense>`;
@@ -194,7 +256,7 @@ export interface MergePromptInput {
   stackedOn: number[]; // parent tickets in this batch (PROCESS.md step 18)
 }
 
-export function mergePrompt(i: MergePromptInput): string {
+export function mergePrompt(i: MergePromptInput, inputPath: string): string {
   const stacked = i.stackedOn.length
     ? `\n## Stacked chain (PROCESS.md step 18 -- order is not optional)
 This branch stacks on ticket(s) #${i.stackedOn.join(", #")}. Their PRs merge FIRST, each WITHOUT deleting its branch (deleting a base branch closes every dependent PR). After each parent lands, retarget this PR to ${i.baseBranch} (gh pr edit --base ${i.baseBranch}). Delete branches only after the whole batch has landed.\n`
@@ -203,6 +265,7 @@ This branch stacks on ticket(s) #${i.stackedOn.join(", #")}. Their PRs merge FIR
 
 ## Workspace
 - Worktree: ${i.worktreePath}, branch ${i.branch}, base ${i.baseBranch}.
+- Full stage input (numbers, PR title, branch, base, worktree, stacked chain) is in ${inputPath} if you need to re-read any field.
 ${stacked}
 ## Steps
 1. Open the PR: gh pr create --base ${i.baseBranch} --head ${i.branch} --title ${shSingleQuote(i.prTitle)} with a body that links the ticket and summarizes what shipped.
@@ -270,8 +333,18 @@ This ticket stays OPEN in Done for human review; bounce it back to Ready with a 
 
 const USAGE = `stage-prompts <command> [args]
 
-  prompt <builder|qa|reviewer|merge> <input.json>   print the stage prompt built from the typed input
+  prompt <builder|qa|merge> <input.json>            print the stage prompt built from the typed input
+  prompt reviewer <input.json> [--adversarial-mode <off|non-trivial|always>] [--labels <json-array>]
+                                                    print the reviewer prompt; the flags decide the
+                                                    super-truth fan-out deterministically (diff size + labels + mode)
   note <input.json>                                 print the completion note (CompletionNoteInput)`;
+
+// A single "--flag value" lookup for the reviewer's two optional flags. Returns
+// the token after the flag, or undefined when the flag is absent (defaults apply).
+function flagValue(argv: string[], flag: string): string | undefined {
+  const i = argv.indexOf(flag);
+  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
+}
 
 export function main(argv: string[]): number {
   const cmd = argv[0];
@@ -290,15 +363,52 @@ export function main(argv: string[]): number {
       } catch (e) {
         throw new ZError(`Cannot read input JSON at ${path}: ${(e as Error).message}`);
       }
-      const builders: Record<string, (i: any) => string> = {
+      if (stage === "reviewer") {
+        // The reviewer is the one stage whose prompt needs more than its input
+        // file: adversarial activation is a deterministic function of the
+        // configured mode, the diff's OWN changed-line count, and the card's
+        // labels. Mode + labels arrive as FLAGS, never as a fifth input key --
+        // the blinded four-key input-<N>.json is untouched (blindness intact).
+        const modeArg = flagValue(argv, "--adversarial-mode");
+        const mode = (modeArg ?? DEFAULT_ADVERSARIAL_MODE) as AdversarialMode;
+        if (!ADVERSARIAL_MODES.includes(mode)) {
+          throw new ZError(
+            `--adversarial-mode must be one of "off", "non-trivial", "always", got ${JSON.stringify(modeArg)}.`
+          );
+        }
+        let labels: string[] = [];
+        const labelsArg = flagValue(argv, "--labels");
+        if (labelsArg !== undefined) {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(labelsArg);
+          } catch (e) {
+            throw new ZError(`--labels must be a JSON array of strings, got ${JSON.stringify(labelsArg)}: ${(e as Error).message}`);
+          }
+          if (!Array.isArray(parsed) || parsed.some((l) => typeof l !== "string")) {
+            throw new ZError(`--labels must be a JSON array of strings, got ${JSON.stringify(labelsArg)}.`);
+          }
+          labels = parsed as string[];
+        }
+        // countDiffLines runs on the input's own diff BEFORE reviewerPrompt's
+        // assertReviewerInput; guard a missing diff so activation computes, then
+        // the four-key gate throws the real "blinded by design" error.
+        const active = adversarialActive(mode, countDiffLines(typeof input.diff === "string" ? input.diff : ""), labels);
+        // Pointer prompt (ticket #57): reviewer reads its payload from the input
+        // file by ABSOLUTE path; the flag-derived `active` selects the fan-out.
+        console.log(reviewerPrompt(input, resolve(path), active));
+        return 0;
+      }
+      const builders: Record<string, (i: any, inputPath: string) => string> = {
         builder: builderPrompt,
         qa: qaPrompt,
-        reviewer: reviewerPrompt,
         merge: mergePrompt,
       };
       const build = builders[stage];
       if (!build) throw new ZError(`Unknown stage "${stage}". Valid: builder, qa, reviewer, merge.`);
-      console.log(build(input));
+      // The pointer prompt references this input file by ABSOLUTE path, so the
+      // worker (a fresh Agent with its own CWD) resolves it unambiguously.
+      console.log(build(input, resolve(path)));
       return 0;
     }
     if (cmd === "note") {

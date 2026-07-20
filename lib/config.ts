@@ -5,6 +5,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { validateConfig } from "./config-schema.ts";
+import type { EventKey } from "./notify.ts";
 
 export type FieldDataType = "SINGLE_SELECT" | "NUMBER" | "TEXT";
 
@@ -53,6 +54,15 @@ export interface QuotaConfig {
 // milestone per epic (recommended) or a parent issue with sub-issue relations.
 export type EpicStyle = "milestones" | "issue-type";
 
+// The adversarial-reviewer control (issue #59). Per project, chosen at setup or
+// hand-edited: never fan out skeptics ("off"), fan out only when a card's blast
+// radius earns it ("non-trivial" -- the default: diff >= 10 changed lines OR a
+// security/migration/payments/auth label), or always ("always"). Consumed at
+// reviewer-spawn time (lib/stage-prompts.ts adversarialActive), not threaded
+// through LoopState. Single source of the enum for config-schema + stage-prompts.
+export type AdversarialMode = "off" | "non-trivial" | "always";
+export const ADVERSARIAL_MODES: AdversarialMode[] = ["off", "non-trivial", "always"];
+
 export interface BoardConfig {
   slug: string;
   owner: string; // repo owner, for repository/issue lookups
@@ -81,7 +91,21 @@ export interface BoardConfig {
   // (PROCESS.md step 15) instead of a direct patch.
   maxQaPasses?: number;
   qaInvestigateAfter?: number;
+  // Adversarial-reviewer control (issue #59): whether the Review stage fans out
+  // independent skeptic sub-agents (super-truth) for a card, and when. Read only
+  // at reviewer-spawn time; #62 gates on the confidence this mode emits.
+  adversarialMode?: AdversarialMode;
   quota?: Partial<QuotaConfig>;
+  // Discord notifications for the five loop events (#60). Absent block = off (a
+  // no-op), which is the correct default -- so there is deliberately no
+  // DEFAULT_NOTIFICATIONS const and no loadConfig mutation. The URL is a SECRET:
+  // config.json lives at ~/.zstack/projects/<slug>/config.json, OUTSIDE the repo
+  // (.gitignore is N/A), and may instead come from ZSTACK_DISCORD_WEBHOOK.
+  notifications?: {
+    discordWebhookUrl?: string; // SECRET; env ZSTACK_DISCORD_WEBHOOK wins over it
+    enabled?: boolean; // master switch (default on when the block is present)
+    events?: Partial<Record<EventKey, boolean>>; // per-state toggles (each default on)
+  };
 }
 
 export const DEFAULT_QUOTA: QuotaConfig = { threshold: 100, mode: "sleep" };
@@ -92,6 +116,7 @@ export const DEFAULT_LOCK_STALENESS_MINUTES = 60;
 export const DEFAULT_AUDIT_EVERY_N_LOOPS = 5;
 export const DEFAULT_MAX_QA_PASSES = 3;
 export const DEFAULT_QA_INVESTIGATE_AFTER = 2;
+export const DEFAULT_ADVERSARIAL_MODE: AdversarialMode = "non-trivial";
 
 // Every actionable failure in the pack is a ZError; main() prints .message to
 // stderr and exits non-zero. Anything else is a bug and bubbles up with a stack.
@@ -191,5 +216,6 @@ export function loadConfig(slug?: string, home = homedir()): BoardConfig {
   cfg.auditEveryNLoops = cfg.auditEveryNLoops ?? DEFAULT_AUDIT_EVERY_N_LOOPS;
   cfg.maxQaPasses = cfg.maxQaPasses ?? DEFAULT_MAX_QA_PASSES;
   cfg.qaInvestigateAfter = cfg.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER;
+  cfg.adversarialMode = cfg.adversarialMode ?? DEFAULT_ADVERSARIAL_MODE;
   return cfg;
 }

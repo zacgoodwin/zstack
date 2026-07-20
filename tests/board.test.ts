@@ -353,6 +353,67 @@ describe("single-page ceiling guards", () => {
   });
 });
 
+// -- ticket #57: one-call drain snapshot (items + bodies) --------------------
+describe("snapshot", () => {
+  const nodeWithBody = (n: number, status: string, body: string | null) => ({
+    content: { number: n, title: `T${n}`, url: `http://x/${n}`, body },
+    fieldValues: {
+      pageInfo: { hasNextPage: false },
+      nodes: [{ __typename: "ProjectV2ItemFieldSingleSelectValue", name: status, field: { name: "Status" } }],
+    },
+  });
+  const boardPage = (nodes: any[]) => ({
+    node: { items: { pageInfo: { hasNextPage: false, endCursor: null }, nodes } },
+  });
+
+  test("emits all-status items PLUS each ticket's body in one ProjectItems pass (no N+1 lookups)", async () => {
+    const calls: Call[] = [];
+    const nodes = [nodeWithBody(4, "Done", "body four"), nodeWithBody(5, "In progress", "body five")];
+    const board = new Board(CFG, makeExecutor({ calls, overrides: { ProjectItems: boardPage(nodes) } }));
+    const snap = await board.snapshot();
+
+    expect(snap.items.map((i) => i.number)).toEqual([4, 5]);
+    expect(snap.items[0].fields.Status).toBe("Done");
+    // Bodies keyed by issue number as a string -- exactly what loop.ts ingest consumes.
+    expect(snap.bodies).toEqual({ "4": "body four", "5": "body five" });
+    // Items are byte-identical to a plain all-status list() over the same board:
+    // snapshot replaces the SKILL's hand-assembled 9-list + per-body fetch.
+    const listBoard = new Board(CFG, makeExecutor({ overrides: { ProjectItems: boardPage(nodes) } }));
+    expect(snap.items).toEqual(await listBoard.list());
+    // One query pass, no per-issue IssueLookup fan-out (bodies ride content.body).
+    expect(calls.filter((c) => c.op === "ProjectItems").length).toBe(1);
+    expect(calls.some((c) => c.op === "IssueLookup")).toBe(false);
+  });
+
+  test("a ticket with a null/absent body serializes as an empty string, never undefined", async () => {
+    const board = new Board(
+      CFG,
+      makeExecutor({ overrides: { ProjectItems: boardPage([nodeWithBody(7, "Ready", null)]) } })
+    );
+    const snap = await board.snapshot();
+    expect(snap.bodies).toEqual({ "7": "" });
+  });
+
+  test("paginates past 100 items exactly like list() (bodies for every page)", async () => {
+    const first = Array.from({ length: 100 }, (_, i) => nodeWithBody(i + 1, "Building", `b${i + 1}`));
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        overrides: {
+          ProjectItems: (vars) =>
+            vars.cursor === "CUR_100"
+              ? boardPage([nodeWithBody(101, "Done", "b101")])
+              : { node: { items: { pageInfo: { hasNextPage: true, endCursor: "CUR_100" }, nodes: first } } },
+        },
+      })
+    );
+    const snap = await board.snapshot();
+    expect(snap.items.length).toBe(101);
+    expect(Object.keys(snap.bodies).length).toBe(101);
+    expect(snap.bodies["101"]).toBe("b101");
+  });
+});
+
 describe("move", () => {
   test("sets the Status single-select option", async () => {
     const calls: Call[] = [];
@@ -964,6 +1025,23 @@ describe("contract enforcement", () => {
     expect(gateScans("bin/z-board")).toBe(true);
   });
 
+  // Ticket #57: bin/z-loop-tick shells only z-board + bun. Its whole reason to
+  // exist (a gh-free per-iteration tick) depends on bodies coming from
+  // `z-board snapshot` (routed through lib/board.ts), so a direct gh call here
+  // would both break the caller gate and defeat the design. The generic gate
+  // above already scans bin/ files; this asserts it EXPLICITLY for z-loop-tick.
+  test("bin/z-loop-tick makes no direct gh call (snapshot fetches bodies through lib/board.ts)", () => {
+    const content = readFileSync(join(REPO_ROOT, "bin", "z-loop-tick"), "utf8");
+    expect(callsGhDirectly(content)).toBe(false);
+    // Stronger than callsGhDirectly: no bare `gh` command token anywhere (any
+    // subcommand, comments included) -- word-boundary so "GitHub"/"through" don't trip it.
+    const ghCommand = /(^|[\s;|&$("'`])gh[\s'"]/m;
+    expect(ghCommand.test(content)).toBe(false);
+    // And it does call the two allowed tools.
+    expect(content).toContain("z-board");
+    expect(content).toContain("lib/loop.ts");
+  });
+
   test("lib/board.ts is in fact the caller (guards against the gate passing vacuously)", () => {
     const content = readFileSync(join(REPO_ROOT, "lib", "board.ts"), "utf8");
     // Must assert the actual detector predicate, not a weaker proxy (`/\bgh\b/`
@@ -1042,6 +1120,10 @@ describe("contract enforcement", () => {
       `gh issue view <N> --json body -q .body > "$TMP/body-<N>.md"`,
       `gh issue view "$N" --json body -q .body > "$TMP/body-$N.md"`,
       `gh issue view`, // prose reference in the builder-input table
+      // issue #59 reviewer-spawn label fetch: read-only. Labels live on the
+      // GitHub issue, not the board item (board.list never fetches them), so the
+      // adversarial-mode predicate reads them here. Trailing ) is from the $(...).
+      `gh issue view <N> --json labels -q '[.labels[].name]')`,
       // planning-pass body write; z-board has no issue-body-edit subcommand
       // (flagged in issue #14 item 2 findings as the one mutation outside z-board)
       `gh issue edit <N> --body-file ...`,

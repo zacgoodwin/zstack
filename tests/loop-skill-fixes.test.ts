@@ -24,14 +24,26 @@ function section(md: string, heading: string): string {
 // ============================================================================
 // C3 -- wave reconciliation is reachable: the drain loop re-ingests every tick
 // ============================================================================
-describe("C3: drain loop re-reads the board before every next", () => {
-  test("Step 4 re-runs list+ingest before asking next (not only Step 3)", () => {
+describe("C3: drain loop re-reads the board before every next (via z-loop-tick)", () => {
+  // Ticket #57 relocated the per-iteration snapshot+ingest+next block into
+  // bin/z-loop-tick (Leak 2) so only the one-line Action re-enters context. The
+  // C3 invariant -- board re-read + re-ingested BEFORE every `next` -- is
+  // unchanged, just inside the wrapper now, so the canary checks both surfaces.
+  test("Step 4 calls z-loop-tick every iteration (the re-read wrapper), before every next", () => {
     const step4 = section(zLoop(), "## Step 4 — The drain loop");
     expect(step4).not.toBe("");
-    expect(step4).toContain('lib/loop.ts" ingest "$STATE"'); // ingest is now inside the drain loop
+    expect(step4).toContain("bin/z-loop-tick"); // the per-iteration tick
     expect(step4).toMatch(/before every/i); // re-read happens before every next
-    // The ingest must be positioned before the `next` call in the section.
-    expect(step4.indexOf('ingest "$STATE"')).toBeLessThan(step4.indexOf('next "$STATE"'));
+  });
+
+  test("z-loop-tick re-reads the board (snapshot) then ingests, strictly before next", () => {
+    const tick = readFileSync(join(REPO_ROOT, "bin", "z-loop-tick"), "utf8");
+    expect(tick).toContain("snapshot");
+    expect(tick).toContain('lib/loop.ts" ingest "$STATE"');
+    expect(tick).toContain('lib/loop.ts" next "$STATE"');
+    // snapshot -> ingest -> next, in that order.
+    expect(tick.indexOf("snapshot")).toBeLessThan(tick.indexOf('ingest "$STATE"'));
+    expect(tick.indexOf('ingest "$STATE"')).toBeLessThan(tick.indexOf('next "$STATE"'));
   });
 });
 
