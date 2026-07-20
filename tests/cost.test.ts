@@ -123,16 +123,18 @@ describe("format-drift canary (AC4)", () => {
   });
 });
 
-// -- harness-synthetic transcript entries (ticket #30) -----------------------
+// -- synthetic transcript entries (ticket #30) --------------------------------
 //
-// Hit live during a /z-loop drain: an agent killed by a session usage limit
-// and later resumed gets a harness-written synthetic assistant entry with
-// `"model": "<synthetic>"` in its transcript. It has a full, validly-shaped
-// usage object (that's why it reached resolveRate at all instead of being
-// filtered out by parseLine's assistant+usage check) but carries nothing
-// billable -- z-cost must skip it before the rate lookup and count the skip,
-// rather than raising the fail-loud unknown-model ZError every OTHER
-// unrecognized model string still must raise.
+// Hit live during a /z-loop drain: Claude Code itself writes an inline
+// synthetic assistant entry with `"model": "<synthetic>"` whenever an API
+// call fails transiently mid-session (isApiErrorMessage:true, apiErrorStatus
+// 429/500/529 -- rate limit or server error). Confirmed against 11/11 real
+// "<synthetic>" occurrences in ~/.claude/projects/ transcripts. It has a
+// full, validly-shaped usage object (that's why it reached resolveRate at
+// all instead of being filtered out by parseLine's assistant+usage check)
+// but carries nothing billable -- z-cost must skip it before the rate lookup
+// and count the skip, rather than raising the fail-loud unknown-model ZError
+// every OTHER unrecognized model string still must raise.
 describe("harness-synthetic entries are skipped, not priced (ticket #30)", () => {
   const ZERO_USAGE = {
     input_tokens: 0,

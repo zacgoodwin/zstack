@@ -77,15 +77,18 @@ export interface CostResult {
   by_model: ModelSpend[];
   requests: number; // unique API calls counted (post-dedup)
   lines_parsed: number; // assistant+usage lines seen (pre-dedup)
-  skippedSynthetic: number; // harness-synthetic ("<synthetic>") lines skipped, not priced
+  skippedSynthetic: number; // synthetic ("<synthetic>") lines skipped, not priced
 }
 
-// The harness (z-loop's watchdog) writes a synthetic assistant entry with
-// this exact model string when a session is killed by a usage limit and
-// later resumed -- it is not a real API response and carries nothing
-// billable. Must skip BEFORE the rate lookup below so it never trips the
-// fail-loud unknown-model ZError that every genuinely-unrecognized model
-// string should still raise (resolveRate in lib/estimate.ts).
+// Claude Code itself (not this repo, not z-loop's watchdog) writes a
+// synthetic assistant entry with this exact model string inline in the
+// transcript whenever an API call fails transiently mid-session (usage.isApiErrorMessage:
+// true, apiErrorStatus 429/500/529 -- rate limit or server error). It is not
+// a real API response and carries nothing billable. Confirmed against 11/11
+// real "<synthetic>" occurrences in ~/.claude/projects/ transcripts. Must
+// skip BEFORE the rate lookup below so it never trips the fail-loud
+// unknown-model ZError that every genuinely-unrecognized model string
+// should still raise (resolveRate in lib/estimate.ts).
 const SYNTHETIC_MODEL = "<synthetic>";
 
 function assertUsageShape(usage: any, where: string): RawUsage {
