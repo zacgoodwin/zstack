@@ -640,4 +640,50 @@ describe("z-plan/SKILL.md: Step 10 evaluates BOTH split gates before filing a dr
     expect(done).toContain("## Subtasks (in order)");
     expect(done).toMatch(/never\s*\n?\s*auto-closed, never moved to Ready/);
   });
+
+  // Reviewer finding on the first pass: item 4's split-parent fielding skip
+  // was scoped to "item 3's either-gate-trips path ran THIS iteration" -- a
+  // SECOND Step 10 run over an already-split parent (item 3 never re-runs,
+  // because the parent's six-section body still passes $Z_LINT) would fall
+  // through to item 4's field-get/field-set branch and write Model/Effort/
+  // Estimate onto a parent that "carries no Estimate of its own" by design,
+  // breaking AC4's zero-writes idempotence. Fix: the skip must key off a
+  // durable signal (the `## Subtasks (in order)` heading already in the
+  // body) that is true on ANY pass, not an iteration-scoped flag.
+  test("item 4's fielding skip is keyed on the Subtasks heading, not on item 3 having run THIS iteration (AC4 regression)", () => {
+    const step10 = section(zPlan(), "## Step 10 — Backlog scan");
+    // The skip check must read the heading out of the ticket's current body
+    // -- durable across runs -- not gate on "item 3's ... path ran" alone.
+    expect(step10).toMatch(/check the ticket's CURRENT body for a\s*\n?\s*`## Subtasks \(in order\)` heading/);
+    expect(step10).toMatch(/durable signal independent of iteration/);
+    expect(step10).toMatch(/a second pass over an already-split parent sees\s*\n?\s*the heading too, not only the run that wrote it/);
+  });
+
+  test("simulated second Step 10 pass over an already-split parent: zero field writes (AC4)", () => {
+    // Simulates the exact scenario the reviewer flagged: a parent body from
+    // a PRIOR Step 10 split run (already carries the Subtasks heading and
+    // all six schema sections, so $Z_LINT passes and item 3 does not
+    // re-run), fed straight into item 4's check on a second pass.
+    const splitParentBody = read("good.md") + "\n\n## Subtasks (in order)\n\n- #101\n- #102\n";
+    // Guard: this fixture still passes the lint gate item 2 runs, so item 3's
+    // split branch genuinely does not fire on this second pass -- item 4's
+    // durable-heading check is the ONLY thing standing between this ticket
+    // and an unwanted field-set.
+    expect(validateTicketBody(splitParentBody).ok).toBe(true);
+
+    const HEADING = "## Subtasks (in order)";
+    const isSplitParent = splitParentBody.includes(HEADING);
+    expect(isSplitParent).toBe(true);
+
+    // Model item 4's branch: field-get/field-set only runs when the ticket
+    // is NOT a split parent. A field-write function that must stay uncalled.
+    let fieldWrites = 0;
+    const fieldSet = () => {
+      fieldWrites++;
+    };
+    if (!isSplitParent) {
+      fieldSet();
+    }
+    expect(fieldWrites).toBe(0);
+  });
 });

@@ -477,15 +477,24 @@ For each ticket number `<N>` in that list:
        close on the parent, never move it, and never promote the parent or
        any child to Ready — item 6 below applies to every ticket a split
        touches, parent and children alike.
-4. **Fields**, independent of whether step 3 ran: read Model, Model Effort, and
-   Estimate (`"$Z_BOARD" field-get <N> <Field> --slug "$SLUG"`, once each). If
-   ANY is empty, choose Model + Model Effort per Step 6's rules of thumb and run
-   the full Step 6 tier chain (`z-plan/tiers.json` → `"$Z_ESTIMATE"`) to
-   `field-set` all three — no arithmetic in prose, same rule as Step 6. A
-   split parent (item 3's either-gate-trips path) skips this step for
-   itself — Step 5's convention holds here too: it carries no Estimate of its
+4. **Fields:** before fielding, check the ticket's CURRENT body for a
+   `## Subtasks (in order)` heading — whichever body is current right now:
+   the one item 3's either-gate-trips path just filed this iteration, or
+   (when that path did not run this iteration) the body item 1 fetched into
+   `$TMP/body-<N>.md`. This is a durable signal independent of iteration: a
+   parent split on a PRIOR Step 10 pass still carries the heading (it still
+   passes `$Z_LINT`'s section-presence check, so item 3 never re-runs the
+   split branch on it), so a second pass over an already-split parent sees
+   the heading too, not only the run that wrote it. If the heading is
+   present, this ticket is a split parent: skip the rest of this step for it
+   unconditionally — Step 5's convention holds here too: it carries no Estimate of its
    own beyond the sum its children report; item 4 fields only the children,
-   each through Step 6's tier chain, when filing them.
+   each through Step 6's tier chain, when filing them. Otherwise, read Model,
+   Model Effort, and Estimate (`"$Z_BOARD" field-get <N> <Field> --slug
+   "$SLUG"`, once each). If ANY is empty, choose Model +
+   Model Effort per Step 6's rules of thumb and run the full Step 6 tier
+   chain (`z-plan/tiers.json` → `"$Z_ESTIMATE"`) to `field-set` all three —
+   no arithmetic in prose, same rule as Step 6.
 5. **Nothing needed, nothing written.** A Backlog ticket whose body already
    passes lint AND already carries all three fields gets zero body edits, zero
    field writes, and zero comments this run — the same idempotent-rerun
