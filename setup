@@ -86,8 +86,16 @@ _link_or_copy() {
       cp -R "$entry" "$staging/$name"
     done
     # Mark the copy as zstack-created so `uninstall` will remove it (existence
-    # is the only thing it checks; the text just orients a human who finds it).
-    printf '%s\n' "Created by zstack ./setup. Safe to remove with ./uninstall (or by deleting this directory)." > "$staging/$MARKER"
+    # is the only thing it checks; the first line just orients a human who
+    # finds it). The second line records the source clone's absolute path so
+    # `bin/z-update` can resolve a git source to pull from a copy that has no
+    # .git of its own -- _owned() above only tests existence, so a legacy
+    # marker without this line still counts as owned, it just can't be
+    # resolved to an update source.
+    {
+      printf '%s\n' "Created by zstack ./setup. Safe to remove with ./uninstall (or by deleting this directory)."
+      printf 'source: %s\n' "$PACK_DIR"
+    } > "$staging/$MARKER"
     if [ -e "$dst" ]; then mv "$dst" "$old"; fi
     mv "$staging" "$dst"
     rm -rf "$old" 2>/dev/null || true
@@ -195,7 +203,17 @@ else
 fi
 
 if [ "$TEAM_MODE" -eq 1 ]; then
-  echo "Team mode requested: no session hooks to register (the five shipped skills -- z-setup, z-plan, z-loop, z-status, z-uninstall -- need none)."
+  # Derived the same way register() finds skills (line 143) rather than
+  # hand-listed, so this message can't undercount again the next time a
+  # z-*/ skill is added (it went stale -- "five" -- the moment #36 shipped
+  # z-update as a sixth).
+  team_skills=""
+  for skill_dir in "$PACK_DIR"/z-*/; do
+    [ -f "$skill_dir/SKILL.md" ] || continue
+    team_skills="$team_skills, $(basename "$skill_dir")"
+  done
+  team_skills="${team_skills#, }"
+  echo "Team mode requested: no session hooks to register (the shipped skills -- $team_skills -- need none)."
 fi
 
 if [ "$CLAUDE_REFUSED" -eq 1 ]; then

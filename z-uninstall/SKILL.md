@@ -41,8 +41,8 @@ PACK="$(cd "$PACK" && pwd -P)"
 Ask via AskUserQuestion before removing anything. Two decisions in one:
 
 1. **Proceed with uninstall?** Removing the skill registrations means `/z-setup`,
-   `/z-plan`, `/z-loop`, `/z-status`, and this command stop being available on
-   this machine until re-installed.
+   `/z-plan`, `/z-loop`, `/z-status`, `/z-update`, and this command stop being
+   available on this machine until re-installed.
 2. **Also purge `~/.zstack`?** That is per-project state: board config, loop
    counter, locks, and run reports. Without purge it stays, and its path plus the
    removal command are printed. **Purging a project's config means the next

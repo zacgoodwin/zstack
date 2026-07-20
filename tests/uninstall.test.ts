@@ -6,7 +6,17 @@
 // 2s-per-file gate budget (each spawn carries the generous timeout scaffold uses
 // for Windows spawn contention).
 import { test, expect, describe, afterEach } from "bun:test";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
@@ -209,6 +219,11 @@ describe("#49 AC3 — a sentinel COPY running its own uninstall is a 'registered
     mkdirSync(copy, { recursive: true });
     cpSync(UNINSTALL_PATH, join(copy, "uninstall"));
     writeFileSync(join(copy, ".zstack-registered"), "Created by zstack ./setup.\n");
+    // The sweep list is derived from PACK_DIR/z-*/SKILL.md dirs (mirrors
+    // setup's register()), so a realistic copy fixture needs the skill's
+    // source dir present too, not just its registered copy below.
+    mkdirSync(join(copy, "z-setup"), { recursive: true });
+    writeFileSync(join(copy, "z-setup", "SKILL.md"), "# fixture\n");
     // A separately-registered per-skill copy that IS ours (and is NOT the running dir).
     const zsetup = sentinelCopy(skills, "z-setup");
 
@@ -226,6 +241,41 @@ describe("#49 AC3 — a sentinel COPY running its own uninstall is a 'registered
   }, SPAWN_TIMEOUT_MS);
 });
 
+// -- Canary: the sweep list is DERIVED, not hand-listed ----------------------
+// Regression for #36 QA pass 2: uninstall used to hardcode
+// ENTRIES=(zstack z-setup z-plan z-loop z-status z-uninstall). When #36 added
+// a 6th skill dir (z-update/), that array went stale and z-update survived
+// every uninstall. The permanent fix makes uninstall glob PACK_DIR/z-*/ for
+// SKILL.md-carrying dirs, mirroring setup's register() (setup:143). This test
+// reads the REAL pack's z-*/ dirs (not a synthetic fixture list like the ACs
+// above use) so it fails for ANY future skill the sweep forgets, not just
+// z-update -- a hardcoded array (or one merely patched to add z-update) would
+// still pass every test above without ever being checked against the pack.
+describe("canary — uninstall's sweep matches the pack's real z-*/SKILL.md dirs", () => {
+  test("every real z-*/ skill in this pack gets swept when registered as a sentinel copy", () => {
+    const realSkillNames = readdirSync(REPO_ROOT).filter(
+      (name) => name.startsWith("z-") && existsSync(join(REPO_ROOT, name, "SKILL.md"))
+    );
+    // Sanity: the derivation actually found the pack's real skills (a bug
+    // that made it find zero would make the rest of this test vacuously pass).
+    expect(realSkillNames.length).toBeGreaterThanOrEqual(5);
+    expect(realSkillNames).toContain("z-update");
+
+    const home = makeHome();
+    const skills = join(home, ".claude", "skills");
+    mkdirSync(skills, { recursive: true });
+    const zstack = sentinelCopy(skills, "zstack");
+    const perSkillPaths = realSkillNames.map((name) => sentinelCopy(skills, name));
+
+    const result = runUninstall({ home });
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(zstack)).toBe(false);
+    for (const p of perSkillPaths) {
+      expect(existsSync(p)).toBe(false);
+    }
+  }, SPAWN_TIMEOUT_MS);
+});
+
 // -- AC2: the pack IS the clone at ~/.claude/skills/zstack -------------------
 describe("AC2 — the pack cloned directly at the skills dir is left, rm -rf printed", () => {
   test("clone left in place; per-skill entry removed; exact removal command printed", () => {
@@ -238,6 +288,11 @@ describe("AC2 — the pack cloned directly at the skills dir is left, rm -rf pri
     mkdirSync(clone, { recursive: true });
     cpSync(UNINSTALL_PATH, join(clone, "uninstall"));
     writeFileSync(join(clone, "VERSION"), "0.1.0\n"); // no sentinel: it's a clone
+    // The sweep list is derived from PACK_DIR/z-*/SKILL.md dirs (mirrors
+    // setup's register()), so a realistic clone fixture needs the skill's
+    // source dir present too, not just its registered copy below.
+    mkdirSync(join(clone, "z-setup"), { recursive: true });
+    writeFileSync(join(clone, "z-setup", "SKILL.md"), "# fixture\n");
     // A separately-registered per-skill entry that IS ours (must be removed).
     const zsetup = sentinelCopy(skills, "z-setup");
 

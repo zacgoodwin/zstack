@@ -154,6 +154,12 @@ describe("setup preconditions", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("Team mode requested");
+    // Regression for #36 QA pass 2: this message used to hand-list "the five
+    // shipped skills", which undercounted and omitted z-update the moment #36
+    // added it as a 6th. It's derived from the real pack's z-*/SKILL.md dirs
+    // now (setup runs against REPO_ROOT here, so z-update is really present).
+    expect(result.stdout).toContain("z-update");
+    expect(result.stdout).not.toContain("the five shipped skills");
   }, SPAWN_TIMEOUT_MS);
 });
 
