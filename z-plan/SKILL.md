@@ -43,6 +43,11 @@ export ZSTACK_SLUG="$SLUG"   # H13: so any z-board call that omits --slug still
                              # resolves the right project (resolveSlug honors
                              # ZSTACK_SLUG) instead of throwing "Multiple zstack
                              # projects" on a multi-project machine.
+REPO_ROOT="$(pwd -P)"        # the TARGET project repo (this skill always runs
+                             # from inside it, same dir `gh repo view` just
+                             # resolved) -- distinct from $PACK, the skill's own
+                             # install dir. Step 4's `## Files` grounding gate
+                             # checks paths against this root.
 ```
 
 ---
@@ -248,14 +253,24 @@ the rest are h2):
 - `## Docs pages touched` — the `docs/user-guide/` pages to update when the
   ticket changes what users see or do; "none (no user-facing change)" otherwise.
 - `## Out of scope` — what this ticket deliberately does not do.
+- `## Files` — optional; one top-level bullet per file the grounding pass
+  (Step 2) discovered, each a path like `lib/board.ts` in the bullet's FIRST
+  backticked span followed by a one-clause role (anything else in the bullet
+  is prose). This is the map the builder/QA/reviewer stages reuse instead of
+  re-discovering the same files with fresh glob/grep in every stage spawn — pay
+  the discovery cost once, here. A file this ticket will CREATE (does not
+  exist yet) gets its bullet suffixed literally `(new)`, exempting it from the
+  existence gate below.
 - `Depends on: #A, #B` — optional line; omit it when the ticket has no
   dependencies. When present it names the issues this ticket waits on.
 
 Gate every body before it touches the board — this is deterministic, so run the
-script, never eyeball it:
+script, never eyeball it. Always pass `--check-paths` with the repo root so a
+hallucinated or stale `## Files` path fails here, at plan time, not at build
+time in a fresh worktree:
 
 ```bash
-"$Z_LINT" /path/to/ticket-body.md   # exit 0 = valid; exit 1 prints each gap on stderr
+"$Z_LINT" /path/to/ticket-body.md --check-paths "$REPO_ROOT"   # exit 0 = valid; exit 1 prints each gap on stderr
 ```
 
 Do not file a ticket whose body does not pass `z-ticket-lint`. The gate is the
