@@ -904,6 +904,14 @@ describe("contract enforcement", () => {
     return proc.stdout.toString().split(/\r?\n/).filter(Boolean);
   }
 
+  // Issue #23: ghExecutor shells to the RAW endpoint (`gh api /graphql`,
+  // issue #17), not the bare `graphql` subcommand. A regex that only matched
+  // the bare form would let a future .ts file that shells to the raw endpoint
+  // directly (a string like "gh api /graphql ...") evade this gate.
+  function callsGhDirectly(content: string): boolean {
+    return /\bgh\s+api\s+\/?graphql\b/.test(content) || /\bgh\s+issue\b/.test(content);
+  }
+
   test("only lib/board.ts calls gh api graphql or gh issue directly", () => {
     const files = trackedFiles().filter(
       (f) =>
@@ -916,7 +924,7 @@ describe("contract enforcement", () => {
     const offenders: string[] = [];
     for (const f of files) {
       const content = readFileSync(join(REPO_ROOT, f), "utf8");
-      if (/\bgh\s+api\s+graphql\b/.test(content) || /\bgh\s+issue\b/.test(content)) offenders.push(f);
+      if (callsGhDirectly(content)) offenders.push(f);
     }
     expect(offenders).toEqual([]);
   });
@@ -924,6 +932,16 @@ describe("contract enforcement", () => {
   test("lib/board.ts is in fact the caller (guards against the gate passing vacuously)", () => {
     const content = readFileSync(join(REPO_ROOT, "lib", "board.ts"), "utf8");
     expect(/\bgh\b/.test(content) && content.includes("api")).toBe(true);
+  });
+
+  // Canary: proves the detector itself catches BOTH forms without needing a
+  // scratch file planted in the repo. A future narrowing of the regex back to
+  // the bare-only form (dropping the `\/?`) turns this red.
+  test("the offender detector catches both the bare and raw-endpoint gh api graphql forms", () => {
+    expect(callsGhDirectly("exec(\"gh api graphql -f query='mutation { m }'\")")).toBe(true);
+    expect(callsGhDirectly('exec("gh api /graphql --input -")')).toBe(true);
+    expect(callsGhDirectly("gh issue edit 1 --body x")).toBe(true);
+    expect(callsGhDirectly("this file has nothing to do with any CLI")).toBe(false);
   });
 
   // Issue #14 item 2: the code gate above excludes *.md, so the skill files --
@@ -1163,6 +1181,17 @@ describe("ghExecutor JSON encoding + error contracts (issue #17)", () => {
     const proc: GhProc = { exitCode: 1, stdout: "", stderr: "error connecting to api.github.com" };
     const exec = ghExecutor(fakeSpawn(proc));
     await expect(exec("mutation SetNumber { x }", {})).rejects.toThrow(/gh api \/graphql failed: error connecting to api\.github\.com/);
+  });
+
+  // Issue #23: exit 0 does not guarantee a JSON body. Every other failure path
+  // in this executor is a named ZError; a raw SyntaxError from JSON.parse was
+  // the one gap.
+  test("exit 0 with non-JSON stdout raises ZError naming the parse failure and a stdout snippet, not a raw SyntaxError", async () => {
+    const proc: GhProc = { exitCode: 0, stdout: "not-json", stderr: "" };
+    const exec = ghExecutor(fakeSpawn(proc));
+    await expect(exec("mutation SetNumber { x }", {})).rejects.toThrow(ZError);
+    await expect(exec("mutation SetNumber { x }", {})).rejects.toThrow(/non-JSON stdout/);
+    await expect(exec("mutation SetNumber { x }", {})).rejects.toThrow(/not-json/);
   });
 });
 

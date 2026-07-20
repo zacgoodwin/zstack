@@ -698,7 +698,19 @@ export function ghExecutor(spawn: GhSpawn = defaultGhSpawn): GraphQLExecutor {
     if (proc.exitCode !== 0) {
       throw new ZError(`gh api /graphql failed: ${proc.stderr.trim()}`);
     }
-    const out = JSON.parse(proc.stdout);
+    // exit 0 does not guarantee a JSON body (e.g. gh printing a plain-text
+    // warning to stdout); a raw SyntaxError here would be the one failure path
+    // in this executor not surfaced as ZError (issue #23). Snippet is bounded
+    // so a huge/binary body doesn't blow up the error message.
+    let out: GraphQLData;
+    try {
+      out = JSON.parse(proc.stdout);
+    } catch (e) {
+      const snippet = proc.stdout.slice(0, 200);
+      throw new ZError(
+        `gh api /graphql returned non-JSON stdout: ${(e as Error).message} (stdout: ${JSON.stringify(snippet)})`
+      );
+    }
     if (Array.isArray(out.errors) && out.errors.length > 0) {
       const e = out.errors[0];
       const where = Array.isArray(e?.path) && e.path.length > 0 ? ` (path: ${e.path.join(".")})` : "";
