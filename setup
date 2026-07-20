@@ -164,6 +164,12 @@ register() {
 
 _ZSTACK_CONFLICT=0
 register "$HOME/.claude/skills" "Claude Code"
+# Capture the Claude Code result NOW, before a Codex/Factory separate-install
+# refusal below can flip the shared flag. A refused PRIMARY host means nothing
+# was registered for Claude Code -- that must fail loudly at the end rather than
+# print the success banner over a no-op (the "complete over nothing" trap that
+# reads as "setup ran fine" when the skills never appeared).
+CLAUDE_REFUSED=$_ZSTACK_CONFLICT
 
 # Codex/Factory: same auto-detection gstack's setup uses (binary on PATH).
 # Skipped when the Claude Code host was refused: every SKILL.md resolves its
@@ -183,6 +189,14 @@ fi
 
 if [ "$TEAM_MODE" -eq 1 ]; then
   echo "Team mode requested: no session hooks to register (the five shipped skills -- z-setup, z-plan, z-loop, z-status, z-uninstall -- need none)."
+fi
+
+if [ "$CLAUDE_REFUSED" -eq 1 ]; then
+  echo "" >&2
+  echo "zstack setup did NOT complete: nothing was registered for Claude Code." >&2
+  echo "  A separate install occupies ~/.claude/skills/zstack -- run setup from there:" >&2
+  echo "    cd ~/.claude/skills/zstack && ./setup" >&2
+  exit 1
 fi
 
 echo "zstack setup complete."

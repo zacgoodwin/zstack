@@ -2,6 +2,12 @@
 
 All notable changes to zstack are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/); versions use `MAJOR.MINOR.PATCH.MICRO`.
 
+## [Unreleased]
+
+### Fixed
+
+- `./setup` now exits non-zero with a clear "run setup from `~/.claude/skills/zstack`" message instead of printing `zstack setup complete.` when it refused to register the Claude Code host. That refusal happens when setup is run from a second checkout (a dev clone, a worktree) while a separate install occupies `~/.claude/skills/zstack`: the primary host registers nothing, but the success banner over that no-op read as "setup ran fine" while the skills never appeared. A Codex/Factory separate-install refusal still exits 0 (Claude Code itself registered) — only a refused primary host fails the run.
+
 ## [0.1.1.0] - 2026-07-19
 
 Installing zstack now actually surfaces its skills. Also adds a `/z-uninstall` command, releases the issue #14 remediation (all 22 items closed), and includes an adversarial hardening pass (OpenAI Codex challenge + independent refute review, every fix mutation-tested).
