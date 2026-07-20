@@ -62,13 +62,22 @@ SHIM
     # cygpath is the standard MSYS converter; on a non-Windows nightly host
     # neither cygpath nor gh.cmd itself is ever consulted (bash's bare "gh"
     # shebang above is what POSIX resolves), so falling back to $REPO there is
-    # inert, not a silent correctness gap.
+    # inert, not a silent correctness gap. `-m` (not `-w`): forward slashes
+    # throughout (cmd.exe and bun both accept them in a quoted script path),
+    # so the emitted file never contains a backslash at all.
     if command -v cygpath >/dev/null 2>&1; then
-      REPO_FOR_CMD="$(cygpath -w "$REPO")"
+      REPO_FOR_CMD="$(cygpath -m "$REPO")"
     else
       REPO_FOR_CMD="$REPO"
     fi
-    printf '@echo off\r\nbun "%s\\evals\\planner\\board-double.ts" %%*\r\n' "$REPO_FOR_CMD" > "$GHDIR/gh.cmd"
+    # Content and write both live in harness.ts's `gh-cmd-shim` (backed by the
+    # pure, unit-tested ghCmdShimContent) -- NOT a bash `printf FORMAT` string.
+    # printf's FORMAT argument interprets its own escape sequences ("\e" ->
+    # ESC 0x1B, "\b" -> backspace 0x08) wherever they appear in FORMAT,
+    # including inside a Windows path's escaped backslashes, which silently
+    # corrupted this exact line into a dead path (confirmed:
+    # `printf 'X\evals\board.ts\n'` -> "Xvalsoard.ts") until this fix.
+    bun "$HERE/harness.ts" gh-cmd-shim "$REPO_FOR_CMD" "$GHDIR/gh.cmd"
     export PATH="$GHDIR:$PATH"
     export ZPLANNER_DOUBLE_SLUG="zstack-planner-eval"
     export ZPLANNER_DOUBLE_ISSUE="501"

@@ -13,6 +13,7 @@ import { mkdtempSync, existsSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  ghCmdShimContent,
   splitDryRunOutput,
   parseScore,
   aggregateScores,
@@ -92,6 +93,97 @@ function writeRun(dir: string, i: number, plan: string, total: number): void {
   writeFileSync(join(dir, `plan-${i}.md`), plan, "utf8");
   writeFileSync(join(dir, `score-${i}.json`), scoreJson(total), "utf8");
 }
+
+// ============================================================================
+// 0. ghCmdShimContent -- the gh.cmd Windows PATH-shim (issue #25 QA fix: a
+//    bash `printf FORMAT` call used to inline the repo root into the FORMAT
+//    string itself, and printf's FORMAT argument interprets its OWN escape
+//    sequences wherever they appear in FORMAT -- "\e" and "\b" inside the
+//    path's escaped backslashes silently became ESC (0x1B) and backspace
+//    (0x08) bytes, corrupting "...ticket-25\evals\planner\board-double.ts"
+//    into "...ticket-25<ESC>vals\planner<BS>oard-double.ts" and killing the
+//    shim with "Module not found" before board-double.ts ever ran. See
+//    harness.ts's doc comment for the confirmed repro
+//    (`printf 'X\evals\board.ts\n'` -> "Xvalsoard.ts").
+// ============================================================================
+describe("ghCmdShimContent", () => {
+  // Deliberately backslash-heavy input (the `cygpath -w` shape the old,
+  // buggy code used) to prove normalization, not just the happy path.
+  const FAKE_ROOT = "D:\\fake\\repo\\root";
+  const content = ghCmdShimContent(FAKE_ROOT);
+
+  test("starts with @echo off", () => {
+    expect(content.startsWith("@echo off\r\n")).toBe(true);
+  });
+
+  test("contains the intended path, forward-slash normalized, verbatim", () => {
+    expect(content).toContain('bun "D:/fake/repo/root/evals/planner/board-double.ts" %*');
+  });
+
+  test("contains no control characters -- no ESC (0x1B), no backspace (0x08)", () => {
+    // The durable regression check: this function builds the string in JS,
+    // never through a shell FORMAT string, so the historical corruption
+    // cannot recur. (Mutation-checked: temporarily reintroducing the old
+    // `printf '...%s\\evals\\planner...'` FORMAT-embedding approach and
+    // re-running this assertion against ITS output turns it red -- see the
+    // build notes for issue #25's QA bounce.)
+    for (let i = 0; i < content.length; i++) {
+      const code = content.charCodeAt(i);
+      expect(code).not.toBe(0x1b);
+      expect(code).not.toBe(0x08);
+    }
+  });
+
+  test("uses CRLF line endings throughout, no bare LF or CR left over", () => {
+    expect(content).toContain("\r\n");
+    expect(content.split("\r\n").join("")).not.toMatch(/[\r\n]/);
+  });
+
+  test("a root with no backslashes at all (already forward-slash) round-trips unchanged", () => {
+    const c = ghCmdShimContent("D:/already/forward/root");
+    expect(c).toContain('bun "D:/already/forward/root/evals/planner/board-double.ts" %*');
+  });
+});
+
+describe("gh-cmd-shim CLI + the real generated file (issue #25 QA fix)", () => {
+  test("`harness.ts gh-cmd-shim` writes a file matching ghCmdShimContent exactly", () => {
+    const dir = tmpDir();
+    const outFile = join(dir, "gh.cmd");
+    const proc = Bun.spawnSync(["bun", join(PLANNER_DIR, "harness.ts"), "gh-cmd-shim", REPO_ROOT, outFile], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(proc.exitCode).toBe(0);
+    const written = readFileSync(outFile, "utf8");
+    expect(written).toBe(ghCmdShimContent(REPO_ROOT));
+  });
+
+  // Optional-but-cheap real invocation (this box is Windows, the exact env
+  // issue #25's QA bounce was filed against): the generated gh.cmd, run
+  // directly through Bun.spawnSync (the same mechanism lib/board.ts's
+  // ghExecutor uses for the real `gh api /graphql` call), resolves and
+  // returns board-double.ts's JSON for a RateLimit query -- the literal
+  // end-to-end proof the old corrupted path could never pass ("Module not
+  // found" before board-double.ts ever ran).
+  test("invoking the generated gh.cmd for real returns board-double's RateLimit JSON", () => {
+    if (process.platform !== "win32") return; // gh.cmd is a Windows-only artifact
+    const dir = tmpDir();
+    const outFile = join(dir, "gh.cmd");
+    writeFileSync(outFile, ghCmdShimContent(REPO_ROOT), "utf8");
+    const stdin = JSON.stringify({
+      query: "query RateLimit { rateLimit { remaining resetAt } }",
+      variables: {},
+    });
+    const proc = Bun.spawnSync([outFile, "api", "/graphql", "--input", "-"], {
+      stdin: Buffer.from(stdin),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(proc.exitCode).toBe(0);
+    const body = JSON.parse(proc.stdout.toString());
+    expect(body.data.rateLimit.remaining).toBeGreaterThan(200);
+  });
+});
 
 // ============================================================================
 // 1. splitDryRunOutput

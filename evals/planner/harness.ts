@@ -14,6 +14,28 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse } from "../../lib/ticket-schema.ts";
 
+// -- 0. gh.cmd Windows PATH-shim content --------------------------------------
+// Pure: the exact gh.cmd file content run.sh's backlog case writes onto PATH
+// (see that file's comment for the full two-shim rationale). Historically
+// this was built with a bash `printf FORMAT ARGS` call that inlined the repo
+// root into the FORMAT string itself; printf's FORMAT argument interprets its
+// OWN escape sequences wherever they appear in FORMAT -- including inside the
+// substituted path's backslashes -- so "\e" and "\b" silently became ESC
+// (0x1B) and backspace (0x08) bytes, corrupting
+// "...ticket-25\evals\planner\board-double.ts" into
+// "...ticket-25<ESC>vals\planner<BS>oard-double.ts" and breaking the shim
+// (confirmed: `printf 'X\evals\board.ts\n'` -> "Xvalsoard.ts"). This function
+// builds the string in JS -- no shell FORMAT string involved, so no such
+// reinterpretation is possible -- and normalizes every backslash to a forward
+// slash first: cmd.exe and bun both accept forward slashes in a quoted script
+// path, so the emitted file is backslash-free end to end and the hazard class
+// cannot recur even if repoRoot itself contains backslashes (e.g. from
+// `cygpath -w`).
+export function ghCmdShimContent(repoRoot: string): string {
+  const forwardSlashRoot = repoRoot.replace(/\\/g, "/");
+  return `@echo off\r\nbun "${forwardSlashRoot}/evals/planner/board-double.ts" %*\r\n`;
+}
+
 // -- 1. Dry-run output splitter -----------------------------------------------
 // Splits one dry-run markdown document into per-ticket body chunks. The
 // boundary is each ticket's own mandatory "## Context" heading (lib/
@@ -255,25 +277,40 @@ export function formatReport(report: CheckReport): string {
 
 // -- CLI -----------------------------------------------------------------------
 const USAGE = `harness.ts check <outDir> <runs>
+harness.ts gh-cmd-shim <repoRoot> <outFile>
 
-  Checks a planner eval run directory (plan-<i>.md / score-<i>.json for
+  check: Checks a planner eval run directory (plan-<i>.md / score-<i>.json for
   i in 1..<runs>, written by run.sh): splits each plan into per-ticket bodies,
   lints each through bin/z-ticket-lint, aggregates the score JSON against the
   >= ${PASS_THRESHOLD}/10 pass threshold, and asserts Estimate reproducibility
   across runs. Exit 0 = pass, 1 = fail (report on stdout either way).
 
+  gh-cmd-shim: writes the gh.cmd Windows PATH-shim (run.sh's backlog case) to
+  <outFile> -- see ghCmdShimContent's doc comment for the historical bash
+  \`printf FORMAT\` bug this CLI wrapper exists to keep out of run.sh for good.
+
   Env: Z_LINT overrides the bin/z-ticket-lint path (default: ../../bin/z-ticket-lint).`;
 
 export function main(argv: string[]): number {
-  const [cmd, outDir, runsArg] = argv;
+  const [cmd, arg1, arg2] = argv;
   if (!cmd || cmd === "-h" || cmd === "--help") {
     console.log(USAGE);
     return cmd ? 0 : 1;
   }
-  if (cmd !== "check" || !outDir || !runsArg) {
+  if (cmd === "gh-cmd-shim") {
+    if (!arg1 || !arg2) {
+      console.error(`Usage: ${USAGE}`);
+      return 1;
+    }
+    writeFileSync(arg2, ghCmdShimContent(arg1), "utf8");
+    return 0;
+  }
+  if (cmd !== "check" || !arg1 || !arg2) {
     console.error(`Usage: ${USAGE}`);
     return 1;
   }
+  const outDir = arg1;
+  const runsArg = arg2;
   const runs = Number(runsArg);
   if (!Number.isInteger(runs) || runs < 1) {
     console.error(`<runs> must be a positive integer, got "${runsArg}".`);
