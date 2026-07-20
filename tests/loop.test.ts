@@ -822,7 +822,7 @@ describe("ingestBoardItems", () => {
   // wipes initialReadyCount/humanNeededNotified for the crossing that just
   // happened on that final ticket -- the control's highest-value case, since a
   // trip with no live lane left to report it is easy to miss otherwise.
-  test("AC11: the batch's LAST ticket crossing the threshold on its own terminal action stays tripped through the confirmation re-ingest (real ingest -> applyAction -> ingest chain, not a hand-built prev)", () => {
+  test("regression: final-tick confirmation preserves counters (real ingest -> applyAction -> ingest chain, not a hand-built prev)", () => {
     const bodies = { "1": "no deps", "2": "no deps", "3": "no deps" };
     const items1 = [
       { number: 1, title: "a", fields: { Status: "Building" } },
@@ -868,7 +868,7 @@ describe("ingestBoardItems", () => {
     expect(hn.initialReadyCount).toBe(3);
   });
 
-  test("AC12: after human-needed-ack, a further re-ingest of the SAME drained batch (no new Building tickets) keeps alreadyNotified true -- only a genuinely new batch resets the fire-once flag", () => {
+  test("regression: fire-once flag survives a same-batch confirmation re-ingest, resets only for a genuinely new batch", () => {
     const bodies = { "1": "no deps" };
     let s = ingestBoardItems(null, [{ number: 1, title: "a", fields: { Status: "Building" } }], bodies, { humanNeededPercent: 30 });
     s.lanes = [lane(1, "builder")];
@@ -894,16 +894,16 @@ describe("ingestBoardItems", () => {
     expect(s.humanNeededNotified).toBe(false);
   });
 
-  // Regression (issue #63 second review bounce): AC11/AC12 above only ever
-  // left a foreign lane's ticket in a terminal status by the time the batch
-  // drained. But drainComplete permits a claimedByOther ticket to remain in
+  // Regression (issue #63 second review bounce): the two tests above only
+  // ever left a foreign lane's ticket in a terminal status by the time the
+  // batch drained. But drainComplete permits a claimedByOther ticket to remain in
   // *Building* -- it belongs to another session's batch, not this one. The
   // bounce-1 fix's buildingCount didn't exclude claimedByOther, so a lingering
   // foreign Building ticket in the snapshot made startingFreshBatch wrongly
   // true on the confirmation re-ingest after THIS session's own last ticket
   // resolved, silently resetting initialReadyCount/humanNeededNotified from a
   // ticket this session never committed.
-  test("AC13: a drained prev's lingering claimedByOther Building ticket does not read as a fresh batch, but a genuinely new UNCLAIMED Building ticket still does", () => {
+  test("regression: claimedByOther Building does not start a fresh batch, but a new unclaimed Building ticket does", () => {
     const bodies = { "1": "no deps", "9": "no deps" };
     const prev: LoopState = {
       tickets: [ticket(1, "Done"), ticket(9, "Building", [], { claimedByOther: true })],
@@ -931,7 +931,8 @@ describe("ingestBoardItems", () => {
     expect(same.humanNeededNotified).toBe(true); // preserved, not silently reset
 
     // A genuinely new batch -- an UNCLAIMED Building ticket appears alongside
-    // the still-foreign #9 -- DOES reset, same as AC10/AC12.
+    // the still-foreign #9 -- DOES reset, same as the AC10 and fire-once-flag
+    // regression tests above.
     const fresh = ingestBoardItems(
       prev,
       [
