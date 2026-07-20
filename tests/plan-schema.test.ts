@@ -180,20 +180,25 @@ describe("needsSplit: the oversize-ticket gate is a deterministic comparison", (
 
 // -- shouldSplitForCost: the cost-based split gate (issue #78) --------------
 describe("shouldSplitForCost: splits only when children total strictly less than parent", () => {
-  test("split-true: two cheaper children beat one opus-high ticket (AC2)", () => {
-    // 0.23 + 1.64 = 1.87 < 4.36
-    const d = shouldSplitForCost("opus-high", ["haiku-low", "sonnet-medium"]);
+  // Post-recalibration (issue #81), sonnet-medium ($10.27) prices above
+  // opus-high ($9.44) -- the measured loop-run data really does show
+  // sonnet-medium tickets costing more than opus-high ones -- so the cheapest
+  // parent still pricier than haiku-low + sonnet-medium combined is
+  // opus-xhigh, not opus-high.
+  test("split-true: two cheaper children beat one opus-xhigh ticket (AC2)", () => {
+    // 1.86 + 10.27 = 12.13 < 15.77
+    const d = shouldSplitForCost("opus-xhigh", ["haiku-low", "sonnet-medium"]);
     expect(d.split).toBe(true);
-    expect(d.reason).toContain("1.87");
-    expect(d.reason).toContain("4.36");
+    expect(d.reason).toContain("12.13");
+    expect(d.reason).toContain("15.77");
   });
 
   test("split-false: two same-tier children cost more than one, no split (AC2)", () => {
-    // 1.64 + 1.64 = 3.28 >= 1.64
+    // 10.27 + 10.27 = 20.54 >= 10.27
     const d = shouldSplitForCost("sonnet-medium", ["sonnet-medium", "sonnet-medium"]);
     expect(d.split).toBe(false);
-    expect(d.reason).toContain("3.28");
-    expect(d.reason).toContain("1.64");
+    expect(d.reason).toContain("20.54");
+    expect(d.reason).toContain("10.27");
   });
 
   test("a tie (children total == parent) does not split -- strictly below only", () => {
@@ -275,15 +280,16 @@ describe("tier -> z-estimate is reproducible (issue #7 AC2)", () => {
   const rates = loadRates();
   const NOW = new Date("2026-07-19T00:00:00Z");
 
-  // These totals are the ones documented in z-plan/SKILL.md Step 6. If a rate in
+  // These totals are the ones documented in z-plan/SKILL.md Step 6, calibrated
+  // 2026-07-20 (issue #81) from measured loop-run actuals. If a rate in
   // references/rates.json or a bucket in z-plan/tiers.json changes, this pins the
   // drift here instead of letting the skill's table quietly go stale.
   const EXPECTED: Record<string, number> = {
-    "haiku-low": 0.23,
-    "sonnet-medium": 1.64,
-    "opus-high": 4.36,
-    "opus-xhigh": 7.15,
-    "fable-xhigh": 19.5,
+    "haiku-low": 1.86,
+    "sonnet-medium": 10.27,
+    "opus-high": 9.44,
+    "opus-xhigh": 15.77,
+    "fable-xhigh": 45.22,
   };
 
   test("every documented tier exists in tiers.json", () => {
@@ -296,6 +302,27 @@ describe("tier -> z-estimate is reproducible (issue #7 AC2)", () => {
       const second = estimate(tiers[name], rates, NOW);
       expect(first).toEqual(second);
       expect(first.total).toBe(total);
+    });
+  }
+
+  // Issue #81 AC: for the three tiers with real transcript data, the new
+  // estimate must land within 0.9x-1.6x of that tier's median ACTUAL on the
+  // 25-ticket dataset the recalibration was measured against -- the same
+  // range the ticket's own worked table lands in (~1.3x). Median actuals are
+  // hard-coded here (not re-derived) so a future bucket edit that silently
+  // regresses back toward the old ~3-5x undercount fails this test by name,
+  // instead of only showing up as a vague "board totals look off" months later.
+  const MEDIAN_ACTUALS: Record<string, number> = {
+    "haiku-low": 1.43, // n=2
+    "sonnet-medium": 8.12, // n=15
+    "opus-high": 7.39, // n=8
+  };
+
+  for (const [name, actual] of Object.entries(MEDIAN_ACTUALS)) {
+    test(`${name}: new estimate is within 0.9x-1.6x of its $${actual} measured median actual`, () => {
+      const ratio = EXPECTED[name] / actual;
+      expect(ratio).toBeGreaterThanOrEqual(0.9);
+      expect(ratio).toBeLessThanOrEqual(1.6);
     });
   }
 });

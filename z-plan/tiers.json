@@ -1,45 +1,45 @@
 {
-  "_comment": "Bucket dictionary for /z-plan. The planner never eyeballs token counts (ESTIMATION.md: 'this is arithmetic, so compute it'). It picks ONE tier per ticket by the ESTIMATION.md model rules-of-thumb, copies that tier's entry verbatim into a buckets.json, and shells it to bin/z-estimate for the dollar figure. Same tier -> same buckets -> same z-estimate output, so estimates are reproducible across runs (issue #7 AC2). Each tier's buckets are directional full-lifecycle volumes (plan + build + QA + review + merge, per ESTIMATION.md step 3). tests/plan-schema.test.ts pins the resulting dollar total of every tier so a rate or bucket change fails the gate instead of silently drifting from SKILL.md.",
+  "_comment": "Bucket dictionary for /z-plan. The planner never eyeballs token counts (ESTIMATION.md: 'this is arithmetic, so compute it'). It picks ONE tier per ticket by the ESTIMATION.md model rules-of-thumb, copies that tier's entry verbatim into a buckets.json, and shells it to bin/z-estimate for the dollar figure. Same tier -> same buckets -> same z-estimate output, so estimates are reproducible across runs (issue #7 AC2). Each tier's buckets are directional full-lifecycle volumes (plan + build + QA + review + merge, per ESTIMATION.md step 3). tests/plan-schema.test.ts pins the resulting dollar total of every tier so a rate or bucket change fails the gate instead of silently drifting from SKILL.md. Calibrated 2026-07-20 (issue #81) from measured loop-run actuals: the original buckets undercounted real spend 3.3x board-wide (haiku-low/sonnet-medium/opus-high buckets modeled 0.7-1.2M cached tokens/ticket; measured medians were 10.3M-20.3M -- cached volume scales with turn-count squared since every turn re-sends the conversation, and stages are tool-call heavy). Derivation recipe (reproducible over the same transcript set, issue #7 AC2's determinism rule): for each Done ticket with a transcript dir under ~/.zstack/projects/<slug>/loop/transcripts/, run `z-cost --json '<dir>/*.jsonl'`, group results by the board's Model + Model Effort tier, take the median of each of fresh_input/cached_input/output across that tier's tickets, round each to the nearest 5000. haiku-low (n=2), sonnet-medium (n=15), and opus-high (n=8) have measured transcripts; opus-xhigh and fable-xhigh have none yet, so their buckets are the old ones scaled by the per-bucket correction factor measured on opus-high (new/old, computed before rounding: output ~x0.09, fresh_input ~x2.67, cached_input ~x8.56), then rounded to 5000 the same way. Output tokens were cut (not raised) across every tier -- cost does not scale with code written, it scales with turns times context size, and the old buckets assumed 5-16x too much output.",
   "tiers": {
     "haiku-low": {
       "model": "haiku",
       "effort": "low",
       "buffer_pct": 30,
-      "output_tokens": 20000,
-      "fresh_input_tokens": 50000,
-      "cached_input_tokens": 250000
+      "output_tokens": 10000,
+      "fresh_input_tokens": 350000,
+      "cached_input_tokens": 10300000
     },
     "sonnet-medium": {
       "model": "sonnet",
       "effort": "medium",
       "buffer_pct": 30,
-      "output_tokens": 50000,
-      "fresh_input_tokens": 100000,
-      "cached_input_tokens": 700000
+      "output_tokens": 10000,
+      "fresh_input_tokens": 555000,
+      "cached_input_tokens": 20280000
     },
     "opus-high": {
       "model": "opus",
       "effort": "high",
       "buffer_pct": 30,
-      "output_tokens": 80000,
-      "fresh_input_tokens": 150000,
-      "cached_input_tokens": 1200000
+      "output_tokens": 5000,
+      "fresh_input_tokens": 400000,
+      "cached_input_tokens": 10270000
     },
     "opus-xhigh": {
       "model": "opus",
       "effort": "xhigh",
       "buffer_pct": 30,
-      "output_tokens": 130000,
-      "fresh_input_tokens": 250000,
-      "cached_input_tokens": 2000000
+      "output_tokens": 10000,
+      "fresh_input_tokens": 665000,
+      "cached_input_tokens": 17115000
     },
     "fable-xhigh": {
       "model": "fable",
       "effort": "xhigh",
       "buffer_pct": 50,
-      "output_tokens": 150000,
-      "fresh_input_tokens": 300000,
-      "cached_input_tokens": 2500000
+      "output_tokens": 15000,
+      "fresh_input_tokens": 800000,
+      "cached_input_tokens": 21395000
     }
   }
 }
