@@ -28,6 +28,16 @@ records the result. It never re-derives a scheduling decision in prose.
   pure prompt constructor (`lib/stage-prompts.ts`). Nothing latent travels between
   stages; the reviewer is blinded to exactly the ticket, its acceptance criteria,
   the diff, and a throwaway worktree.
+- **Adversarial review, when the card earns it.** When `adversarialMode` is
+  active for a card, the Review stage runs a super-truth pass: it fans out
+  independent skeptic sub-agents that each try to REFUTE the diff against the
+  acceptance criteria, then reconciles them into an aggregated `confidence`
+  (0–100). When inactive it is today's single pass. Activation is deterministic —
+  a pure function of the diff's changed-line count, the issue's labels, and the
+  `adversarialMode` knob (default `non-trivial`: a ≥ 10-line diff OR a
+  `security`/`migration`/`payments`/`auth` label; `off` never, `always` every
+  card). The confidence rides in the reviewer's exit marker; gating on it is a
+  later step.
 - **Dependency-ordered, capped concurrency.** A dependent is not claimable until
   its dependencies are Done; at most `maxLanes` (default 3) lanes run at once;
   merges happen one at a time in topological order (stacked chains retarget the

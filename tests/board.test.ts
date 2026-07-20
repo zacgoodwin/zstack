@@ -1042,6 +1042,10 @@ describe("contract enforcement", () => {
       `gh issue view <N> --json body -q .body > "$TMP/body-<N>.md"`,
       `gh issue view "$N" --json body -q .body > "$TMP/body-$N.md"`,
       `gh issue view`, // prose reference in the builder-input table
+      // issue #59 reviewer-spawn label fetch: read-only. Labels live on the
+      // GitHub issue, not the board item (board.list never fetches them), so the
+      // adversarial-mode predicate reads them here. Trailing ) is from the $(...).
+      `gh issue view <N> --json labels -q '[.labels[].name]')`,
       // planning-pass body write; z-board has no issue-body-edit subcommand
       // (flagged in issue #14 item 2 findings as the one mutation outside z-board)
       `gh issue edit <N> --body-file ...`,
