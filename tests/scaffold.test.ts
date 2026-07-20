@@ -68,13 +68,21 @@ function runSetup(opts: { path: string; home: string; args?: string[] }) {
   };
 }
 
+// Each test here spawns a real bash process running the setup script (no
+// mocking the shell out). 5000ms (bun's default) is comfortably clear in
+// isolation but was observed exceeded under full-suite parallel load on
+// Windows (issue #23) -- process spawn/teardown contends with every other
+// file's spawns. 20000ms keeps a genuine hang failing loud while absorbing
+// that contention; the test logic and what it asserts are unchanged.
+const SPAWN_TIMEOUT_MS = 20000;
+
 describe("setup preconditions", () => {
   test("bun missing: exits non-zero pointing to bun.sh", () => {
     const home = makeTmpHome(false);
     const result = runSetup({ path: CORE_DIR, home });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("bun is required");
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test("gstack missing: exits non-zero printing the exact gstack install command", () => {
     const home = makeTmpHome(false);
@@ -87,14 +95,14 @@ describe("setup preconditions", () => {
       "git clone --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack"
     );
     expect(result.stderr).toContain("cd ~/.claude/skills/gstack && ./setup --team");
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test("gh missing: exits non-zero", () => {
     const home = makeTmpHome(true);
     const result = runSetup({ path: `${BUN_DIR}:${CORE_DIR}`, home });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("gh (GitHub CLI) is required");
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test.skipIf(!GH_DIR)("all deps present: registers the pack dir without error", () => {
     const home = makeTmpHome(true);
@@ -107,7 +115,7 @@ describe("setup preconditions", () => {
     expect(readFileSync(join(registered, "VERSION"), "utf8").trim()).toBe(
       readFileSync(join(REPO_ROOT, "VERSION"), "utf8").trim()
     ); // the registered copy matches the repo VERSION (whatever the parent bumped it to)
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test.skipIf(!GH_DIR)("--team flag is accepted", () => {
     const home = makeTmpHome(true);
@@ -118,7 +126,7 @@ describe("setup preconditions", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("Team mode requested");
-  });
+  }, SPAWN_TIMEOUT_MS);
 });
 
 describe("references/ restructure", () => {
