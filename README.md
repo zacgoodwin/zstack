@@ -112,7 +112,8 @@ What it **asks** — exactly two questions:
   | **C) Skip** | Nothing | Today's behavior; one-off approvals keep piling up |
 
   This edits `~/.claude/settings.json`, which affects **every project on the
-  machine**, not just this repo. Undo is a documented hand-edit;
+  machine**, not just this repo. Undo with `bin/z-setup-permissions --remove`
+  (strips exactly the auto-approval settings `/z-setup` wrote);
   `z-setup-permissions --check` reports which layers are active. Details in the
   [z-setup guide](docs/user-guide/z-setup.md).
 

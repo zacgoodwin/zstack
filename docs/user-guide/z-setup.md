@@ -46,7 +46,7 @@ does not exist yet, you need `/z-setup`.
    - **C) Skip** — no permission changes.
    Applied only through `bin/z-setup-permissions` (atomic write, JSON-validated,
    never clobbers existing keys). `z-setup-permissions --check` reports which of
-   the three layers are present. Undo is a documented hand-edit (see the SKILL).
+   the three layers are present. Undo with `bin/z-setup-permissions --remove`.
 
 ## Board shape template
 
