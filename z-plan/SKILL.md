@@ -222,6 +222,25 @@ Do not file a ticket whose body does not pass `z-ticket-lint`. The gate is the
 same one the loop's planning pass runs, so "all mandatory sections present"
 means one thing everywhere.
 
+**Plan-time edges → a `## Needs input —` comment.** Once the body passes the
+lint gate, name every chosen default, spec-ambiguous call, or data-loss-ish
+behavior the PLAN itself introduces — PROCESS.md step 6's plan-time
+counterpart to step 20's completion-note edges — as a `{check, doStep,
+expect}` `CompletionEdge`. When that list is non-empty, render it with
+`planEdgesComment` (`lib/stage-prompts.ts`, reusing the `CompletionEdge` shape)
+and post it at the bottom of the plan comment. Informational only: the ticket
+stays exactly where it already is — this never moves it to Questions, that is
+Step 8's job for a genuine blocking question, not a plan-time edge.
+
+```bash
+bun "$PACK/lib/stage-prompts.ts" plan-edges "$TMP/edges-<N>.json" > "$TMP/edges-<N>.md"
+[ -s "$TMP/edges-<N>.md" ] && "$Z_BOARD" comment <N> --body-file "$TMP/edges-<N>.md" --slug "$SLUG"
+```
+
+`edges-<N>.json` is a `CompletionEdge[]` array. An empty list renders `""`
+(the CLI prints nothing), so `[ -s ... ]` skips the comment entirely — a plan
+that introduced no edges posts nothing.
+
 ---
 
 ## Step 5 — Chunking: split anything that needs more than 400K tokens of context
@@ -347,6 +366,24 @@ move the ticket to Questions. Do not guess it into the plan.
 "$Z_BOARD" comment <N> --body-file question.md --slug "$SLUG"
 "$Z_BOARD" move <N> Questions --slug "$SLUG"
 ```
+
+**Fold-in gate (PROCESS.md step 6).** Applies every time this skill touches a
+ticket that may already carry human comments — Step 9's idempotent re-plan and
+Step 10's Backlog scan, not just a first pass. Before drafting or updating a
+body, read its comments and find the newest one authored by someone other than
+this session's own login (`gh api user -q .login`, the board's known
+bot/session identity — the only distinction this gate draws; no further
+human-vs-bot detection):
+
+```bash
+gh issue view <N> --json comments -q '.comments'
+```
+
+If that comment postdates the plan already on the ticket, fold in its
+suggestion and rebuild the plan if it changed. **If it raises a NEW question
+the plan doesn't already answer, do not start:** post it as a `## Needs input
+—` comment and move the ticket to Questions, exactly like the block above —
+never guess it into the plan.
 
 ---
 

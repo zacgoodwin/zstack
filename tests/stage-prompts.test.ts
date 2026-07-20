@@ -13,6 +13,7 @@ import {
   completionNote,
   countDiffLines,
   mergePrompt,
+  planEdgesComment,
   qaPrompt,
   reviewerPrompt,
   shSingleQuote,
@@ -20,6 +21,7 @@ import {
   REVIEWER_INPUT_KEYS,
   ZError,
   type BuilderPromptInput,
+  type CompletionEdge,
   type CompletionNoteInput,
   type MergePromptInput,
   type QaPromptInput,
@@ -442,6 +444,28 @@ describe("completion note", () => {
     const n = completionNote({ ...NOTE_INPUT, edges: [], filedTickets: [] });
     expect(n).toContain("**Edges a human must validate:**\n- None surfaced.");
     expect(n).toContain("**Use cases filed to Backlog:**\n- None surfaced.");
+  });
+});
+
+// -- plan-time edges comment (ticket #77 AC1) ---------------------------------
+
+describe("planEdgesComment", () => {
+  const EDGES: CompletionEdge[] = [
+    { check: "the chosen retry default", doStep: "trigger two consecutive failures", expect: "a third attempt, not a park" },
+    { check: "the ambiguous empty-input case", doStep: "submit with no rows selected", expect: "a no-op, not an error" },
+  ];
+
+  test("starts with the Needs-input heading and renders one to-check/do/expect bullet per edge", () => {
+    const c = planEdgesComment(EDGES);
+    expect(c.startsWith("## Needs input —")).toBe(true);
+    expect(c).toContain("To check the chosen retry default, do trigger two consecutive failures, expect a third attempt, not a park.");
+    expect(c).toContain("To check the ambiguous empty-input case, do submit with no rows selected, expect a no-op, not an error.");
+    // Exactly one bullet per edge, nothing extra.
+    expect(c.split("\n").filter((l) => l.startsWith("- ")).length).toBe(EDGES.length);
+  });
+
+  test("an empty list renders \"\" so the caller posts no comment", () => {
+    expect(planEdgesComment([])).toBe("");
   });
 });
 

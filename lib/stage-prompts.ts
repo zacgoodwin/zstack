@@ -335,6 +335,22 @@ ${filed}
 This ticket stays OPEN in Done for human review; bounce it back to Ready with a comment if anything is wrong.`;
 }
 
+// -- plan-time edges -----------------------------------------------------------
+
+// PROCESS.md step 6/step 3, C6's plan-time counterpart to completionNote above:
+// the same "edges a human must validate" class (chosen defaults, spec-ambiguous
+// calls, data-loss-ish behaviors) but surfaced when the PLAN is authored, not
+// when the work completes. Reuses CompletionEdge -- same {check, doStep, expect}
+// shape, same to-check-X-do-Y-expect-Z rendering. Informational only: an empty
+// list renders "" so the caller posts no comment; this never blocks a ticket --
+// a blocking question is the separate `## Needs input --` + Questions move
+// (z-plan/SKILL.md Step 8, PROCESS.md step 6), not this comment.
+export function planEdgesComment(edges: CompletionEdge[]): string {
+  if (edges.length === 0) return "";
+  const bullets = edges.map((e) => `- To check ${e.check}, do ${e.doStep}, expect ${e.expect}.`).join("\n");
+  return `## Needs input — edges a human should validate\n\n${bullets}`;
+}
+
 // -- CLI ---------------------------------------------------------------------
 
 const USAGE = `stage-prompts <command> [args]
@@ -343,7 +359,9 @@ const USAGE = `stage-prompts <command> [args]
   prompt reviewer <input.json> [--adversarial-mode <off|non-trivial|always>] [--labels <json-array>]
                                                     print the reviewer prompt; the flags decide the
                                                     super-truth fan-out deterministically (diff size + labels + mode)
-  note <input.json>                                 print the completion note (CompletionNoteInput)`;
+  note <input.json>                                 print the completion note (CompletionNoteInput)
+  plan-edges <edges.json>                           print the plan-time "Needs input" edges comment
+                                                    (CompletionEdge[]); prints nothing for an empty list`;
 
 // A single "--flag value" lookup for the reviewer's two optional flags. Returns
 // the token after the flag, or undefined when the flag is absent (defaults apply).
@@ -421,6 +439,15 @@ export function main(argv: string[]): number {
       if (!argv[1]) throw new ZError("Usage: stage-prompts note <input.json>");
       const input = JSON.parse(readFileSync(argv[1], "utf8")) as CompletionNoteInput;
       console.log(completionNote(input));
+      return 0;
+    }
+    if (cmd === "plan-edges") {
+      if (!argv[1]) throw new ZError("Usage: stage-prompts plan-edges <edges.json>");
+      const edges = JSON.parse(readFileSync(argv[1], "utf8")) as CompletionEdge[];
+      const out = planEdgesComment(edges);
+      // Empty list -> no output, so a caller's "post only if non-empty" check
+      // ($(...) truthiness on the captured string) sees nothing to post.
+      if (out) console.log(out);
       return 0;
     }
     console.error(`Unknown command "${cmd}".\n\n${USAGE}`);

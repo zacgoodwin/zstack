@@ -110,22 +110,35 @@ otherwise.
 
 ---
 
-## Step 1 — Planning pass (PROCESS.md steps 1–4)
+## Step 1 — Planning pass (PROCESS.md steps 1–4, 6)
 
 For every ticket in Ready (`"$Z_BOARD" list --status Ready --json --slug "$SLUG"`):
 
 1. Fetch the body: `gh issue view <N> --json body -q .body > "$TMP/body-<N>.md"`.
-2. **Gate it:** `"$Z_LINT" "$TMP/body-<N>.md"`. On failure the plan is missing
+2. **Fold-in gate (PROCESS.md step 6) — before this ticket can reach Step 2's
+   batch commit.** Read its comments and find the newest one authored by
+   someone other than `$ME` (the board's known bot/session login — the only
+   distinction this gate draws; no further human-vs-bot detection):
+   `gh issue view <N> --json comments -q '.comments' > "$TMP/comments-<N>.json"`.
+   If that comment postdates whatever plan is already on the ticket, fold in
+   its suggestion and rebuild the plan (step 3 below) if it changed. **If it
+   raises a NEW question the plan doesn't already answer, do not start:** post
+   it as a `## Needs input —` comment (`"$Z_BOARD" comment <N> --body-file
+   needs-input.md`), `"$Z_BOARD" move <N> Questions`, and skip the rest of this
+   loop's steps for this ticket — it never reaches Step 2's batch commit. A
+   ticket with no comments newer than its own plan skips this gate with no
+   writes.
+3. **Gate it:** `"$Z_LINT" "$TMP/body-<N>.md"`. On failure the plan is missing
    or invalid: ground yourself in the actual code (open the files the ticket
    touches), draft the body to the C5 schema (z-plan/SKILL.md Step 4 — Context,
    Plan with real file refs, `### Acceptance Criteria` as setup → action →
    expected outcome, Tests + evals, Docs pages touched, Out of scope), update
    the body with `gh issue edit <N> --body-file ...`, re-run the gate, and
    comment that the loop's planning pass added the plan.
-3. **Human needed?** A genuine ambiguity, contradiction, or missing decision
+4. **Human needed?** A genuine ambiguity, contradiction, or missing decision
    (Confusion Protocol bar): `"$Z_BOARD" comment <N> --body-file question.md`
    then `"$Z_BOARD" move <N> Questions`. Never guess it into the plan.
-4. **Estimate absent?** `"$Z_BOARD" field-get <N> Estimate` empty → set Model +
+5. **Estimate absent?** `"$Z_BOARD" field-get <N> Estimate` empty → set Model +
    Model Effort if missing (ESTIMATION.md rules of thumb), then the z-plan
    Step 6 tier chain: copy the `<model>-<effort>` tier verbatim from
    `$PACK/z-plan/tiers.json` into a buckets file, `"$Z_ESTIMATE"` it, and
