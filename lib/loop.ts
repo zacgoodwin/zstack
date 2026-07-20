@@ -18,6 +18,7 @@ import {
   DEFAULT_QA_INVESTIGATE_AFTER,
   DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
   DEFAULT_WATCHDOG_MINUTES,
+  loadConfig,
   ZError,
   type BoardStatus,
 } from "./config.ts";
@@ -74,6 +75,34 @@ export const STATUS_FOR_STAGE: Record<Stage, BoardStatus> = {
   reviewer: "Review",
   merge: "Review",
 };
+
+// Per-stage model routing (issue #82). The merge stage is mechanical (`gh pr
+// create`, a conflict check, `gh pr merge`) and never needs the ticket's
+// build-tier model -- Loop run 2 billed every merge spawn at the ticket's full
+// tier for $73/10 tickets. This is the pack default applied ONLY when a
+// project's config omits `stageModels` entirely; a project that sets it
+// explicitly (including `{}`) opts out of the default completely -- see
+// resolveStageModel below for why "absent" and "present-as-{}" must stay
+// distinguishable this far from the JSON on disk.
+export const DEFAULT_STAGE_MODELS: Partial<Record<Stage, string>> = { merge: "haiku" };
+
+// Pure: the ticket's board Model field is the fallback for every stage;
+// `stageModels[stage]`, when set, overrides it. `stageModels === undefined`
+// (the config key is absent) is the ONE case that falls back to
+// DEFAULT_STAGE_MODELS -- an explicit `{}` is used as-written (no default
+// merged in), so a project can opt every stage back to the ticket's Model
+// with an empty object. Values are already validated against rates.json by
+// config-schema.ts's validateConfig at config-write/load time, so this never
+// re-validates -- an unknown key here can only mean a hand-edited config that
+// bypassed loadConfig.
+export function resolveStageModel(
+  stage: Stage,
+  ticketModel: string,
+  stageModels: Partial<Record<Stage, string>> | undefined
+): string {
+  const effective = stageModels === undefined ? DEFAULT_STAGE_MODELS : stageModels;
+  return effective[stage] ?? ticketModel;
+}
 
 export interface TicketSnapshot {
   number: number;
@@ -750,6 +779,9 @@ export function ingestBoardItems(
 
 const USAGE = `loop <command> [args]
 
+  stage-model <builder|qa|reviewer|merge> <ticketModel> --slug <s>
+                                                     print the resolved model name for that stage
+                                                     (config stageModels override, else ticketModel)
   next <state.json> [--now <ms>]                     print the next Action as JSON (no writes)
   apply <state.json> <action.json> [--now <ms>]      apply an Action, rewrite the state file
   outcome <state.json> <ticket> <msg.txt> [--now <ms>]  parse a stage's final message onto its lane
@@ -813,6 +845,23 @@ export function main(argv: string[]): number {
     return cmd ? 0 : 1;
   }
   try {
+    // stage-model takes no state.json (it reads config, not loop state), so it
+    // is handled before the generic statePath guard below applies to every
+    // other command.
+    if (cmd === "stage-model") {
+      const stages: Stage[] = ["builder", "qa", "reviewer", "merge"];
+      const stage = argv[1] as Stage;
+      const ticketModel = argv[2];
+      if (!stages.includes(stage) || !ticketModel) {
+        throw new ZError(`Usage: loop stage-model <${stages.join("|")}> <ticketModel> --slug <s>`);
+      }
+      // --slug is optional here the same way it is everywhere else (H13):
+      // loadConfig's resolveSlug falls back to ZSTACK_SLUG or the sole
+      // configured project, and throws its own ZError when neither resolves.
+      console.log(resolveStageModel(stage, ticketModel, loadConfig(flagValue(argv, "--slug")).stageModels));
+      return 0;
+    }
+
     // The only Date.now() in this file: the CLI boundary. Pure functions above
     // always take nowMs.
     const nowMs = Number(flagValue(argv, "--now") ?? Date.now());
