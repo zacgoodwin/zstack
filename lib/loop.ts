@@ -621,11 +621,23 @@ export function ingestBoardItems(
   // fallback chain than the knobs above -- a naive "preserve whenever prev is
   // non-null" would carry a FIRST run's drained, terminal-status prev (and its
   // stale counters) into a second /z-loop invocation, since state.json is
-  // never deleted between runs. drainComplete is the reset boundary: a batch
-  // is "fresh" when there is no prior state at all, or the prior state was
-  // fully drained (no lanes, every ticket terminal) -- exactly the condition
-  // under which `lanes` also lands at [] naturally between runs.
-  const startingFreshBatch = !prev || drainComplete(prev.tickets, prev.lanes);
+  // never deleted between runs. drainComplete alone is NOT a sufficient reset
+  // boundary, though: applyAction updates a terminal ticket's status and drops
+  // its lane in the SAME state write, so the tick that resolves a batch's
+  // LAST ticket already leaves `prev` drainComplete -- and the very next
+  // ingest (the confirmation tick that just re-observes that same finished
+  // batch, nothing new committed) would wrongly read as "fresh", wiping
+  // initialReadyCount/humanNeededNotified for a crossing that just happened on
+  // that final ticket. A drained prev has, by definition, zero Building
+  // tickets (Building is a workable status); so a fresh batch is when there is
+  // no prior state at all, OR the prior state was fully drained AND the
+  // incoming snapshot actually shows new Building tickets (the batch-commit
+  // step moves the whole new batch to Building before its first ingest, so
+  // "any Building tickets present" IS "a new batch was just committed"). A
+  // drained prev whose incoming snapshot is still all-terminal is the SAME
+  // batch's final state, not a new one -- preserve its counters.
+  const buildingCount = tickets.filter((t) => t.status === "Building").length;
+  const startingFreshBatch = !prev || (drainComplete(prev.tickets, prev.lanes) && buildingCount > 0);
 
   return {
     tickets: tickets.sort((a, b) => a.number - b.number),
@@ -636,9 +648,7 @@ export function ingestBoardItems(
     qaInvestigateAfter: cfg?.qaInvestigateAfter ?? prev?.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER,
     humanNeededPercent: cfg?.humanNeededPercent ?? prev?.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT,
     mergedThisRun: [...(prev?.mergedThisRun ?? [])],
-    initialReadyCount: startingFreshBatch
-      ? tickets.filter((t) => t.status === "Building").length
-      : (prev!.initialReadyCount ?? 0),
+    initialReadyCount: startingFreshBatch ? buildingCount : (prev!.initialReadyCount ?? 0),
     humanNeededNotified: startingFreshBatch ? false : (prev!.humanNeededNotified ?? false),
   };
 }

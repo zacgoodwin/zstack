@@ -810,6 +810,89 @@ describe("ingestBoardItems", () => {
     expect(s.initialReadyCount).toBe(2); // recomputed from the NEW batch, not the stale 7
     expect(s.humanNeededNotified).toBe(false); // reset
   });
+
+  // Regression (issue #63 review bounce, ticket #63): AC9/AC10 above only ever
+  // drove ingestBoardItems against hand-authored `prev` fixtures. The real
+  // production sequence is ingest -> applyAction (park/skip/complete) ->
+  // ingest, and applyAction updates a terminal ticket's status AND drops its
+  // lane in the SAME state write. So the tick that resolves a batch's LAST
+  // ticket already leaves that written state drainComplete -- and the very
+  // NEXT ingest (which just re-observes that same finished batch, having
+  // committed nothing new) must NOT read as "a fresh batch", or it silently
+  // wipes initialReadyCount/humanNeededNotified for the crossing that just
+  // happened on that final ticket -- the control's highest-value case, since a
+  // trip with no live lane left to report it is easy to miss otherwise.
+  test("AC11: the batch's LAST ticket crossing the threshold on its own terminal action stays tripped through the confirmation re-ingest (real ingest -> applyAction -> ingest chain, not a hand-built prev)", () => {
+    const bodies = { "1": "no deps", "2": "no deps", "3": "no deps" };
+    const items1 = [
+      { number: 1, title: "a", fields: { Status: "Building" } },
+      { number: 2, title: "b", fields: { Status: "Building" } },
+      { number: 3, title: "c", fields: { Status: "Building" } },
+    ];
+    let s = ingestBoardItems(null, items1, bodies, { humanNeededPercent: 30 });
+    s.lanes = [lane(1, "builder"), lane(2, "builder"), lane(3, "builder")];
+    expect(s.initialReadyCount).toBe(3);
+
+    // #2 parks Blocked; #3 completes Done. Only #1's lane remains -- the LAST
+    // ticket of the whole batch still being worked.
+    s = ingestBoardItems(s, [
+      { number: 1, title: "a", fields: { Status: "Building" } },
+      { number: 2, title: "b", fields: { Status: "Blocked" } },
+      { number: 3, title: "c", fields: { Status: "Done" } },
+    ], bodies);
+    s.lanes = [lane(1, "builder")];
+    expect(s.initialReadyCount).toBe(3); // preserved through the mid-batch re-ingest (AC9's case)
+
+    // #1 -- the batch's final ticket -- gets skipped (watchdog: dead worker).
+    // This crosses (1 Blocked + 1 Skipped) / 3 = 66.7% > 30% for the FIRST
+    // time, applied through the REAL reducer (park/lane-drop in one write).
+    s = applyAction(s, { kind: "skip", ticket: 1, note: "Worker died mid-build" }, 5000);
+    expect(drainComplete(s.tickets, s.lanes)).toBe(true); // this state IS the next tick's `prev`
+
+    // Next tick: a fresh board snapshot just confirms #1 is now Skipped too --
+    // nothing new committed to Building. The bug reset initialReadyCount to 0
+    // here (recomputed from an all-terminal snapshot) and humanNeededNotified
+    // to false, which by itself looks harmless, but initialReadyCount=0 makes
+    // humanNeededTripped's initialReady<=0 guard force tripped=false forever.
+    s = ingestBoardItems(s, [
+      { number: 1, title: "a", fields: { Status: "Skipped" } },
+      { number: 2, title: "b", fields: { Status: "Blocked" } },
+      { number: 3, title: "c", fields: { Status: "Done" } },
+    ], bodies);
+    expect(s.initialReadyCount).toBe(3); // preserved, NOT reset to 0
+    expect(s.humanNeededNotified).toBe(false); // preserved (never yet acked)
+    const hn = humanNeededStatus(s);
+    expect(hn.tripped).toBe(true); // (1 blocked + 1 skipped) / 3 = 66.7% > 30%
+    expect(hn.blocked).toBe(1);
+    expect(hn.skipped).toBe(1);
+    expect(hn.initialReadyCount).toBe(3);
+  });
+
+  test("AC12: after human-needed-ack, a further re-ingest of the SAME drained batch (no new Building tickets) keeps alreadyNotified true -- only a genuinely new batch resets the fire-once flag", () => {
+    const bodies = { "1": "no deps" };
+    let s = ingestBoardItems(null, [{ number: 1, title: "a", fields: { Status: "Building" } }], bodies, { humanNeededPercent: 30 });
+    s.lanes = [lane(1, "builder")];
+    s = applyAction(s, { kind: "skip", ticket: 1, note: "dead" }, 1000);
+    expect(drainComplete(s.tickets, s.lanes)).toBe(true);
+    s = ingestBoardItems(s, [{ number: 1, title: "a", fields: { Status: "Skipped" } }], bodies);
+    expect(humanNeededStatus(s).tripped).toBe(true);
+    s = markHumanNeededNotified(s);
+
+    // Another confirmation tick on the same drained batch: still no new
+    // Building tickets. Must not re-arm the control.
+    s = ingestBoardItems(s, [{ number: 1, title: "a", fields: { Status: "Skipped" } }], bodies);
+    expect(s.humanNeededNotified).toBe(true);
+    expect(humanNeededStatus(s).alreadyNotified).toBe(true);
+
+    // A genuinely NEW batch (fresh Building tickets) DOES reset, even though
+    // the old ticket #1 is still present in the snapshot.
+    s = ingestBoardItems(s, [
+      { number: 1, title: "a", fields: { Status: "Skipped" } },
+      { number: 2, title: "b", fields: { Status: "Building" } },
+    ], { ...bodies, "2": "no deps" });
+    expect(s.initialReadyCount).toBe(1); // only the new batch's Building count
+    expect(s.humanNeededNotified).toBe(false);
+  });
 });
 
 // -- CLI smoke ----------------------------------------------------------------

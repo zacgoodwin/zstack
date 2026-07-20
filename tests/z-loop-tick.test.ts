@@ -13,7 +13,7 @@
 // the real loop already uses. The wrapper runs the REAL lib/loop.ts (its
 // $PACK resolves to this repo), so ingest + next are the production code paths.
 import { test, expect, describe, afterAll } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -159,5 +159,91 @@ describe("z-loop-tick", () => {
     // the real notification still fires once the project IS configured.
     const written = JSON.parse(readFileSync(tickState, "utf8"));
     expect(written.humanNeededNotified).not.toBe(true);
+  });
+
+  // The test above only exercises the failure/unconfigured branch (`SENT` !=
+  // "sent") of z-loop-tick's `[ "$SENT" = "sent" ] && human-needed-ack` line;
+  // nothing previously drove the success branch end-to-end through the real
+  // wrapper script. This pins it with a real `~/.zstack/projects/<slug>/
+  // config.json` (Bun on Windows resolves os.homedir() from USERPROFILE, not
+  // HOME -- overridden here) and a local mock Discord webhook that actually
+  // answers 200, so notify.ts's `send` completes a real round trip and prints
+  // "sent". Uses Bun.spawn (async), not spawnSync: a synchronous spawn blocks
+  // this process's event loop, which would starve Bun.serve() of the chance to
+  // answer the child's request.
+  test("human-needed: a successful notify send (real config.json + local webhook) actually POSTs and sets the fire-once flag", async () => {
+    const dir = mkTmp();
+    const stub = writeStubZBoard(dir, TRIPPED_ITEMS, TRIPPED_BODIES);
+    const tickTmp = join(dir, "tick-tmp");
+    const tickState = join(dir, "tick-state.json");
+
+    let hits = 0;
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        hits++;
+        return new Response("ok", { status: 200 });
+      },
+    });
+
+    // ZSTACK_DISCORD_WEBHOOK wins over config.json's discordWebhookUrl (and,
+    // being env-sourced, skips the config schema's https:// requirement), so
+    // the config below only needs notifications.enabled -- no secret on disk.
+    const fakeHome = join(dir, "fake-home");
+    const slug = "e2e-notify";
+    const configDir = join(fakeHome, ".zstack", "projects", slug);
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, "config.json"),
+      JSON.stringify({
+        slug,
+        owner: "acme",
+        repo: "widgets",
+        projectNumber: 1,
+        projectId: "PVT_x",
+        repositoryId: "R_x",
+        statusField: { id: "F_status", dataType: "SINGLE_SELECT", options: { Building: "opt1" } },
+        fields: {},
+        notifications: { enabled: true },
+      })
+    );
+
+    try {
+      const proc = Bun.spawn(
+        ["bash", Z_LOOP_TICK, "--slug", slug, "--state", tickState, "--tmp", tickTmp],
+        {
+          env: {
+            ...process.env,
+            Z_BOARD: stub,
+            USERPROFILE: fakeHome,
+            ZSTACK_DISCORD_WEBHOOK: `http://127.0.0.1:${server.port}/hook`,
+          },
+          stdout: "pipe",
+          stderr: "pipe",
+        }
+      );
+      const [stdout, , exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+
+      expect(exitCode).toBe(0);
+      const lines = stdout.split(/\r?\n/).filter((l) => l.trim() !== "");
+      expect(lines.length).toBe(1);
+      expect(JSON.parse(lines[0])).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+
+      expect(hits).toBe(1); // the webhook actually received one real POST
+
+      const hn = JSON.parse(readFileSync(join(tickTmp, "human-needed.json"), "utf8"));
+      expect(hn.tripped).toBe(true);
+
+      // The fire-once flag IS set this time: notify.ts reported "sent".
+      const written = JSON.parse(readFileSync(tickState, "utf8"));
+      expect(written.humanNeededNotified).toBe(true);
+    } finally {
+      server.stop(true);
+    }
   });
 });
