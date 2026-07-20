@@ -124,8 +124,8 @@ a secret — anyone holding it can post to your channel.
   `https://`; a pasted bare token is rejected by `loadConfig` (its error names the
   field only, never the value).
 
-**3. The six events**, each posted once at the moment the state machine reaches
-it:
+**3. The seven events**, each posted once at the moment the state machine
+reaches it:
 
 | Event | Fires when |
 | --- | --- |
@@ -135,6 +135,7 @@ it:
 | `ticket-parked` | a ticket is moved to **Blocked** or **Skipped** by the work |
 | `safety-violation` | a safety control tripped (a wedged/dead worker; GraphQL quota exhausted) |
 | `token-burn` | a spend/deadlock anomaly (no lane can make progress) |
+| `human-needed` | a batch's parked tickets cross `humanNeededPercent` mid-run (once per batch — see below) |
 
 Every event defaults **on**. Toggle any of them under `notifications.events`
 (a missing key stays on):
@@ -151,6 +152,63 @@ body. Treat the webhook like a password: anyone with it can post to your channel
 To rotate or revoke, delete the webhook in Discord (Server Settings → Integrations
 → Webhooks) and create a new one. A failed post is logged (event + error, never
 the URL) and dropped — a down webhook never stalls or crashes the loop.
+
+## Human-needed safety control
+
+`PROCESS.md`'s no-token-burn rule guarantees every ticket ends a batch in Done,
+Questions, Blocked, or Skipped — but a batch can still be quietly going
+sideways mid-run, e.g. 6 of 10 committed tickets piled up in
+Blocked/Skipped/Questions while the loop happily keeps draining the rest. The
+`humanNeededPercent` config knob (default 30, `0` disables) pages you the
+moment that happens instead of leaving you to discover it only at the
+drain-complete report.
+
+**Threshold.** Every drain tick (`bin/z-loop-tick`, right after it re-ingests
+the board), the loop recomputes:
+
+```text
+(Blocked + Skipped + Questions) / initialReadyCount * 100
+```
+
+`initialReadyCount` is the number of tickets the batch committed to Building
+at Step 2/3 — the batch's size at ingest-time-zero, captured once and carried
+across every re-ingest for the rest of that batch. The instant this percentage
+first exceeds `humanNeededPercent`, the control trips.
+
+**Once per batch.** The first tick that trips the control fires exactly one
+`human-needed` Discord notification — the exact parked counts and which
+ticket numbers — through the same `lib/notify.ts` transport as the other
+events above, then sets a fire-once flag so it never re-fires for the same
+crossing. A fresh batch resets both the committed-size baseline and the
+fire-once flag, so the control is live again from zero — but "fresh" is a
+two-part test, not just "the prior batch fully drained": there must be no
+prior state at all, OR the prior state was fully drained **and** the
+incoming board snapshot shows new, **unclaimed** Building tickets (the
+batch-commit step moves the whole new batch to Building before its first
+ingest, so any unclaimed Building ticket in a post-drain snapshot IS that new
+batch; a lingering `claimedByOther` Building ticket belongs to another
+session's batch and does not count). The prior batch being drained is
+necessary but not sufficient: a tick that merely re-confirms the SAME drained
+batch (no new, unclaimed tickets committed — e.g. the very tick right after
+that batch's own last ticket parks or completes, which is what first makes it
+"drained") is not a new batch, so it keeps that batch's baseline and
+fire-once flag rather than resetting them — otherwise the batch's
+highest-value crossing, its last ticket tipping it over the threshold, would
+reset to a zero baseline the instant it happens and never trip. It is **not**
+re-evaluated again within the same tick after that tick's one scheduling
+action applies — same once-per-iteration cadence as every other signal in the
+drain loop.
+
+**Depends on `notifications`.** Like the other six events, `human-needed` is
+governed by the `notifications` block above: absent/disabled/unconfigured means
+the send is a silent no-op, and because the fire-once flag is set only after a
+send actually reports delivered, the control keeps trying every tick without
+ever wedging — the moment `notifications` IS configured, the next tick's send
+succeeds and the notification finally reaches you. It is independently
+toggle-able via `notifications.events["human-needed"]` the same as any other
+event; see
+[z-setup.md → Config knobs](z-setup.md#config-knobs-hand-edit-configjson-after-setup)
+for the `humanNeededPercent` knob itself.
 
 ## --reconcile (crash recovery)
 

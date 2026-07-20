@@ -6,14 +6,14 @@
 // line or a rendered message; and config-schema's notifications branch is checked
 // good-and-bad, including that a bad value never leaks into the error.
 //
-// No eval suite (AC9): the six messages are fully templated and deterministic --
+// No eval suite (AC9): the seven messages are fully templated and deterministic --
 // there is no latent/LLM step and no quality dimension to measure -- so per
 // CLAUDE.md's latent-vs-deterministic split these gate tests are the complete
 // verification. A future free-text notification (e.g. an LLM-summarized digest)
 // would add an evals/ runbook; this ticket ships none and says so.
-import { test, expect, describe, afterEach } from "bun:test";
+import { test, expect, describe, afterEach, afterAll } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import {
   notify,
@@ -78,6 +78,16 @@ const PARK: PayloadByEvent["ticket-parked"] = {
   note: "stage-blocked: build failed",
 };
 const PAUSE: PayloadByEvent["human-pause"] = { ticket: 9, title: "Auth flow", note: "which OAuth provider?" };
+const HUMAN_NEEDED: PayloadByEvent["human-needed"] = {
+  tripped: true,
+  alreadyNotified: false,
+  blocked: 2,
+  skipped: 1,
+  questions: 1,
+  initialReadyCount: 10,
+  percent: 30,
+  tickets: { blocked: [1, 2], skipped: [3], questions: [4] },
+};
 
 // -- renderNotification (pure) -----------------------------------------------
 describe("renderNotification", () => {
@@ -127,6 +137,20 @@ describe("renderNotification", () => {
     expect(renderNotification("token-burn", { detail: "dependency deadlock", ticket: 8 })).toContain(
       "token-burn guard on #8"
     );
+  });
+
+  test("human-needed formats the parked-tickets breakdown (issue #63)", () => {
+    const s = renderNotification("human-needed", HUMAN_NEEDED);
+    expect(s).toContain("4/10 parked"); // 2 blocked + 1 skipped + 1 questions
+    expect(s).toContain("> 30%");
+    expect(s).toContain("Blocked #1, #2");
+    expect(s).toContain("Skipped #3");
+    expect(s).toContain("Questions #4");
+  });
+
+  test("human-needed lists 'none' for an empty parked category", () => {
+    const s = renderNotification("human-needed", { ...HUMAN_NEEDED, skipped: 0, tickets: { ...HUMAN_NEEDED.tickets, skipped: [] } });
+    expect(s).toContain("Skipped none");
   });
 
   test("identical input is byte-identical (deterministic)", () => {
@@ -325,9 +349,99 @@ describe("validateConfig: notifications block shapes", () => {
     ).toThrow(/notifications\.events\.work-complete/);
   });
 
-  test("EVENT_KEYS enumerates exactly the six events", () => {
+  test("EVENT_KEYS enumerates exactly the seven events", () => {
     expect(([...EVENT_KEYS] as string[]).sort()).toEqual(
-      ["human-pause", "plan-complete", "safety-violation", "ticket-parked", "token-burn", "work-complete"].sort()
+      [
+        "human-needed",
+        "human-pause",
+        "plan-complete",
+        "safety-violation",
+        "ticket-parked",
+        "token-burn",
+        "work-complete",
+      ].sort()
     );
+  });
+});
+
+// -- CLI (main() edge) --------------------------------------------------------
+describe("CLI", () => {
+  const REPO_ROOT = join(import.meta.dir, "..");
+  const dir = mkdtempSync(join(tmpdir(), "zstack-notify-cli-"));
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  const notify_ts = join(REPO_ROOT, "lib", "notify.ts");
+  const run = (args: string[], env?: Record<string, string>) =>
+    Bun.spawnSync(["bun", notify_ts, ...args], { stdout: "pipe", stderr: "pipe", env });
+
+  test("render <event> <payload.json> prints the rendered message (AC1)", () => {
+    // Create a temp payload file for ticket-parked event
+    const payload = PARK;
+    const payloadFile = join(dir, "payload.json");
+    writeFileSync(payloadFile, JSON.stringify(payload));
+
+    // Run: bun lib/notify.ts render ticket-parked <file>
+    const proc = run(["render", "ticket-parked", payloadFile], process.env as Record<string, string>);
+
+    // Assert: exit 0
+    expect(proc.exitCode).toBe(0);
+    // Assert: stdout equals renderNotification's output byte-for-byte
+    const expectedOutput = renderNotification("ticket-parked", payload);
+    expect(proc.stdout.toString()).toBe(expectedOutput + "\n");
+  });
+
+  test("send <event> <payload.json> --slug <s> prints skipped when config has no notifications block (AC2)", () => {
+    // Use a test slug that we control. Create the config in the user's .zstack directory
+    // (this is where the CLI will look for it).
+    const testSlug = "notify-cli-test";
+    const projectDir = join(homedir(), ".zstack", "projects", testSlug);
+    const configPath = join(projectDir, "config.json");
+    mkdirSync(projectDir, { recursive: true });
+
+    try {
+      // Write a minimal valid config with no notifications block
+      const config = cfgWith(undefined);
+      writeFileSync(configPath, JSON.stringify(config));
+
+      // Create a temp payload file
+      const payload = PARK;
+      const payloadFile = join(dir, "send-payload.json");
+      writeFileSync(payloadFile, JSON.stringify(payload));
+
+      // Ensure ZSTACK_DISCORD_WEBHOOK is not set so the config is used
+      const env = { ...process.env } as Record<string, string>;
+      delete env.ZSTACK_DISCORD_WEBHOOK;
+
+      // Run: bun lib/notify.ts send ticket-parked <file> --slug notify-cli-test
+      const proc = run(["send", "ticket-parked", payloadFile, "--slug", testSlug], env);
+
+      // Assert: exit 0
+      expect(proc.exitCode).toBe(0);
+      // Assert: prints "skipped" (because config has no notifications block)
+      expect(proc.stdout.toString().trim()).toBe("skipped");
+    } finally {
+      // Clean up the test config
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  test("render bogus-event <payload.json> exits 1 and names the five valid events (AC3)", () => {
+    // Create a temp payload file (content doesn't matter for this test)
+    const payloadFile = join(dir, "dummy.json");
+    writeFileSync(payloadFile, JSON.stringify(PARK));
+
+    // Run: bun lib/notify.ts render bogus-event <file>
+    const proc = run(["render", "bogus-event", payloadFile]);
+
+    // Assert: exit 1
+    expect(proc.exitCode).toBe(1);
+    // Assert: error names the five valid events
+    const stderr = proc.stderr.toString();
+    expect(stderr).toContain("Unknown event");
+    expect(stderr).toContain("work-complete");
+    expect(stderr).toContain("human-pause");
+    expect(stderr).toContain("ticket-parked");
+    expect(stderr).toContain("safety-violation");
+    expect(stderr).toContain("token-burn");
   });
 });

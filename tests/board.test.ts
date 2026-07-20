@@ -1354,6 +1354,16 @@ describe("config loader", () => {
     expect(loaded.lockStalenessMinutes).toBe(60); // C7 default applied (issue #2)
   });
 
+  // AC11 (issue #63): a config.json with no humanNeededPercent key loads the
+  // default (30), same fallback-application style as every other knob above.
+  test("applies the humanNeededPercent default when absent", () => {
+    const home = makeHome();
+    const written = { ...CFG, humanNeededPercent: undefined };
+    writeConfig(home, "zstack", written);
+    const loaded = loadConfig("zstack", home);
+    expect(loaded.humanNeededPercent).toBe(30);
+  });
+
   test("malformed config (missing keys) names what is missing", () => {
     const home = makeHome();
     writeConfig(home, "zstack", { slug: "zstack" });

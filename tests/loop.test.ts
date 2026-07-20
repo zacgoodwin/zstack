@@ -13,8 +13,11 @@ import {
   applyAction,
   canTransition,
   drainComplete,
+  humanNeededStatus,
+  humanNeededTripped,
   ingestBoardItems,
   markClaimLost,
+  markHumanNeededNotified,
   nextAction,
   parseReviewerConfidence,
   parseStageResult,
@@ -532,6 +535,74 @@ describe("drain-complete", () => {
   });
 });
 
+// -- human-needed safety control (issue #63) ----------------------------------
+
+describe("humanNeededTripped", () => {
+  test("AC1: below threshold does not trip (1/10 = 10%)", () => {
+    expect(humanNeededTripped(1, 0, 0, 10, 30)).toBe(false);
+  });
+
+  test("AC2: exactly at threshold does not trip (strict >, 3/10 = 30%)", () => {
+    expect(humanNeededTripped(3, 0, 0, 10, 30)).toBe(false);
+  });
+
+  test("AC3: above threshold trips (4/10 = 40%)", () => {
+    expect(humanNeededTripped(4, 0, 0, 10, 30)).toBe(true);
+  });
+
+  test("AC4: percent 0 disables regardless of counts (100% parked)", () => {
+    expect(humanNeededTripped(10, 10, 10, 10, 0)).toBe(false);
+  });
+
+  test("AC5: initialReady 0 never trips (division-by-zero guarded)", () => {
+    expect(humanNeededTripped(5, 5, 5, 0, 30)).toBe(false);
+  });
+});
+
+describe("humanNeededStatus / markHumanNeededNotified", () => {
+  test("AC6: reports tripped + alreadyNotified + which tickets", () => {
+    const s = state(
+      [
+        ticket(1, "Blocked"),
+        ticket(2, "Blocked"),
+        ticket(3, "Skipped"),
+        ticket(4, "Questions"),
+        ...([5, 6, 7, 8, 9, 10].map((n) => ticket(n, "Building"))),
+      ],
+      []
+    );
+    s.initialReadyCount = 10;
+    s.humanNeededPercent = 30;
+    const status = humanNeededStatus(s);
+    expect(status.tripped).toBe(true); // 4/10 = 40% > 30%
+    expect(status.alreadyNotified).toBe(false);
+    expect(status.blocked).toBe(2);
+    expect(status.skipped).toBe(1);
+    expect(status.questions).toBe(1);
+    expect(status.initialReadyCount).toBe(10);
+    expect(status.percent).toBe(30);
+    expect(status.tickets.blocked).toEqual([1, 2]);
+    expect(status.tickets.skipped).toEqual([3]);
+    expect(status.tickets.questions).toEqual([4]);
+  });
+
+  test("AC7: markHumanNeededNotified flips alreadyNotified without clearing tripped (fire-once)", () => {
+    const s = state(
+      [ticket(1, "Blocked"), ticket(2, "Blocked"), ticket(3, "Skipped"), ticket(4, "Questions")],
+      []
+    );
+    s.initialReadyCount = 10;
+    s.humanNeededPercent = 30;
+    expect(humanNeededStatus(s).alreadyNotified).toBe(false);
+    const acked = markHumanNeededNotified(s);
+    const status = humanNeededStatus(acked);
+    expect(status.tripped).toBe(true); // still over threshold
+    expect(status.alreadyNotified).toBe(true); // fire-once flag now set
+    // pure: input untouched
+    expect(humanNeededStatus(s).alreadyNotified).toBe(false);
+  });
+});
+
 // -- deadlock breaker vs cross-session deps (issue #14 C7) --------------------
 
 describe("deadlock breaker excludes still-completable deps", () => {
@@ -772,6 +843,197 @@ describe("ingestBoardItems", () => {
     expect(overridden.maxQaPasses).toBe(7);
     expect(overridden.qaInvestigateAfter).toBe(4);
   });
+
+  // -- issue #63: initialReadyCount / humanNeededNotified capture-once + reset -
+  test("AC8: a genuinely first ingest captures initialReadyCount from Building tickets only, defaults humanNeededPercent, humanNeededNotified false", () => {
+    const items = [
+      { number: 1, title: "a", fields: { Status: "Building" } },
+      { number: 2, title: "b", fields: { Status: "Building" } },
+      { number: 3, title: "c", fields: { Status: "Building" } },
+      { number: 4, title: "d", fields: { Status: "Building" } },
+      { number: 5, title: "e", fields: { Status: "Done" } },
+      { number: 6, title: "f", fields: { Status: "Done" } },
+    ];
+    const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
+    const s = ingestBoardItems(null, items, bodies);
+    expect(s.initialReadyCount).toBe(4); // only the Building count
+    expect(s.humanNeededPercent).toBe(30); // default
+    expect(s.humanNeededNotified).toBe(false);
+  });
+
+  test("AC9: a mid-batch re-ingest (prev has a live lane) preserves initialReadyCount/humanNeededNotified unchanged", () => {
+    const prev: LoopState = {
+      tickets: [ticket(5, "QA"), ticket(7, "Building")],
+      lanes: [lane(5, "qa")],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      initialReadyCount: 7,
+      humanNeededNotified: true,
+    };
+    const items = [
+      { number: 5, title: "A", fields: { Status: "QA" } },
+      { number: 7, title: "B", fields: { Status: "Building" } },
+    ];
+    const bodies = { "5": "no deps", "7": "no deps" };
+    const s = ingestBoardItems(prev, items, bodies);
+    expect(s.initialReadyCount).toBe(7); // preserved, not recomputed
+    expect(s.humanNeededNotified).toBe(true); // preserved
+  });
+
+  test("AC10: a re-ingest after the prior batch fully drained resets initialReadyCount/humanNeededNotified (drainComplete is the boundary)", () => {
+    const prev: LoopState = {
+      tickets: [ticket(5, "Done"), ticket(7, "Blocked")],
+      lanes: [],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      initialReadyCount: 7,
+      humanNeededNotified: true,
+    };
+    expect(drainComplete(prev.tickets, prev.lanes)).toBe(true); // sanity: prev IS fully drained
+    const items = [
+      { number: 10, title: "New1", fields: { Status: "Building" } },
+      { number: 11, title: "New2", fields: { Status: "Building" } },
+    ];
+    const bodies = { "10": "no deps", "11": "no deps" };
+    const s = ingestBoardItems(prev, items, bodies);
+    expect(s.initialReadyCount).toBe(2); // recomputed from the NEW batch, not the stale 7
+    expect(s.humanNeededNotified).toBe(false); // reset
+  });
+
+  // Regression (issue #63 review bounce, ticket #63): AC9/AC10 above only ever
+  // drove ingestBoardItems against hand-authored `prev` fixtures. The real
+  // production sequence is ingest -> applyAction (park/skip/complete) ->
+  // ingest, and applyAction updates a terminal ticket's status AND drops its
+  // lane in the SAME state write. So the tick that resolves a batch's LAST
+  // ticket already leaves that written state drainComplete -- and the very
+  // NEXT ingest (which just re-observes that same finished batch, having
+  // committed nothing new) must NOT read as "a fresh batch", or it silently
+  // wipes initialReadyCount/humanNeededNotified for the crossing that just
+  // happened on that final ticket -- the control's highest-value case, since a
+  // trip with no live lane left to report it is easy to miss otherwise.
+  test("regression: final-tick confirmation preserves counters (real ingest -> applyAction -> ingest chain, not a hand-built prev)", () => {
+    const bodies = { "1": "no deps", "2": "no deps", "3": "no deps" };
+    const items1 = [
+      { number: 1, title: "a", fields: { Status: "Building" } },
+      { number: 2, title: "b", fields: { Status: "Building" } },
+      { number: 3, title: "c", fields: { Status: "Building" } },
+    ];
+    let s = ingestBoardItems(null, items1, bodies, { humanNeededPercent: 30 });
+    s.lanes = [lane(1, "builder"), lane(2, "builder"), lane(3, "builder")];
+    expect(s.initialReadyCount).toBe(3);
+
+    // #2 parks Blocked; #3 completes Done. Only #1's lane remains -- the LAST
+    // ticket of the whole batch still being worked.
+    s = ingestBoardItems(s, [
+      { number: 1, title: "a", fields: { Status: "Building" } },
+      { number: 2, title: "b", fields: { Status: "Blocked" } },
+      { number: 3, title: "c", fields: { Status: "Done" } },
+    ], bodies);
+    s.lanes = [lane(1, "builder")];
+    expect(s.initialReadyCount).toBe(3); // preserved through the mid-batch re-ingest (AC9's case)
+
+    // #1 -- the batch's final ticket -- gets skipped (watchdog: dead worker).
+    // This crosses (1 Blocked + 1 Skipped) / 3 = 66.7% > 30% for the FIRST
+    // time, applied through the REAL reducer (park/lane-drop in one write).
+    s = applyAction(s, { kind: "skip", ticket: 1, note: "Worker died mid-build" }, 5000);
+    expect(drainComplete(s.tickets, s.lanes)).toBe(true); // this state IS the next tick's `prev`
+
+    // Next tick: a fresh board snapshot just confirms #1 is now Skipped too --
+    // nothing new committed to Building. The bug reset initialReadyCount to 0
+    // here (recomputed from an all-terminal snapshot) and humanNeededNotified
+    // to false, which by itself looks harmless, but initialReadyCount=0 makes
+    // humanNeededTripped's initialReady<=0 guard force tripped=false forever.
+    s = ingestBoardItems(s, [
+      { number: 1, title: "a", fields: { Status: "Skipped" } },
+      { number: 2, title: "b", fields: { Status: "Blocked" } },
+      { number: 3, title: "c", fields: { Status: "Done" } },
+    ], bodies);
+    expect(s.initialReadyCount).toBe(3); // preserved, NOT reset to 0
+    expect(s.humanNeededNotified).toBe(false); // preserved (never yet acked)
+    const hn = humanNeededStatus(s);
+    expect(hn.tripped).toBe(true); // (1 blocked + 1 skipped) / 3 = 66.7% > 30%
+    expect(hn.blocked).toBe(1);
+    expect(hn.skipped).toBe(1);
+    expect(hn.initialReadyCount).toBe(3);
+  });
+
+  test("regression: fire-once flag survives a same-batch confirmation re-ingest, resets only for a genuinely new batch", () => {
+    const bodies = { "1": "no deps" };
+    let s = ingestBoardItems(null, [{ number: 1, title: "a", fields: { Status: "Building" } }], bodies, { humanNeededPercent: 30 });
+    s.lanes = [lane(1, "builder")];
+    s = applyAction(s, { kind: "skip", ticket: 1, note: "dead" }, 1000);
+    expect(drainComplete(s.tickets, s.lanes)).toBe(true);
+    s = ingestBoardItems(s, [{ number: 1, title: "a", fields: { Status: "Skipped" } }], bodies);
+    expect(humanNeededStatus(s).tripped).toBe(true);
+    s = markHumanNeededNotified(s);
+
+    // Another confirmation tick on the same drained batch: still no new
+    // Building tickets. Must not re-arm the control.
+    s = ingestBoardItems(s, [{ number: 1, title: "a", fields: { Status: "Skipped" } }], bodies);
+    expect(s.humanNeededNotified).toBe(true);
+    expect(humanNeededStatus(s).alreadyNotified).toBe(true);
+
+    // A genuinely NEW batch (fresh Building tickets) DOES reset, even though
+    // the old ticket #1 is still present in the snapshot.
+    s = ingestBoardItems(s, [
+      { number: 1, title: "a", fields: { Status: "Skipped" } },
+      { number: 2, title: "b", fields: { Status: "Building" } },
+    ], { ...bodies, "2": "no deps" });
+    expect(s.initialReadyCount).toBe(1); // only the new batch's Building count
+    expect(s.humanNeededNotified).toBe(false);
+  });
+
+  // Regression (issue #63 second review bounce): the two tests above only
+  // ever left a foreign lane's ticket in a terminal status by the time the
+  // batch drained. But drainComplete permits a claimedByOther ticket to remain in
+  // *Building* -- it belongs to another session's batch, not this one. The
+  // bounce-1 fix's buildingCount didn't exclude claimedByOther, so a lingering
+  // foreign Building ticket in the snapshot made startingFreshBatch wrongly
+  // true on the confirmation re-ingest after THIS session's own last ticket
+  // resolved, silently resetting initialReadyCount/humanNeededNotified from a
+  // ticket this session never committed.
+  test("regression: claimedByOther Building does not start a fresh batch, but a new unclaimed Building ticket does", () => {
+    const bodies = { "1": "no deps", "9": "no deps" };
+    const prev: LoopState = {
+      tickets: [ticket(1, "Done"), ticket(9, "Building", [], { claimedByOther: true })],
+      lanes: [],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      initialReadyCount: 5,
+      humanNeededNotified: true,
+    };
+    // sanity: OWN batch is drained (ticket 1 terminal); #9 is another
+    // session's Building ticket, which drainComplete explicitly permits.
+    expect(drainComplete(prev.tickets, prev.lanes)).toBe(true);
+
+    // Confirmation tick: the same foreign Building ticket #9 is still there,
+    // nothing new committed. Must NOT read as a fresh batch.
+    const same = ingestBoardItems(
+      prev,
+      [
+        { number: 1, title: "a", fields: { Status: "Done" } },
+        { number: 9, title: "z", fields: { Status: "Building" } },
+      ],
+      bodies
+    );
+    expect(same.initialReadyCount).toBe(5); // preserved, not recomputed from the foreign ticket
+    expect(same.humanNeededNotified).toBe(true); // preserved, not silently reset
+
+    // A genuinely new batch -- an UNCLAIMED Building ticket appears alongside
+    // the still-foreign #9 -- DOES reset, same as the AC10 and fire-once-flag
+    // regression tests above.
+    const fresh = ingestBoardItems(
+      prev,
+      [
+        { number: 1, title: "a", fields: { Status: "Done" } },
+        { number: 9, title: "z", fields: { Status: "Building" } },
+        { number: 10, title: "New", fields: { Status: "Building" } },
+      ],
+      { ...bodies, "10": "no deps" }
+    );
+    expect(fresh.initialReadyCount).toBe(1); // only the new UNCLAIMED Building ticket, not the foreign #9
+    expect(fresh.humanNeededNotified).toBe(false); // reset
+  });
 });
 
 // -- CLI smoke ----------------------------------------------------------------
@@ -827,5 +1089,41 @@ describe("loop CLI", () => {
     const { exitCode } = runIngest(statePath);
     expect(exitCode).toBe(0);
     expect(existsSync(statePath)).toBe(true);
+  });
+
+  // -- AC13: `human-needed` / `human-needed-ack` CLI verbs ---------------------
+  test("human-needed prints the breakdown without writing, matching AC6's shape", () => {
+    const statePath = join(dir, "human-needed-state.json");
+    const s = state(
+      [ticket(1, "Blocked"), ticket(2, "Blocked"), ticket(3, "Skipped"), ticket(4, "Questions")],
+      []
+    );
+    s.initialReadyCount = 10;
+    s.humanNeededPercent = 30;
+    writeFileSync(statePath, JSON.stringify(s));
+    const before = readFileSync(statePath, "utf8");
+
+    const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "human-needed", statePath], { stdout: "pipe", stderr: "pipe" });
+    expect(proc.exitCode).toBe(0);
+    const status = JSON.parse(proc.stdout.toString());
+    expect(status).toMatchObject({
+      tripped: true,
+      alreadyNotified: false,
+      blocked: 2,
+      skipped: 1,
+      questions: 1,
+      initialReadyCount: 10,
+      percent: 30,
+      tickets: { blocked: [1, 2], skipped: [3], questions: [4] },
+    });
+    // no writes: state.json is byte-identical after a `human-needed` call.
+    expect(readFileSync(statePath, "utf8")).toBe(before);
+
+    // human-needed-ack sets alreadyNotified on the next human-needed call.
+    const ack = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "human-needed-ack", statePath], { stdout: "pipe", stderr: "pipe" });
+    expect(ack.exitCode).toBe(0);
+    const proc2 = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "human-needed", statePath], { stdout: "pipe", stderr: "pipe" });
+    expect(proc2.exitCode).toBe(0);
+    expect(JSON.parse(proc2.stdout.toString())).toMatchObject({ tripped: true, alreadyNotified: true });
   });
 });
