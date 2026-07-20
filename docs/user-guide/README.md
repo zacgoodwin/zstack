@@ -5,6 +5,7 @@ The full walkthrough, from a bare machine to your first green loop. The
 contracts live next to each skill (`z-setup/SKILL.md` etc.) and each has a
 shorter reference page here: [z-setup](z-setup.md) · [z-plan](z-plan.md) ·
 [z-loop](z-loop.md) · [z-status](z-status.md) · [z-uninstall](z-uninstall.md) ·
+[z-update](z-update.md) ·
 [troubleshooting](troubleshooting.md).
 
 ## The mental model
@@ -95,24 +96,34 @@ so the clone lands in a literal `~` folder instead of your home directory.
 
 `./setup` verifies the three prerequisites (refusing with the exact fix command
 if one is missing), then registers the skills. Hosts discover skills at
-`skills/<name>/SKILL.md` exactly one level deep, so each of the five skills
+`skills/<name>/SKILL.md` exactly one level deep, so each of the six skills
 gets its own top-level entry — the pack directory alone is never enough,
 which is why running `./setup` is mandatory even when you cloned straight
 into `~/.claude/skills/zstack`:
 
 - **Claude Code**: the pack at `~/.claude/skills/zstack` (runtime assets:
   `bin/`, `lib/`) plus `~/.claude/skills/z-setup`, `z-plan`, `z-loop`,
-  `z-status`, `z-uninstall` (symlinks on macOS/Linux, copies on Windows).
+  `z-status`, `z-uninstall`, `z-update` (symlinks on macOS/Linux, copies on Windows).
 - **Codex** (`~/.codex/skills`) and **Factory** (`~/.factory/skills`) are
   registered the same way when their binaries (`codex` / `droid`) are on PATH.
 
 Restart Claude Code afterwards — the skill list is scanned at session start,
 so `/z-setup` and friends appear in the next session, not the current one.
 
-**Updating:** `git pull` in the pack directory. On macOS/Linux that's the whole
-update for existing skills (symlinks). On Windows the registrations are copies,
-so re-run `./setup` after pulling. Either way, a pull that adds a NEW skill
-needs one `./setup` re-run to register it.
+**Updating:** run `/z-update` (or `bin/z-update` directly from the pack root).
+It resolves the git clone backing this install — the clone itself, a symlinked
+registration, or, on Windows, the source a sentinel copy's marker recorded —
+`git pull --ff-only`s it, and re-runs that clone's `./setup`, refreshing every
+host's registrations in one step. Refuses with the exact reinstall commands
+when no git source can be resolved (a ZIP or manual install touches nothing on
+disk in that case), and stops before running `./setup` if the pull itself
+fails (e.g. diverged local commits), surfacing git's error. Full contract:
+[z-update](z-update.md).
+
+The manual equivalent, if you'd rather not use the command: `git pull` in the
+pack directory, then re-run `./setup` (required on Windows, where
+registrations are copies, not symlinks — a pull that adds a NEW skill needs
+one `./setup` re-run to register it even on macOS/Linux).
 
 **Uninstalling:** run `/z-uninstall` to reverse `./setup`: it removes the host
 registrations the pack created (symlinks on macOS/Linux, copies on Windows),
@@ -127,9 +138,9 @@ when present. Confirm first; the GitHub board is remote and untouched:
 For pre-sentinel installs (before z-uninstall existed), remove by hand:
 
 ```bash
-rm -rf ~/.claude/skills/zstack ~/.claude/skills/z-{setup,plan,loop,status,uninstall}
-rm -rf ~/.codex/skills/zstack ~/.codex/skills/z-{setup,plan,loop,status,uninstall}
-rm -rf ~/.factory/skills/zstack ~/.factory/skills/z-{setup,plan,loop,status,uninstall}
+rm -rf ~/.claude/skills/zstack ~/.claude/skills/z-{setup,plan,loop,status,uninstall,update}
+rm -rf ~/.codex/skills/zstack ~/.codex/skills/z-{setup,plan,loop,status,uninstall,update}
+rm -rf ~/.factory/skills/zstack ~/.factory/skills/z-{setup,plan,loop,status,uninstall,update}
 ```
 
 Only delete entries zstack created: symlinks into the pack, or copies carrying

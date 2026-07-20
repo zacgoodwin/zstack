@@ -12,6 +12,7 @@ bin/z-cost text eol=lf
 bin/z-setup-board text eol=lf
 bin/z-setup-permissions text eol=lf
 bin/z-ticket-lint text eol=lf
+bin/z-update text eol=lf
 # Extensionless bash in the eval fixture app; same CRLF hazard as setup.
 evals/fixture-app/scripts/deploy text eol=lf
 # Planner eval harness bash scripts (issue #25); same CRLF hazard as setup.

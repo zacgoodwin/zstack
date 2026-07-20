@@ -86,8 +86,16 @@ _link_or_copy() {
       cp -R "$entry" "$staging/$name"
     done
     # Mark the copy as zstack-created so `uninstall` will remove it (existence
-    # is the only thing it checks; the text just orients a human who finds it).
-    printf '%s\n' "Created by zstack ./setup. Safe to remove with ./uninstall (or by deleting this directory)." > "$staging/$MARKER"
+    # is the only thing it checks; the first line just orients a human who
+    # finds it). The second line records the source clone's absolute path so
+    # `bin/z-update` can resolve a git source to pull from a copy that has no
+    # .git of its own -- _owned() above only tests existence, so a legacy
+    # marker without this line still counts as owned, it just can't be
+    # resolved to an update source.
+    {
+      printf '%s\n' "Created by zstack ./setup. Safe to remove with ./uninstall (or by deleting this directory)."
+      printf 'source: %s\n' "$PACK_DIR"
+    } > "$staging/$MARKER"
     if [ -e "$dst" ]; then mv "$dst" "$old"; fi
     mv "$staging" "$dst"
     rm -rf "$old" 2>/dev/null || true
