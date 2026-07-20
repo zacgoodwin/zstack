@@ -110,6 +110,13 @@ each defaulted by `loadConfig` when absent:
   ≥ 10 changed lines OR a `security` / `migration` / `payments` / `auth` label
   on the issue; `always` fans out on every card; `off` never does. An invalid
   value is a loud config error, never a silent fallback.
+- `tickThrottleSeconds` (default `0`, off) — minimum wall-clock seconds
+  between `bin/z-loop-tick` invocations. Set it to `120` to keep ProjectsV2
+  GraphQL spend under GitHub's 5k/hr budget (~103 pts/tick × ~30 ticks/hr ≈
+  3.1k/hr). Complements the reactive `enforceQuota()` backstop, which only
+  intervenes once remaining points are already low. Hand-edited in
+  `config.json`, same as `auditEveryNLoops`/`maxQaPasses`/`qaInvestigateAfter`
+  — no `/z-setup` CLI flag.
 - `minReviewerConfidence` (default 70) — the aggregated reviewer confidence
   (0–100) a `REVIEW-APPROVE` must clear to merge.
 - `reviewerBelowThresholdAction` (default `"block"`, values `block` | `retry`

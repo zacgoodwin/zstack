@@ -96,6 +96,12 @@ export interface BoardConfig {
   // at reviewer-spawn time; #62 gates on the confidence this mode emits.
   adversarialMode?: AdversarialMode;
   quota?: Partial<QuotaConfig>;
+  // Minimum wall-clock seconds between bin/z-loop-tick invocations (issue
+  // #58); 0 = no throttling (default, today's behavior). Proactive pacing
+  // that keeps ProjectsV2 GraphQL point spend under GitHub's 5k/hr budget;
+  // complements the REACTIVE enforceQuota() backstop (board.ts:199-234),
+  // which only intervenes once remaining points are already low.
+  tickThrottleSeconds?: number;
   // The reviewer-confidence safety gate (issue #62): the aggregated confidence
   // (0-100) #59's reviewer stamps into its REVIEW-APPROVE marker must clear
   // this floor to merge; below it, reviewerBelowThresholdAction decides what
@@ -126,6 +132,7 @@ export const DEFAULT_AUDIT_EVERY_N_LOOPS = 5;
 export const DEFAULT_MAX_QA_PASSES = 3;
 export const DEFAULT_QA_INVESTIGATE_AFTER = 2;
 export const DEFAULT_ADVERSARIAL_MODE: AdversarialMode = "non-trivial";
+export const DEFAULT_TICK_THROTTLE_SECONDS = 0;
 export const DEFAULT_MIN_REVIEWER_CONFIDENCE = 70;
 export const DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION = "block" as const;
 
@@ -228,6 +235,7 @@ export function loadConfig(slug?: string, home = homedir()): BoardConfig {
   cfg.maxQaPasses = cfg.maxQaPasses ?? DEFAULT_MAX_QA_PASSES;
   cfg.qaInvestigateAfter = cfg.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER;
   cfg.adversarialMode = cfg.adversarialMode ?? DEFAULT_ADVERSARIAL_MODE;
+  cfg.tickThrottleSeconds = cfg.tickThrottleSeconds ?? DEFAULT_TICK_THROTTLE_SECONDS;
   cfg.minReviewerConfidence = cfg.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE;
   cfg.reviewerBelowThresholdAction = cfg.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION;
   return cfg;

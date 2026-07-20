@@ -57,6 +57,9 @@ records the result. It never re-derives a scheduling decision in prose.
   its dependencies are Done; at most `maxLanes` (default 3) lanes run at once;
   merges happen one at a time in topological order (stacked chains retarget the
   base and delete branches only at batch end).
+- **Optional tick throttle.** `bin/z-loop-tick` sleeps out the remainder of
+  the `tickThrottleSeconds` config knob (default `0`, off) before starting its
+  next snapshot+ingest+`next` cycle, once the knob is set above its default.
 - **No token burn.** Every ticket ends the run in Done, Questions, Blocked, or
   Skipped. QA bugs bounce to a fresh builder: from QA-bounce config
   `qaInvestigateAfter` (default 2) onward, the rebuild runs `/investigate`
