@@ -111,9 +111,10 @@ a real (non-symlink) directory pointing at a different install — it prints
 directory alone rather than clobbering it.
 
 `/z-uninstall` is the mirror. It removes a host registration only when it can
-prove ownership — a **symlink**, or a **copy carrying the `.zstack-registered`
-sentinel** setup drops into every copied install. A same-named directory with
-neither is **left in place and named**:
+prove ownership — a **symlink whose target resolves into the pack**, or a **copy
+carrying the `.zstack-registered` sentinel** setup drops into every copied
+install. A same-named directory — or a symlink pointing outside the pack — with
+neither proof is **left in place and named**:
 
 ```text
   left /…/.claude/skills/zstack -- not created by zstack (no symlink, no .zstack-registered); left untouched.

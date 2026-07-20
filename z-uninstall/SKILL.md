@@ -5,7 +5,8 @@ description: |
   (and any z-* skill entries) from each host skills dir it owns, and -- with
   --purge -- ~/.zstack (project configs, loop state, locks, reports). Honors the
   same ownership rule setup uses: it never deletes a directory it cannot prove it
-  created (a symlink, or a copy carrying the .zstack-registered sentinel). Also
+  created (a symlink pointing into the pack, or a copy carrying the
+  .zstack-registered sentinel). Also
   strips the Claude Code auto-approval entries /z-setup's Step 7 wrote, when they
   are present. Destructive: confirms with you first. GitHub-side data (the board,
   milestones, labels) is remote and never touched.
@@ -26,6 +27,11 @@ Resolve the pack directory once (same pattern as the other z-skills):
 ```bash
 PACK="$HOME/.claude/skills/zstack"
 [ -d "$PACK" ] || PACK="$(cd "$(dirname "${BASH_SOURCE:-$0}")/.." && pwd -P)"
+# Bind $PACK to its PHYSICAL path up front. On a symlinked (macOS/Linux) install,
+# Step 2's uninstall removes the ~/.claude/skills/zstack symlink -- after which a
+# link-relative $PACK/bin/z-setup-permissions (Step 3) would be gone. The real
+# clone behind the link keeps bin/, so resolve to it BEFORE anything is removed.
+PACK="$(cd "$PACK" && pwd -P)"
 ```
 
 ---
@@ -56,10 +62,14 @@ If C, stop. Do not run anything below.
 ## Step 2 — Run the uninstall script
 
 The deterministic half is `uninstall` at the pack root. It removes only what it
-owns (a symlink, or a copy carrying `.zstack-registered`); a same-named directory
-it cannot prove it created is left in place and named. If the pack IS the git
-clone at `~/.claude/skills/zstack`, that clone is left alone (it may be your only
-copy) and the exact `rm -rf` command is printed for you to run by hand.
+owns (a symlink whose target resolves into the pack, or a copy carrying
+`.zstack-registered`); a same-named directory it cannot prove it created — or a
+symlink pointing OUTSIDE the pack (a user's own `z-*` link) — is left in place and
+named. If the pack IS the git clone at `~/.claude/skills/zstack`, that clone is
+left alone (it may be your only copy) and the exact `rm -rf` command is printed
+for you to run by hand. A Windows registered COPY running its own `uninstall` is
+likewise left (you cannot delete the running dir), named as a registered copy with
+its own `rm -rf`.
 
 ```bash
 # A) keep ~/.zstack
@@ -78,7 +88,10 @@ any printed `rm -rf` command for a clone or for `~/.zstack`.
 `/z-setup` Step 7 optionally wrote Claude Code permission entries into
 `~/.claude/settings.json` (an allow hook, `bypassPermissions` default mode + skip
 flags, and the git/gh/bun/bunx allow rules). Check whether any are present, and
-strip exactly those — leaving every other setting intact — only when they are:
+strip exactly those — leaving every other setting intact — only when they are.
+`$PACK` is the physically-resolved clone (see the resolve step above), so
+`$PACK/bin/z-setup-permissions` still exists here even though Step 2 removed the
+`~/.claude/skills/zstack` registration:
 
 ```bash
 "$PACK/bin/z-setup-permissions" --check    # reports hook / bypassMode / allowlist

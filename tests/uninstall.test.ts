@@ -6,12 +6,24 @@
 // 2s-per-file gate budget (each spawn carries the generous timeout scaffold uses
 // for Windows spawn contention).
 import { test, expect, describe, afterEach } from "bun:test";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const UNINSTALL_PATH = join(REPO_ROOT, "uninstall");
+const SKILL_PATH = join(REPO_ROOT, "z-uninstall", "SKILL.md");
+
+// Extract the FIRST ```bash fenced block from SKILL.md — the pack-resolution
+// snippet the skill prescribes before Step 2. AC2 runs THIS snippet (not a copy
+// of it) so a regression in the skill's own resolution trips the gate. Normalize
+// CRLF first: the repo checks out .md with CRLF on Windows, and stray \r in a
+// `bash -c` body breaks command parsing.
+function firstBashBlock(md: string): string {
+  const m = md.replace(/\r\n/g, "\n").match(/```bash\n([\s\S]*?)```/);
+  if (!m) throw new Error("no ```bash block found in SKILL.md");
+  return m[1];
+}
 
 const BASH = Bun.which("bash");
 if (!BASH) throw new Error("bash not found on PATH: required to exercise the uninstall script");
@@ -105,23 +117,112 @@ describe("AC1 — ownership: owned entries removed, un-owned left untouched", ()
     expect(result.stdout).toContain("not created by zstack");
   }, SPAWN_TIMEOUT_MS);
 
-  test.skipIf(!CAN_SYMLINK)("a symlink registration is recognized as ours and removed", () => {
+  // #49 AC1: a symlink counts as ours ONLY when its target resolves INTO the pack
+  // (setup only ever links to PACK_DIR or a skill dir within it).
+  test.skipIf(!CAN_SYMLINK)("a symlink INTO the pack is recognized as ours and removed; its target is untouched", () => {
     const home = makeHome();
     const skills = join(home, ".claude", "skills");
     mkdirSync(skills, { recursive: true });
-    // A symlink named z-loop -> some target dir. Removing the link must not
-    // delete the target (proof: the target survives).
-    const target = join(home, "some-pack");
-    mkdirSync(target, { recursive: true });
-    writeFileSync(join(target, "VERSION"), "0.1.0\n");
+    // The macOS/Linux install: z-loop -> <pack>/z-loop. readlink -f lands inside
+    // PACK_DIR (the repo root here), so it's ours. Removing the link must not
+    // delete the target (proof: the real skill dir survives).
+    const target = join(REPO_ROOT, "z-loop"); // a real skill dir inside the pack
     const link = join(skills, "z-loop");
     symlinkSync(target, link);
 
     const result = runUninstall({ home });
     expect(result.exitCode).toBe(0);
     expect(existsSync(link)).toBe(false); // link gone
-    expect(existsSync(join(target, "VERSION"))).toBe(true); // target untouched
-    expect(result.stdout).toContain("symlink");
+    expect(existsSync(join(target, "SKILL.md"))).toBe(true); // target untouched
+    expect(result.stdout).toContain("symlink into the pack");
+  }, SPAWN_TIMEOUT_MS);
+
+  // #49 AC1: a same-named symlink pointing OUTSIDE the pack is a user's own link,
+  // NOT ours -- deletion-safety demands it be left, never removed.
+  test.skipIf(!CAN_SYMLINK)("a foreign symlink pointing OUTSIDE the pack is left and named; its target is untouched", () => {
+    const home = makeHome();
+    const skills = join(home, ".claude", "skills");
+    mkdirSync(skills, { recursive: true });
+    // A user's OWN skill named z-loop, symlinked from outside the pack.
+    const theirs = join(home, "their-skills", "z-loop");
+    mkdirSync(theirs, { recursive: true });
+    writeFileSync(join(theirs, "SKILL.md"), "---\nname: z-loop\n---\ntheirs\n");
+    const link = join(skills, "z-loop");
+    symlinkSync(theirs, link);
+
+    const result = runUninstall({ home });
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(link)).toBe(true); // link LEFT in place
+    expect(existsSync(join(theirs, "SKILL.md"))).toBe(true); // target untouched
+    expect(result.stdout).toContain("z-loop");
+    expect(result.stdout).toContain("outside the zstack pack");
+  }, SPAWN_TIMEOUT_MS);
+});
+
+// -- #49 AC2: a symlinked pack -- the sequence keeps its bin after uninstall -----
+describe("#49 AC2 — symlinked pack: /z-uninstall keeps bin/z-setup-permissions reachable after Step 2", () => {
+  test.skipIf(!CAN_SYMLINK)("PACK resolves to the physical clone up front, so Step 3's tool survives the symlink removal", () => {
+    const home = makeHome();
+    const skills = join(home, ".claude", "skills");
+    mkdirSync(skills, { recursive: true });
+    // A real clone elsewhere, carrying bin/ and the real uninstall script.
+    const clone = join(home, "zstack-clone");
+    mkdirSync(join(clone, "bin"), { recursive: true });
+    cpSync(UNINSTALL_PATH, join(clone, "uninstall"));
+    writeFileSync(join(clone, "bin", "z-setup-permissions"), "#!/usr/bin/env bash\necho ok\n");
+    // The canonical macOS/Linux install: the pack entry is a symlink into the clone.
+    symlinkSync(clone, join(skills, "zstack"));
+
+    // Run the skill's OWN resolution snippet, then Step 2 (uninstall), then probe
+    // for Step 3's tool via $PACK and via the naive link-relative path.
+    const script = [
+      firstBashBlock(readFileSync(SKILL_PATH, "utf8")),
+      `"$PACK/uninstall" >/dev/null 2>&1`,
+      `test -e "$PACK/bin/z-setup-permissions" && echo BIN_FOUND || echo BIN_MISSING`,
+      `test -e "$HOME/.claude/skills/zstack" && echo LINK_PRESENT || echo LINK_GONE`,
+    ].join("\n");
+    const env: Record<string, string> = { PATH: CORE_DIR, HOME: home };
+    for (const key of ["SYSTEMROOT", "windir", "TEMP", "TMP"]) {
+      const v = process.env[key];
+      if (v) env[key] = v;
+    }
+    const proc = Bun.spawnSync([BASH!, "-c", script], { env });
+    const out = proc.stdout.toString();
+    expect(proc.exitCode).toBe(0);
+    // Step 2 really removed the symlinked registration (so the naive path is dead)...
+    expect(out).toContain("LINK_GONE");
+    // ...yet $PACK, bound to the physical clone before Step 2, still reaches the tool.
+    expect(out).toContain("BIN_FOUND");
+    expect(out).not.toContain("BIN_MISSING");
+  }, SPAWN_TIMEOUT_MS);
+});
+
+// -- #49 AC3: a registered COPY running its own uninstall names itself honestly --
+describe("#49 AC3 — a sentinel COPY running its own uninstall is a 'registered copy', not 'the clone'", () => {
+  test("the running copy is left and named a registered copy with rm -rf; separate owned entries still removed", () => {
+    const home = makeHome();
+    const skills = join(home, ".claude", "skills");
+    mkdirSync(skills, { recursive: true });
+    // The Windows install: ~/.claude/skills/zstack is a sentinel-carrying COPY,
+    // and we run THAT copy's own uninstall (so PACK_DIR == the copy).
+    const copy = join(skills, "zstack");
+    mkdirSync(copy, { recursive: true });
+    cpSync(UNINSTALL_PATH, join(copy, "uninstall"));
+    writeFileSync(join(copy, ".zstack-registered"), "Created by zstack ./setup.\n");
+    // A separately-registered per-skill copy that IS ours (and is NOT the running dir).
+    const zsetup = sentinelCopy(skills, "z-setup");
+
+    const result = runUninstall({ home, uninstallPath: join(copy, "uninstall") });
+    expect(result.exitCode).toBe(0);
+    // The running copy is left (we cannot delete the dir we're executing from)...
+    expect(existsSync(copy)).toBe(true);
+    // ...named honestly as a registered copy, NOT "the clone itself"...
+    expect(result.stdout).toContain("registered copy");
+    expect(result.stdout).not.toContain("clone itself");
+    // ...with the exact manual removal command.
+    expect(result.stdout).toContain("rm -rf");
+    // The separately-registered entry we own is still removed.
+    expect(existsSync(zsetup)).toBe(false);
   }, SPAWN_TIMEOUT_MS);
 });
 
@@ -185,9 +286,9 @@ describe("AC3 — ~/.zstack removed only under --purge", () => {
   }, SPAWN_TIMEOUT_MS);
 });
 
-// -- AC5: a second run is a clean no-op --------------------------------------
-describe("AC5 — running twice: the second run removes nothing, exit 0", () => {
-  test("first run removes the install; second run reports nothing to remove", () => {
+// -- AC5 / #49 AC4: a second run's message matches what the docs promise -------
+describe("AC5 / #49 AC4 — running twice: the second run's output matches the docs", () => {
+  test("symlink/copy install: first run removes it; second run reports nothing to remove", () => {
     const home = makeHome();
     const skills = join(home, ".claude", "skills");
     mkdirSync(skills, { recursive: true });
@@ -200,6 +301,30 @@ describe("AC5 — running twice: the second run removes nothing, exit 0", () => 
     const second = runUninstall({ home });
     expect(second.exitCode).toBe(0);
     expect(second.stdout).toContain("Nothing to remove");
+  }, SPAWN_TIMEOUT_MS);
+
+  // #49 AC4: a clone-in-skills install keeps the retained clone every run, so the
+  // second run must NOT print "Nothing to remove" -- it reports the clone left,
+  // exactly as docs/user-guide/z-uninstall.md ("Running it again") now promises.
+  test("clone-in-skills install: second run reports the clone left, not 'Nothing to remove'", () => {
+    const home = makeHome();
+    const skills = join(home, ".claude", "skills");
+    mkdirSync(skills, { recursive: true });
+    const clone = join(skills, "zstack");
+    mkdirSync(clone, { recursive: true });
+    cpSync(UNINSTALL_PATH, join(clone, "uninstall"));
+    writeFileSync(join(clone, "VERSION"), "0.1.0\n"); // no sentinel: a bare clone
+
+    const first = runUninstall({ home, uninstallPath: join(clone, "uninstall") });
+    expect(first.exitCode).toBe(0);
+    expect(existsSync(clone)).toBe(true); // deliberately retained
+
+    const second = runUninstall({ home, uninstallPath: join(clone, "uninstall") });
+    expect(second.exitCode).toBe(0);
+    expect(existsSync(clone)).toBe(true); // still retained
+    expect(second.stdout).toContain("clone itself");
+    expect(second.stdout).toContain("rm -rf");
+    expect(second.stdout).not.toContain("Nothing to remove");
   }, SPAWN_TIMEOUT_MS);
 });
 

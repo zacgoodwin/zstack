@@ -11,7 +11,10 @@ Full skill contract: `z-uninstall/SKILL.md`. The deterministic half is the
 ## When to run it
 
 When you want zstack off this machine, or to undo a specific install. It is safe
-to run more than once — a second run is a clean no-op ("nothing to remove").
+to run more than once: once a symlink or copy install is removed, a second run
+finds nothing to remove. (A clone you installed straight into the skills dir is
+the exception — it is deliberately kept on every run, so each run reports it left
+with the manual `rm -rf`, not "nothing to remove"; see below.)
 
 ## What it removes (and what it deliberately does not)
 
@@ -19,15 +22,17 @@ to run more than once — a second run is a clean no-op ("nothing to remove").
    (`~/.codex/skills`, `~/.factory/skills`, then `~/.claude/skills` last, so the
    command deletes its own registration as its final act), it removes the `zstack`
    pack entry and any `z-*` skill entry **only when it owns them**:
-   - a **symlink** (the macOS/Linux install) — self-evidently ours, and removing
-     the link never touches its target;
+   - a **symlink whose target resolves into the pack** (the macOS/Linux install) —
+     setup only ever links to the pack or a skill dir inside it, so a link that
+     lands there is provably ours; removing the link never touches its target;
    - a **copy carrying the `.zstack-registered` sentinel** (the Windows install) —
      setup drops that marker into every copy so a copy is distinguishable from a
      user's own same-named directory.
 
-   A same-named directory with neither proof is **left in place and named** — the
-   mirror of setup's "already exists as a separate install; skipping" refusal.
-   Neither tool touches a directory it did not create.
+   A same-named directory with neither proof — **or a symlink pointing OUTSIDE the
+   pack** (your own `z-*` link that merely shares the name) — is **left in place
+   and named**, the mirror of setup's "already exists as a separate install;
+   skipping" refusal. Neither tool touches a directory or link it did not create.
 
 2. **The clone itself is never deleted.** If the pack IS the git clone at
    `~/.claude/skills/zstack` (you cloned straight into the skills dir), that clone
@@ -55,10 +60,19 @@ to run more than once — a second run is a clean no-op ("nothing to remove").
    them yourself on github.com if you want them gone), and gstack (a separate
    pack). This is uninstall, not the update flow (#36).
 
-## Second run is a clean no-op
+## Running it again
 
-Running `uninstall` again after everything is gone exits 0 and prints "nothing to
-remove". There is no error, no partial state.
+For a symlink or copy install, the first run removes everything it owns, so a
+second run exits 0 and prints "Nothing to remove -- no zstack registrations
+found". There is no error, no partial state.
+
+The one exception is a clone you installed straight into the skills dir
+(`~/.claude/skills/zstack` **is** the git clone). That clone is deliberately never
+deleted — it may be your only copy — so every run, the second included, reports it
+left in place and prints the exact `rm -rf` command for you to run by hand. That
+is expected, not an error: "Nothing to remove" prints only once there is
+genuinely nothing left that we own, and a retained clone is something we
+deliberately keep, not something we failed to remove.
 
 ## Done when
 
