@@ -123,7 +123,7 @@ What it **asks** — exactly two questions:
 | **`/z-plan [spec]`** | Turn a spec into milestones + board-ready tickets: grounded plans, `### Acceptance Criteria`, Model/Effort, a reproducible dollar Estimate, dependencies linked both ways. Idempotent by title slug. No arg → newest gstack CEO plan for the repo. | `--dry-run` emits tickets to stdout with zero board writes (what `evals/planner/` grades). |
 | **`/z-loop`** | Drain the Ready batch: plan → build → QA → adversarial review → merge in dependency order, then end-of-loop regression + deploy (green) or bug-filing (red), report, exit. No daemon. | `--reconcile` clears a crashed run's locks/worktrees, parks its tickets back to Ready, then starts. Never clears a live loop's lock. |
 | **`/z-status`** | Read-only dashboard: status counts, Questions/Blocked waiting on you, in-flight lanes with age, last loop's verdict, Estimate vs Actual totals. | — |
-| **`/z-uninstall`** | Reverse `./setup`: remove the host registrations it owns (a symlink, or a copy carrying `.zstack-registered`), leaving any dir it did not create; strip `/z-setup`'s auto-approval settings when present. Confirms first; the GitHub board is remote and untouched. | `--purge` also deletes `~/.zstack` (config, loop state, locks, reports). |
+| **`/z-uninstall`** | Reverse `./setup`: remove the host registrations it owns (a symlink into the pack, or a copy carrying `.zstack-registered`), leaving any dir — or a symlink pointing outside the pack — it did not create; strip `/z-setup`'s auto-approval settings when present. Confirms first; the GitHub board is remote and untouched. | `--purge` also deletes `~/.zstack` (config, loop state, locks, reports). |
 
 Tunables live in `~/.zstack/projects/<slug>/config.json`: `maxLanes` (default 3
 concurrent lanes), `watchdogMinutes` (default 10, stuck-worker timeout),
@@ -233,10 +233,11 @@ Two lanes, per `docs/user-guide/spec/PRINCIPLES.md`:
 
 Run `/z-uninstall` (or the `uninstall` script at the pack root directly). It
 reverses `./setup`, honoring the same ownership rule: it removes only the host
-registrations it can prove it created — a symlink, or a copy carrying the
-`.zstack-registered` sentinel — and leaves any same-named directory it did not
-create, naming it. If the pack IS the git clone at `~/.claude/skills/zstack`, it
-leaves the clone (it may be your only copy) and prints the exact `rm -rf` command.
+registrations it can prove it created — a symlink whose target resolves into the
+pack, or a copy carrying the `.zstack-registered` sentinel — and leaves any
+same-named directory (or a symlink pointing outside the pack) it did not create,
+naming it. If the pack IS the git clone at `~/.claude/skills/zstack`, it leaves
+the clone (it may be your only copy) and prints the exact `rm -rf` command.
 
 ```bash
 "$HOME/.claude/skills/zstack/uninstall"           # remove registrations, keep ~/.zstack

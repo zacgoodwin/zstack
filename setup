@@ -53,8 +53,15 @@ esac
 MARKER=".zstack-registered"
 
 _owned() {
-  # $1 is ours to replace when it's a symlink or carries our sentinel.
-  [ -L "$1" ] || [ -f "$1/$MARKER" ]
+  # $1 is ours to replace when it's a symlink resolving INTO this pack, or a dir
+  # carrying our sentinel. A user's own z-* symlink pointing ELSEWHERE is not ours
+  # -- treating it as ours would let `ln -snf` below hijack their registration.
+  # Mirrors uninstall's remove_entry ownership check (kept in sync).
+  if [ -L "$1" ]; then
+    local t; t="$(readlink -f "$1" 2>/dev/null || true)"
+    case "$t" in "$PACK_DIR"|"$PACK_DIR"/*) return 0 ;; *) return 1 ;; esac
+  fi
+  [ -f "$1/$MARKER" ]
 }
 
 _link_or_copy() {

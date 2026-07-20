@@ -6,7 +6,8 @@
 // unasserted). Scenarios launch concurrently at module load to stay inside
 // the gate budget on Windows (~1s per bash spawn).
 import { test, expect, describe, afterAll } from "bun:test";
-import { rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { rmSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { makeEnv, makePack, runSetup } from "./helpers/setup-harness.ts";
 
@@ -14,6 +15,22 @@ const roots: string[] = [];
 afterAll(() => {
   while (roots.length) rmSync(roots.pop()!, { recursive: true, force: true });
 });
+
+// Can this platform create symlinks without elevation? (Windows without
+// Developer Mode throws EPERM.) Gates the symlink-ownership scenario, exactly
+// like the symlink cases in tests/uninstall.test.ts.
+function canSymlink(): boolean {
+  const probe = mkdtempSync(join(tmpdir(), "zstack-setup-symprobe-"));
+  roots.push(probe);
+  try {
+    writeFileSync(join(probe, "t"), "x");
+    symlinkSync(join(probe, "t"), join(probe, "l"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+const CAN_SYMLINK = canSymlink();
 
 // Scenario D1: skills/zstack holds a SEPARATE real clone (.git dir). That
 // checkout owns the host — every SKILL.md resolves PACK to this path, so
@@ -109,6 +126,26 @@ const scenarioE = (async () => {
   return { env, run };
 })();
 
+// Scenario F (#49): skills/z-alpha is the USER's OWN symlink pointing OUTSIDE the
+// pack (their own skill that merely shares the name). Pre-#49 `_owned` treated ANY
+// symlink as ours, so `ln -snf` hijacked their registration to point at our skill.
+// The tightened rule: a symlink is ours only when it resolves INTO the pack; a
+// foreign symlink is left and its target untouched. POSIX-gated (symlink creation
+// needs privilege on Windows).
+const scenarioF = CAN_SYMLINK ? (async () => {
+  const env = makeEnv(roots, "zstack-setup-edge-");
+  const packDir = join(env.root, "elsewhere", "zstack");
+  makePack(packDir, ["z-alpha"]);
+  const theirs = join(env.root, "their-skills", "z-alpha");
+  mkdirSync(theirs, { recursive: true });
+  writeFileSync(join(theirs, "SKILL.md"), "---\nname: z-alpha\n---\ntheirs\n");
+  writeFileSync(join(theirs, "keep.md"), "their own work\n");
+  const link = join(env.skills, "z-alpha");
+  symlinkSync(theirs, link);
+  const run = await runSetup(packDir, env);
+  return { env, theirs, link, run };
+})() : null;
+
 describe("setup register edge branches", () => {
   test("a separate clone (.git dir) refuses the host, exits non-zero, and skips Codex/Factory too", async () => {
     const { env, separate, run } = await scenarioD1;
@@ -162,6 +199,18 @@ describe("setup register edge branches", () => {
     expect(run.stderr).toContain("not registered by zstack setup");
     expect(readFileSync(join(foreign, "my-notes.md"), "utf8")).toContain("uncommitted notes");
     expect(existsSync(join(foreign, ".git"))).toBe(true);
+  });
+
+  test.skipIf(!CAN_SYMLINK)("a user's own z-alpha symlink pointing outside the pack is left, not hijacked", async () => {
+    const { theirs, link, run } = (await scenarioF)!;
+    expect(run.code).toBe(0);
+    expect(run.stderr).toContain("not registered by zstack setup");
+    // Their symlink is left, still pointing at THEIR dir (not re-pointed into the pack).
+    expect(existsSync(link)).toBe(true);
+    expect(readFileSync(join(theirs, "keep.md"), "utf8")).toContain("their own work");
+    // Reading through the link resolves to their SKILL.md ("theirs"), proving the
+    // registration was not hijacked to the pack's synthetic z-alpha.
+    expect(readFileSync(join(link, "SKILL.md"), "utf8")).toContain("theirs");
   });
 
   test("z-* dir without SKILL.md is skipped; Windows copy filters all baggage", async () => {

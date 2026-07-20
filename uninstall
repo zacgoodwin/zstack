@@ -2,11 +2,14 @@
 # zstack uninstall: reverse what ./setup created, honoring the SAME ownership
 # rule setup uses -- never remove anything we cannot prove we created.
 #
-#   owned    := a symlink under one of our managed names (self-evidently ours; it
-#               points into the pack), OR a directory carrying the
-#               .zstack-registered sentinel setup drops into every COPIED
-#               registration (the Windows install path).
-#   not-ours := a same-named directory with neither -> left untouched, and named.
+#   owned    := a symlink under one of our managed names WHOSE TARGET resolves
+#               into this pack (setup only ever links to PACK_DIR or a skill dir
+#               within it), OR a directory carrying the .zstack-registered
+#               sentinel setup drops into every COPIED registration (the Windows
+#               install path).
+#   not-ours := a same-named directory with neither, OR a same-named symlink whose
+#               target points OUTSIDE the pack (a user's own z-* link) -> left
+#               untouched, and named.
 #
 # Removes the "zstack" pack registration (and, defensively, any separately
 # registered z-* skill entry) from each host skills dir that exists. When a
@@ -62,12 +65,27 @@ remove_entry() {
     return 0
   fi
 
-  # A symlink under our managed name is ours; removing the link never touches its
-  # target (which may be the pack itself). Checked before -d, which follows links.
+  # A symlink under our managed name is ours ONLY when it resolves INTO this pack
+  # (setup only ever links to PACK_DIR or a skill dir within it). A user's own
+  # symlink named z-* that points elsewhere is NOT ours -- removing it would break
+  # their link, so leave-and-name it like an un-sentineled dir. `readlink -f`
+  # canonicalizes even a dangling link, so a stale link of ours is still cleaned;
+  # an unresolved/foreign target (empty or outside) is left. Removing the link
+  # itself never touches its target. Checked before -d, which follows links.
   if [ -L "$path" ]; then
-    rm -f "$path"
-    echo "  removed $path (symlink)"
-    removed=$((removed + 1))
+    local target_real
+    target_real="$(readlink -f "$path" 2>/dev/null || true)"
+    case "$target_real" in
+      "$PACK_DIR"|"$PACK_DIR"/*)
+        rm -f "$path"
+        echo "  removed $path (symlink into the pack)"
+        removed=$((removed + 1))
+        ;;
+      *)
+        echo "  left $path -- symlink to ${target_real:-an unresolved target} outside the zstack pack; not created by zstack, left untouched."
+        left=$((left + 1))
+        ;;
+    esac
     return 0
   fi
 
@@ -75,16 +93,27 @@ remove_entry() {
     local real
     real="$(cd "$path" && pwd -P)"
 
-    # (a) The running clone itself (parent-match): never delete -- it may be the
-    #     only copy. Leave it, remember it, print the exact rm -rf at the end.
+    # (a) The dir we're running from (parent-match): we cannot delete the pack out
+    #     from under the running script. The message splits on the sentinel:
+    #       - a sentinel-carrying COPY (a Windows registration executing its own
+    #         uninstall) IS provably ours, but it has a source elsewhere -- name it
+    #         honestly as a registered copy and print the manual removal command,
+    #         NOT the "may be your only copy" clone warning (that source is safe).
+    #       - a bare clone with no sentinel may be your ONLY copy -- warn, remember
+    #         it, print the exact rm -rf in the closing summary.
     if [ "$real" = "$PACK_DIR" ]; then
-      echo "  left $path -- this is the zstack clone itself (may be your only copy); not deleted."
-      clone_left+=("$path")
+      if [ -f "$path/$SENTINEL" ]; then
+        echo "  left $path -- this is the running zstack registered copy; the source it was copied from owns the install. Remove this copy from there, or by hand:"
+        echo "    rm -rf \"$path\""
+      else
+        echo "  left $path -- this is the zstack clone itself (may be your only copy); not deleted."
+        clone_left+=("$path")
+      fi
       left=$((left + 1))
       return 0
     fi
 
-    # (b) A copy carrying our sentinel is ours.
+    # (b) A copy carrying our sentinel (and NOT the running dir) is ours to remove.
     if [ -f "$path/$SENTINEL" ]; then
       rm -rf "$path"
       echo "  removed $path (zstack-created copy)"
