@@ -123,6 +123,106 @@ describe("format-drift canary (AC4)", () => {
   });
 });
 
+// -- synthetic transcript entries (ticket #30) --------------------------------
+//
+// Hit live during a /z-loop drain: Claude Code itself writes an inline
+// synthetic assistant entry with `"model": "<synthetic>"` whenever an API
+// call fails transiently mid-session (isApiErrorMessage:true, apiErrorStatus
+// 429/500/529 -- rate limit or server error). Confirmed against 11/11 real
+// "<synthetic>" occurrences in ~/.claude/projects/ transcripts. It has a
+// full, validly-shaped usage object (that's why it reached resolveRate at
+// all instead of being filtered out by parseLine's assistant+usage check)
+// but carries nothing billable -- z-cost must skip it before the rate lookup
+// and count the skip, rather than raising the fail-loud unknown-model ZError
+// every OTHER unrecognized model string still must raise.
+describe("synthetic transcript entries are skipped, not priced (ticket #30)", () => {
+  const ZERO_USAGE = {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+  };
+  const syntheticLine = (requestId: string) =>
+    JSON.stringify({
+      type: "assistant",
+      requestId,
+      message: { model: "<synthetic>", role: "assistant", usage: ZERO_USAGE },
+    });
+  const realLine = (requestId: string, model: string) =>
+    JSON.stringify({
+      type: "assistant",
+      requestId,
+      message: {
+        model,
+        usage: { input_tokens: 100, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      },
+    });
+
+  test("AC1: mixed transcript prices the real entries and reports skippedSynthetic", () => {
+    // Real fixture (hand-computed total $0.09, 3 requests -- see AC3 above)
+    // plus one synthetic line appended: the total and request count must be
+    // unaffected, with exactly one skip counted.
+    const content = readFileSync(FIXTURE, "utf8").replace(/\n$/, "") + "\n" + syntheticLine("req_SYN") + "\n";
+    const file = tmpFile(content);
+    const result = costOfFiles([file], RATES);
+    expect(result.total).toBe(0.09); // unchanged from the real-only fixture
+    expect(result.requests).toBe(3); // synthetic entry does not count as a request
+    expect(result.skippedSynthetic).toBe(1);
+  });
+
+  test("AC2: an all-synthetic transcript yields total 0 with skippedSynthetic set, no unknown-model error", () => {
+    const content = [syntheticLine("req_SYN1"), syntheticLine("req_SYN2"), syntheticLine("req_SYN3")].join("\n") + "\n";
+    const file = tmpFile(content);
+    const result = costOfFiles([file], RATES);
+    expect(result.total).toBe(0);
+    expect(result.requests).toBe(0);
+    expect(result.by_model).toEqual([]);
+    expect(result.skippedSynthetic).toBe(3); // one per line, not deduped
+  });
+
+  test("AC3: a genuinely unknown model string still raises the fail-loud ZError", () => {
+    const file = tmpFile(realLine("req_UNKNOWN", "gpt-oss") + "\n");
+    expect(() => costOfFiles([file], RATES)).toThrow(ZError);
+    expect(() => costOfFiles([file], RATES)).toThrow(/No rate for model "gpt-oss"/);
+  });
+
+  test("--json surfaces skippedSynthetic for consumers (z-loop's Actual field-set)", async () => {
+    const content = readFileSync(FIXTURE, "utf8").replace(/\n$/, "") + "\n" + syntheticLine("req_SYN") + "\n";
+    const file = tmpFile(content);
+    const pattern = join(file, "..", "*.jsonl").replaceAll("\\", "/");
+    const ratesFile = tmpFile(JSON.stringify(RATES), "rates.json");
+
+    const logs: string[] = [];
+    const orig = console.log;
+    console.log = (...a: unknown[]) => void logs.push(a.join(" "));
+    let code: number;
+    try {
+      code = await main(["--json", pattern, "--rates", ratesFile]);
+    } finally {
+      console.log = orig;
+    }
+    expect(code).toBe(0);
+    const obj = JSON.parse(logs.join("\n"));
+    expect(obj.total).toBe(0.09);
+    expect(obj.skippedSynthetic).toBe(1);
+  });
+
+  test("human summary line surfaces the skip count when nonzero", async () => {
+    const file = tmpFile(syntheticLine("req_SYN") + "\n");
+    const logs: string[] = [];
+    const orig = console.log;
+    console.log = (...a: unknown[]) => void logs.push(a.join(" "));
+    let code: number;
+    try {
+      code = await main([file]);
+    } finally {
+      console.log = orig;
+    }
+    expect(code).toBe(0);
+    expect(logs.join("\n")).toMatch(/1 synthetic skipped/);
+  });
+});
+
 // -- glob expansion (native Bun.Glob, no new dependency) ---------------------
 describe("expandGlob", () => {
   test("matches jsonl files under a directory and returns readable paths", () => {
