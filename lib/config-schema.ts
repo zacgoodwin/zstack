@@ -171,6 +171,18 @@ export function validateConfig(cfg: unknown): BoardConfig {
       `Config "reviewerBelowThresholdAction" must be "block", "retry", or "off", got ${JSON.stringify(c.reviewerBelowThresholdAction)}.`
     );
   }
+  // maxReviewBounces (issue #76): the reviewer->builder bounce cap. A count of
+  // bounces, so -- unlike requirePositiveNumber's knobs -- a fraction is
+  // meaningless too; same integer + floor shape as auditEveryNLoops above, not
+  // requirePositiveNumber (which would silently accept e.g. 2.5).
+  if (
+    c.maxReviewBounces !== undefined &&
+    (typeof c.maxReviewBounces !== "number" || !Number.isInteger(c.maxReviewBounces) || c.maxReviewBounces < 1)
+  ) {
+    throw new ZError(
+      `Config "maxReviewBounces" must be a positive integer (>= 1), got ${JSON.stringify(c.maxReviewBounces)}.`
+    );
+  }
   if (c.quota !== undefined) {
     if (typeof c.quota !== "object" || c.quota === null) {
       throw new ZError(`Config "quota" must be an object.`);

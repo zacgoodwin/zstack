@@ -73,7 +73,7 @@ function ticket(number: number, status: TicketSnapshot["status"], dependsOn: num
   return { number, title: `Ticket ${number}`, status, dependsOn, model: "sonnet" };
 }
 function lane(ticketNumber: number, stage: Stage, over: Partial<LaneState> = {}): LaneState {
-  return { ticket: ticketNumber, stage, lastActivityMs: 0, qaBounces: 0, ...over };
+  return { ticket: ticketNumber, stage, lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, ...over };
 }
 function state(tickets: TicketSnapshot[], lanes: LaneState[] = [], maxLanes = 3): LoopState {
   return { tickets, lanes, maxLanes, watchdogMinutes: 10, mergedThisRun: [] };

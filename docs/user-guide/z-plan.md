@@ -97,24 +97,37 @@ board writes rather than silently skipping.
    authored before any code), `## Tests + evals`, `## Docs pages touched`,
    `## Out of scope`, and an optional `Depends on:` line. Every body must pass
    `bin/z-ticket-lint` before it hits the board.
-4. **Splits oversized tickets.** A ticket needing more than a 400K-token context
+4. **Plan-time edges comment.** Once the body passes the lint gate, chosen
+   defaults, spec-ambiguous calls, and data-loss-ish behaviors the PLAN itself
+   introduces are collected as `{check, doStep, expect}` edges and, when
+   non-empty, rendered by `planEdgesComment` (`lib/stage-prompts.ts`, reusing
+   completion-note's `CompletionEdge` shape) and posted as a `## Needs input —`
+   comment at the bottom of the plan. Informational only — the ticket stays
+   wherever it already is; an empty edge list posts no comment.
+5. **Splits oversized tickets.** A ticket needing more than a 400K-token context
    is broken into ordered subtasks (the `needsSplit` gate), with the order
    recorded in the parent.
-5. **Fields and a reproducible Estimate.** Model + Model Effort per the
+6. **Fields and a reproducible Estimate.** Model + Model Effort per the
    ESTIMATION.md rules of thumb (when in doubt, tier up — rework is expensive).
    The tier selects a fixed bucket entry that `bin/z-estimate` prices, so the same
    spec always yields the same dollar figure. No arithmetic in prose.
-6. **Dependencies both directions.** Finds or creates each dependency, links
+7. **Dependencies both directions.** Finds or creates each dependency, links
    "N Depends on #M" and "M Blocks #N", and pulls the next-to-analyze dependents
    into Ready.
-7. **Questions to a human.** A genuine ambiguity (Confusion Protocol bar) is
-   commented on the ticket and the ticket moved to Questions — never guessed into
-   the plan.
-8. **Backlog scan, with two split gates.** Every ticket already in Backlog gets
+8. **Questions to a human, and a fold-in gate.** A genuine ambiguity (Confusion
+   Protocol bar) is commented on the ticket and the ticket moved to Questions —
+   never guessed into the plan. Whenever this skill touches a ticket that may
+   already carry human comments (a re-plan below, or the Backlog scan), it also
+   folds in the newest comment authored by someone other than its own session
+   login and rebuilds the plan if that comment changed it; a comment raising a
+   NEW question the plan doesn't already answer is posted as `## Needs input —`
+   and the ticket moves to Questions, same as any other open question
+   (PROCESS.md step 6).
+9. **Backlog scan, with two split gates.** Every ticket already in Backlog gets
    the same lint gate and the same fields (Model/Model Effort/Estimate) a
    Ready ticket gets — without being promoted. A ticket that already passes
    and is already fielded gets zero writes (idempotent). A genuine ambiguity
-   still goes to Questions, same as step 7. When a scan drafts a fresh body
+   still goes to Questions, same as step 8. When a scan drafts a fresh body
    (the ticket didn't already pass lint), it's checked against BOTH split
    gates before filing: `needsSplit` (context, same as item 4 above) and
    `shouldSplitForCost` (`lib/ticket-schema.ts`) — splitting only when a
@@ -126,7 +139,7 @@ board writes rather than silently skipping.
    auto-closed, moved, or promoted. Runs as the final step of every spec run,
    alone via `/z-plan --backlog`, or scoped to one ticket via
    `/z-plan --ticket <N>`.
-9. **Cost-saving suggestions.** A terminal, batch-specific report for the human
+10. **Cost-saving suggestions.** A terminal, batch-specific report for the human
    running `/z-plan` — the ticket numbers, real dollar figures, and shared files
    from *this run's own batch* (every ticket this run filed, updated, or drafted
    a body for in the Backlog scan, excluding tickets the scan left untouched or

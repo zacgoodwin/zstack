@@ -28,6 +28,13 @@ records the result. It never re-derives a scheduling decision in prose.
   pure prompt constructor (`lib/stage-prompts.ts`). Nothing latent travels between
   stages; the reviewer is blinded to exactly the ticket, its acceptance criteria,
   the diff, and a throwaway worktree.
+- **Planning-pass fold-in gate (PROCESS.md step 6).** Before a Ready ticket can
+  reach Step 2's batch commit, the planning pass reads its comments and folds
+  in the newest one from anyone other than the loop's own session login. If
+  that comment raises a new question the plan doesn't already answer, the
+  ticket never enters the batch: it's posted back as a `## Needs input —`
+  comment and parked in Questions instead — the same don't-start mechanism
+  as any other open question, never a silent guess into the plan.
 - **Bounded orchestrator context.** The orchestrator holds no ticket context. Each
   stage's payload (body, diff) is assembled off-context into `input-<N>.json` and
   the printed prompt is a *pointer* to that file — small and payload-independent —
@@ -53,6 +60,14 @@ records the result. It never re-derives a scheduling decision in prose.
   (`retry`), or is ignored entirely (`off`). A `REVIEW-APPROVE` with no
   parseable confidence is treated the same as a sub-floor score — fail-closed,
   never a silent merge — whenever the gate is on.
+- **Reviewer->builder bounces are capped.** A `REVIEW-FINDINGS` and a
+  `reviewerBelowThresholdAction: "retry"` both send the ticket back to the
+  builder from Review, and both draw on the same per-lane budget: at config
+  `maxReviewBounces` (default 2), the ticket parks Blocked with
+  `review bounce cap reached (N/N)` instead of bouncing again — the same
+  no-token-burn discipline as the QA-bounce cap below, closing the one retry
+  path (issue #62) that could otherwise loop builder->QA->review forever on a
+  ticket the reviewer never gets confident about (issue #76).
 - **Dependency-ordered, capped concurrency.** A dependent is not claimable until
   its dependencies are Done; at most `maxLanes` (default 3) lanes run at once;
   merges happen one at a time in topological order (stacked chains retarget the

@@ -75,11 +75,11 @@ mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports" 
 4. Read the loop knobs from config (defaults 3 lanes / 10 minutes / audits
    every 5th loop / 3 QA passes before Blocked / investigate from QA bounce 2 /
    human-needed at 30% parked / reviewer-confidence floor 70, block a
-   sub-floor approve):
+   sub-floor approve / 2 reviewer->builder bounces before Blocked):
 
 ```bash
-read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMAN_NEEDED_PERCENT MIN_REVIEWER_CONFIDENCE REVIEWER_BELOW_ACTION <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
-  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.humanNeededPercent, c.minReviewerConfidence, c.reviewerBelowThresholdAction)")"
+read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMAN_NEEDED_PERCENT MIN_REVIEWER_CONFIDENCE REVIEWER_BELOW_ACTION MAX_REVIEW_BOUNCES <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
+  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.humanNeededPercent, c.minReviewerConfidence, c.reviewerBelowThresholdAction, c.maxReviewBounces)")"
 ```
 
 5. **Startup orphan scan (C7).** A crashed prior loop leaves lane locks in
@@ -110,22 +110,35 @@ otherwise.
 
 ---
 
-## Step 1 — Planning pass (PROCESS.md steps 1–4)
+## Step 1 — Planning pass (PROCESS.md steps 1–4, 6)
 
 For every ticket in Ready (`"$Z_BOARD" list --status Ready --json --slug "$SLUG"`):
 
 1. Fetch the body: `gh issue view <N> --json body -q .body > "$TMP/body-<N>.md"`.
-2. **Gate it:** `"$Z_LINT" "$TMP/body-<N>.md"`. On failure the plan is missing
+2. **Fold-in gate (PROCESS.md step 6) — before this ticket can reach Step 2's
+   batch commit.** Read its comments and find the newest one authored by
+   someone other than `$ME` (the board's known bot/session login — the only
+   distinction this gate draws; no further human-vs-bot detection):
+   `gh issue view <N> --json comments -q '.comments' > "$TMP/comments-<N>.json"`.
+   If that comment postdates whatever plan is already on the ticket, fold in
+   its suggestion and rebuild the plan (step 3 below) if it changed. **If it
+   raises a NEW question the plan doesn't already answer, do not start:** post
+   it as a `## Needs input —` comment (`"$Z_BOARD" comment <N> --body-file
+   needs-input.md`), `"$Z_BOARD" move <N> Questions`, and skip the rest of this
+   loop's steps for this ticket — it never reaches Step 2's batch commit. A
+   ticket with no comments newer than its own plan skips this gate with no
+   writes.
+3. **Gate it:** `"$Z_LINT" "$TMP/body-<N>.md"`. On failure the plan is missing
    or invalid: ground yourself in the actual code (open the files the ticket
    touches), draft the body to the C5 schema (z-plan/SKILL.md Step 4 — Context,
    Plan with real file refs, `### Acceptance Criteria` as setup → action →
    expected outcome, Tests + evals, Docs pages touched, Out of scope), update
    the body with `gh issue edit <N> --body-file ...`, re-run the gate, and
    comment that the loop's planning pass added the plan.
-3. **Human needed?** A genuine ambiguity, contradiction, or missing decision
+4. **Human needed?** A genuine ambiguity, contradiction, or missing decision
    (Confusion Protocol bar): `"$Z_BOARD" comment <N> --body-file question.md`
    then `"$Z_BOARD" move <N> Questions`. Never guess it into the plan.
-4. **Estimate absent?** `"$Z_BOARD" field-get <N> Estimate` empty → set Model +
+5. **Estimate absent?** `"$Z_BOARD" field-get <N> Estimate` empty → set Model +
    Model Effort if missing (ESTIMATION.md rules of thumb), then the z-plan
    Step 6 tier chain: copy the `<model>-<effort>` tier verbatim from
    `$PACK/z-plan/tiers.json` into a buckets file, `"$Z_ESTIMATE"` it, and
@@ -161,7 +174,8 @@ bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" \
   --max-lanes "$MAX_LANES" --watchdog-minutes "$WATCHDOG" \
   --max-qa-passes "$MAX_QA_PASSES" --qa-investigate-after "$QA_INVESTIGATE_AFTER" \
   --human-needed-percent "$HUMAN_NEEDED_PERCENT" \
-  --min-reviewer-confidence "$MIN_REVIEWER_CONFIDENCE" --reviewer-below-threshold-action "$REVIEWER_BELOW_ACTION"
+  --min-reviewer-confidence "$MIN_REVIEWER_CONFIDENCE" --reviewer-below-threshold-action "$REVIEWER_BELOW_ACTION" \
+  --max-review-bounces "$MAX_REVIEW_BOUNCES"
 ```
 
 This is the ONE ingest call that captures `initialReadyCount` for the batch --

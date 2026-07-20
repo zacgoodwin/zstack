@@ -81,7 +81,9 @@ export function happyOutcome(stage: Stage, ticket: number): string {
 // LaneState's full key set. Anything outside this -- especially a conversation /
 // session / context id -- would mean latent state travels between stages, which
 // the "one fresh agent per stage" rule forbids (PROCESS.md, issue #3 AC).
-const ALLOWED_LANE_KEYS = new Set(["ticket", "stage", "lastActivityMs", "qaBounces", "workerDead", "outcome"]);
+// `reviewBounces` (issue #76) mirrors `qaBounces`: a scheduling counter, not a
+// carried conversation.
+const ALLOWED_LANE_KEYS = new Set(["ticket", "stage", "lastActivityMs", "qaBounces", "reviewBounces", "workerDead", "outcome"]);
 const FORBIDDEN_LANE_KEY = /conversation|session|context|thread|agent.?id|history|transcript/i;
 
 export interface SimTrace {
