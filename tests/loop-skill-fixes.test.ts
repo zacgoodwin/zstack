@@ -96,6 +96,18 @@ describe("H17: counter peek at start, bump after the report", () => {
 });
 
 // ============================================================================
+// issue #82 -- per-stage model routing: the spawn step resolves through
+// lib/loop.ts stage-model, not a literal "the ticket's Model field" read
+// ============================================================================
+describe("issue #82: Step 4's spawn resolves model via stage-model, not the ticket's Model field verbatim", () => {
+  test("the SKILL invokes the stage-model resolver before spawning", () => {
+    const md = zLoop();
+    expect(md).toContain('lib/loop.ts" stage-model');
+    expect(md).not.toContain("`model` = the ticket's Model field");
+  });
+});
+
+// ============================================================================
 // M22 -- red-path bug filing moves the NEW bug, not the drained ticket
 // ============================================================================
 describe("M22: red-path parses the created bug number", () => {

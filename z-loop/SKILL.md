@@ -288,10 +288,22 @@ the input file, never through your context; ticket #57, Leak 1):
    extra flags (`--adversarial-mode`, `--labels`) — see its row below; they decide
    the super-truth fan-out and NEVER become input keys.
 3. Spawn a FRESH harness Agent (Agent tool), `run_in_background: true`, with
-   that prompt and `model` = the ticket's Model field
-   (`"$Z_BOARD" field-get <N> Model`; the Model Effort field selected the
-   estimate tier — the Agent call has no per-spawn effort knob, a known
-   ceiling).
+   that prompt and `model` resolved through the per-stage router (issue #82:
+   the merge stage is mechanical — a PR create, a conflict check, a PR merge —
+   and never needs the ticket's build-tier model, a direct, zero-quality-risk
+   cost cut):
+
+   ```bash
+   TICKET_MODEL=$("$Z_BOARD" field-get <N> Model)
+   MODEL=$(bun "$PACK/lib/loop.ts" stage-model <stage> "$TICKET_MODEL" --slug "$SLUG")
+   ```
+
+   Pass `$MODEL` as the Agent spawn's `model` param — never the raw
+   `TICKET_MODEL` directly. `stage-model` reads the project's `stageModels`
+   config (`lib/loop.ts resolveStageModel`): absent entirely, only `merge`
+   downshifts to `haiku`; present (even `{}`), used exactly as configured, no
+   default layered on. The Model Effort field selected the estimate tier —
+   the Agent call has no per-spawn effort knob, a known ceiling.
 
 | Stage | Input JSON fields |
 |---|---|
