@@ -57,28 +57,68 @@ export ZSTACK_SLUG="$SLUG"   # H13: so any z-board call that omits --slug still
 
 ---
 
-## Step 1 — Resolve the input spec(s), and the `--backlog` / `--dry-run` flags
+## Step 1 — Resolve the input spec(s), and the `--backlog` / `--ticket` / `--dry-run` flags
 
-Two flags are recognized ahead of any spec path arguments; parse them first
+Three flags are recognized ahead of any spec path arguments; parse them first
 and collect every remaining non-flag argument into an ordered list,
-first-is-primary (below):
+first-is-primary (below). `--ticket` takes a value (the issue number), so it
+consumes the next argument rather than standing alone like the other two:
 
 ```bash
 BACKLOG_ONLY=""
+TICKET_ONLY=""
 DRY_RUN=""
 SPECS=()
+WANT_TICKET=""
 for arg in "$@"; do
+  if [ -n "$WANT_TICKET" ]; then
+    TICKET_ONLY="$arg"
+    WANT_TICKET=""
+    continue
+  fi
   case "$arg" in
     --backlog) BACKLOG_ONLY=1 ;;
+    --ticket) WANT_TICKET=1 ;;
     --dry-run) DRY_RUN=1 ;;
     *) SPECS+=("$arg") ;;
   esac
 done
+[ -z "$WANT_TICKET" ] || { echo "z-plan: --ticket requires a value (the issue number)." >&2; exit 1; }
 ```
 
-**When `--backlog` is set:** skip straight to Step 10 — no spec resolution, and
-no "No spec file found" failure (AC4). Steps 2–9 do not run; `--dry-run` still
-applies (Dry-run / eval mode below).
+**When `--backlog` or `--ticket <N>` is set:** skip straight to Step 10 — no
+spec resolution, and no "No spec file found" failure (AC4). Steps 2–9 do not
+run; `--dry-run` still applies (Dry-run / eval mode below).
+
+**`--ticket <N>` (issue #78)** is the single-ticket form of `--backlog`'s
+scoping: it implies the same bypass above, but scopes Step 10's loop to
+exactly ticket `N` instead of the whole Backlog list — every other Step 10
+behavior (the lint gate, the fields, the split gates, the idempotent
+zero-write rerun, never promoting to Ready) is identical between the two
+forms. `--backlog` with no `--ticket` still scans the whole Backlog list, any
+status. To find `N`, fetch the whole board once — no `--status` filter, since
+`N` can be sitting in any status — and select the entry whose number equals
+`N`.
+
+Zero matches (no ticket `N` on the board) or a `Status` of `Done` are both
+errors, not a silent skip: fail loud naming `N` and exit 1 with no board
+writes ("z-plan: no ticket #N found on the board." / "z-plan: ticket #N is
+Done; nothing to plan." — Step 10 never re-plans a Done ticket). Any other
+status runs Step 10 exactly as written, scoped to that one item instead of
+the Backlog list (Step 10's own list step below shows the branch):
+
+```bash
+if [ -n "$TICKET_ONLY" ]; then
+  TICKET_MATCH_JSON=$("$Z_BOARD" list --json --slug "$SLUG" | bun -e '
+    const items = JSON.parse(require("fs").readFileSync(0, "utf8"));
+    const n = Number(process.argv[1]);
+    const m = items.filter((i) => i.number === n);
+    if (m.length === 0) { console.error(`z-plan: no ticket #${n} found on the board.`); process.exit(1); }
+    if (m[0].fields.Status === "Done") { console.error(`z-plan: ticket #${n} is Done; nothing to plan.`); process.exit(1); }
+    console.log(JSON.stringify(m));
+  ' "$TICKET_ONLY") || exit 1
+fi
+```
 
 **Otherwise**, resolve the spec(s):
 
@@ -377,11 +417,19 @@ human hand-promotes them. This step closes that gap: every ticket already in
 Backlog gets the same schema gate and fields a Ready ticket gets, without being
 promoted. It runs as the final step of a normal spec run (right after Step 9)
 and it also runs alone via `/z-plan --backlog` (Step 1's flag parsing — no spec
-file needed either way, AC4).
+file needed either way, AC4), or scoped to one ticket via `/z-plan --ticket <N>`
+(issue #78, Step 1).
 
 ```bash
 TMP="$HOME/.zstack/projects/$SLUG/z-plan/tmp"; mkdir -p "$TMP"
-"$Z_BOARD" list --status Backlog --json --slug "$SLUG" > "$TMP/backlog.json"
+if [ -n "$TICKET_ONLY" ]; then
+  # --ticket <N>: this scan is scoped to exactly the one ticket Step 1 already
+  # found and validated (exists, not Done) -- no other Backlog ticket is read
+  # or written this run.
+  echo "$TICKET_MATCH_JSON" > "$TMP/backlog.json"   # the single-element array Step 1 built
+else
+  "$Z_BOARD" list --status Backlog --json --slug "$SLUG" > "$TMP/backlog.json"
+fi
 ```
 
 For each ticket number `<N>` in that list:
@@ -398,18 +446,46 @@ For each ticket number `<N>` in that list:
      `"$Z_BOARD" move <N> Questions --slug "$SLUG"`. Do not draft a body. This
      is the ONE case in this step that moves a Backlog ticket off Backlog.
    - **Otherwise**, ground in the actual code this ticket's ask touches (Step 2
-     applies here too — no file ref you have not opened), draft the body to
-     the Step 4 schema, update it with `gh issue edit <N> --body-file ...`,
-     re-run `"$Z_LINT"` on the rewritten body to confirm it now passes, and
-     comment that the scan added the plan
-     (`"$Z_BOARD" comment <N> --body-file note.md --slug "$SLUG"`; one line:
-     the scan added the plan above, the ticket is still in Backlog for a human
-     to promote).
+     applies here too — no file ref you have not opened) and draft the body to
+     the Step 4 schema. Before filing it, evaluate splitting with BOTH gates
+     against this draft (issue #78) — `needsSplit(F, S)` (Step 5's context
+     gate: F = distinct files the plan reads/modifies, S = ordered `## Plan`
+     steps) and `shouldSplitForCost(parentTier, childTiers)`
+     (`lib/ticket-schema.ts` — `parentTier` is the Model/Effort tier this
+     single-ticket draft would carry per Step 6's rules of thumb; `childTiers`
+     is the tier each ticket in a proposed decomposition would carry; it
+     splits only when the children's Estimate sum is strictly below the
+     parent's):
+     - **Neither gate trips:** update the ticket with
+       `gh issue edit <N> --body-file ...`, re-run `"$Z_LINT"` on the
+       rewritten body to confirm it now passes, and comment that the scan
+       added the plan (`"$Z_BOARD" comment <N> --body-file note.md --slug
+       "$SLUG"`; one line: the scan added the plan above, the ticket is still
+       in Backlog for a human to promote).
+     - **Either gate trips:** break the draft into the subtasks the gate
+       implies — the same convention Step 5 uses for spec-derived tickets:
+       each child falls under `needsSplit`'s thresholds, and when the cost
+       gate tripped, each carries a tier `shouldSplitForCost` confirmed is
+       cheaper in total than the parent's. File each child to the Step 4
+       schema (gated by `"$Z_LINT"`, fielded per Step 6, same as any other
+       ticket this step files). Link parent<->child both directions (Step 7).
+       Write a `## Subtasks (in order)` list (Step 5's convention) into the
+       PARENT's body alongside its own Step 4 sections
+       (`gh issue edit <N> --body-file ...`), then comment on the parent that
+       it should be closed by a human once every child lands (`"$Z_BOARD"
+       comment <N> --body-file close-me.md --slug "$SLUG"`). Never call a
+       close on the parent, never move it, and never promote the parent or
+       any child to Ready — item 6 below applies to every ticket a split
+       touches, parent and children alike.
 4. **Fields**, independent of whether step 3 ran: read Model, Model Effort, and
    Estimate (`"$Z_BOARD" field-get <N> <Field> --slug "$SLUG"`, once each). If
    ANY is empty, choose Model + Model Effort per Step 6's rules of thumb and run
    the full Step 6 tier chain (`z-plan/tiers.json` → `"$Z_ESTIMATE"`) to
-   `field-set` all three — no arithmetic in prose, same rule as Step 6.
+   `field-set` all three — no arithmetic in prose, same rule as Step 6. A
+   split parent (item 3's either-gate-trips path) skips this step for
+   itself — Step 5's convention holds here too: it carries no Estimate of its
+   own beyond the sum its children report; item 4 fields only the children,
+   each through Step 6's tier chain, when filing them.
 5. **Nothing needed, nothing written.** A Backlog ticket whose body already
    passes lint AND already carries all three fields gets zero body edits, zero
    field writes, and zero comments this run — the same idempotent-rerun
@@ -493,6 +569,12 @@ block to stdout — its number, the drafted body, the fields it would set, and
 no GitHub writes. This is what `evals/planner/`'s backlog-scan pass
 (`fixture-backlog-ticket.md`) grades.
 
+**`--dry-run --ticket <N>`** (issue #78) composes the same way: identical to
+`--dry-run --backlog` above, scoped to exactly ticket `N` per `--ticket`'s
+Step 1/Step 10 contract — the same lookup-and-validate (exists, not Done)
+runs before anything is emitted; a missing or Done `N` still fails loud with
+no output, dry run or not.
+
 ---
 
 ## Done criteria
@@ -514,6 +596,11 @@ Report DONE only when all hold:
   Effort, and Estimate (Step 10). This step never promotes a ticket to Ready —
   the only path anywhere in this skill that ever moves a Backlog ticket to
   Ready remains Step 7.4's dependency pull.
+- A ticket Step 10 split on either gate (`needsSplit` or `shouldSplitForCost`,
+  issue #78) carries a `## Subtasks (in order)` list and both-direction links
+  to its filed children; the parent stays OPEN and un-promoted — never
+  auto-closed, never moved to Ready — with a comment that a human should
+  close it once every child lands.
 
 **Notify.** Once DONE, `send plan-complete` through the shared notification edge
 (`lib/notify.ts`) so a `/z-plan` run pings the same Discord channel as the loop —

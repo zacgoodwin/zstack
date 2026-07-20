@@ -11,10 +11,12 @@ import { join } from "node:path";
 import {
   main,
   needsSplit,
+  shouldSplitForCost,
   slugifyTitle,
   validateTicketBody,
   SPLIT_MAX_FILES,
   SPLIT_MAX_STEPS,
+  TIER_ESTIMATES,
   type TicketError,
 } from "../lib/ticket-schema.ts";
 import { estimate, loadRates, type Buckets } from "../lib/estimate.ts";
@@ -173,6 +175,59 @@ describe("needsSplit: the oversize-ticket gate is a deterministic comparison", (
 
   test("same inputs -> same decision (deterministic)", () => {
     expect(needsSplit(20, 40)).toEqual(needsSplit(20, 40));
+  });
+});
+
+// -- shouldSplitForCost: the cost-based split gate (issue #78) --------------
+describe("shouldSplitForCost: splits only when children total strictly less than parent", () => {
+  test("split-true: two cheaper children beat one opus-high ticket (AC2)", () => {
+    // 0.23 + 1.64 = 1.87 < 4.36
+    const d = shouldSplitForCost("opus-high", ["haiku-low", "sonnet-medium"]);
+    expect(d.split).toBe(true);
+    expect(d.reason).toContain("1.87");
+    expect(d.reason).toContain("4.36");
+  });
+
+  test("split-false: two same-tier children cost more than one, no split (AC2)", () => {
+    // 1.64 + 1.64 = 3.28 >= 1.64
+    const d = shouldSplitForCost("sonnet-medium", ["sonnet-medium", "sonnet-medium"]);
+    expect(d.split).toBe(false);
+    expect(d.reason).toContain("3.28");
+    expect(d.reason).toContain("1.64");
+  });
+
+  test("a tie (children total == parent) does not split -- strictly below only", () => {
+    const d = shouldSplitForCost("opus-high", ["opus-high"]);
+    expect(d.split).toBe(false);
+  });
+
+  test("unknown-tier error: an unrecognized parent tier throws, naming it", () => {
+    expect(() => shouldSplitForCost("bogus-tier", ["haiku-low"])).toThrow(/bogus-tier/);
+  });
+
+  test("unknown-tier error: an unrecognized child tier throws, naming it", () => {
+    expect(() => shouldSplitForCost("opus-high", ["haiku-low", "bogus-tier"])).toThrow(/bogus-tier/);
+  });
+
+  test("an empty child list is rejected -- a split needs at least one child", () => {
+    expect(() => shouldSplitForCost("opus-high", [])).toThrow(/non-empty/);
+  });
+
+  test("same inputs -> same decision (deterministic)", () => {
+    expect(shouldSplitForCost("opus-xhigh", ["opus-high", "sonnet-medium"])).toEqual(
+      shouldSplitForCost("opus-xhigh", ["opus-high", "sonnet-medium"])
+    );
+  });
+
+  test("TIER_ESTIMATES matches the tier -> z-estimate reproducibility chain (no silent drift)", () => {
+    const tiers = JSON.parse(
+      readFileSync(join(import.meta.dir, "..", "z-plan", "tiers.json"), "utf8")
+    ).tiers as Record<string, Buckets>;
+    const rates = loadRates();
+    const NOW = new Date("2026-07-19T00:00:00Z");
+    for (const [name, dollars] of Object.entries(TIER_ESTIMATES)) {
+      expect(estimate(tiers[name], rates, NOW).total).toBe(dollars);
+    }
   });
 });
 
@@ -482,5 +537,107 @@ describe("z-plan/SKILL.md: Step 1 multiple explicit path arguments (issue #19)",
     expect(step1).toContain("SPECS=()");
     expect(step1).toContain('SPECS+=("$arg")');
     expect(step1).not.toContain('SPEC="$arg"');
+  });
+});
+
+// -- --ticket flag + Step 10 cost-split gate (issue #78) ---------------------
+// The SKILL is executed by an agent, not this test suite (same rationale as
+// the Step 10/Step 1 doc canaries above): these pin the exact contract
+// strings in z-plan/SKILL.md that make AC1/AC3/AC4 true, so a future edit
+// that silently drops --ticket's scoping or the split-gate evaluation fails
+// loudly here instead of shipping.
+describe("z-plan/SKILL.md: --ticket flag scopes Step 10 to one issue (issue #78)", () => {
+  const zPlan = () => readFileSync(join(import.meta.dir, "..", "z-plan", "SKILL.md"), "utf8");
+
+  function section(md: string, heading: string): string {
+    const start = md.indexOf(heading);
+    if (start < 0) return "";
+    const rest = md.slice(start + heading.length);
+    const next = rest.indexOf("\n## ");
+    return next < 0 ? rest : rest.slice(0, next);
+  }
+
+  test("Step 1 parses --ticket as a value-taking flag alongside --backlog", () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toContain("TICKET_ONLY");
+    expect(step1).toContain("--ticket) WANT_TICKET=1");
+    expect(step1).toContain("--ticket requires a value");
+    // The existing --backlog/SPECS contract (prior doc canaries) must survive
+    // unweakened alongside the new flag.
+    expect(step1).toContain("BACKLOG_ONLY=1");
+    expect(step1).toContain("SPECS=()");
+  });
+
+  test("--ticket <N> implies --backlog's spec-resolution bypass, scoped to N (AC1)", () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toContain("single-ticket form of `--backlog`'s");
+    expect(step1).toContain("skip straight to Step 10");
+    expect(step1).toMatch(/scopes Step 10's loop to\s*\n?\s*exactly ticket `N`/);
+    expect(step1).toContain("`--backlog` with no `--ticket` still scans the whole Backlog list");
+  });
+
+  test("--ticket <N> errors loud on an unknown number or a Done ticket, no board writes (AC1)", () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toMatch(/no ticket #N found on the board/);
+    expect(step1).toMatch(/ticket #N is\s*\nDone; nothing to plan/);
+    expect(step1).toContain("Step 10 never re-plans a Done ticket");
+  });
+
+  test("Step 10's list step branches on TICKET_ONLY without dropping the --backlog list call", () => {
+    const step10 = section(zPlan(), "## Step 10 — Backlog scan");
+    expect(step10).toContain('if [ -n "$TICKET_ONLY" ]');
+    // Prior doc canary's pinned string must still be reachable in the else branch.
+    expect(step10).toContain('"$Z_BOARD" list --status Backlog --json');
+  });
+});
+
+describe("z-plan/SKILL.md: Step 10 evaluates BOTH split gates before filing a drafted body (issue #78)", () => {
+  const zPlan = () => readFileSync(join(import.meta.dir, "..", "z-plan", "SKILL.md"), "utf8");
+
+  function section(md: string, heading: string): string {
+    const start = md.indexOf(heading);
+    if (start < 0) return "";
+    const rest = md.slice(start + heading.length);
+    const next = rest.indexOf("\n## ");
+    return next < 0 ? rest : rest.slice(0, next);
+  }
+
+  test("item 3's otherwise-branch calls needsSplit AND shouldSplitForCost before filing (AC3)", () => {
+    const step10 = section(zPlan(), "## Step 10 — Backlog scan");
+    expect(step10).toContain("needsSplit(F, S)");
+    expect(step10).toContain("shouldSplitForCost(parentTier, childTiers)");
+    expect(step10).toContain("lib/ticket-schema.ts");
+  });
+
+  test("a tripped gate files children to schema+fields, links both ways, and marks the parent (AC3)", () => {
+    const step10 = section(zPlan(), "## Step 10 — Backlog scan");
+    expect(step10).toMatch(/File each child to the Step 4\s*\n?\s*schema/);
+    expect(step10).toContain("Link parent<->child both directions (Step 7)");
+    expect(step10).toContain("## Subtasks (in order)");
+    expect(step10).toMatch(/comment on the parent that\s*\n?\s*it should be closed by a human once every child lands/);
+  });
+
+  test("a split never closes, moves, or promotes the parent or any child (Out of scope: no auto-close)", () => {
+    const step10 = section(zPlan(), "## Step 10 — Backlog scan");
+    expect(step10).toMatch(/Never call a\s*\n?\s*close on the parent, never move it/);
+    expect(step10).toMatch(/never promote the parent or\s*\n?\s*any child to Ready/);
+  });
+
+  test("a split parent carries no Estimate of its own -- item 4 fields only the children", () => {
+    const step10 = section(zPlan(), "## Step 10 — Backlog scan");
+    expect(step10).toMatch(/carries no Estimate of its\s*\n?\s*own beyond the sum its children report/);
+  });
+
+  test("--dry-run --ticket composes identically to --dry-run --backlog, scoped to N", () => {
+    const dryRun = section(zPlan(), "## Dry-run / eval mode");
+    expect(dryRun).toContain("--dry-run --ticket <N>");
+    expect(dryRun).toMatch(/composes the same way/);
+  });
+
+  test("Done criteria names the split-parent contract (Subtasks list, links, stays open, un-promoted)", () => {
+    const done = section(zPlan(), "## Done criteria");
+    expect(done).toMatch(/split on either gate/);
+    expect(done).toContain("## Subtasks (in order)");
+    expect(done).toMatch(/never\s*\n?\s*auto-closed, never moved to Ready/);
   });
 });

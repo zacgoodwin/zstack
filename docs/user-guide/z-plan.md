@@ -70,6 +70,21 @@ This needs no spec file and no CEO plan on disk; it runs the Backlog scan
 too, as its final step, so Backlog never falls behind just because you keep
 planning new specs.
 
+To run that same scan against a single ticket instead of the whole Backlog:
+
+```bash
+/z-plan --ticket 42
+```
+
+`--ticket <N>` is the single-ticket form of `--backlog` — it needs no spec
+file either, and shares every Backlog-scan behavior with `--backlog` (the
+lint gate, the fields, the split gates below, the idempotent zero-write
+rerun, never promoting to Ready). The difference is scope: `--ticket 42`
+reads and writes only issue #42, wherever it currently sits (any status
+except Done), and leaves every other Backlog ticket untouched. A ticket
+number that isn't on the board, or that's already Done, fails loud with no
+board writes rather than silently skipping.
+
 ## What it does
 
 1. **Grounds in the codebase first.** Reads the files the spec touches; every
@@ -95,12 +110,22 @@ planning new specs.
 7. **Questions to a human.** A genuine ambiguity (Confusion Protocol bar) is
    commented on the ticket and the ticket moved to Questions — never guessed into
    the plan.
-8. **Backlog scan.** Every ticket already in Backlog gets the same lint gate and
-   the same fields (Model/Model Effort/Estimate) a Ready ticket gets — without
-   being promoted. A ticket that already passes and is already fielded gets zero
-   writes (idempotent). A genuine ambiguity still goes to Questions, same as
-   step 7. Runs as the final step of every spec run, and alone via
-   `/z-plan --backlog`.
+8. **Backlog scan, with two split gates.** Every ticket already in Backlog gets
+   the same lint gate and the same fields (Model/Model Effort/Estimate) a
+   Ready ticket gets — without being promoted. A ticket that already passes
+   and is already fielded gets zero writes (idempotent). A genuine ambiguity
+   still goes to Questions, same as step 7. When a scan drafts a fresh body
+   (the ticket didn't already pass lint), it's checked against BOTH split
+   gates before filing: `needsSplit` (context, same as item 4 above) and
+   `shouldSplitForCost` (`lib/ticket-schema.ts`) — splitting only when a
+   proposed decomposition's children would cost strictly less, combined, than
+   the single ticket's own tier. Either gate tripping files the children to
+   the same schema/fields/links as any other ticket, adds a
+   `## Subtasks (in order)` list to the parent, and comments on the parent
+   that a human should close it once every child lands — the parent is never
+   auto-closed, moved, or promoted. Runs as the final step of every spec run,
+   alone via `/z-plan --backlog`, or scoped to one ticket via
+   `/z-plan --ticket <N>`.
 9. **Cost-saving suggestions.** A terminal, batch-specific report for the human
    running `/z-plan` — the ticket numbers, real dollar figures, and shared files
    from *this run's own batch* (every ticket this run filed, updated, or drafted
@@ -122,7 +147,8 @@ offline. This is what the planner eval (`evals/planner/`) runs through local
 
 `/z-plan --dry-run --backlog` does the same for the Backlog scan: no
 `gh issue edit`, no `z-board` writes, no comments — just each ticket that
-needed a change, emitted to stdout as one markdown block.
+needed a change, emitted to stdout as one markdown block. `/z-plan --dry-run
+--ticket <N>` composes the same way, scoped to that one ticket.
 
 ## Done when
 
@@ -131,6 +157,8 @@ Every filed ticket passes the lint gate, carries Model/Effort/Estimate via
 gate, parks open questions, and a re-run creates zero duplicates. Every ticket
 still in Backlog after the scan — i.e., not moved to Questions by a genuine
 ambiguity — passes the same lint gate and carries the same three fields; this
-step never promotes a ticket to Ready. A run that plants at least one Estimate
-this run also ends with the cost-saving report above, printed once, after
-everything else is written.
+step never promotes a ticket to Ready. A ticket split by either gate carries
+a `## Subtasks (in order)` list and both-direction links to its filed
+children, and stays open and un-promoted for a human to close once every
+child lands. A run that plants at least one Estimate this run also ends with
+the cost-saving report above, printed once, after everything else is written.

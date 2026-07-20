@@ -7,6 +7,7 @@
 // (PRINCIPLES.md, latent vs deterministic), so it lives in a script with tests
 // and never in a prompt.
 import { readFileSync } from "node:fs";
+import { roundCents } from "./estimate.ts";
 
 export type TicketErrorCode = "missing" | "malformed" | "empty";
 
@@ -187,6 +188,51 @@ export function needsSplit(fileCount: number, stepCount: number): SplitDecision 
     return { split: true, reason: `${fileCount} files and ${stepCount} steps together exceed the ${CONTEXT_BUDGET_TOKENS}-token context budget.` };
   }
   return { split: false, reason: "fits in one context window" };
+}
+
+// The cost-based split gate (issue #78), complementing needsSplit's context
+// gate: even a plan that fits in one context window can still be cheaper to
+// run as several smaller tickets than as one big one, because the Estimate
+// tiers (z-plan/SKILL.md Step 6) are not linear in scope. Dollar totals
+// mirror the tier table pinned in tests/plan-schema.test.ts (the same
+// tier -> z-estimate chain issue #7 AC2 made reproducible); a test there
+// cross-checks this table against that chain so a rates.json/tiers.json
+// change can't silently desync this pure lookup.
+export const TIER_ESTIMATES: Record<string, number> = {
+  "haiku-low": 0.23,
+  "sonnet-medium": 1.64,
+  "opus-high": 4.36,
+  "opus-xhigh": 7.15,
+  "fable-xhigh": 19.5,
+};
+
+function tierEstimate(tier: string): number {
+  const dollars = TIER_ESTIMATES[tier];
+  if (dollars === undefined) {
+    throw new Error(
+      `shouldSplitForCost: unknown tier "${tier}". Known tiers: ${Object.keys(TIER_ESTIMATES).join(", ")}.`
+    );
+  }
+  return dollars;
+}
+
+// Deciding whether to split is a comparison on two dollar figures, so it is
+// deterministic space (PRINCIPLES.md), not the planner's head: z-plan picks
+// the tier the single ticket would carry and the tiers a proposed
+// decomposition's children would each carry, and calls this. Splits only
+// when the children's Estimate sum is STRICTLY below the parent's -- a split
+// that costs the same or more just adds review/merge overhead for nothing.
+export function shouldSplitForCost(parentTier: string, childTiers: string[]): SplitDecision {
+  if (childTiers.length === 0) {
+    throw new Error("shouldSplitForCost: childTiers must be non-empty (a split needs at least one child).");
+  }
+  const parentTotal = tierEstimate(parentTier);
+  const childTotal = roundCents(childTiers.reduce((sum, t) => sum + tierEstimate(t), 0));
+  const split = childTotal < parentTotal;
+  const reason = split
+    ? `children total $${childTotal.toFixed(2)} < parent ${parentTier} $${parentTotal.toFixed(2)}; splitting is cheaper.`
+    : `children total $${childTotal.toFixed(2)} >= parent ${parentTier} $${parentTotal.toFixed(2)}; splitting does not save money.`;
+  return { split, reason };
 }
 
 // -- CLI ---------------------------------------------------------------------
