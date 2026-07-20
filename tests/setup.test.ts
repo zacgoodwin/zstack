@@ -5,7 +5,7 @@
 // creation vs adoption, idempotence (a re-run plans zero mutations), and schema
 // validation that fails loudly with the field named.
 import { test, expect, describe, afterEach } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -686,6 +686,42 @@ describe("writeConfig", () => {
     expect(loaded.minReviewerConfidence).toBe(70);
     expect(loaded.reviewerBelowThresholdAction).toBe("block");
   });
+
+  // -- issue #82 (AC6): stageModels default only for a brand-new project ------
+  test("a brand-new project's config includes the stageModels default and passes validateConfig", async () => {
+    const backend = setupBackend();
+    const setup = new SetupBoard(backend.exec);
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    expect(result.created).toBe(true);
+    expect(result.config.stageModels).toEqual({ merge: "haiku" });
+    expect(() => validateConfig(result.config)).not.toThrow();
+  });
+
+  // Re-running setup against an existing config (adoption) never touches
+  // stageModels -- neither injecting the default nor stripping a key the
+  // config didn't have. Simulates a config written BEFORE this ticket (no
+  // stageModels key at all): a second apply/write against the now-existing
+  // project must leave the file byte-identical.
+  test("re-running setup against an existing config without stageModels leaves it byte-identical", async () => {
+    const backend = setupBackend();
+    const setup = new SetupBoard(backend.exec);
+
+    // First run creates the project; strip stageModels to simulate a config
+    // that predates this ticket, then write it -- the "existing config
+    // without the key" AC6 names.
+    const first = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    delete (first.config as any).stageModels;
+    const home = makeHome();
+    const path = writeConfig(first.config, home);
+    const before = readFileSync(path, "utf8");
+
+    // Second run adopts the now-existing project (created === false).
+    const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    expect(second.created).toBe(false);
+    expect(second.config.stageModels).toBeUndefined(); // adoption never injects the default
+    writeConfig(second.config, home);
+    expect(readFileSync(path, "utf8")).toBe(before);
+  });
 });
 
 // -- board template override (issue #20 AC2 + AC5) ---------------------------
@@ -1053,6 +1089,59 @@ describe("validateConfig", () => {
       expect(() => validateConfig(cfg)).not.toThrow();
       delete cfg.humanNeededPercent;
       expect(() => validateConfig(cfg)).not.toThrow();
+    });
+  });
+
+  // -- issue #82: per-stage model routing knob ---------------------------------
+  describe("stageModels (issue #82)", () => {
+    // AC4: an unknown stage name fails, naming the exact path.
+    test("an unknown stage name fails, naming stageModels.<stage>", () => {
+      const cfg = goodConfig() as any;
+      cfg.stageModels = { deploy: "haiku" };
+      expect(() => validateConfig(cfg)).toThrow(/stageModels\.deploy/);
+    });
+
+    // AC4: a non-string value on a KNOWN stage also fails, naming the path
+    // (not the "unknown stage" message -- "merge" is a valid stage name).
+    test("a non-string value on a known stage fails, naming stageModels.<stage>", () => {
+      const cfg = goodConfig() as any;
+      cfg.stageModels = { merge: 3 };
+      expect(() => validateConfig(cfg)).toThrow(/stageModels\.merge/);
+    });
+
+    // AC7: a string that isn't a known rate key fails through the SAME lookup
+    // z-cost/z-estimate use (resolveRate in lib/estimate.ts), naming the path.
+    test("a model that is not a known rate key fails validation, naming stageModels.<stage>", () => {
+      const cfg = goodConfig() as any;
+      cfg.stageModels = { merge: "not-a-model" };
+      expect(() => validateConfig(cfg)).toThrow(/stageModels\.merge/);
+    });
+
+    test('a real rate-key model ({"merge": "haiku"}) is accepted', () => {
+      const cfg = goodConfig() as any;
+      cfg.stageModels = { merge: "haiku" };
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    // AC3: an explicit {} (the resolver's opt-out signal) is a perfectly valid
+    // object as far as the schema is concerned -- the absent-vs-{} distinction
+    // is the RESOLVER's job (lib/loop.ts resolveStageModel), not the schema's.
+    test("an explicit {} passes", () => {
+      const cfg = goodConfig() as any;
+      cfg.stageModels = {};
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    test("absent is optional and passes", () => {
+      const cfg = goodConfig() as any;
+      delete cfg.stageModels;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    test("a non-object stageModels fails", () => {
+      const cfg = goodConfig() as any;
+      cfg.stageModels = "haiku";
+      expect(() => validateConfig(cfg)).toThrow(/"stageModels" must be an object/);
     });
   });
 });

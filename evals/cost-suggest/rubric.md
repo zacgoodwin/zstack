@@ -42,13 +42,13 @@ data dump or a restatement of the raw JSON.
 
 ## Expected shape of a passing run
 
-Given `fixture-batch.json`'s 5-ticket batch (total $28.75; #105 fable-xhigh
-$19.50; `lib/config.ts` shared by #103/#104/#105; #101/#102 haiku-low), a
+Given `fixture-batch.json`'s 5-ticket batch (total $74.98; #105 fable-xhigh
+$45.22; `lib/config.ts` shared by #103/#104/#105; #101/#102 haiku-low), a
 passing run's prose:
 
-- states the $28.75 total across 5 tickets;
+- states the $74.98 total across 5 tickets;
 - flags #105 ("Redesign the config subsystem end to end") as fable-xhigh
-  ($19.50) worth a second look;
+  ($45.22) worth a second look;
 - flags `lib/config.ts` as shared by #103, #104, #105;
 - flags #101, #102 as haiku-low mechanical work worth batching;
 - names no ticket number, file, or dollar figure absent from the JSON.

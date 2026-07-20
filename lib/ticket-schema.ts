@@ -199,11 +199,11 @@ export function needsSplit(fileCount: number, stepCount: number): SplitDecision 
 // cross-checks this table against that chain so a rates.json/tiers.json
 // change can't silently desync this pure lookup.
 export const TIER_ESTIMATES: Record<string, number> = {
-  "haiku-low": 0.23,
-  "sonnet-medium": 1.64,
-  "opus-high": 4.36,
-  "opus-xhigh": 7.15,
-  "fable-xhigh": 19.5,
+  "haiku-low": 1.86,
+  "sonnet-medium": 10.27,
+  "opus-high": 9.44,
+  "opus-xhigh": 15.77,
+  "fable-xhigh": 45.22,
 };
 
 function tierEstimate(tier: string): number {

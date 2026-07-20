@@ -339,11 +339,16 @@ The chain that makes two runs on the same spec land on the same dollar figure:
 
    | Tier          | Model  | Effort | Buffer | Estimate |
    |---------------|--------|--------|--------|----------|
-   | `haiku-low`   | haiku  | low    | 30%    | $0.23    |
-   | `sonnet-medium` | sonnet | medium | 30%  | $1.64    |
-   | `opus-high`   | opus   | high   | 30%    | $4.36    |
-   | `opus-xhigh`  | opus   | xhigh  | 30%    | $7.15    |
-   | `fable-xhigh` | fable  | xhigh  | 50%    | $19.50   |
+   | `haiku-low`   | haiku  | low    | 30%    | $1.86    |
+   | `sonnet-medium` | sonnet | medium | 30%  | $10.27   |
+   | `opus-high`   | opus   | high   | 30%    | $9.44    |
+   | `opus-xhigh`  | opus   | xhigh  | 30%    | $15.77   |
+   | `fable-xhigh` | fable  | xhigh  | 50%    | $45.22   |
+
+   Calibrated 2026-07-20 (issue #81) from measured loop-run actuals — the
+   buckets behind these totals are per-tier medians from real ticket
+   transcripts (`z-plan/tiers.json`'s `_comment` has the derivation recipe),
+   not the directional guesses the tiers started from.
 
 2. Copy that tier's entry verbatim into a `buckets.json` and shell it to
    `z-estimate`. You produce the bucket **counts** by tier lookup (no
@@ -352,7 +357,7 @@ The chain that makes two runs on the same spec land on the same dollar figure:
    ```bash
    bun -e "require('fs').writeFileSync('/tmp/bk.json',
      JSON.stringify(require('$TIERS').tiers['opus-xhigh']))"
-   "$Z_ESTIMATE" /tmp/bk.json          # -> $7.15 (subtotal $5.50, buffer 30%, model opus)
+   "$Z_ESTIMATE" /tmp/bk.json          # -> $15.77 (subtotal $12.13, buffer 30%, model opus)
    ```
 
 **Why this is reproducible (issue #7 AC2):** the tier is a function of the
@@ -369,7 +374,7 @@ Write all three fields through the board contract — never hand-edit the board:
 ```bash
 "$Z_BOARD" field-set <N> Model "opus"        --slug "$SLUG"
 "$Z_BOARD" field-set <N> "Model Effort" xhigh --slug "$SLUG"
-"$Z_BOARD" field-set <N> Estimate 7.15        --slug "$SLUG"
+"$Z_BOARD" field-set <N> Estimate 15.77       --slug "$SLUG"
 ```
 
 ---
@@ -587,8 +592,8 @@ files, and dollar figures the JSON gave you; never generic advice the JSON
 does not support (no "write more efficient code", no boilerplate unconnected
 to this batch's actual numbers). Example shape (not literal wording):
 
-- total batch estimate is $28.75 across 5 tickets.
-- #105 ("...") is fable-xhigh ($19.50) — confirm the tier is warranted or
+- total batch estimate is $74.98 across 5 tickets.
+- #105 ("...") is fable-xhigh ($45.22) — confirm the tier is warranted or
   split it.
 - lib/config.ts is touched by 3 tickets (#103, #104, #105) — sequencing them
   reduces re-review churn.

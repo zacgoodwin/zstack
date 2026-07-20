@@ -6,7 +6,7 @@
 // Questions never claimable (AC6), plus dependency-order claiming, merge
 // ordering with a stacked chain, and drain-complete detection.
 import { test, expect, describe, afterAll } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -23,6 +23,7 @@ import {
   parseStageResult,
   recordOutcome,
   recordProbe,
+  resolveStageModel,
   ZError,
   type Action,
   type LaneState,
@@ -1186,6 +1187,48 @@ describe("ingestBoardItems", () => {
   });
 });
 
+// -- resolveStageModel (issue #82) --------------------------------------------
+// Loop run 2 billed every mechanical merge stage at the ticket's full model
+// tier ($73/10 tickets); the merge spawn (gh pr create/merge, conflict check)
+// never needs it. These three cases are AC1-3 verbatim.
+describe("resolveStageModel", () => {
+  const ALL_STAGES: Stage[] = ["builder", "qa", "reviewer", "merge"];
+
+  // AC1: stageModels: {merge: "haiku"}, ticket Model "opus" -> merge resolves
+  // "haiku"; builder/qa/reviewer resolve "opus" (the ticket Model, untouched).
+  test("AC1: an explicit override wins for its stage; every other stage still resolves the ticket Model", () => {
+    const stageModels = { merge: "haiku" };
+    expect(resolveStageModel("merge", "opus", stageModels)).toBe("haiku");
+    for (const s of ["builder", "qa", "reviewer"] as Stage[]) {
+      expect(resolveStageModel(s, "opus", stageModels)).toBe("opus");
+    }
+  });
+
+  // AC2: no stageModels key at all (undefined, not read from disk) -> the pack
+  // default ({merge: "haiku"}) applies; every other stage resolves the ticket
+  // Model.
+  test("AC2: stageModels undefined (key absent) -> pack default merge->haiku, others untouched", () => {
+    expect(resolveStageModel("merge", "opus", undefined)).toBe("haiku");
+    for (const s of ["builder", "qa", "reviewer"] as Stage[]) {
+      expect(resolveStageModel(s, "opus", undefined)).toBe("opus");
+    }
+  });
+
+  // AC3: stageModels: {} (explicit opt-out) -> NO default layered on top; every
+  // stage, including merge, resolves the ticket Model. This is the case that
+  // distinguishes resolveStageModel from a naive "?? DEFAULT_STAGE_MODELS[stage]"
+  // merge -- {} must NOT silently regain the merge->haiku default.
+  test("AC3: stageModels === {} (explicit opt-out) -> no default layered on, every stage is the ticket Model", () => {
+    for (const s of ALL_STAGES) {
+      expect(resolveStageModel(s, "opus", {})).toBe("opus");
+    }
+  });
+
+  test("a stage-specific override always wins over the pack default, even for merge", () => {
+    expect(resolveStageModel("merge", "opus", { merge: "sonnet" })).toBe("sonnet");
+  });
+});
+
 // -- CLI smoke ----------------------------------------------------------------
 
 describe("loop CLI", () => {
@@ -1275,5 +1318,54 @@ describe("loop CLI", () => {
     const proc2 = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "human-needed", statePath], { stdout: "pipe", stderr: "pipe" });
     expect(proc2.exitCode).toBe(0);
     expect(JSON.parse(proc2.stdout.toString())).toMatchObject({ tripped: true, alreadyNotified: true });
+  });
+
+  // -- stage-model (issue #82): the real CLI wiring the SKILL shells out to --
+  describe("stage-model", () => {
+    test("prints the resolved model, reading a REAL config.json through loadConfig (not hardcoded)", () => {
+      const home = mkdtempSync(join(tmpdir(), "zstack-loop-stagemodel-home-"));
+      try {
+        const projDir = join(home, ".zstack", "projects", "demo");
+        mkdirSync(projDir, { recursive: true });
+        const cfg = {
+          slug: "demo",
+          owner: "acme",
+          repo: "demo",
+          projectNumber: 1,
+          projectId: "PVT_1",
+          repositoryId: "R_1",
+          statusField: { id: "F_status", dataType: "SINGLE_SELECT", options: { Backlog: "o1", Done: "o2" } },
+          fields: {},
+          stageModels: { merge: "haiku" },
+        };
+        writeFileSync(join(projDir, "config.json"), JSON.stringify(cfg));
+        const env = { ...process.env, HOME: home, USERPROFILE: home };
+
+        const merge = Bun.spawnSync(
+          ["bun", join(REPO_ROOT, "lib", "loop.ts"), "stage-model", "merge", "opus", "--slug", "demo"],
+          { stdout: "pipe", stderr: "pipe", env }
+        );
+        expect(merge.exitCode).toBe(0);
+        expect(merge.stdout.toString().trim()).toBe("haiku");
+
+        const builder = Bun.spawnSync(
+          ["bun", join(REPO_ROOT, "lib", "loop.ts"), "stage-model", "builder", "opus", "--slug", "demo"],
+          { stdout: "pipe", stderr: "pipe", env }
+        );
+        expect(builder.exitCode).toBe(0);
+        expect(builder.stdout.toString().trim()).toBe("opus");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    test("rejects an unknown stage with a ZError: non-zero exit, message on stderr", () => {
+      const proc = Bun.spawnSync(
+        ["bun", join(REPO_ROOT, "lib", "loop.ts"), "stage-model", "deploy", "opus"],
+        { stdout: "pipe", stderr: "pipe" }
+      );
+      expect(proc.exitCode).toBe(1);
+      expect(proc.stderr.toString()).toMatch(/Usage: loop stage-model/);
+    });
   });
 });

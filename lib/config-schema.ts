@@ -12,9 +12,15 @@ import {
   FieldDataType,
   ZError,
 } from "./config.ts";
+import { loadRates, resolveRate } from "./estimate.ts";
 import { EVENT_KEYS } from "./notify.ts";
 
 const DATA_TYPES: FieldDataType[] = ["SINGLE_SELECT", "NUMBER", "TEXT"];
+
+// The four stage names a stageModels key may name (lib/loop.ts's Stage type,
+// duplicated here rather than imported to avoid a config.ts <-> config-schema.ts
+// <-> loop.ts import cycle -- loop.ts already imports from config.ts).
+const STAGE_NAMES = ["builder", "qa", "reviewer", "merge"];
 
 // Positive-finite guard, exported so z-setup's pre-flight (F9, issue #14) can
 // reject user-supplied numerics BEFORE any board mutation runs, with the exact
@@ -249,6 +255,39 @@ export function validateConfig(cfg: unknown): BoardConfig {
         if (typeof v !== "boolean") {
           throw new ZError(`Config "notifications.events.${k}" must be a boolean.`);
         }
+      }
+    }
+  }
+
+  // stageModels (issue #82): per-stage model routing. Validated only when
+  // present -- absent means lib/loop.ts's resolveStageModel applies the pack
+  // default ({merge: "haiku"}), and a config that omits the knob entirely
+  // must keep passing. Keys are restricted to the four stage names; values
+  // must resolve through the SAME rate-key lookup z-cost/z-estimate use
+  // (resolveRate in lib/estimate.ts), so a typo'd model name fails here --
+  // at config-write (z-setup) / config-load (loadConfig) time -- instead of
+  // silently at spawn time.
+  if (c.stageModels !== undefined) {
+    if (typeof c.stageModels !== "object" || c.stageModels === null) {
+      throw new ZError(`Config "stageModels" must be an object of {stage: model}.`);
+    }
+    const rates = loadRates();
+    for (const [stage, model] of Object.entries(c.stageModels)) {
+      if (!STAGE_NAMES.includes(stage)) {
+        throw new ZError(
+          `Config "stageModels.${stage}" is not a known stage. Valid: ${STAGE_NAMES.join(", ")}.`
+        );
+      }
+      if (typeof model !== "string" || !model) {
+        throw new ZError(`Config "stageModels.${stage}" must be a non-empty string.`);
+      }
+      try {
+        resolveRate(model, rates);
+      } catch {
+        throw new ZError(
+          `Config "stageModels.${stage}" is not a known model rate key, got ${JSON.stringify(model)}. ` +
+            `Known: ${Object.keys(rates.rates).join(", ")}.`
+        );
       }
     }
   }
