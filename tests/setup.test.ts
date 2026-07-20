@@ -941,6 +941,33 @@ describe("validateConfig", () => {
       expect(() => validateConfig(cfg)).not.toThrow();
     });
   });
+
+  // -- issue #58: the tick-throttle pacing knob --------------------------------
+  describe("tickThrottleSeconds (issue #58)", () => {
+    // AC3: 0 -- the required "off" value -- must NOT be rejected the way
+    // requirePositiveNumber would reject it (that guard rejects v <= 0).
+    test("accepts 0 (off), the value requirePositiveNumber would wrongly reject", () => {
+      const cfg = goodConfig() as any;
+      cfg.tickThrottleSeconds = 0;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    test("accepts a positive integer and is optional", () => {
+      const cfg = goodConfig() as any;
+      cfg.tickThrottleSeconds = 120;
+      expect(() => validateConfig(cfg)).not.toThrow();
+      delete cfg.tickThrottleSeconds;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    // AC4: -1, 2.5, NaN, and "120" all fail, naming the field + the
+    // non-negative-integer rule.
+    test.each([-1, 2.5, NaN, "120"])("rejects %p, naming the field and the non-negative integer rule", (bad) => {
+      const cfg = goodConfig() as any;
+      cfg.tickThrottleSeconds = bad;
+      expect(() => validateConfig(cfg)).toThrow(/"tickThrottleSeconds" must be a non-negative integer/);
+    });
+  });
 });
 
 // -- loadConfig surfaces schema errors (deep validation is wired in) ---------
@@ -1033,5 +1060,16 @@ describe("loadConfig deep validation", () => {
     const cfg = loadConfig("zstack", home);
     expect(cfg.maxQaPasses).toBe(5);
     expect(cfg.qaInvestigateAfter).toBe(1);
+  });
+
+  // -- issue #58: tickThrottleSeconds default-and-override through loadConfig --
+  test("AC1: tickThrottleSeconds absent -> loadConfig defaults it to 0 (today's behavior unchanged)", () => {
+    const home = writeRaw("zstack", validRawConfig());
+    expect(loadConfig("zstack", home).tickThrottleSeconds).toBe(0);
+  });
+
+  test("AC2: tickThrottleSeconds 120 in config.json is honored through loadConfig, not overridden by the default", () => {
+    const home = writeRaw("zstack", validRawConfig({ tickThrottleSeconds: 120 }));
+    expect(loadConfig("zstack", home).tickThrottleSeconds).toBe(120);
   });
 });

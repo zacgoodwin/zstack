@@ -96,6 +96,12 @@ export interface BoardConfig {
   // at reviewer-spawn time; #62 gates on the confidence this mode emits.
   adversarialMode?: AdversarialMode;
   quota?: Partial<QuotaConfig>;
+  // Minimum wall-clock seconds between bin/z-loop-tick invocations (issue
+  // #58); 0 = no throttling (default, today's behavior). Proactive pacing
+  // that keeps ProjectsV2 GraphQL point spend under GitHub's 5k/hr budget;
+  // complements the REACTIVE enforceQuota() backstop (board.ts:199-234),
+  // which only intervenes once remaining points are already low.
+  tickThrottleSeconds?: number;
   // Discord notifications for the five loop events (#60). Absent block = off (a
   // no-op), which is the correct default -- so there is deliberately no
   // DEFAULT_NOTIFICATIONS const and no loadConfig mutation. The URL is a SECRET:
@@ -117,6 +123,7 @@ export const DEFAULT_AUDIT_EVERY_N_LOOPS = 5;
 export const DEFAULT_MAX_QA_PASSES = 3;
 export const DEFAULT_QA_INVESTIGATE_AFTER = 2;
 export const DEFAULT_ADVERSARIAL_MODE: AdversarialMode = "non-trivial";
+export const DEFAULT_TICK_THROTTLE_SECONDS = 0;
 
 // Every actionable failure in the pack is a ZError; main() prints .message to
 // stderr and exits non-zero. Anything else is a bug and bubbles up with a stack.
@@ -217,5 +224,6 @@ export function loadConfig(slug?: string, home = homedir()): BoardConfig {
   cfg.maxQaPasses = cfg.maxQaPasses ?? DEFAULT_MAX_QA_PASSES;
   cfg.qaInvestigateAfter = cfg.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER;
   cfg.adversarialMode = cfg.adversarialMode ?? DEFAULT_ADVERSARIAL_MODE;
+  cfg.tickThrottleSeconds = cfg.tickThrottleSeconds ?? DEFAULT_TICK_THROTTLE_SECONDS;
   return cfg;
 }
