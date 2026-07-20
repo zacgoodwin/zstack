@@ -96,6 +96,18 @@ describe("H17: counter peek at start, bump after the report", () => {
 });
 
 // ============================================================================
+// issue #82 -- per-stage model routing: the spawn step resolves through
+// lib/loop.ts stage-model, not a literal "the ticket's Model field" read
+// ============================================================================
+describe("issue #82: Step 4's spawn resolves model via stage-model, not the ticket's Model field verbatim", () => {
+  test("the SKILL invokes the stage-model resolver before spawning", () => {
+    const md = zLoop();
+    expect(md).toContain('lib/loop.ts" stage-model');
+    expect(md).not.toContain("`model` = the ticket's Model field");
+  });
+});
+
+// ============================================================================
 // M22 -- red-path bug filing moves the NEW bug, not the drained ticket
 // ============================================================================
 describe("M22: red-path parses the created bug number", () => {
@@ -104,5 +116,34 @@ describe("M22: red-path parses the created bug number", () => {
     expect(md).toContain("BUG_N=${NEW%% *}"); // parse the created issue number
     expect(md).toContain('"$Z_BOARD" move "$BUG_N" Backlog'); // move THAT bug
     expect(md).not.toContain('"$Z_BOARD" move <N> Backlog'); // the ambiguous placeholder is gone
+  });
+});
+
+// ============================================================================
+// Ticket #85 -- exclude lockfiles from the adversarial reviewer diff
+// ============================================================================
+describe("Ticket #85: lockfile exclusion in reviewer diff", () => {
+  // AC 1: z-loop/SKILL.md's reviewer input row carries all four exclude pathspecs exactly as written
+  test("AC 1: reviewer row includes all four lockfile exclusion pathspecs", () => {
+    const md = zLoop();
+    const reviewerRow = section(md, "| `reviewer` |");
+    expect(reviewerRow).not.toBe("");
+    // Check all four pathspecs are present exactly as specified
+    expect(reviewerRow).toContain("':(exclude)*.lock'");
+    expect(reviewerRow).toContain("':(exclude)package-lock.json'");
+    expect(reviewerRow).toContain("':(exclude)pnpm-lock.yaml'");
+    expect(reviewerRow).toContain("':(exclude)yarn.lock'");
+  });
+
+  // AC 3: the SKILL.md text instructs falling back to the unfiltered diff when filtered diff is empty
+  test("AC 3: reviewer row documents empty-diff fallback to unfiltered diff", () => {
+    const md = zLoop();
+    const reviewerRow = section(md, "| `reviewer` |");
+    expect(reviewerRow).not.toBe("");
+    // Check that the fallback pattern is documented
+    expect(reviewerRow).toContain("[ ! -s");
+    expect(reviewerRow).toContain("diff-<N>.txt"); // the temp file being checked
+    expect(reviewerRow).toContain("lockfile-only"); // rationale
+    expect(reviewerRow).toMatch(/fall.*back|fallback/i);
   });
 });

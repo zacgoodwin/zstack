@@ -26,8 +26,8 @@ else
   # fixture-batch.json, standing in for what a real claude -p run would print
   # from the CostBreakdown JSON.
   cat << PROSE
-Total batch estimate is \$28.75 across 5 tickets.
-#105 ("Redesign the config subsystem end to end") is fable-xhigh (\$19.50) -- confirm the tier is warranted or split it.
+Total batch estimate is \$74.98 across 5 tickets.
+#105 ("Redesign the config subsystem end to end") is fable-xhigh (\$45.22) -- confirm the tier is warranted or split it.
 lib/config.ts is touched by 3 tickets (#103, #104, #105) -- sequencing them reduces re-review churn.
 #101, #102 are haiku-low mechanical work -- batch them in one lane.
 PROSE

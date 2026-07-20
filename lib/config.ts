@@ -63,6 +63,17 @@ export type EpicStyle = "milestones" | "issue-type";
 export type AdversarialMode = "off" | "non-trivial" | "always";
 export const ADVERSARIAL_MODES: AdversarialMode[] = ["off", "non-trivial", "always"];
 
+// Per-stage model routing (issue #82): overrides the ticket's board Model
+// field for one or more of the loop's four stage spawns. Not a Stage-keyed
+// import from lib/loop.ts (that would cycle back through this file) -- the
+// four literal names are duplicated here and re-checked in config-schema.ts.
+// Deliberately NOT defaulted by loadConfig below: the resolver
+// (lib/loop.ts resolveStageModel) is the one place that must tell "key
+// absent" (apply the pack default) apart from "key present as {}" (explicit
+// opt-out, no default). Filling a default here would collapse that
+// distinction before the resolver ever sees it.
+export type StageModels = Partial<Record<"builder" | "qa" | "reviewer" | "merge", string>>;
+
 export interface BoardConfig {
   slug: string;
   owner: string; // repo owner, for repository/issue lookups
@@ -132,6 +143,11 @@ export interface BoardConfig {
     enabled?: boolean; // master switch (default on when the block is present)
     events?: Partial<Record<EventKey, boolean>>; // per-state toggles (each default on)
   };
+  // Per-stage model overrides (issue #82). Absent entirely -> lib/loop.ts's
+  // resolveStageModel applies the pack default ({merge: "haiku"}); present
+  // (including {}) -> used exactly as written, no default layered on. See the
+  // StageModels comment above for why loadConfig must never fill this in.
+  stageModels?: StageModels;
 }
 
 export const DEFAULT_QUOTA: QuotaConfig = { threshold: 100, mode: "sleep" };

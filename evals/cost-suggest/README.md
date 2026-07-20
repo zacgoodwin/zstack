@@ -30,9 +30,9 @@ Repeat for N runs and average; pass when the mean total ≥ 5/6 (`rubric.md`).
 
 - `fixture-batch.json` -- the case-1 5-ticket `PlannedTicket[]` batch (also
   the fixture `../../tests/cost-suggest.test.ts` cases 1-6 read -- one
-  fixture for both lanes): #101/#102 haiku-low ($0.23 each), #103
-  sonnet-medium ($1.64, `lib/config.ts`), #104 opus-xhigh ($7.15,
-  `lib/config.ts`+`lib/loop.ts`), #105 fable-xhigh ($19.50, `lib/config.ts`).
+  fixture for both lanes): #101/#102 haiku-low ($1.86 each), #103
+  sonnet-medium ($10.27, `lib/config.ts`), #104 opus-xhigh ($15.77,
+  `lib/config.ts`+`lib/loop.ts`), #105 fable-xhigh ($45.22, `lib/config.ts`).
 - `rubric.md` -- the scoring contract.
 - `../../z-plan/SKILL.md`'s Step 11 -- the prose contract under test.
 - `../../lib/cost-suggest.ts` -- the deterministic helper that produces the
