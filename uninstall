@@ -46,6 +46,33 @@ done
 
 PACK_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 
+# Canonicalize a symlink's target to an absolute real path, following the whole
+# chain -- portable across readlink flavors. Prefer `readlink -f` (GNU coreutils,
+# macOS 12.3+); fall back to a POSIX resolve loop where `-f` is unavailable (BSD
+# readlink on macOS < 12.3 rejects -f and prints nothing). Prints the canonical
+# path, or NOTHING on any failure -- and an unresolved target is treated as
+# foreign/leave, NEVER deleted, so a portability gap can only ever under-remove,
+# never destroy a user's file. Kept in sync with the same helper in ./setup.
+_realpath() {
+  local p="$1" out
+  # Fast path: GNU / macOS 12.3+ `readlink -f` canonicalizes in one shot.
+  out="$(readlink -f "$p" 2>/dev/null)" && [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+  # Fallback: follow the symlink chain by hand, then canonicalize the parent dir
+  # via `cd ... && pwd -P` (resolves symlinks in the parent components too, so the
+  # result matches PACK_DIR's own pwd -P form for the string compare).
+  local target n=0
+  while [ -L "$p" ]; do
+    n=$((n + 1)); [ "$n" -gt 40 ] && return 1   # cycle guard
+    target="$(readlink "$p")" || return 1
+    case "$target" in
+      /*) p="$target" ;;                    # absolute target
+      *)  p="$(dirname "$p")/$target" ;;    # target relative to the link's dir
+    esac
+  done
+  out="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s\n' "$out" "$(basename "$p")"
+}
+
 # setup registers the pack as "zstack"; the shipped z-* skills live inside it.
 # We also sweep the individual z-* names so a hand-made per-skill registration
 # is cleaned too -- each removed only when owned, exactly like the pack entry.
@@ -75,13 +102,14 @@ remove_entry() {
   # A symlink under our managed name is ours ONLY when it resolves INTO this pack
   # (setup only ever links to PACK_DIR or a skill dir within it). A user's own
   # symlink named z-* that points elsewhere is NOT ours -- removing it would break
-  # their link, so leave-and-name it like an un-sentineled dir. `readlink -f`
-  # canonicalizes even a dangling link, so a stale link of ours is still cleaned;
-  # an unresolved/foreign target (empty or outside) is left. Removing the link
-  # itself never touches its target. Checked before -d, which follows links.
+  # their link, so leave-and-name it like an un-sentineled dir. `_realpath`
+  # canonicalizes even a dangling link (parent still present), so a stale link of
+  # ours is still cleaned; an unresolved/foreign target (empty or outside) is
+  # left. Removing the link itself never touches its target. Checked before -d,
+  # which follows links.
   if [ -L "$path" ]; then
     local target_real
-    target_real="$(readlink -f "$path" 2>/dev/null || true)"
+    target_real="$(_realpath "$path" || true)"
     case "$target_real" in
       "$PACK_DIR"|"$PACK_DIR"/*)
         rm -f "$path"

@@ -6,6 +6,7 @@ All notable changes to zstack are documented here. Format follows [Keep a Change
 
 ### Fixed
 
+- `uninstall`/`setup` symlink-ownership resolution is now portable to pre-12.3 macOS. BSD `readlink` there lacks `-f`, so `readlink -f` returned empty and a genuinely-owned `z-*` symlink was never swept (`uninstall`), and `setup` refused to refresh it — the safe direction (no foreign target was ever deleted), but incomplete. A shared `_realpath` helper in both scripts now prefers `readlink -f` (GNU coreutils, macOS 12.3+) and falls back to a POSIX resolve loop (`while [ -L ]` + `cd "$(dirname)" && pwd -P`) where `-f` is unavailable. The invariant is unchanged: any failure to canonicalize a target still falls to leave-and-name, never to deletion. POSIX-gated tests run the resolution under a shimmed BSD `readlink` and assert an owned-into-pack link is still removed and a foreign-outside link is still left.
 - `./setup` now exits non-zero with a clear "run setup from `~/.claude/skills/zstack`" message instead of printing `zstack setup complete.` when it refused to register the Claude Code host. That refusal happens when setup is run from a second checkout (a dev clone, a worktree) while a separate install occupies `~/.claude/skills/zstack`: the primary host registers nothing, but the success banner over that no-op read as "setup ran fine" while the skills never appeared. A Codex/Factory separate-install refusal still exits 0 (Claude Code itself registered) — only a refused primary host fails the run.
 
 ## [0.1.1.0] - 2026-07-19

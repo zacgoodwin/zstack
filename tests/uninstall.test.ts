@@ -95,14 +95,34 @@ function canSymlink(): boolean {
 }
 const CAN_SYMLINK = canSymlink();
 
-function runUninstall(opts: { home: string; uninstallPath?: string; args?: string[] }) {
-  const env: Record<string, string> = { PATH: CORE_DIR, HOME: opts.home };
+function runUninstall(opts: { home: string; uninstallPath?: string; args?: string[]; pathPrefix?: string }) {
+  const path = opts.pathPrefix ? `${opts.pathPrefix}:${CORE_DIR}` : CORE_DIR;
+  const env: Record<string, string> = { PATH: path, HOME: opts.home };
   for (const key of ["SYSTEMROOT", "windir", "TEMP", "TMP"]) {
     const v = process.env[key];
     if (v) env[key] = v;
   }
   const proc = Bun.spawnSync([BASH!, opts.uninstallPath ?? UNINSTALL_PATH, ...(opts.args ?? [])], { env });
   return { exitCode: proc.exitCode, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
+}
+
+// #52: a `readlink` shim that emulates BSD readlink on macOS < 12.3 -- it rejects
+// `-f` (the flag that version lacks), so the uninstall script's fast path fails
+// and its POSIX resolve-loop fallback must carry ownership resolution. Every other
+// invocation delegates to the REAL readlink (by absolute path, so a plain
+// `readlink` on the shimmed PATH doesn't recurse into the shim). Prepend the
+// returned dir to PATH via runUninstall's pathPrefix. #!/bin/sh keeps the shebang
+// off the stripped fixture PATH.
+function bsdReadlinkShimDir(): string {
+  const dir = makeHome();
+  writeFileSync(
+    join(dir, "readlink"),
+    `#!/bin/sh\n` +
+      `if [ "$1" = "-f" ]; then echo "readlink: illegal option -- f" >&2; exit 1; fi\n` +
+      `exec "${CORE_DIR}/readlink" "$@"\n`,
+    { mode: 0o755 },
+  );
+  return toPosixPath(dir);
 }
 
 // -- AC1: owned entries removed, an un-owned same-named dir left, exit 0 -----
@@ -165,6 +185,51 @@ describe("AC1 — ownership: owned entries removed, un-owned left untouched", ()
     expect(existsSync(link)).toBe(true); // link LEFT in place
     expect(existsSync(join(theirs, "SKILL.md"))).toBe(true); // target untouched
     expect(result.stdout).toContain("z-loop");
+    expect(result.stdout).toContain("outside the zstack pack");
+  }, SPAWN_TIMEOUT_MS);
+});
+
+// -- #52: target resolution stays correct where `readlink -f` is unavailable ----
+// On pre-12.3 macOS (BSD readlink, no -f) the #49 code got an EMPTY canonical
+// target and fell to leave-and-name for BOTH owned and foreign links -- the safe
+// direction (no data loss) but it stopped sweeping genuinely-owned links. The
+// portable _realpath fallback resolves the target by hand so ownership resolution
+// is correct on every readlink flavor. Run under the BSD shim (readlink -f fails),
+// so WITHOUT the fallback AC1 would regress (owned link left, not removed).
+// POSIX-gated exactly like the #49 symlink cases (symlinks are EPERM on Windows).
+describe("#52 — ownership resolution is portable where `readlink -f` is unavailable", () => {
+  // AC1: an owned link INTO the pack is still resolved and removed under BSD readlink.
+  test.skipIf(!CAN_SYMLINK)("BSD readlink (no -f): an owned symlink INTO the pack is still removed; target untouched", () => {
+    const home = makeHome();
+    const skills = join(home, ".claude", "skills");
+    mkdirSync(skills, { recursive: true });
+    const target = join(REPO_ROOT, "z-loop"); // a real skill dir inside the pack
+    const link = join(skills, "z-loop");
+    symlinkSync(target, link);
+
+    const result = runUninstall({ home, pathPrefix: bsdReadlinkShimDir() });
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(link)).toBe(false); // owned link swept by the fallback
+    expect(existsSync(join(target, "SKILL.md"))).toBe(true); // target untouched
+    expect(result.stdout).toContain("symlink into the pack");
+  }, SPAWN_TIMEOUT_MS);
+
+  // AC2: a foreign link OUTSIDE the pack is still left-and-named -- the fallback
+  // must not over-correct into deleting a user's own link. Safe direction preserved.
+  test.skipIf(!CAN_SYMLINK)("BSD readlink (no -f): a foreign symlink OUTSIDE the pack is still left and named; target untouched", () => {
+    const home = makeHome();
+    const skills = join(home, ".claude", "skills");
+    mkdirSync(skills, { recursive: true });
+    const theirs = join(home, "their-skills", "z-loop"); // a user's own skill
+    mkdirSync(theirs, { recursive: true });
+    writeFileSync(join(theirs, "SKILL.md"), "---\nname: z-loop\n---\ntheirs\n");
+    const link = join(skills, "z-loop");
+    symlinkSync(theirs, link);
+
+    const result = runUninstall({ home, pathPrefix: bsdReadlinkShimDir() });
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(link)).toBe(true); // foreign link LEFT (no data loss)
+    expect(existsSync(join(theirs, "SKILL.md"))).toBe(true); // target untouched
     expect(result.stdout).toContain("outside the zstack pack");
   }, SPAWN_TIMEOUT_MS);
 });
