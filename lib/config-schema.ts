@@ -189,6 +189,18 @@ export function validateConfig(cfg: unknown): BoardConfig {
     }
   }
 
+  // humanNeededPercent (issue #63): the mid-run breakdown notification's trip
+  // threshold. `0` is a legitimate "disable" value (unlike maxLanes etc.), so
+  // this is a bespoke non-negative-finite guard, not requirePositiveNumber.
+  if (
+    c.humanNeededPercent !== undefined &&
+    (typeof c.humanNeededPercent !== "number" || !Number.isFinite(c.humanNeededPercent) || c.humanNeededPercent < 0)
+  ) {
+    throw new ZError(
+      `Config "humanNeededPercent" must be a non-negative number (0 disables), got ${JSON.stringify(c.humanNeededPercent)}.`
+    );
+  }
+
   // notifications (#60): validated only when present (absent = off). The
   // discordWebhookUrl is a SECRET, so its error text names the field ONLY and
   // never echoes the value -- a pasted bare token or a leaked URL must not land

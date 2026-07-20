@@ -111,7 +111,11 @@ export interface BoardConfig {
   // below-floor score, whenever the gate is on.
   minReviewerConfidence?: number;
   reviewerBelowThresholdAction?: "block" | "retry" | "off";
-  // Discord notifications for the six loop/plan events (#60, #68). Absent block = off (a
+  // Safety control (issue #63): mid-run breakdown notification when parked
+  // tickets (Blocked + Skipped + Questions) exceed this percent of the
+  // batch's initial committed-to-Building count. 0 disables the control.
+  humanNeededPercent?: number;
+  // Discord notifications for the loop/plan events (#60, #63, #68). Absent block = off (a
   // no-op), which is the correct default -- so there is deliberately no
   // DEFAULT_NOTIFICATIONS const and no loadConfig mutation. The URL is a SECRET:
   // config.json lives at ~/.zstack/projects/<slug>/config.json, OUTSIDE the repo
@@ -135,6 +139,7 @@ export const DEFAULT_ADVERSARIAL_MODE: AdversarialMode = "non-trivial";
 export const DEFAULT_TICK_THROTTLE_SECONDS = 0;
 export const DEFAULT_MIN_REVIEWER_CONFIDENCE = 70;
 export const DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION = "block" as const;
+export const DEFAULT_HUMAN_NEEDED_PERCENT = 30;
 
 // Every actionable failure in the pack is a ZError; main() prints .message to
 // stderr and exits non-zero. Anything else is a bug and bubbles up with a stack.
@@ -238,5 +243,6 @@ export function loadConfig(slug?: string, home = homedir()): BoardConfig {
   cfg.tickThrottleSeconds = cfg.tickThrottleSeconds ?? DEFAULT_TICK_THROTTLE_SECONDS;
   cfg.minReviewerConfidence = cfg.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE;
   cfg.reviewerBelowThresholdAction = cfg.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION;
+  cfg.humanNeededPercent = cfg.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT;
   return cfg;
 }

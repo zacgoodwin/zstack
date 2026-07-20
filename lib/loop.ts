@@ -10,6 +10,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { atomicWrite, handleCliError, readJson } from "./cli.ts";
 import {
   BOARD_STATUSES,
+  DEFAULT_HUMAN_NEEDED_PERCENT,
   DEFAULT_MAX_LANES,
   DEFAULT_MAX_QA_PASSES,
   DEFAULT_MIN_REVIEWER_CONFIDENCE,
@@ -117,6 +118,14 @@ export interface LoopState {
   // (stacked-chain rule: branches are deleted only after the whole batch), so a
   // dependent's merge stage must know to retarget onto the base branch.
   mergedThisRun?: number[];
+  // Safety control (issue #63): the batch's committed size at ingest-time-zero,
+  // and whether the mid-run breakdown notification already fired for THIS
+  // batch's threshold crossing. Both are captured once and carried across
+  // re-ingests like lanes are; see ingestBoardItems below for the exact reset
+  // boundary (a fresh batch after a full drain, not merely "prev is null").
+  initialReadyCount?: number;
+  humanNeededPercent?: number;
+  humanNeededNotified?: boolean;
 }
 
 // -- stage outcomes -----------------------------------------------------------
@@ -432,6 +441,64 @@ export function drainComplete(tickets: TicketSnapshot[], lanes: LaneState[]): bo
   return lanes.length === 0 && tickets.every((t) => !isWorkableStatus(t.status) || t.claimedByOther === true);
 }
 
+// -- human-needed safety control (issue #63) ----------------------------------
+
+// Pure predicate: has the batch crossed the config threshold of tickets parked
+// for human attention? percent <= 0 is the explicit "disable" knob
+// (BoardConfig.humanNeededPercent, default 30). initialReady <= 0 can never
+// trip: there is no meaningful percentage of a batch that committed nothing
+// (also guards the division for a stale/pre-feature state file where
+// initialReadyCount was never captured).
+export function humanNeededTripped(
+  blocked: number,
+  skipped: number,
+  questions: number,
+  initialReady: number,
+  percent: number
+): boolean {
+  if (percent <= 0 || initialReady <= 0) return false;
+  return ((blocked + skipped + questions) / initialReady) * 100 > percent;
+}
+
+export interface HumanNeededStatus {
+  tripped: boolean;
+  alreadyNotified: boolean;
+  blocked: number;
+  skipped: number;
+  questions: number;
+  initialReadyCount: number;
+  percent: number;
+  tickets: { blocked: number[]; skipped: number[]; questions: number[] };
+}
+
+// The one place that turns a LoopState into the human-needed breakdown: counts
+// + which tickets (the notify() payload), plus tripped/alreadyNotified so the
+// orchestrator's fire-once check is a single field read, never prose
+// bookkeeping. Read-only -- the CLI wraps this with no writes, same contract
+// as `next`.
+export function humanNeededStatus(state: LoopState): HumanNeededStatus {
+  const byStatus = (s: BoardStatus) => state.tickets.filter((t) => t.status === s);
+  const blocked = byStatus("Blocked");
+  const skipped = byStatus("Skipped");
+  const questions = byStatus("Questions");
+  const initialReadyCount = state.initialReadyCount ?? 0;
+  const percent = state.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT;
+  return {
+    tripped: humanNeededTripped(blocked.length, skipped.length, questions.length, initialReadyCount, percent),
+    alreadyNotified: state.humanNeededNotified === true,
+    blocked: blocked.length,
+    skipped: skipped.length,
+    questions: questions.length,
+    initialReadyCount,
+    percent,
+    tickets: {
+      blocked: blocked.map((t) => t.number),
+      skipped: skipped.map((t) => t.number),
+      questions: questions.map((t) => t.number),
+    },
+  };
+}
+
 // -- state reducers -----------------------------------------------------------
 
 function findTicket(state: LoopState, n: number): TicketSnapshot {
@@ -535,6 +602,16 @@ export function markClaimLost(state: LoopState, ticket: number): LoopState {
   return next;
 }
 
+// A safety-control acknowledgement (issue #63): the orchestrator calls this
+// ONLY after notify() has actually delivered the mid-run breakdown, so the
+// next tick's humanNeededStatus() reports alreadyNotified and the SKILL never
+// re-fires for the same crossing.
+export function markHumanNeededNotified(state: LoopState): LoopState {
+  const next = structuredClone(state);
+  next.humanNeededNotified = true;
+  return next;
+}
+
 // -- board-snapshot ingest ----------------------------------------------------
 
 // The shape z-board list --json emits (lib/board.ts BoardItem).
@@ -559,6 +636,7 @@ export function ingestBoardItems(
     qaInvestigateAfter?: number;
     minReviewerConfidence?: number;
     reviewerBelowThresholdAction?: "block" | "retry" | "off";
+    humanNeededPercent?: number;
   }
 ): LoopState {
   const prevByNumber = new Map((prev?.tickets ?? []).map((t) => [t.number, t]));
@@ -588,6 +666,37 @@ export function ingestBoardItems(
   const present = new Set(tickets.map((t) => t.number));
   const lanes = (prev?.lanes ?? []).filter((l) => present.has(l.ticket));
 
+  // Safety control (issue #63): initialReadyCount/humanNeededNotified are
+  // per-BATCH state, not a per-project setting, so they need a different
+  // fallback chain than the knobs above -- a naive "preserve whenever prev is
+  // non-null" would carry a FIRST run's drained, terminal-status prev (and its
+  // stale counters) into a second /z-loop invocation, since state.json is
+  // never deleted between runs. drainComplete alone is NOT a sufficient reset
+  // boundary, though: applyAction updates a terminal ticket's status and drops
+  // its lane in the SAME state write, so the tick that resolves a batch's
+  // LAST ticket already leaves `prev` drainComplete -- and the very next
+  // ingest (the confirmation tick that just re-observes that same finished
+  // batch, nothing new committed) would wrongly read as "fresh", wiping
+  // initialReadyCount/humanNeededNotified for a crossing that just happened on
+  // that final ticket. A drained prev has, by definition, zero Building
+  // tickets belonging to THIS batch (drainComplete explicitly permits a
+  // Building ticket to remain when claimedByOther -- it belongs to another
+  // session's batch, not this one); so a fresh batch is when there is no
+  // prior state at all, OR the prior state was fully drained AND the incoming
+  // snapshot actually shows new, UNCLAIMED Building tickets (the batch-commit
+  // step moves the whole new batch to Building before its first ingest, so
+  // "any unclaimed Building tickets present" IS "a new batch was just
+  // committed"). buildingCount must exclude claimedByOther for the same
+  // reason every other workable-for-this-batch check in this file does
+  // (nextAction's unclaimed filter, the deadlock discriminator, drainComplete
+  // itself) -- otherwise a lingering foreign Building ticket in the snapshot
+  // masquerades as a new batch on the very re-ingest that should be preserving
+  // this batch's counters. A drained prev whose incoming snapshot has no new
+  // unclaimed Building tickets is the SAME batch's final state, not a new one
+  // -- preserve its counters.
+  const buildingCount = tickets.filter((t) => t.status === "Building" && !t.claimedByOther).length;
+  const startingFreshBatch = !prev || (drainComplete(prev.tickets, prev.lanes) && buildingCount > 0);
+
   return {
     tickets: tickets.sort((a, b) => a.number - b.number),
     lanes: structuredClone(lanes),
@@ -598,7 +707,10 @@ export function ingestBoardItems(
     minReviewerConfidence: cfg?.minReviewerConfidence ?? prev?.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE,
     reviewerBelowThresholdAction:
       cfg?.reviewerBelowThresholdAction ?? prev?.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
+    humanNeededPercent: cfg?.humanNeededPercent ?? prev?.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT,
     mergedThisRun: [...(prev?.mergedThisRun ?? [])],
+    initialReadyCount: startingFreshBatch ? buildingCount : (prev!.initialReadyCount ?? 0),
+    humanNeededNotified: startingFreshBatch ? false : (prev!.humanNeededNotified ?? false),
   };
 }
 
@@ -611,8 +723,10 @@ const USAGE = `loop <command> [args]
   outcome <state.json> <ticket> <msg.txt> [--now <ms>]  parse a stage's final message onto its lane
   probe <state.json> <ticket> <alive|dead> [--now <ms>] record an aliveness probe
   claim-lost <state.json> <ticket>                   mark a ticket claimed by another session
+  human-needed <state.json>                          print the breakdown + tripped/alreadyNotified (no writes)
+  human-needed-ack <state.json>                       mark the mid-run notification as sent (fire-once flag)
   ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M]
-                      [--max-qa-passes N] [--qa-investigate-after N]
+                      [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N]
                       [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off]
                                                      build/refresh the snapshot (creates state.json)
 
@@ -724,8 +838,19 @@ export function main(argv: string[]): number {
       console.log(`#${ticket} claimed by another session; out of this batch`);
       return 0;
     }
+    if (cmd === "human-needed") {
+      const state = readJson(statePath) as LoopState;
+      console.log(JSON.stringify(humanNeededStatus(state)));
+      return 0;
+    }
+    if (cmd === "human-needed-ack") {
+      const state = readJson(statePath) as LoopState;
+      atomicWrite(statePath, JSON.stringify(markHumanNeededNotified(state), null, 2));
+      console.log("human-needed notification acknowledged");
+      return 0;
+    }
     if (cmd === "ingest") {
-      if (!argv[2] || !argv[3]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off]");
+      if (!argv[2] || !argv[3]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off]");
       const prev = readPrevState(statePath);
       const items = readJson(argv[2]) as BoardItemLike[];
       const bodies = readJson(argv[3]) as Record<string, string>;
@@ -733,6 +858,7 @@ export function main(argv: string[]): number {
       const watchdogMinutes = flagValue(argv, "--watchdog-minutes");
       const maxQaPasses = flagValue(argv, "--max-qa-passes");
       const qaInvestigateAfter = flagValue(argv, "--qa-investigate-after");
+      const humanNeededPercent = flagValue(argv, "--human-needed-percent");
       const minReviewerConfidence = flagValue(argv, "--min-reviewer-confidence");
       const reviewerBelowThresholdAction = flagValue(argv, "--reviewer-below-threshold-action");
       if (
@@ -746,6 +872,7 @@ export function main(argv: string[]): number {
         watchdogMinutes: watchdogMinutes === undefined ? undefined : Number(watchdogMinutes),
         maxQaPasses: maxQaPasses === undefined ? undefined : Number(maxQaPasses),
         qaInvestigateAfter: qaInvestigateAfter === undefined ? undefined : Number(qaInvestigateAfter),
+        humanNeededPercent: humanNeededPercent === undefined ? undefined : Number(humanNeededPercent),
         minReviewerConfidence: minReviewerConfidence === undefined ? undefined : Number(minReviewerConfidence),
         reviewerBelowThresholdAction: reviewerBelowThresholdAction as "block" | "retry" | "off" | undefined,
       });
