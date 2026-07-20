@@ -130,6 +130,12 @@ each defaulted by `loadConfig` when absent:
   `truth-check failed (confidence X/100)`; `retry` bounces it back to the
   builder; `off` disables the gate entirely (a low-confidence or unparseable
   approval merges, the pre-#62 behavior).
+- `maxReviewBounces` (default 2) — reviewer->builder bounces (a
+  `REVIEW-FINDINGS`, or a `reviewerBelowThresholdAction: "retry"`) on a ticket
+  before it parks Blocked with `review bounce cap reached (N/N)` instead of
+  bouncing again (issue #76). Both routes share one budget on the lane. Must
+  be a positive integer — a fraction, zero, or a negative is a loud config
+  error, never a silent fallback.
 - `notifications` (absent = off) — Discord notifications for the seven loop/plan
   events (including `human-needed` — issue #63). Shape: `{ "enabled": true, "discordWebhookUrl": "https://…",
   "events": { "human-pause": false } }`. `enabled` is the master switch; each

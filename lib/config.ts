@@ -111,6 +111,13 @@ export interface BoardConfig {
   // below-floor score, whenever the gate is on.
   minReviewerConfidence?: number;
   reviewerBelowThresholdAction?: "block" | "retry" | "off";
+  // Reviewer->builder bounce cap (issue #76): both routes that send a ticket
+  // back to the builder from Review (a `REVIEW-FINDINGS`, and a
+  // reviewerBelowThresholdAction "retry") draw on one shared bounce budget --
+  // at this many bounces the ticket parks Blocked instead of looping
+  // builder->QA->review forever. Same optional-with-fallback treatment as the
+  // gate knobs above.
+  maxReviewBounces?: number;
   // Safety control (issue #63): mid-run breakdown notification when parked
   // tickets (Blocked + Skipped + Questions) exceed this percent of the
   // batch's initial committed-to-Building count. 0 disables the control.
@@ -139,6 +146,7 @@ export const DEFAULT_ADVERSARIAL_MODE: AdversarialMode = "non-trivial";
 export const DEFAULT_TICK_THROTTLE_SECONDS = 0;
 export const DEFAULT_MIN_REVIEWER_CONFIDENCE = 70;
 export const DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION = "block" as const;
+export const DEFAULT_MAX_REVIEW_BOUNCES = 2;
 export const DEFAULT_HUMAN_NEEDED_PERCENT = 30;
 
 // Every actionable failure in the pack is a ZError; main() prints .message to
@@ -243,6 +251,7 @@ export function loadConfig(slug?: string, home = homedir()): BoardConfig {
   cfg.tickThrottleSeconds = cfg.tickThrottleSeconds ?? DEFAULT_TICK_THROTTLE_SECONDS;
   cfg.minReviewerConfidence = cfg.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE;
   cfg.reviewerBelowThresholdAction = cfg.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION;
+  cfg.maxReviewBounces = cfg.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES;
   cfg.humanNeededPercent = cfg.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT;
   return cfg;
 }

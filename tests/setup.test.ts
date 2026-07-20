@@ -1006,6 +1006,26 @@ describe("validateConfig", () => {
     });
   });
 
+  // -- issue #76: the reviewer->builder bounce cap knob ------------------------
+  describe("maxReviewBounces (issue #76)", () => {
+    // AC3: 0, a negative, and a fraction are all rejected -- unlike
+    // requirePositiveNumber's knobs (maxLanes etc.), which accept a fraction;
+    // same integer + floor shape as auditEveryNLoops above.
+    test.each([0, -1, 2.5, NaN, "2"])("rejects %p, naming the field and the integer >= 1 rule", (bad) => {
+      const cfg = goodConfig() as any;
+      cfg.maxReviewBounces = bad;
+      expect(() => validateConfig(cfg)).toThrow(/"maxReviewBounces" must be a positive integer \(>= 1\)/);
+    });
+
+    test("accepts a positive integer and is optional", () => {
+      const cfg = goodConfig() as any;
+      cfg.maxReviewBounces = 4;
+      expect(() => validateConfig(cfg)).not.toThrow();
+      delete cfg.maxReviewBounces;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+  });
+
   // -- issue #63: the human-needed safety-control threshold knob --------------
   describe("humanNeededPercent (issue #63)", () => {
     // AC12: 0 is the documented "disable" value (unlike maxLanes/watchdogMinutes
@@ -1127,6 +1147,25 @@ describe("loadConfig deep validation", () => {
     const cfg = loadConfig("zstack", home);
     expect(cfg.maxQaPasses).toBe(5);
     expect(cfg.qaInvestigateAfter).toBe(1);
+  });
+
+  // -- issue #76: maxReviewBounces end to end through loadConfig, same
+  // integer + floor contract as auditEveryNLoops (AC3).
+  test("AC3: maxReviewBounces 0, negative, or fractional fails loadConfig, naming the key and the integer >= 1 rule", () => {
+    for (const bad of [0, -1, 2.5]) {
+      const home = writeRaw("zstack", validRawConfig({ maxReviewBounces: bad }));
+      expect(() => loadConfig("zstack", home)).toThrow(/"maxReviewBounces" must be a positive integer \(>= 1\)/);
+    }
+  });
+
+  test("AC3: maxReviewBounces absent -> loadConfig defaults it to 2", () => {
+    const home = writeRaw("zstack", validRawConfig());
+    expect(loadConfig("zstack", home).maxReviewBounces).toBe(2);
+  });
+
+  test("explicit maxReviewBounces in config.json is honored through loadConfig, not overridden by the default", () => {
+    const home = writeRaw("zstack", validRawConfig({ maxReviewBounces: 5 }));
+    expect(loadConfig("zstack", home).maxReviewBounces).toBe(5);
   });
 
   // -- issue #58: tickThrottleSeconds default-and-override through loadConfig --
