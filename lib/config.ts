@@ -5,6 +5,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { validateConfig } from "./config-schema.ts";
+import type { EventKey } from "./notify.ts";
 
 export type FieldDataType = "SINGLE_SELECT" | "NUMBER" | "TEXT";
 
@@ -95,6 +96,16 @@ export interface BoardConfig {
   // at reviewer-spawn time; #62 gates on the confidence this mode emits.
   adversarialMode?: AdversarialMode;
   quota?: Partial<QuotaConfig>;
+  // Discord notifications for the five loop events (#60). Absent block = off (a
+  // no-op), which is the correct default -- so there is deliberately no
+  // DEFAULT_NOTIFICATIONS const and no loadConfig mutation. The URL is a SECRET:
+  // config.json lives at ~/.zstack/projects/<slug>/config.json, OUTSIDE the repo
+  // (.gitignore is N/A), and may instead come from ZSTACK_DISCORD_WEBHOOK.
+  notifications?: {
+    discordWebhookUrl?: string; // SECRET; env ZSTACK_DISCORD_WEBHOOK wins over it
+    enabled?: boolean; // master switch (default on when the block is present)
+    events?: Partial<Record<EventKey, boolean>>; // per-state toggles (each default on)
+  };
 }
 
 export const DEFAULT_QUOTA: QuotaConfig = { threshold: 200, mode: "sleep" };

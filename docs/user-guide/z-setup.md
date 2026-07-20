@@ -105,6 +105,14 @@ each defaulted by `loadConfig` when absent:
   ≥ 10 changed lines OR a `security` / `migration` / `payments` / `auth` label
   on the issue; `always` fans out on every card; `off` never does. An invalid
   value is a loud config error, never a silent fallback.
+- `notifications` (absent = off) — Discord notifications for the five loop
+  events. Shape: `{ "enabled": true, "discordWebhookUrl": "https://…",
+  "events": { "human-pause": false } }`. `enabled` is the master switch; each
+  key under `events` toggles one event (all default on). The webhook URL is a
+  **secret**: prefer the `ZSTACK_DISCORD_WEBHOOK` env var (it wins over the
+  config value) so it never lands in a file, and note the URL must begin with
+  `https://` or `loadConfig` rejects it (without echoing the value). Full setup:
+  [z-loop.md → Notifications](z-loop.md#notifications).
 
 `maxLanes` and `watchdogMinutes` can also be set at setup time with
 `--max-lanes` / `--watchdog-minutes`; the others are hand-edited in
