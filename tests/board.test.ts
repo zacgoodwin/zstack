@@ -1105,6 +1105,13 @@ describe("contract enforcement", () => {
       // uses; z-board has no issue-body-edit subcommand (the one mutation
       // outside z-board, already sanctioned for z-loop above)
       `gh issue edit <N> --body-file ...`,
+      // ticket #77 Step 8 fold-in gate (PROCESS.md step 6): read-only session
+      // login lookup, the board's known bot/session identity used to spot a
+      // human comment newer than the plan
+      `gh api user -q .login`,
+      // ticket #77 Step 8 fold-in gate: read-only comments fetch; z-board has
+      // no comment-read subcommand
+      `gh issue view <N> --json comments -q '.comments'`,
     ],
     "z-status/SKILL.md": [
       `gh repo view --json name -q .name)`, // slug lookup: read-only
@@ -1132,6 +1139,10 @@ describe("contract enforcement", () => {
       `gh pr view`, // prose reference in the H9 dead-merge paragraph: read-only check
       `gh pr merge`, // prose reference naming what a dead worker MAY have run; not an instruction
       `gh issue close`, // prose PROHIBITION: "never gh issue close"
+      // ticket #77 Step 1 fold-in gate (PROCESS.md step 6): read-only comments
+      // fetch; z-board has no comment-read subcommand. Author comparison uses
+      // $ME, already looked up in the preamble -- no new gh call for that part.
+      `gh issue view <N> --json comments -q '.comments' > "$TMP/comments-<N>.json"`,
     ],
   };
 

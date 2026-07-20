@@ -28,6 +28,13 @@ records the result. It never re-derives a scheduling decision in prose.
   pure prompt constructor (`lib/stage-prompts.ts`). Nothing latent travels between
   stages; the reviewer is blinded to exactly the ticket, its acceptance criteria,
   the diff, and a throwaway worktree.
+- **Planning-pass fold-in gate (PROCESS.md step 6).** Before a Ready ticket can
+  reach Step 2's batch commit, the planning pass reads its comments and folds
+  in the newest one from anyone other than the loop's own session login. If
+  that comment raises a new question the plan doesn't already answer, the
+  ticket never enters the batch: it's posted back as a `## Needs input —`
+  comment and parked in Questions instead — the same don't-start mechanism
+  as any other open question, never a silent guess into the plan.
 - **Bounded orchestrator context.** The orchestrator holds no ticket context. Each
   stage's payload (body, diff) is assembled off-context into `input-<N>.json` and
   the printed prompt is a *pointer* to that file — small and payload-independent —
