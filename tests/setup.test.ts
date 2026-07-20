@@ -678,6 +678,9 @@ describe("writeConfig", () => {
     // omits it entirely -- loadConfig must still default it to 5 (AC2:
     // existing "every 5th loop" behavior unchanged for every already-set-up project).
     expect(loaded.auditEveryNLoops).toBe(5);
+    // issue #59 AC8: same for adversarialMode -- SetupBoard never writes it, so
+    // loadConfig must default an omitting config to "non-trivial".
+    expect(loaded.adversarialMode).toBe("non-trivial");
   });
 });
 
@@ -915,6 +918,27 @@ describe("validateConfig", () => {
       const cfg = goodConfig() as any;
       cfg.auditEveryNLoops = bad;
       expect(() => validateConfig(cfg)).toThrow(/"auditEveryNLoops" must be a positive integer \(>= 1\)/);
+    });
+  });
+
+  // -- issue #59: the adversarial-reviewer mode knob --------------------------
+  describe("adversarialMode (issue #59)", () => {
+    // AC9: a value outside the three-enum is rejected, naming the field and the
+    // valid set; a valid value (and omission -- loadConfig defaults it) passes.
+    test("rejects a bad adversarialMode", () => {
+      const cfg = goodConfig() as any;
+      cfg.adversarialMode = "sometimes";
+      expect(() => validateConfig(cfg)).toThrow(/adversarialMode.*"off", "non-trivial", "always"/);
+    });
+
+    test("accepts a valid adversarialMode and is optional", () => {
+      const cfg = goodConfig() as any;
+      for (const mode of ["off", "non-trivial", "always"]) {
+        cfg.adversarialMode = mode;
+        expect(() => validateConfig(cfg)).not.toThrow();
+      }
+      delete cfg.adversarialMode;
+      expect(() => validateConfig(cfg)).not.toThrow();
     });
   });
 });

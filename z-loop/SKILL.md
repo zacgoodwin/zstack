@@ -237,7 +237,9 @@ only the transport and those two events.
 1. Assemble the stage's typed input JSON (table below) into `"$TMP/input-<N>.json"`.
 2. `bun "$PACK/lib/stage-prompts.ts" prompt <stage> "$TMP/input-<N>.json" > "$TMP/prompt-<N>.txt"`
    — the constructor is the contract; if it exits non-zero the input is wrong,
-   fix the input, never hand-write the prompt.
+   fix the input, never hand-write the prompt. The `reviewer` stage is the one
+   exception that takes two extra flags (`--adversarial-mode`, `--labels`) — see
+   its row below; they decide the super-truth fan-out and NEVER become input keys.
 3. Spawn a FRESH harness Agent (Agent tool), `run_in_background: true`, with
    that prompt and `model` = the ticket's Model field
    (`"$Z_BOARD" field-get <N> Model`; the Model Effort field selected the
@@ -248,7 +250,7 @@ only the transport and those two events.
 |---|---|
 | `builder` | `ticketNumber`, `ticketTitle`, `ticketBody` (fresh `gh issue view`), `worktreePath` (`.worktrees/ticket-<N>`), `branch`, `baseBranch`; on a bounce also `qaNotes`/`investigateFirst` or `reviewNotes` per the advance row above. |
 | `qa` | `ticketNumber`, `ticketBody`, `worktreePath`, `branch`, `qaPass` (the lane's `qaBounces` in the state file + 1), `webTarget` (true when the ticket changes a web-served surface — your judgment; QA then drives gstack /qa). |
-| `reviewer` | **BLINDED — exactly** `ticketBody`, `acceptanceCriteria` (the `### Acceptance Criteria` section: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' body.md`), `diff` (`git -C .worktrees/ticket-<N> diff "$BASE"...HEAD`), `worktreePath` = a THROWAWAY worktree of the head commit (`git worktree add "$TMP/review-<N>" <head-sha>`; remove it after the stage). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. |
+| `reviewer` | **BLINDED — exactly** `ticketBody`, `acceptanceCriteria` (the `### Acceptance Criteria` section: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' body.md`), `diff` (`git -C .worktrees/ticket-<N> diff "$BASE"...HEAD`), `worktreePath` = a THROWAWAY worktree of the head commit (`git worktree add "$TMP/review-<N>" <head-sha>`; remove it after the stage). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. **Adversarial control (#59):** build this stage's prompt with two extra flags — `MODE=$("$Z_BOARD" ... )` the project's `adversarialMode` (read it from `~/.zstack/projects/$SLUG/config.json`; `loadConfig` defaults it to `non-trivial`) and `LABELS=$(gh issue view <N> --json labels -q '[.labels[].name]')` (a JSON array — labels live on the GitHub issue, NOT on the board item, so `board.list` never fetched them; get them here). Then `bun "$PACK/lib/stage-prompts.ts" prompt reviewer "$TMP/input-<N>.json" --adversarial-mode "$MODE" --labels "$LABELS" > "$TMP/prompt-<N>.txt"`. The predicate (`adversarialActive`) reads the diff's own changed-line count from the blinded input — `always`/`non-trivial`-on-a-big-or-labeled diff spawns the skeptic fan-out and emits a `confidence=` token; `off`/small-unlabeled is the single pass. Mode + labels ride as FLAGS; the four-key input JSON is untouched. |
 | `merge` | `ticketNumber`, `prTitle` (the ticket title), `branch`, `baseBranch`, `worktreePath`, `stackedOn` (from the advance action — parents whose branches this PR stacks on; the prompt carries the PROCESS.md step 18 chain rules: parents first, no branch deletion mid-batch, retarget, delete last). |
 
 **Per-stage Actual (every stage, no exceptions):** when a stage agent finishes,

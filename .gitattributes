@@ -22,6 +22,11 @@ evals/planner/mock-claude.sh text eol=lf
 *.json  text eol=lf
 *.jsonl text eol=lf
 *.toml  text eol=lf
+# The reviewer single-pass golden (issue #59): a byte-for-byte snapshot of the
+# pre-#59 prompt, compared against reviewerPrompt(input, false) output. That
+# output is LF (its *.ts source is eol=lf), so the golden must stay LF too or the
+# comparison would spuriously fail on a CRLF Windows checkout.
+tests/reviewer-single-pass.golden.txt text eol=lf
 
 # Diagrams: never touch bytes.
 *.png binary

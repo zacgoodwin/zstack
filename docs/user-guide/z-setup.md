@@ -99,6 +99,12 @@ each defaulted by `loadConfig` when absent:
 - `qaInvestigateAfter` (default 2) — the QA-bounce count at/after which the
   rebuild runs `/investigate` first instead of patching straight from QA's
   notes (PROCESS.md step 15).
+- `adversarialMode` (default `"non-trivial"`, values `off` | `non-trivial` |
+  `always`) — when the Review stage fans out independent skeptic sub-agents
+  (super-truth) instead of a single pass. `non-trivial` activates on a diff of
+  ≥ 10 changed lines OR a `security` / `migration` / `payments` / `auth` label
+  on the issue; `always` fans out on every card; `off` never does. An invalid
+  value is a loud config error, never a silent fallback.
 - `notifications` (absent = off) — Discord notifications for the five loop
   events. Shape: `{ "enabled": true, "discordWebhookUrl": "https://…",
   "events": { "human-pause": false } }`. `enabled` is the master switch; each

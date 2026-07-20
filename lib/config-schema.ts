@@ -7,6 +7,7 @@
 // error three subcommands later. /z-setup (C3) runs this on the config it builds
 // before writing; loadConfig runs it on every read.
 import {
+  ADVERSARIAL_MODES,
   BoardConfig,
   FieldDataType,
   ZError,
@@ -119,6 +120,16 @@ export function validateConfig(cfg: unknown): BoardConfig {
   ) {
     throw new ZError(
       `Config "auditEveryNLoops" must be a positive integer (>= 1), got ${JSON.stringify(c.auditEveryNLoops)}.`
+    );
+  }
+  // adversarialMode (issue #59): the reviewer super-truth control. Single
+  // enforcement point -- z-setup writes through it, loadConfig reads through it,
+  // and stage-prompts trusts the loaded value is one of the three. Validated
+  // only when present so a config that omits it (loadConfig defaults it to
+  // "non-trivial") still passes.
+  if (c.adversarialMode !== undefined && !ADVERSARIAL_MODES.includes(c.adversarialMode)) {
+    throw new ZError(
+      `Config "adversarialMode" must be one of "off", "non-trivial", "always", got ${JSON.stringify(c.adversarialMode)}.`
     );
   }
   if (c.quota !== undefined) {
