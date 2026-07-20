@@ -156,7 +156,8 @@ Every filed ticket passes the lint gate, carries Model/Effort/Estimate via
 `z-board`, links its dependencies both ways, splits anything over the context
 gate, parks open questions, and a re-run creates zero duplicates. Every ticket
 still in Backlog after the scan — i.e., not moved to Questions by a genuine
-ambiguity — passes the same lint gate and carries the same three fields; this
+ambiguity — passes the same lint gate and carries the same three fields —
+except a split parent, which fields only its children (below); this
 step never promotes a ticket to Ready. A ticket split by either gate carries
 a `## Subtasks (in order)` list and both-direction links to its filed
 children, and stays open and un-promoted for a human to close once every

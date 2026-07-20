@@ -602,7 +602,8 @@ Report DONE only when all hold:
 - A re-run on the same spec updates in place and creates zero duplicates (Step 9).
 - Every ticket still in Backlog after the scan — i.e., not moved to Questions
   by item 3's ambiguity path — passes `z-ticket-lint` and carries Model, Model
-  Effort, and Estimate (Step 10). This step never promotes a ticket to Ready —
+  Effort, and Estimate (Step 10) — except a split parent, which fields only
+  its children (next item). This step never promotes a ticket to Ready —
   the only path anywhere in this skill that ever moves a Backlog ticket to
   Ready remains Step 7.4's dependency pull.
 - A ticket Step 10 split on either gate (`needsSplit` or `shouldSplitForCost`,
