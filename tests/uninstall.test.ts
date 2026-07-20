@@ -326,6 +326,34 @@ describe("AC5 / #49 AC4 — running twice: the second run's output matches the d
     expect(second.stdout).toContain("rm -rf");
     expect(second.stdout).not.toContain("Nothing to remove");
   }, SPAWN_TIMEOUT_MS);
+
+  // #49 AC4 (review bounce): the Windows registered COPY that /z-uninstall runs
+  // from is the standard Windows path, not an edge -- it is owned (sentinel) but
+  // the running dir cannot self-delete, so uninstall retains it and increments
+  // `left` on EVERY run. "Nothing to remove" therefore never prints for it. This
+  // pins the second exception docs/user-guide/z-uninstall.md now documents, so the
+  // user-guide can no longer drift back to the old "copy install -> Nothing to
+  // remove" overstatement without tripping the gate.
+  test("registered-copy-in-skills install: second run reports the copy left, not 'Nothing to remove'", () => {
+    const home = makeHome();
+    const skills = join(home, ".claude", "skills");
+    mkdirSync(skills, { recursive: true });
+    const copy = join(skills, "zstack");
+    mkdirSync(copy, { recursive: true });
+    cpSync(UNINSTALL_PATH, join(copy, "uninstall"));
+    writeFileSync(join(copy, ".zstack-registered"), "Created by zstack ./setup.\n"); // sentinel: a registered copy
+
+    const first = runUninstall({ home, uninstallPath: join(copy, "uninstall") });
+    expect(first.exitCode).toBe(0);
+    expect(existsSync(copy)).toBe(true); // deliberately retained (the running dir)
+
+    const second = runUninstall({ home, uninstallPath: join(copy, "uninstall") });
+    expect(second.exitCode).toBe(0);
+    expect(existsSync(copy)).toBe(true); // still retained
+    expect(second.stdout).toContain("registered copy");
+    expect(second.stdout).toContain("rm -rf");
+    expect(second.stdout).not.toContain("Nothing to remove");
+  }, SPAWN_TIMEOUT_MS);
 });
 
 // -- argument handling -------------------------------------------------------

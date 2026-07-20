@@ -11,10 +11,13 @@ Full skill contract: `z-uninstall/SKILL.md`. The deterministic half is the
 ## When to run it
 
 When you want zstack off this machine, or to undo a specific install. It is safe
-to run more than once: once a symlink or copy install is removed, a second run
-finds nothing to remove. (A clone you installed straight into the skills dir is
-the exception — it is deliberately kept on every run, so each run reports it left
-with the manual `rm -rf`, not "nothing to remove"; see below.)
+to run more than once: once a symlink install, or a copy whose registration you
+remove from the source clone, is gone, a second run finds nothing to remove. Two
+installs are the exception — a clone you put straight into the skills dir, and the
+Windows copy `/z-uninstall` runs from — because there the pack directory the
+command executes from IS the registration, and it cannot delete itself. Each run
+(the second included) reports that directory left with the manual `rm -rf`, not
+"nothing to remove"; see below.
 
 ## What it removes (and what it deliberately does not)
 
@@ -37,7 +40,10 @@ with the manual `rm -rf`, not "nothing to remove"; see below.)
 2. **The clone itself is never deleted.** If the pack IS the git clone at
    `~/.claude/skills/zstack` (you cloned straight into the skills dir), that clone
    is left alone — it may be your only copy — and the exact `rm -rf` command is
-   printed for you to run by hand.
+   printed for you to run by hand. The Windows registered copy that `/z-uninstall`
+   runs from is likewise left — the command cannot delete the copy it is executing
+   from — but it is named a registered copy (its source elsewhere owns the install),
+   with its own `rm -rf`, not the "only copy" warning.
 
 3. **`~/.zstack` only under `--purge`.** Per-project state (board config, loop
    counter, locks, run reports) is kept by default, with its path and the purge
@@ -62,17 +68,26 @@ with the manual `rm -rf`, not "nothing to remove"; see below.)
 
 ## Running it again
 
-For a symlink or copy install, the first run removes everything it owns, so a
-second run exits 0 and prints "Nothing to remove -- no zstack registrations
-found". There is no error, no partial state.
+For a symlink install, or a copy whose registration you remove from the source
+clone, the first run removes everything it owns, so a second run exits 0 and
+prints "Nothing to remove -- no zstack registrations found". There is no error, no
+partial state.
 
-The one exception is a clone you installed straight into the skills dir
-(`~/.claude/skills/zstack` **is** the git clone). That clone is deliberately never
-deleted — it may be your only copy — so every run, the second included, reports it
-left in place and prints the exact `rm -rf` command for you to run by hand. That
-is expected, not an error: "Nothing to remove" prints only once there is
-genuinely nothing left that we own, and a retained clone is something we
-deliberately keep, not something we failed to remove.
+Two installs are the exception, and in both the pack directory the command runs
+from IS the registration it cannot delete out from under itself:
+
+- A **clone you put straight into the skills dir** (`~/.claude/skills/zstack` **is**
+  the git clone, no sentinel). It may be your only copy, so it is deliberately
+  never deleted; every run reports it left and prints the exact `rm -rf`.
+- The **Windows registered copy `/z-uninstall` runs from.** The command resolves the
+  pack to `~/.claude/skills/zstack` and executes that copy's own `uninstall`, so the
+  running directory is a sentinel-carrying copy it cannot self-delete; every run
+  names it a registered copy and prints the `rm -rf` to run from the source or by
+  hand.
+
+That is expected, not an error: "Nothing to remove" prints only once there is
+genuinely nothing left that we own, and a deliberately-retained running directory
+is something we keep, not something we failed to remove.
 
 ## Done when
 
