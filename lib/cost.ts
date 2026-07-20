@@ -154,6 +154,42 @@ export function parseLine(line: string, where: string): ParsedUsageLine | null {
   return { dedupKeys, model, usage };
 }
 
+// Apportions `targetCents` (integer cents) across `rawDollars` (each file's
+// unrounded dollar share) via the largest-remainder method (Hamilton
+// apportionment): floor every share to whole cents, then hand out the
+// leftover cents to the shares with the largest fractional remainder first
+// (or, if the floors overshot the target, take cents away from the smallest
+// remainder first) until the sum matches EXACTLY. Review bounce #83 finding
+// 1: rounding each file independently (roundCents per entry, the previous
+// implementation) does not generally sum to `total` -- total rounds once per
+// model across every file combined, so two files that each round DOWN
+// individually can still round UP once their tokens are combined (e.g. two
+// files at $0.004998 each round to $0.00 + $0.00 = $0.00, while the combined
+// $0.009996 rounds to $0.01). Apportionment makes AC1 hold for any input, not
+// just a fixture where the numbers happen to land on the same cent both ways.
+// Ties (equal remainders) break by array index so the result is deterministic
+// given the caller's already-sorted file order.
+function apportionCents(rawDollars: number[], targetCents: number): number[] {
+  // Round to 1e-6-cent precision first to kill float noise (e.g.
+  // 45.000000000001) before flooring, so an exact cent amount floors to itself.
+  const rawCents = rawDollars.map((d) => Math.round(d * 100 * 1e6) / 1e6);
+  const floors = rawCents.map(Math.floor);
+  const remainders = rawCents.map((c, i) => c - floors[i]);
+  const base = floors.reduce((a, b) => a + b, 0);
+  const leftover = targetCents - base;
+
+  const byRemainderDesc = remainders.map((_, i) => i).sort((a, b) => remainders[b] - remainders[a] || a - b);
+
+  const cents = [...floors];
+  if (leftover > 0) {
+    for (let k = 0; k < leftover; k++) cents[byRemainderDesc[k % byRemainderDesc.length]] += 1;
+  } else if (leftover < 0) {
+    // Smallest remainder loses a cent first (reverse of the above order).
+    for (let k = 0; k < -leftover; k++) cents[byRemainderDesc[byRemainderDesc.length - 1 - (k % byRemainderDesc.length)]] -= 1;
+  }
+  return cents;
+}
+
 export function costOfFiles(paths: string[], rates: RatesFile, opts?: { byFile?: boolean }): CostResult {
   const byFile = opts?.byFile === true;
   const seenKeys = new Set<string>();
@@ -239,20 +275,31 @@ export function costOfFiles(paths: string[], rates: RatesFile, opts?: { byFile?:
     // a file that never had a first-seen request (empty, synthetic-only, or
     // entirely duplicate content already priced under another file)
     // contributes nothing and is left out rather than padded with a $0 row.
-    result.by_file = paths
-      .filter((p) => perFileModel!.has(p))
-      .map((path) => {
-        const fModels = perFileModel!.get(path)!;
-        let dollarsUnrounded = 0;
-        const tokens: TokenTotals = { fresh_input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 };
-        for (const [key, t] of fModels) {
-          dollarsUnrounded += priceTokensUnrounded(t.fresh_input_tokens, t.cached_input_tokens, t.output_tokens, rates.rates[key]);
-          tokens.fresh_input_tokens += t.fresh_input_tokens;
-          tokens.cached_input_tokens += t.cached_input_tokens;
-          tokens.output_tokens += t.output_tokens;
-        }
-        return { file: path, dollars: roundCents(dollarsUnrounded), requests: perFileRequests!.get(path)!, tokens };
-      });
+    const files = paths.filter((p) => perFileModel!.has(p));
+    const perFileTokens = new Map<string, TokenTotals>();
+    const rawDollars = files.map((path) => {
+      const fModels = perFileModel!.get(path)!;
+      let dollarsUnrounded = 0;
+      const tokens: TokenTotals = { fresh_input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 };
+      for (const [key, t] of fModels) {
+        dollarsUnrounded += priceTokensUnrounded(t.fresh_input_tokens, t.cached_input_tokens, t.output_tokens, rates.rates[key]);
+        tokens.fresh_input_tokens += t.fresh_input_tokens;
+        tokens.cached_input_tokens += t.cached_input_tokens;
+        tokens.output_tokens += t.output_tokens;
+      }
+      perFileTokens.set(path, tokens);
+      return dollarsUnrounded;
+    });
+    // Apportion `total`'s cents across files by largest remainder (see
+    // apportionCents above) instead of rounding each file independently, so
+    // sum(by_file.dollars) === total to the cent for ANY input (AC1).
+    const cents = apportionCents(rawDollars, Math.round(result.total * 100));
+    result.by_file = files.map((path, i) => ({
+      file: path,
+      dollars: cents[i] / 100,
+      requests: perFileRequests!.get(path)!,
+      tokens: perFileTokens.get(path)!,
+    }));
   }
 
   return result;
@@ -261,16 +308,22 @@ export function costOfFiles(paths: string[], rates: RatesFile, opts?: { byFile?:
 // Buckets by_file entries by the stage encoded in each file's name
 // (`<stage>-<attempt>.jsonl`, z-loop/SKILL.md Step 4's per-stage transcript
 // copy): the segment of the basename before its first "-". A name that
-// doesn't match (no "-", or an unrecognized prefix) goes to "other" rather
-// than being dropped -- every dollar the batch spent must show up somewhere
-// in the end-of-loop spend-by-stage table (lib/endloop.ts).
+// doesn't match a KNOWN_STAGE (no "-" at all, or a prefix that isn't one of
+// the four real stages -- e.g. a manually-dropped "notes.jsonl" or
+// "manual-drop.jsonl") goes to "other" rather than being dropped -- every
+// dollar the batch spent must show up somewhere in the end-of-loop
+// spend-by-stage table (lib/endloop.ts SPEND_STAGE_ORDER only ever renders
+// these five row names; anything else would silently vanish from the report,
+// review bounce #83 finding 2).
 const STAGE_PREFIX = /^([^-]+)-/;
+const KNOWN_STAGES = new Set(["builder", "qa", "reviewer", "merge"]);
 
 export function sumByStage(byFile: FileSpend[]): { stage: string; dollars: number }[] {
   const totals = new Map<string, number>();
   for (const f of byFile) {
     const base = f.file.replace(/\\/g, "/").split("/").pop()!.replace(/\.jsonl$/i, "");
-    const stage = STAGE_PREFIX.exec(base)?.[1] ?? "other";
+    const prefix = STAGE_PREFIX.exec(base)?.[1];
+    const stage = prefix && KNOWN_STAGES.has(prefix) ? prefix : "other";
     totals.set(stage, (totals.get(stage) ?? 0) + f.dollars);
   }
   return [...totals.entries()].map(([stage, dollars]) => ({ stage, dollars: roundCents(dollars) }));

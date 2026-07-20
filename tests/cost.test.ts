@@ -603,10 +603,10 @@ describe("--by-file attribution (ticket #83)", () => {
   test("AC1: by_file dollars sum equals total to the cent, over two fixture files", () => {
     const dir = mkdtempSync(join(tmpdir(), "zcost-byfile-"));
     tmpPaths.push(dir);
-    // Sonnet rate: input $3/1M, output $15/1M. Round token counts so the
-    // file-level rounding and the model-level rounding this fixture happens
-    // to land on the same cent (a pin, not a general rounding proof -- see
-    // costOfFiles' by_file comment).
+    // Sonnet rate: input $3/1M, output $15/1M. Both files land on exact cent
+    // amounts here, so this alone doesn't exercise apportionment (see the
+    // dedicated apportionment test below for that) -- it just pins the
+    // ordinary case still gives the expected per-file dollars.
     writeFileSync(join(dir, "builder-1.jsonl"), line("req_A", "claude-sonnet-4-5", 100000, 10000) + "\n"); // $0.30 + $0.15 = $0.45
     writeFileSync(join(dir, "qa-1.jsonl"), line("req_B", "claude-sonnet-4-5", 100000, 0) + "\n"); // $0.30
 
@@ -618,6 +618,32 @@ describe("--by-file attribution (ticket #83)", () => {
     expect(Math.round(sum * 100) / 100).toBe(result.total);
     expect(result.by_file!.find((f) => f.file.endsWith("builder-1.jsonl"))!.dollars).toBe(0.45);
     expect(result.by_file!.find((f) => f.file.endsWith("qa-1.jsonl"))!.dollars).toBe(0.3);
+  });
+
+  // Review bounce #83 finding 1: independent per-file rounding (roundCents
+  // per entry) is an apportionment problem, not a rounding problem -- sum of
+  // independently-rounded parts != round-of-the-combined-whole in general.
+  // Exact repro from the finding: two files each contribute 1666 sonnet
+  // input tokens. Unrounded, each file's share is $0.004998, which rounds to
+  // $0.00 independently -- but the combined 3332 tokens price to $0.009996,
+  // which rounds to $0.01 as the total. A by_file sum of independently
+  // rounded parts would give $0.00, not $0.01. apportionCents (largest
+  // remainder) fixes this generally, not just for a hand-picked fixture.
+  test("apportionment (review bounce #83 finding 1): two files that individually round DOWN to $0.00 but combine to a $0.01 total -- by_file still sums to the cent-exact total", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-byfile-apportion-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "builder-1.jsonl"), line("req_A", "claude-sonnet-4-5", 1666, 0) + "\n");
+    writeFileSync(join(dir, "qa-1.jsonl"), line("req_B", "claude-sonnet-4-5", 1666, 0) + "\n");
+
+    const files = expandGlob("*.jsonl", dir); // sorted: builder-1.jsonl, qa-1.jsonl
+    const result = costOfFiles(files, RATES, { byFile: true });
+    expect(result.total).toBe(0.01); // combined tokens round UP once summed
+    const sum = result.by_file!.reduce((s, f) => s + f.dollars, 0);
+    expect(Math.round(sum * 100) / 100).toBe(result.total); // AC1 holds even here
+    // Equal remainders tie-break by (sorted) file order -- the earlier file
+    // gets the leftover cent.
+    expect(result.by_file!.find((f) => f.file.endsWith("builder-1.jsonl"))!.dollars).toBe(0.01);
+    expect(result.by_file!.find((f) => f.file.endsWith("qa-1.jsonl"))!.dollars).toBe(0);
   });
 
   // AC2: without --by-file, output is byte-identical to today -- no by_file
@@ -738,5 +764,25 @@ describe("sumByStage", () => {
   test("a Windows-style path (backslashes) still resolves to the basename's stage", () => {
     const byFile = [fileSpend("C:\\state\\transcripts\\ticket-9\\qa-1.jsonl", 0.5)];
     expect(sumByStage(byFile)).toEqual([{ stage: "qa", dollars: 0.5 }]);
+  });
+
+  // Review bounce #83 finding 2: STAGE_PREFIX matched ANY text before the
+  // first hyphen, so a hyphenated-but-unrecognized filename (e.g. a manually
+  // dropped transcript) minted its own fake "stage" instead of falling to
+  // "other" -- and since lib/endloop.ts's render only ever looks up the five
+  // known rows (builder/qa/reviewer/merge/other), that dollar amount then
+  // vanished from the report with no error. Only the four real stage names
+  // may claim a row; everything else -- hyphenated or not -- buckets to
+  // "other".
+  test("a hyphenated-but-unrecognized prefix falls to 'other', not a new made-up stage", () => {
+    const byFile = [fileSpend("manual-drop.jsonl", 5), fileSpend("builder-1.jsonl", 1)];
+    const stages = sumByStage(byFile);
+    expect(stages).toEqual(
+      expect.arrayContaining([
+        { stage: "other", dollars: 5 },
+        { stage: "builder", dollars: 1 },
+      ])
+    );
+    expect(stages.find((s) => s.stage === "manual")).toBeUndefined();
   });
 });

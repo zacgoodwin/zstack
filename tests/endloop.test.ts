@@ -570,4 +570,45 @@ describe("ticket #83: endloop CLI `spend-by-stage <cost-result.json>`", () => {
     expect(main(["spend-by-stage", costResultPath])).toBe(1);
     expect(errs.mock.calls.flat().join(" ")).toMatch(/by_file/);
   });
+
+  // Review bounce #83 finding 2, end to end: a manually-dropped transcript
+  // file (hyphenated name, no recognized stage prefix) must NOT mint its own
+  // fake stage row -- it has to land in "other" so its dollars still show up
+  // once fed into buildEndLoopReport's fixed-row table, instead of silently
+  // vanishing (the bug: sumByStage produced {stage:"manual",...}, and
+  // buildEndLoopReport's SPEND_STAGE_ORDER lookup only ever renders the five
+  // known rows, so that entry was dropped with no error anywhere).
+  test("a manually-dropped transcript file's dollars survive into the 'other' row, not a dropped made-up stage", () => {
+    const costResultPath = join(tmp(), "cost-result.json");
+    writeFileSync(
+      costResultPath,
+      JSON.stringify({
+        total: 6,
+        by_model: [],
+        by_file: [
+          { file: "manual-drop.jsonl", dollars: 5, requests: 1, tokens: { fresh_input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } },
+          { file: "builder-1.jsonl", dollars: 1, requests: 1, tokens: { fresh_input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } },
+        ],
+        requests: 2,
+        lines_parsed: 2,
+        skippedSynthetic: 0,
+      })
+    );
+    expect(main(["spend-by-stage", costResultPath])).toBe(0);
+    const spendByStage = JSON.parse(logs.mock.calls.at(-1)![0] as string) as { stage: string; dollars: number }[];
+    expect(spendByStage.find((s) => s.stage === "manual")).toBeUndefined();
+    expect(spendByStage.find((s) => s.stage === "other")!.dollars).toBe(5);
+
+    const report = buildEndLoopReport({
+      regression: GREEN,
+      loopCount: 1,
+      auditsRan: false,
+      tickets: [],
+      edges: [],
+      bugsFiled: [],
+      spendByStage,
+    });
+    expect(report).toContain("| other | $5.00 |"); // the $5 shows up, not silently dropped
+    expect(report).not.toContain("manual");
+  });
 });
