@@ -18,6 +18,13 @@ invisible. `./setup` registers each skill as its own top-level entry
 3. On Windows, check for a literal `~` folder in `~/.claude/skills` — it means
    the install commands ran in `cmd.exe`, which doesn't expand `~`. Delete it
    and re-run the install from Git Bash.
+4. If `./setup` printed `is a separate zstack install we didn't create; leaving
+   Claude Code untouched`, another clone or manual copy already owns
+   `~/.claude/skills/zstack`, and setup refuses to register this pack's skills
+   against it (it also skips Codex/Factory until that is resolved — re-running
+   from here keeps refusing, by design). Either run `./setup` from that install
+   instead, or replace it with this one:
+   `rm -rf ~/.claude/skills/zstack`, then re-run `./setup` from your clone.
 
 Verify: `ls ~/.claude/skills/z-*/SKILL.md` should list four files.
 

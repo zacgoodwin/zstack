@@ -28,7 +28,7 @@ Installing zstack now actually surfaces the four skills. Also releases the issue
 - `epicStyle "issue-type"` is rejected at config validation and z-setup until a sub-issue create path exists; epic style is always `milestones`.
 - `field-get` on a nonexistent issue throws the same not-found error as other subcommands (was a silent empty value), and never falls back to another project's same-named field.
 - Root strict `tsconfig` + `bun run typecheck` wired into the gate suite; shared CLI plumbing consolidated into `lib/cli.ts`; board statuses single-sourced in `lib/config.ts`.
-- 100+ new gate tests (456 total), each proven to bite via mutation testing.
+- 100+ new gate tests (481 total), each proven to bite via mutation testing.
 
 ## [0.1.0.0] - 2026-07-19
 
