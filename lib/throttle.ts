@@ -22,7 +22,7 @@ export function defaultLoopDir(slug: string, home = homedir()): string {
   return join(projectsDir(home), slug, "loop");
 }
 
-export function lastTickPath(loopDir: string): string {
+function lastTickPath(loopDir: string): string {
   return join(loopDir, "last-tick");
 }
 

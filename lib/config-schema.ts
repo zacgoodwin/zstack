@@ -22,13 +22,32 @@ const DATA_TYPES: FieldDataType[] = ["SINGLE_SELECT", "NUMBER", "TEXT"];
 // <-> loop.ts import cycle -- loop.ts already imports from config.ts).
 const STAGE_NAMES = ["builder", "qa", "reviewer", "merge"];
 
+// Shared shape behind every numeric config knob below: typeof/finite check,
+// optional integer requirement, optional inclusive/exclusive bounds. One
+// throw site so every knob's rejection follows the same rule; `desc` carries
+// each knob's own rule text so the message stays specific (ponytail-audit
+// #109 item 2 -- ALL numeric guards fold into this one function).
+function requireNumber(
+  key: string,
+  v: unknown,
+  opts: { min?: number; exclusiveMin?: boolean; max?: number; integer?: boolean; desc: string }
+): void {
+  if (v === undefined) return;
+  const { min, exclusiveMin, max, integer, desc } = opts;
+  const bad =
+    typeof v !== "number" ||
+    !Number.isFinite(v) ||
+    (integer === true && !Number.isInteger(v)) ||
+    (min !== undefined && (exclusiveMin ? v <= min : v < min)) ||
+    (max !== undefined && v > max);
+  if (bad) throw new ZError(`Config "${key}" must be ${desc}, got ${JSON.stringify(v)}.`);
+}
+
 // Positive-finite guard, exported so z-setup's pre-flight (F9, issue #14) can
 // reject user-supplied numerics BEFORE any board mutation runs, with the exact
 // same rule and error text as the config those numbers would become.
 export function requirePositiveNumber(key: string, v: unknown): void {
-  if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v) || v <= 0)) {
-    throw new ZError(`Config "${key}" must be a positive number, got ${JSON.stringify(v)}.`);
-  }
+  requireNumber(key, v, { min: 0, exclusiveMin: true, desc: "a positive number" });
 }
 
 function requireString(obj: any, key: string): void {
@@ -118,36 +137,18 @@ export function validateConfig(cfg: unknown): BoardConfig {
   for (const k of ["maxLanes", "watchdogMinutes", "lockStalenessMinutes", "maxQaPasses", "qaInvestigateAfter"]) {
     requirePositiveNumber(k, c[k]);
   }
-  // auditEveryNLoops (issue #18): the /cso + /health end-of-loop cadence. One
-  // combined check (the isInteger half of projectNumber's pattern at lines
-  // 78-80, plus a >= 1 floor) so every rejected value -- 0, a negative, NaN,
-  // a string, or a fraction like 2.5 ("every 2.5th loop" is meaningless) --
-  // gets the same "positive integer (>= 1)" message naming the field. Not
-  // requirePositiveNumber alone: that guard accepts fractions, which this
-  // knob must not.
-  if (
-    c.auditEveryNLoops !== undefined &&
-    (typeof c.auditEveryNLoops !== "number" || !Number.isInteger(c.auditEveryNLoops) || c.auditEveryNLoops < 1)
-  ) {
-    throw new ZError(
-      `Config "auditEveryNLoops" must be a positive integer (>= 1), got ${JSON.stringify(c.auditEveryNLoops)}.`
-    );
-  }
+  // auditEveryNLoops (issue #18): the /cso + /health end-of-loop cadence, an
+  // integer >= 1 -- not requirePositiveNumber alone, since that guard accepts
+  // fractions like 2.5 ("every 2.5th loop" is meaningless).
+  requireNumber("auditEveryNLoops", c.auditEveryNLoops, { min: 1, integer: true, desc: "a positive integer (>= 1)" });
   // tickThrottleSeconds (issue #58): the minimum wall-clock seconds between
-  // bin/z-loop-tick invocations. 0 (off, the default) is the required floor
-  // value, so this can't reuse requirePositiveNumber (which rejects v <= 0) --
-  // same shape as auditEveryNLoops's integer + floor check above, but the
-  // floor is >= 0 instead of >= 1.
-  if (
-    c.tickThrottleSeconds !== undefined &&
-    (typeof c.tickThrottleSeconds !== "number" ||
-      !Number.isInteger(c.tickThrottleSeconds) ||
-      c.tickThrottleSeconds < 0)
-  ) {
-    throw new ZError(
-      `Config "tickThrottleSeconds" must be a non-negative integer (0 = no throttling), got ${JSON.stringify(c.tickThrottleSeconds)}.`
-    );
-  }
+  // bin/z-loop-tick invocations. 0 (off, the default) is a required floor
+  // value, so this can't reuse requirePositiveNumber (which rejects v <= 0).
+  requireNumber("tickThrottleSeconds", c.tickThrottleSeconds, {
+    min: 0,
+    integer: true,
+    desc: "a non-negative integer (0 = no throttling)",
+  });
   // adversarialMode (issue #59): the reviewer super-truth control. Single
   // enforcement point -- z-setup writes through it, loadConfig reads through it,
   // and stage-prompts trusts the loaded value is one of the three. Validated
@@ -157,19 +158,8 @@ export function validateConfig(cfg: unknown): BoardConfig {
   // minReviewerConfidence / reviewerBelowThresholdAction (issue #62): the
   // reviewer-confidence safety gate. minReviewerConfidence is an integer
   // percentage 0-100, so requirePositiveNumber (which rejects 0 and accepts
-  // fractions/150) is the wrong guard -- this mirrors auditEveryNLoops' own
-  // isInteger + bounds check above but adds the upper bound a percentage needs.
-  if (
-    c.minReviewerConfidence !== undefined &&
-    (typeof c.minReviewerConfidence !== "number" ||
-      !Number.isInteger(c.minReviewerConfidence) ||
-      c.minReviewerConfidence < 0 ||
-      c.minReviewerConfidence > 100)
-  ) {
-    throw new ZError(
-      `Config "minReviewerConfidence" must be an integer 0-100, got ${JSON.stringify(c.minReviewerConfidence)}.`
-    );
-  }
+  // fractions/150) is the wrong guard.
+  requireNumber("minReviewerConfidence", c.minReviewerConfidence, { min: 0, max: 100, integer: true, desc: "an integer 0-100" });
   if (
     c.reviewerBelowThresholdAction !== undefined &&
     !["block", "retry", "off"].includes(c.reviewerBelowThresholdAction)
@@ -180,29 +170,15 @@ export function validateConfig(cfg: unknown): BoardConfig {
   }
   // maxReviewBounces (issue #76): the reviewer->builder bounce cap. A count of
   // bounces, so -- unlike requirePositiveNumber's knobs -- a fraction is
-  // meaningless too; same integer + floor shape as auditEveryNLoops above, not
-  // requirePositiveNumber (which would silently accept e.g. 2.5).
-  if (
-    c.maxReviewBounces !== undefined &&
-    (typeof c.maxReviewBounces !== "number" || !Number.isInteger(c.maxReviewBounces) || c.maxReviewBounces < 1)
-  ) {
-    throw new ZError(
-      `Config "maxReviewBounces" must be a positive integer (>= 1), got ${JSON.stringify(c.maxReviewBounces)}.`
-    );
-  }
+  // meaningless too; not requirePositiveNumber (which would silently accept
+  // e.g. 2.5).
+  requireNumber("maxReviewBounces", c.maxReviewBounces, { min: 1, integer: true, desc: "a positive integer (>= 1)" });
   if (c.quota !== undefined) validateQuota(c.quota);
 
   // humanNeededPercent (issue #63): the mid-run breakdown notification's trip
   // threshold. `0` is a legitimate "disable" value (unlike maxLanes etc.), so
-  // this is a bespoke non-negative-finite guard, not requirePositiveNumber.
-  if (
-    c.humanNeededPercent !== undefined &&
-    (typeof c.humanNeededPercent !== "number" || !Number.isFinite(c.humanNeededPercent) || c.humanNeededPercent < 0)
-  ) {
-    throw new ZError(
-      `Config "humanNeededPercent" must be a non-negative number (0 disables), got ${JSON.stringify(c.humanNeededPercent)}.`
-    );
-  }
+  // this is a non-negative-finite guard, not requirePositiveNumber.
+  requireNumber("humanNeededPercent", c.humanNeededPercent, { min: 0, desc: "a non-negative number (0 disables)" });
 
   // notifications (#60): validated only when present (absent = off). The
   // discordWebhookUrl is a SECRET, so its error text names the field ONLY and

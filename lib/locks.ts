@@ -339,7 +339,7 @@ export function acquireLoopLock(
   }
 }
 
-export function releaseLoopLock(locksDir: string): void {
+function releaseLoopLock(locksDir: string): void {
   rmSync(loopLockPath(locksDir), { force: true });
 }
 

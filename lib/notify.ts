@@ -102,7 +102,7 @@ const RENDERERS: { [K in EventKey]: (p: PayloadByEvent[K]) => string } = {
 // read this, and it can never drift from the templates above.
 export const EVENT_KEYS = Object.keys(RENDERERS) as EventKey[];
 
-export function isEventKey(s: string): s is EventKey {
+function isEventKey(s: string): s is EventKey {
   return (EVENT_KEYS as string[]).includes(s);
 }
 
