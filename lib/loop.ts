@@ -402,6 +402,27 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
         note: `A human moved #${lane.ticket} to ${byNumber.get(lane.ticket)!.status} during the run; stopping its lane cleanly at the ${lane.stage} boundary (other lanes continue).`,
       };
     }
+    // Stage/status desync guard (#110). t.status is re-read from the live board
+    // each tick (ingestBoardItems), while the advance resolveOutcome/merge-gate
+    // derives comes from lane.stage. When the two disagree at a boundary -- a
+    // lagged/failed stage board-write, or a human/board move back to an
+    // in-flight status that reconcileBoardMoves (terminal-only) does not catch
+    // -- letting the outcome resolve hands applyAction an advance whose
+    // setStatus is illegal from the stale status (the qa-pass lane still showing
+    // Building -> the Building->Review that threw an unhandled ZError and
+    // aborted the WHOLE tick). Stop THIS one lane cleanly instead, mirroring the
+    // human-move path above: LEGAL_TRANSITIONS is untouched so skip-QA stays
+    // illegal, the ticket keeps its board status (a genuine move-back to
+    // Building is re-claimed as a fresh builder next tick), and every other
+    // lane's progress survives.
+    const t = byNumber.get(lane.ticket);
+    if (t && t.status !== STATUS_FOR_STAGE[lane.stage]) {
+      return {
+        kind: "stop-lane",
+        ticket: lane.ticket,
+        note: `#${lane.ticket}'s board status (${t.status}) disagrees with its ${lane.stage} stage (expected ${STATUS_FOR_STAGE[lane.stage]}); stopping its lane cleanly at the ${lane.stage} boundary so one desynced lane cannot abort the tick (other lanes continue).`,
+      };
+    }
     // A PASSING review-approve (or a disabled gate) resolves to null here and
     // falls through to the merge gate below, exactly as before #62; a FAILING
     // approve is resolved right here, same as any other terminal outcome.

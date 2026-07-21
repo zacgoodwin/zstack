@@ -917,6 +917,68 @@ describe("transitions and reducers", () => {
   });
 });
 
+// -- #110: a stage/status desync must fail SOFT, never abort the whole tick ----
+// A lane can reach a boundary while its ticket's board status (re-read live each
+// tick) disagrees with the status its stage runs under -- a lagged/failed stage
+// board-write, or a human/board move back to an in-flight status. Resolving the
+// outcome would hand applyAction an advance whose setStatus is illegal from the
+// stale status (the qa-pass lane still showing Building -> the Building->Review
+// that threw an unhandled ZError and killed every lane's progress with it).
+describe("stage/status desync fails soft (#110)", () => {
+  test("AC1: a qa-pass lane whose board status lags at Building stops its own lane, does not throw, leaves the other lane untouched", () => {
+    let s = state(
+      [ticket(1, "Building"), ticket(2, "QA")],
+      [
+        lane(1, "qa", { outcome: { kind: "qa-pass" } }), // board write to QA lagged
+        lane(2, "qa"), // healthy, mid-stage (no outcome yet)
+      ]
+    );
+    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    // The desynced lane is resolved deterministically -- NOT the illegal
+    // advance-to-reviewer that used to throw.
+    expect(a).toMatchObject({ kind: "stop-lane", ticket: 1 });
+    expect((a as { note: string }).note).toContain("disagrees");
+    expect((a as { note: string }).note).toContain("Building");
+    expect(() => applyAction(s, a, 0)).not.toThrow(); // the tick does not abort
+    s = applyAction(s, a, 0);
+    expect(s.lanes.map((l) => l.ticket)).toEqual([2]); // desynced lane dropped
+    expect(s.lanes[0]).toEqual(lane(2, "qa")); // #2 untouched (still mid-stage, no outcome)
+  });
+
+  test("AC2: the QA-skip walk invariant holds -- the ticket never lands in Review directly from Building", () => {
+    // The guard exists precisely because this transition is (and stays) illegal.
+    expect(canTransition("Building", "Review")).toBe(false);
+    // The raw advance the reducer would have produced still throws -- proving the
+    // soft-stop, not a loosened transition, is what keeps the tick alive.
+    const desynced = state([ticket(1, "Building")], [lane(1, "qa", { outcome: { kind: "qa-pass" } })]);
+    expect(() => applyAction(desynced, { kind: "advance", ticket: 1, to: "reviewer" }, 0)).toThrow(ZError);
+    // Through nextAction, the same lane resolves to a soft stop and the ticket
+    // never reaches Review.
+    const a = nextAction(desynced.tickets, desynced.lanes, OPTS(desynced));
+    expect(a.kind).toBe("stop-lane");
+    const after = applyAction(desynced, a, 0);
+    expect(after.tickets[0].status).toBe("Building"); // still Building, never Review
+    expect(after.lanes).toEqual([]);
+  });
+
+  test("AC3: a lane a human dragged back to Building parks only its own lane; other lanes continue", () => {
+    let s = state(
+      [ticket(1, "Building"), ticket(2, "Building")],
+      [
+        lane(1, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }), // dragged Review -> Building
+        lane(2, "builder", { outcome: { kind: "built" } }), // healthy, ready to advance
+      ]
+    );
+    const stop = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(stop).toMatchObject({ kind: "stop-lane", ticket: 1 });
+    expect((stop as { note: string }).note).toContain("reviewer");
+    s = applyAction(s, stop, 0);
+    expect(s.lanes.map((l) => l.ticket)).toEqual([2]); // only #1's lane stopped
+    // The other lane continues on the very next tick.
+    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toMatchObject({ kind: "advance", ticket: 2, to: "qa" });
+  });
+});
+
 // -- board-snapshot ingest ----------------------------------------------------
 
 describe("ingestBoardItems", () => {
