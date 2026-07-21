@@ -4,6 +4,10 @@ All notable changes to zstack are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.0.0.0] - 2026-07-20
+
+First stable release. zstack is a self-contained Claude Code skill pack for the develop stage of a project: `/z-setup` provisions the GitHub ProjectV2 board, `/z-plan` turns a spec into codebase-grounded, fielded tickets, and `/z-loop` drains the Ready queue through fresh-agent builder → QA → adversarial-review → merge lanes, then runs an end-of-loop regression / ship / audit pass — every scheduling and transition decision computed in `lib/`, never in prose. This release folds in the full mid-run safety-control suite (tick throttling #58, GraphQL quota #61, adversarial-review #59 and confidence #62 gates, human-needed trip #63, review-bounce cap #76), Discord notifications for every loop event (#60/#68), per-stage model routing with `z-cost --by-file` / spend-by-stage reporting (#82/#83), plan-time cost-saving suggestions (#64), and the `/z-update` (#36) and `/z-uninstall` (#37) lifecycle commands. 943 gate tests green; typecheck clean.
+
 ### Added
 
 - `/z-loop` bounds the orchestrator's resident context on a drain (#57), so a single drain-and-exit session works large batches without tripping mid-loop auto-compaction. A new `z-board snapshot --out-items <F> --out-bodies <F>` returns every-status items PLUS each ticket's body in one paginated pass through `lib/board.ts` (body rides `content.body`, so it stays the sole `gh` caller), and a new `bin/z-loop-tick` wraps snapshot → ingest → `next` into one per-iteration call that prints only the one-line Action JSON — collapsing the old ~15-line drain block so the repeated bash text no longer re-enters context. `evals/orchestrator-context` measures the cut (deterministic, gated in `tests/orchestrator-context.test.ts`): ~85% less peak orchestrator context per drained ticket on a synthetic 6-ticket drain, against a >= 60% threshold.
