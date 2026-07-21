@@ -4,6 +4,7 @@
 import { test, expect, describe, afterEach, spyOn } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import * as os from "node:os";
 import { join } from "node:path";
 import { defaultLoopDir, main, readLastTick, throttleDelayMs, writeLastTick } from "../lib/throttle.ts";
 
@@ -121,24 +122,20 @@ describe('main("wait"): config-to-CLI wiring (review fix, issue #58)', () => {
     return home;
   }
 
-  // loadConfig() resolves the OS home via node:os homedir(), which reads
-  // HOME/USERPROFILE at call time -- the same seam tests/z-loop-tick.test.ts
-  // sets on a spawned subprocess's env. Setting it on THIS process for the
+  // loadConfig() resolves the OS home via node:os homedir() (used as the
+  // default `home` param of configPath/loadConfig/defaultLoopDir). Under Bun,
+  // homedir() reads the OS user database, NOT process.env.HOME/USERPROFILE, so
+  // setting those env vars does not redirect it. Spying homedir() for the
   // duration of one main() call (then restoring it) is the in-process
-  // equivalent, and is what lets this test drive the REAL loadConfig() without
-  // a subprocess.
+  // equivalent, and -- because throttle.ts and config.ts both import the same
+  // live `homedir` binding from node:os -- is what lets this test drive the
+  // REAL loadConfig() against a temp home without a subprocess.
   async function withHome<T>(home: string, fn: () => Promise<T>): Promise<T> {
-    const prevHome = process.env.HOME;
-    const prevProfile = process.env.USERPROFILE;
-    process.env.HOME = home;
-    process.env.USERPROFILE = home;
+    const spy = spyOn(os, "homedir").mockReturnValue(home);
     try {
       return await fn();
     } finally {
-      if (prevHome === undefined) delete process.env.HOME;
-      else process.env.HOME = prevHome;
-      if (prevProfile === undefined) delete process.env.USERPROFILE;
-      else process.env.USERPROFILE = prevProfile;
+      spy.mockRestore();
     }
   }
 
