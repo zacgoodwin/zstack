@@ -12,7 +12,7 @@
 // verification. A future free-text notification (e.g. an LLM-summarized digest)
 // would add an evals/ runbook; this ticket ships none and says so.
 import { test, expect, describe, afterEach, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -407,10 +407,18 @@ describe("CLI", () => {
   });
 
   test("send <event> <payload.json> --slug <s> prints skipped when config has no notifications block (AC2)", () => {
-    // Use a test slug that we control. Create the config in the user's .zstack directory
-    // (this is where the CLI will look for it).
+    // issue #118: this used to write straight to the REAL ~/.zstack/projects/<slug>
+    // (via node:os homedir()) and rmSync it afterward -- exactly the pattern the
+    // z-uninstall purge path treats as a subtree to delete, and exactly what the
+    // full test suite must never touch when it runs inside a reviewer throwaway
+    // worktree. Route it through a sandboxed $HOME/$USERPROFILE instead (the same
+    // subprocess-env pattern tests/z-loop-tick.test.ts already uses): Bun's
+    // os.homedir() resolves a *spawned child's* home from these env vars, so the
+    // CLI's real loadConfig(slug) call resolves into the fake home, never the
+    // operator's real one.
     const testSlug = "notify-cli-test";
-    const projectDir = join(homedir(), ".zstack", "projects", testSlug);
+    const fakeHome = mkdtempSync(join(tmpdir(), "zstack-notify-cli-home-"));
+    const projectDir = join(fakeHome, ".zstack", "projects", testSlug);
     const configPath = join(projectDir, "config.json");
     mkdirSync(projectDir, { recursive: true });
 
@@ -424,9 +432,12 @@ describe("CLI", () => {
       const payloadFile = join(dir, "send-payload.json");
       writeFileSync(payloadFile, JSON.stringify(payload));
 
-      // Ensure ZSTACK_DISCORD_WEBHOOK is not set so the config is used
+      // Ensure ZSTACK_DISCORD_WEBHOOK is not set so the config is used, and point
+      // HOME/USERPROFILE at the sandbox so the CLI never resolves the real home.
       const env = { ...process.env } as Record<string, string>;
       delete env.ZSTACK_DISCORD_WEBHOOK;
+      env.HOME = fakeHome;
+      env.USERPROFILE = fakeHome;
 
       // Run: bun lib/notify.ts send ticket-parked <file> --slug notify-cli-test
       const proc = run(["send", "ticket-parked", payloadFile, "--slug", testSlug], env);
@@ -435,9 +446,12 @@ describe("CLI", () => {
       expect(proc.exitCode).toBe(0);
       // Assert: prints "skipped" (because config has no notifications block)
       expect(proc.stdout.toString().trim()).toBe("skipped");
+      // Assert: the REAL ~/.zstack was never touched -- the CLI resolved the
+      // sandbox home, not the operator's real one (issue #118 AC2/AC3).
+      const realProjectDir = join(homedir(), ".zstack", "projects", testSlug);
+      expect(existsSync(realProjectDir)).toBe(false);
     } finally {
-      // Clean up the test config
-      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(fakeHome, { recursive: true, force: true });
     }
   });
 

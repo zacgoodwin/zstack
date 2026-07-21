@@ -933,8 +933,16 @@ describe("transitions and reducers", () => {
 // outcome would hand applyAction an advance whose setStatus is illegal from the
 // stale status (the qa-pass lane still showing Building -> the Building->Review
 // that threw an unhandled ZError and killed every lane's progress with it).
+//
+// #116 refined the one-hop-behind case (the qa-pass-lagging-at-Building fixture
+// below): rather than stop-lane for every desync, it is now resynced and
+// advanced when the gap is explainable by the loop's own still-propagating
+// write -- see the "resync-on-lag vs genuine move-back (#116)" block below for
+// the side-by-side pinning. The two tests here are updated in place (same
+// fixtures, corrected expectations) since they ARE that exact scenario; AC3
+// (a two-hop, unambiguous human move) is untouched.
 describe("stage/status desync fails soft (#110)", () => {
-  test("AC1: a qa-pass lane whose board status lags at Building stops its own lane, does not throw, leaves the other lane untouched", () => {
+  test("AC1: a qa-pass lane whose board status lags at Building resyncs and advances (#116), does not throw, leaves the other lane untouched", () => {
     let s = state(
       [ticket(1, "Building"), ticket(2, "QA")],
       [
@@ -943,31 +951,33 @@ describe("stage/status desync fails soft (#110)", () => {
       ]
     );
     const a = nextAction(s.tickets, s.lanes, OPTS(s));
-    // The desynced lane is resolved deterministically -- NOT the illegal
-    // advance-to-reviewer that used to throw.
-    expect(a).toMatchObject({ kind: "stop-lane", ticket: 1 });
-    expect((a as { note: string }).note).toContain("disagrees");
-    expect((a as { note: string }).note).toContain("Building");
+    // One hop behind (Building is qa's own preceding status) -- resync-on-lag
+    // (#116), not the old stop-lane, and NOT the illegal advance-to-reviewer
+    // that used to throw before #110's guard existed.
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "reviewer", resyncStatus: "QA" });
     expect(() => applyAction(s, a, 0)).not.toThrow(); // the tick does not abort
     s = applyAction(s, a, 0);
-    expect(s.lanes.map((l) => l.ticket)).toEqual([2]); // desynced lane dropped
-    expect(s.lanes[0]).toEqual(lane(2, "qa")); // #2 untouched (still mid-stage, no outcome)
+    expect(s.tickets.find((t) => t.number === 1)!.status).toBe("Review"); // resynced, then advanced
+    expect(s.lanes.find((l) => l.ticket === 1)).toMatchObject({ stage: "reviewer" });
+    expect(s.lanes.find((l) => l.ticket === 1)!.outcome).toBeUndefined();
+    expect(s.lanes.find((l) => l.ticket === 2)).toEqual(lane(2, "qa")); // #2 untouched (still mid-stage, no outcome)
   });
 
-  test("AC2: the QA-skip walk invariant holds -- the ticket never lands in Review directly from Building", () => {
+  test("AC2: the QA-skip walk invariant holds -- an un-resynced advance never lands the ticket in Review directly from Building", () => {
     // The guard exists precisely because this transition is (and stays) illegal.
     expect(canTransition("Building", "Review")).toBe(false);
-    // The raw advance the reducer would have produced still throws -- proving the
-    // soft-stop, not a loosened transition, is what keeps the tick alive.
+    // The raw advance without nextAction's resync correction still throws --
+    // proving the resyncStatus write, not a loosened transition, is what makes
+    // the corrected advance below legal.
     const desynced = state([ticket(1, "Building")], [lane(1, "qa", { outcome: { kind: "qa-pass" } })]);
     expect(() => applyAction(desynced, { kind: "advance", ticket: 1, to: "reviewer" }, 0)).toThrow(ZError);
-    // Through nextAction, the same lane resolves to a soft stop and the ticket
-    // never reaches Review.
+    // Through nextAction, the same lane now resolves to a resync-on-lag advance
+    // (#116) and actually reaches Review, instead of the old soft stop.
     const a = nextAction(desynced.tickets, desynced.lanes, OPTS(desynced));
-    expect(a.kind).toBe("stop-lane");
+    expect(a).toMatchObject({ kind: "advance", to: "reviewer", resyncStatus: "QA" });
     const after = applyAction(desynced, a, 0);
-    expect(after.tickets[0].status).toBe("Building"); // still Building, never Review
-    expect(after.lanes).toEqual([]);
+    expect(after.tickets[0].status).toBe("Review");
+    expect(after.lanes[0]).toMatchObject({ ticket: 1, stage: "reviewer" });
   });
 
   test("AC3: a lane a human dragged back to Building parks only its own lane; other lanes continue", () => {
@@ -985,6 +995,44 @@ describe("stage/status desync fails soft (#110)", () => {
     expect(s.lanes.map((l) => l.ticket)).toEqual([2]); // only #1's lane stopped
     // The other lane continues on the very next tick.
     expect(nextAction(s.tickets, s.lanes, OPTS(s))).toMatchObject({ kind: "advance", ticket: 2, to: "qa" });
+  });
+});
+
+// -- #116: resync-on-lag instead of stop-lane rebuild, when the board status --
+// merely lags the loop's own write -----------------------------------------
+// A lagged board write (GitHub eventual consistency) and a genuine human
+// move-back produce the IDENTICAL snapshot for a mid-pipeline stage -- the
+// discriminator #116 uses is distance: the board only ever moves one column
+// per advance, so a gap of exactly one hop behind the lane's own stage is
+// treated as our own write still propagating (resync + advance, no rebuild,
+// no wasted QA re-run); a gap of more than one hop cannot be explained by a
+// single write in flight and stays #110's safe stop-lane.
+describe("resync-on-lag vs genuine move-back (#116)", () => {
+  test("AC1: one hop behind (qa lane lagging at Building) resyncs to QA and advances to reviewer -- no stop-lane, no rebuild", () => {
+    const s = state(
+      [ticket(1, "Building")],
+      [lane(1, "qa", { outcome: { kind: "qa-pass" } })] // the loop's own QA-move write has not landed yet
+    );
+    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "reviewer", resyncStatus: "QA" });
+    const after = applyAction(s, a, 0);
+    expect(after.tickets[0].status).toBe("Review");
+    expect(after.lanes[0]).toMatchObject({ ticket: 1, stage: "reviewer" });
+    expect(after.lanes[0].outcome).toBeUndefined();
+  });
+
+  test("AC2: two hops behind (reviewer lane at Building) is a genuine move-back -- stop-lane, and the ticket re-claims as a fresh builder", () => {
+    let s = state(
+      [ticket(1, "Building")],
+      [lane(1, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } })] // human dragged Review -> Building
+    );
+    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(a).toMatchObject({ kind: "stop-lane", ticket: 1 });
+    s = applyAction(s, a, 0);
+    expect(s.lanes).toEqual([]);
+    expect(s.tickets[0].status).toBe("Building"); // the human's move is honored, not overwritten
+    // Re-claimed as a fresh builder next tick -- the full build+QA cycle re-runs.
+    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toMatchObject({ kind: "claim", ticket: 1, stage: "builder" });
   });
 });
 
@@ -1120,6 +1168,46 @@ describe("ingestBoardItems", () => {
     const s = ingestBoardItems(prev, items, bodies);
     expect(s.initialReadyCount).toBe(2); // recomputed from the NEW batch, not the stale 7
     expect(s.humanNeededNotified).toBe(false); // reset
+  });
+
+  // -- issue #119: mergedThisRun resets at the same startingFreshBatch boundary
+  // as initialReadyCount/humanNeededNotified. Before this fix mergedThisRun
+  // carried forward unconditionally (lib/loop.ts:793 used to be
+  // `[...(prev?.mergedThisRun ?? [])]` with no fresh-batch branch), so a merge
+  // from batches ago stayed visible to the merge gate's runParents check
+  // forever, since state.json is never deleted between /z-loop invocations.
+  test("issue #119 AC2: a mid-batch re-ingest (startingFreshBatch false) preserves mergedThisRun unchanged", () => {
+    const prev: LoopState = {
+      tickets: [ticket(5, "QA"), ticket(7, "Building")],
+      lanes: [lane(5, "qa")],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      mergedThisRun: [50],
+    };
+    const items = [
+      { number: 5, title: "A", fields: { Status: "QA" } },
+      { number: 7, title: "B", fields: { Status: "Building" } },
+    ];
+    const bodies = { "5": "no deps", "7": "no deps" };
+    const s = ingestBoardItems(prev, items, bodies);
+    expect(s.mergedThisRun).toEqual([50]); // preserved -- a merge earlier in this batch is not lost
+  });
+
+  test("issue #119 AC1: a re-ingest after the prior batch fully drained resets mergedThisRun (drainComplete + new Building is the fresh-batch boundary)", () => {
+    const prev: LoopState = {
+      tickets: [ticket(5, "Done"), ticket(7, "Blocked")],
+      lanes: [],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      mergedThisRun: [50],
+    };
+    expect(drainComplete(prev.tickets, prev.lanes)).toBe(true); // sanity: prev IS fully drained
+    const items = [
+      { number: 200, title: "New", fields: { Status: "Building" } },
+    ];
+    const bodies = { "200": "Depends on: #50" };
+    const s = ingestBoardItems(prev, items, bodies);
+    expect(s.mergedThisRun).toEqual([]); // reset, not [50] -- #50 merged batches ago and has no branch left
   });
 
   // Regression (issue #63 review bounce, ticket #63): AC9/AC10 above only ever

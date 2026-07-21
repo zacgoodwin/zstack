@@ -76,6 +76,21 @@ export const STATUS_FOR_STAGE: Record<Stage, BoardStatus> = {
   merge: "Review",
 };
 
+// The board status one hop EARLIER in the fixed pipeline (builder -> qa ->
+// reviewer -> merge) than a stage's own STATUS_FOR_STAGE (issue #116, the
+// nextAction desync guard below). builder has no entry: a builder-stage lane
+// only ever reaches that guard after a CLAIM (Ready/Building -> Building,
+// never an async write in flight by the time a builder agent finishes), never
+// an ADVANCE, so there is no lagged-write story to resync from -- any mismatch
+// there stays #110's safe stop-lane. merge is omitted too: its own status is
+// ALSO "Review" (same as reviewer's), so a merge lane can never be one hop
+// behind its own expected status -- the guard's mismatch check already
+// excludes it.
+const PRECEDING_BOARD_STATUS: Partial<Record<Stage, BoardStatus>> = {
+  qa: "Building",
+  reviewer: "QA",
+};
+
 // Per-stage model routing (issue #82). The merge stage is mechanical (`gh pr
 // create`, a conflict check, `gh pr merge`) and never needs the ticket's
 // build-tier model -- Loop run 2 billed every merge spawn at the ticket's full
@@ -245,7 +260,15 @@ export function parseStageResult(stage: Stage, finalMessage: string): StageOutco
 
 export type Action =
   | { kind: "claim"; ticket: number; stage: Stage }
-  | { kind: "advance"; ticket: number; to: Stage; note?: string; investigateFirst?: boolean; stackedOn?: number[] }
+  | {
+      kind: "advance";
+      ticket: number;
+      to: Stage;
+      note?: string;
+      investigateFirst?: boolean;
+      stackedOn?: number[];
+      resyncStatus?: BoardStatus; // #116: correct a one-hop-lagged board status before this advance's setStatus, bypassing canTransition -- see the nextAction desync guard for why this is safe
+    }
   | { kind: "park"; ticket: number; status: "Questions" | "Blocked"; note: string }
   | { kind: "skip"; ticket: number; note: string }
   | { kind: "stop-lane"; ticket: number; note: string }
@@ -345,6 +368,17 @@ function resolveOutcome(lane: LaneState, qaLimits: QaBounceLimits, reviewerGate:
   }
 }
 
+// Attaches a resync-on-lag correction (#116) to an advance action, when
+// nextAction's desync guard below judged this ticket's board read to be one
+// hop behind its own lane's already-advanced stage. Only "advance" carries a
+// setStatus that can throw from a stale status (park/skip/complete/stop-lane
+// never do), so every other kind passes through untouched.
+function withResync(action: Action, resyncStatus: Map<number, BoardStatus>): Action {
+  if (action.kind !== "advance") return action;
+  const status = resyncStatus.get(action.ticket);
+  return status === undefined ? action : { ...action, resyncStatus: status };
+}
+
 export interface LoopOpts {
   nowMs: number;
   maxLanes?: number;
@@ -384,6 +418,12 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
     maxReviewBounces: opts.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES,
   };
   const byNumber = new Map(tickets.map((t) => [t.number, t]));
+  // Tickets this tick's desync guard judged as a lagged (not genuine) board
+  // write -- see the guard below. Populated during step 1's lane loop, read by
+  // both that loop's own return and the merge gate (step 2), which reaches a
+  // lane only after this loop already let it fall through (a passing
+  // review-approve resolves to null here, same lane check either way).
+  const resyncStatus = new Map<number, BoardStatus>();
 
   // 1. Wave reconciliation + finished stages, in lane order. A human who moved a
   //    lane's ticket to a stop status mid-run (the board is re-read before each
@@ -402,32 +442,43 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
         note: `A human moved #${lane.ticket} to ${byNumber.get(lane.ticket)!.status} during the run; stopping its lane cleanly at the ${lane.stage} boundary (other lanes continue).`,
       };
     }
-    // Stage/status desync guard (#110). t.status is re-read from the live board
-    // each tick (ingestBoardItems), while the advance resolveOutcome/merge-gate
-    // derives comes from lane.stage. When the two disagree at a boundary -- a
-    // lagged/failed stage board-write, or a human/board move back to an
-    // in-flight status that reconcileBoardMoves (terminal-only) does not catch
-    // -- letting the outcome resolve hands applyAction an advance whose
-    // setStatus is illegal from the stale status (the qa-pass lane still showing
-    // Building -> the Building->Review that threw an unhandled ZError and
-    // aborted the WHOLE tick). Stop THIS one lane cleanly instead, mirroring the
-    // human-move path above: LEGAL_TRANSITIONS is untouched so skip-QA stays
-    // illegal, the ticket keeps its board status (a genuine move-back to
-    // Building is re-claimed as a fresh builder next tick), and every other
-    // lane's progress survives.
+    // Stage/status desync guard (#110, resync-on-lag #116). t.status is
+    // re-read from the live board each tick (ingestBoardItems), while the
+    // advance resolveOutcome/merge-gate derives comes from lane.stage. When the
+    // two disagree at a boundary, a single snapshot cannot prove WHY: a human
+    // could have dragged the card back, or the loop's own prior advance simply
+    // has not landed on the board yet (GitHub eventual consistency). The board
+    // only ever moves one column per advance, though, so a gap of EXACTLY one
+    // hop behind, along the fixed pipeline (PRECEDING_BOARD_STATUS) is what our
+    // own still-propagating write looks like -- anything further back (or
+    // sideways/ahead) is not explainable by a single write in flight and is
+    // treated as a genuine move. A one-hop gap resyncs: the ticket is corrected
+    // to the lane's own expected status and the tick proceeds with the normal
+    // advance (no rebuild, no re-run of QA that already passed) instead of
+    // stopping the lane. Anything else keeps #110's safe stop-lane: letting the
+    // outcome resolve unresynced would hand applyAction an advance whose
+    // setStatus is illegal from the stale status (the qa-pass lane still
+    // showing Building -> the Building->Review that used to throw an
+    // unhandled ZError and abort the WHOLE tick). LEGAL_TRANSITIONS is
+    // untouched either way, so skip-QA stays illegal, and every other lane's
+    // progress survives.
     const t = byNumber.get(lane.ticket);
     if (t && t.status !== STATUS_FOR_STAGE[lane.stage]) {
-      return {
-        kind: "stop-lane",
-        ticket: lane.ticket,
-        note: `#${lane.ticket}'s board status (${t.status}) disagrees with its ${lane.stage} stage (expected ${STATUS_FOR_STAGE[lane.stage]}); stopping its lane cleanly at the ${lane.stage} boundary so one desynced lane cannot abort the tick (other lanes continue).`,
-      };
+      if (t.status === PRECEDING_BOARD_STATUS[lane.stage]) {
+        resyncStatus.set(lane.ticket, STATUS_FOR_STAGE[lane.stage]);
+      } else {
+        return {
+          kind: "stop-lane",
+          ticket: lane.ticket,
+          note: `#${lane.ticket}'s board status (${t.status}) disagrees with its ${lane.stage} stage (expected ${STATUS_FOR_STAGE[lane.stage]}); stopping its lane cleanly at the ${lane.stage} boundary so one desynced lane cannot abort the tick (other lanes continue).`,
+        };
+      }
     }
     // A PASSING review-approve (or a disabled gate) resolves to null here and
     // falls through to the merge gate below, exactly as before #62; a FAILING
     // approve is resolved right here, same as any other terminal outcome.
     const action = resolveOutcome(lane, qaLimits, reviewerGate);
-    if (action) return action;
+    if (action) return withResync(action, resyncStatus);
   }
 
   // 2. Merge gate: one merge at a time, dependency order across ready lanes.
@@ -444,7 +495,7 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
     const mergedThisRun = new Set(opts.mergedThisRun ?? []);
     const runParents = (byNumber.get(first.ticket)?.dependsOn ?? []).filter((d) => mergedThisRun.has(d));
     const stackedOn = [...new Set([...first.stackedOn, ...runParents])].sort((a, b) => a - b);
-    return { kind: "advance", ticket: first.ticket, to: "merge", stackedOn };
+    return withResync({ kind: "advance", ticket: first.ticket, to: "merge", stackedOn }, resyncStatus);
   }
 
   // 3. Watchdog on silent lanes (an unresolved merge approval is not silent).
@@ -618,7 +669,17 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
       lane.lastActivityMs = nowMs;
       delete lane.outcome;
       delete lane.workerDead;
-      setStatus(findTicket(next, action.ticket), STATUS_FOR_STAGE[action.to]);
+      const t = findTicket(next, action.ticket);
+      if (action.resyncStatus !== undefined) {
+        // #116: nextAction's desync guard already established this ticket's
+        // board read is one hop behind where the lane's own prior advance put
+        // it (a lagged write, not a genuine move) -- write the correction
+        // directly, bypassing canTransition (this is fixing a stale read, not
+        // making a semantic move), so the real transition right below
+        // validates from the corrected status instead of the stale one.
+        t.status = action.resyncStatus;
+      }
+      setStatus(t, STATUS_FOR_STAGE[action.to]);
       return next;
     }
     case "park": {
@@ -759,7 +820,12 @@ export function ingestBoardItems(
   // ingest (the confirmation tick that just re-observes that same finished
   // batch, nothing new committed) would wrongly read as "fresh", wiping
   // initialReadyCount/humanNeededNotified for a crossing that just happened on
-  // that final ticket. A drained prev has, by definition, zero Building
+  // that final ticket. mergedThisRun (issue #119) is per-batch state for the
+  // same reason -- it feeds the merge gate's stacked-parent check (line ~444),
+  // and a stale entry from a batch that finished loops ago points a new
+  // ticket's PR at a parent branch that no longer exists -- so it resets on
+  // the same startingFreshBatch boundary as the other two. A drained prev has,
+  // by definition, zero Building
   // tickets belonging to THIS batch (drainComplete explicitly permits a
   // Building ticket to remain when claimedByOther -- it belongs to another
   // session's batch, not this one); so a fresh batch is when there is no
@@ -790,7 +856,7 @@ export function ingestBoardItems(
       cfg?.reviewerBelowThresholdAction ?? prev?.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
     maxReviewBounces: cfg?.maxReviewBounces ?? prev?.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES,
     humanNeededPercent: cfg?.humanNeededPercent ?? prev?.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT,
-    mergedThisRun: [...(prev?.mergedThisRun ?? [])],
+    mergedThisRun: startingFreshBatch ? [] : [...(prev?.mergedThisRun ?? [])],
     initialReadyCount: startingFreshBatch ? buildingCount : (prev!.initialReadyCount ?? 0),
     humanNeededNotified: startingFreshBatch ? false : (prev!.humanNeededNotified ?? false),
   };
