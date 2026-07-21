@@ -285,7 +285,16 @@ describe("expandGlob: absolute patterns (ticket #22)", () => {
     writeFileSync(join(dir, "transcript.jsonl"), readFileSync(FIXTURE, "utf8"));
     // Strip the drive letter to simulate a POSIX-style absolute pattern
     // ("/Users/.../*.jsonl") -- the leading-slash branch of ABSOLUTE_PATTERN.
-    const posixDir = "/" + dir.replace(/^[a-zA-Z]:[\\/]/, "").replaceAll("\\", "/");
+    // On Windows `dir` is drive-rooted ("C:\...") so stripping the drive leaves
+    // a driveless tail; on POSIX `dir` is already "/..."-rooted. Either way,
+    // normalize to EXACTLY one leading slash: two would read as a UNC share
+    // ("//server/share"), which expandGlob deliberately refuses.
+    const posixDir =
+      "/" +
+      dir
+        .replace(/^[a-zA-Z]:[\\/]/, "")
+        .replaceAll("\\", "/")
+        .replace(/^\/+/, "");
     const pattern = `${posixDir}/*.jsonl`;
     const files = expandGlob(pattern);
     expect(files.length).toBe(1);

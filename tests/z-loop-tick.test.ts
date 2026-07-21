@@ -208,8 +208,8 @@ describe("z-loop-tick", () => {
   // "sent") of z-loop-tick's `[ "$SENT" = "sent" ] && human-needed-ack` line;
   // nothing previously drove the success branch end-to-end through the real
   // wrapper script. This pins it with a real `~/.zstack/projects/<slug>/
-  // config.json` (Bun on Windows resolves os.homedir() from USERPROFILE, not
-  // HOME -- overridden here) and a local mock Discord webhook that actually
+  // config.json` (Bun resolves os.homedir() from HOME on POSIX and USERPROFILE
+  // on Windows -- both overridden below) and a local mock Discord webhook that actually
   // answers 200, so notify.ts's `send` completes a real round trip and prints
   // "sent". Uses Bun.spawn (async), not spawnSync: a synchronous spawn blocks
   // this process's event loop, which would starve Bun.serve() of the chance to
@@ -259,6 +259,11 @@ describe("z-loop-tick", () => {
           env: {
             ...process.env,
             Z_BOARD: stub,
+            // Bun's os.homedir() resolves from HOME on POSIX and USERPROFILE on
+            // Windows -- set both so the child finds config.json under fakeHome
+            // regardless of platform. (USERPROFILE alone leaves POSIX homedir()
+            // pointing at the real home, so the config would not be found.)
+            HOME: fakeHome,
             USERPROFILE: fakeHome,
             ZSTACK_DISCORD_WEBHOOK: `http://127.0.0.1:${server.port}/hook`,
           },
