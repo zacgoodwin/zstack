@@ -43,7 +43,7 @@ function requireString(obj: any, key: string): void {
 // lets z-board translate a human option name into the id a GraphQL mutation
 // needs.
 function validateField(path: string, f: any, expectedType?: FieldDataType): void {
-  if (typeof f !== "object" || f === null) {
+  if (typeof f !== "object" || f === null || Array.isArray(f)) {
     throw new ZError(`Config "${path}" must be an object.`);
   }
   if (typeof f.id !== "string" || !f.id) {
@@ -58,7 +58,12 @@ function validateField(path: string, f: any, expectedType?: FieldDataType): void
     throw new ZError(`Config "${path}.dataType" must be ${expectedType}, got ${f.dataType}.`);
   }
   if (f.dataType === "SINGLE_SELECT") {
-    if (typeof f.options !== "object" || f.options === null || !Object.keys(f.options).length) {
+    if (
+      typeof f.options !== "object" ||
+      f.options === null ||
+      Array.isArray(f.options) ||
+      !Object.keys(f.options).length
+    ) {
       throw new ZError(
         `Config "${path}.options" must be a non-empty {name: optionId} map for a single-select field.`
       );
@@ -77,7 +82,7 @@ function validateField(path: string, f: any, expectedType?: FieldDataType): void
 // its dep tree).
 export function validateConfig(cfg: unknown): BoardConfig {
   const c = cfg as any;
-  if (typeof c !== "object" || c === null) {
+  if (typeof c !== "object" || c === null || Array.isArray(c)) {
     throw new ZError("Config must be a JSON object.");
   }
   for (const k of ["slug", "owner", "repo", "projectId", "repositoryId"]) {
@@ -89,7 +94,7 @@ export function validateConfig(cfg: unknown): BoardConfig {
 
   validateField("statusField", c.statusField, "SINGLE_SELECT");
 
-  if (typeof c.fields !== "object" || c.fields === null) {
+  if (typeof c.fields !== "object" || c.fields === null || Array.isArray(c.fields)) {
     throw new ZError(`Config "fields" must be an object of {name: FieldConfig}.`);
   }
   for (const [name, f] of Object.entries(c.fields)) {
@@ -226,6 +231,13 @@ export function validateConfig(cfg: unknown): BoardConfig {
 // carry a validly-parsed but wrong-shape value in exactly one of these four
 // fields, and that field alone must fall back to "nothing to preserve" rather
 // than these throwing past a caller who only wants a per-field yes/no.
+//
+// Every `typeof x !== "object" || x === null` guard in this file (here and in
+// validateField/validateConfig above) also rejects Array.isArray(x): a bare
+// array passes `typeof [] === "object"` and `[] !== null`, so without this a
+// hand-edited `quota: []` silently validated as a valid quota object, and
+// #97's priorOptionalFields preserved it verbatim across a re-apply since it
+// never throws (issue #106).
 export function validateAdversarialMode(mode: unknown): void {
   if (!ADVERSARIAL_MODES.includes(mode as any)) {
     throw new ZError(
@@ -235,8 +247,8 @@ export function validateAdversarialMode(mode: unknown): void {
 }
 
 export function validateQuota(quota: unknown): void {
-  if (typeof quota !== "object" || quota === null) {
-    throw new ZError(`Config "quota" must be an object.`);
+  if (typeof quota !== "object" || quota === null || Array.isArray(quota)) {
+    throw new ZError(`Config "quota" must be an object, not an array.`);
   }
   const q = quota as any;
   // Number.isFinite matters (issue #14 item 18): a NaN threshold passed the
@@ -255,8 +267,8 @@ export function validateQuota(quota: unknown): void {
 // leaked URL must not land in a log line.
 export function validateNotifications(notifications: unknown): void {
   const n = notifications as any;
-  if (typeof n !== "object" || n === null) {
-    throw new ZError(`Config "notifications" must be an object.`);
+  if (typeof n !== "object" || n === null || Array.isArray(n)) {
+    throw new ZError(`Config "notifications" must be an object, not an array.`);
   }
   if (n.enabled !== undefined && typeof n.enabled !== "boolean") {
     throw new ZError(`Config "notifications.enabled" must be a boolean.`);
@@ -272,7 +284,7 @@ export function validateNotifications(notifications: unknown): void {
     );
   }
   if (n.events !== undefined) {
-    if (typeof n.events !== "object" || n.events === null) {
+    if (typeof n.events !== "object" || n.events === null || Array.isArray(n.events)) {
       throw new ZError(`Config "notifications.events" must be an object of {event: boolean}.`);
     }
     for (const [k, v] of Object.entries(n.events)) {
@@ -290,7 +302,7 @@ export function validateNotifications(notifications: unknown): void {
 // must resolve through the SAME rate-key lookup z-cost/z-estimate use
 // (resolveRate in lib/estimate.ts), so a typo'd model name fails here.
 export function validateStageModels(stageModels: unknown): void {
-  if (typeof stageModels !== "object" || stageModels === null) {
+  if (typeof stageModels !== "object" || stageModels === null || Array.isArray(stageModels)) {
     throw new ZError(`Config "stageModels" must be an object of {stage: model}.`);
   }
   const rates = loadRates();
