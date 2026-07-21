@@ -88,13 +88,22 @@ each defaulted by `loadConfig` when absent:
 
 **A re-apply preserves your hand-edits (issue #97).** `z-setup-board apply`
 assembles the rest of the config fresh from the live board every run, but four
-fields have no CLI flag and exist only because you hand-edited them in:
+fields are instead carried forward from the prior config.json on disk:
 `stageModels`, `quota`, `notifications`, `adversarialMode`. Whatever value one
-of these carries in the config file on disk wins over the freshly-assembled
-default the next time `apply` genuinely rewrites the file (a board-shape
-change forced a real `writeConfig`, not the common no-op re-run). A field you
-never added stays exactly as it would today. `maxLanes`/`watchdogMinutes` are
-not in this set — they have a `--max-lanes`/`--watchdog-minutes` CLI flag, so
+of these carries wins over the freshly-assembled default the next time `apply`
+genuinely rewrites the file (a board-shape change forced a real `writeConfig`,
+not the common no-op re-run). Of the four, `stageModels`/`notifications`/
+`adversarialMode` have no CLI flag and are absent unless you hand-edit them in
+— a field you never added stays exactly as it would today. `quota` is
+different: `buildConfig` writes `{...DEFAULT_QUOTA}` into every config.json
+unconditionally, hand-edited or not, so it is carried forward on every
+re-apply from day one — including a *future* release changing `DEFAULT_QUOTA`,
+whose new default an existing project's `config.json` would then never pick up
+through this path (a known follow-up, not addressed here). A field whose value
+on disk fails its own shape check (a corrupt hand-edit, e.g. `quota` as a
+string) is treated as though it were absent — the fresh default wins for that
+field only, the others are unaffected. `maxLanes`/`watchdogMinutes` are not in
+this set — they have a `--max-lanes`/`--watchdog-minutes` CLI flag, so
 re-running `/z-setup` with (or without) that flag is the supported way to
 change them.
 

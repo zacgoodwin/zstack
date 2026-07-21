@@ -811,6 +811,52 @@ describe("writeConfig", () => {
     expect(second.config.quota).toEqual({ threshold: 100, mode: "sleep" }); // fresh default, nothing preserved
     expect(second.config.stageModels).toBeUndefined(); // adoption path -- no default injected either
   });
+
+  // Reviewer finding 1 (blocker): a validly-parsed JSON value whose SHAPE is
+  // wrong for one of the four preserved fields (a string where an object is
+  // required, or an explicit null) used to reach validateConfig unfiltered --
+  // and apply() runs the board's GraphQL mutations BEFORE buildConfig/
+  // validateConfig, so that crash landed AFTER the live board already changed,
+  // with config.json never written. A wrong-shape field must instead fall
+  // back to "nothing to preserve for that field" -- the same tolerant
+  // treatment priorOptionalFields already gives a missing/unparsable file --
+  // while a correctly-shaped sibling field is unaffected.
+  test("a validly-parsed but wrong-shape preserved field does not crash apply() after board mutations run; falls back per-field, siblings still preserved", async () => {
+    const backend = setupBackend();
+    const setup = new SetupBoard(backend.exec);
+    const home = testHome();
+
+    const first = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
+    const path = writeConfig(first.config, home);
+    // Hand-edit the file directly (bypassing writeConfig's own validateConfig
+    // call) to a validly-parsed JSON document carrying two bad-shape fields
+    // (a string "quota", an explicit-null "adversarialMode") alongside a
+    // correctly-shaped "stageModels" -- a realistic typo that leaves the rest
+    // of the file intact.
+    const onDisk = JSON.parse(readFileSync(path, "utf8"));
+    onDisk.quota = "banana"; // wrong shape: a string, not {threshold, mode}
+    onDisk.adversarialMode = null; // valid JSON, explicit null -- also wrong shape
+    onDisk.stageModels = { merge: "haiku", qa: "haiku" }; // correctly-shaped sibling
+    writeFileSync(path, JSON.stringify(onDisk, null, 2) + "\n");
+
+    // Force board-shape drift so apply()'s mutation loop (lines 580-594)
+    // actually executes GraphQL calls before buildConfig/validateConfig run --
+    // reproducing the exact hazard finding 1 reported (mutate the board, then
+    // throw before config.json is written).
+    backend.project!.fields.find((f) => f.name === "Model")!.options = ["haiku", "sonnet", "opus"];
+
+    // The bug: this used to throw (validateConfig rejecting the unfiltered
+    // "banana" quota) AFTER the set-field-options mutation above already ran.
+    // Awaiting it directly here means any regression fails this test the same
+    // way it fails production -- an uncaught throw, not a silent pass.
+    const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
+
+    expect(second.actions.some((a) => a.kind === "set-field-options" && a.name === "Model")).toBe(true);
+    expect(second.config.quota).toEqual({ threshold: 100, mode: "sleep" }); // default wins, not "banana"
+    expect(second.config.adversarialMode).toBeUndefined(); // null wasn't preserved, no default either
+    expect(second.config.stageModels).toEqual({ merge: "haiku", qa: "haiku" }); // sibling untouched
+    expect(() => validateConfig(second.config)).not.toThrow();
+  });
 });
 
 // -- board template override (issue #20 AC2 + AC5) ---------------------------

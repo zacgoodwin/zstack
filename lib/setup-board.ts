@@ -29,7 +29,14 @@ import {
   configPath,
   ZError,
 } from "./config.ts";
-import { requirePositiveNumber, validateConfig } from "./config-schema.ts";
+import {
+  requirePositiveNumber,
+  validateAdversarialMode,
+  validateConfig,
+  validateNotifications,
+  validateQuota,
+  validateStageModels,
+} from "./config-schema.ts";
 import { ghExecutor, type GraphQLData, type GraphQLExecutor } from "./board.ts";
 import {
   type BoardShape,
@@ -657,6 +664,17 @@ function requireFieldId(state: ProjectState, name: string): string {
 // exactly). Tolerates a missing or unparsable prior file -- first-time setup
 // and a corrupt hand-edit both fall back to "nothing to preserve", never a
 // crash.
+//
+// Each field is ALSO shape-validated with config-schema.ts's per-field
+// validators before being preserved (issue #97 review finding 1): apply()
+// runs the board's GraphQL mutations (lines 580-594) before buildConfig ->
+// validateConfig ever sees this value, so a validly-parsed but wrong-shape
+// hand-edit (e.g. `{"quota":"banana"}`) must not reach validateConfig and
+// throw AFTER the board already changed -- the config.json would never get
+// written and the live board and file would go out of sync. A field that
+// fails its own shape check falls back to "nothing to preserve for that
+// field" (same tolerant treatment as a missing/unparsable file), leaving the
+// other three fields' preservation unaffected.
 type PreservedOptionalFields = Partial<
   Pick<BoardConfig, "stageModels" | "quota" | "notifications" | "adversarialMode">
 >;
@@ -671,10 +689,20 @@ function priorOptionalFields(slug: string, home: string): PreservedOptionalField
     return {};
   }
   const preserved: PreservedOptionalFields = {};
-  if (raw.stageModels !== undefined) preserved.stageModels = raw.stageModels;
-  if (raw.quota !== undefined) preserved.quota = raw.quota;
-  if (raw.notifications !== undefined) preserved.notifications = raw.notifications;
-  if (raw.adversarialMode !== undefined) preserved.adversarialMode = raw.adversarialMode;
+  const take = <K extends keyof PreservedOptionalFields>(key: K, validate: (v: unknown) => void): void => {
+    const value = raw[key];
+    if (value === undefined) return;
+    try {
+      validate(value);
+    } catch {
+      return; // wrong-shape hand-edit: nothing to preserve for this field
+    }
+    preserved[key] = value as PreservedOptionalFields[K];
+  };
+  take("stageModels", validateStageModels);
+  take("quota", validateQuota);
+  take("notifications", validateNotifications);
+  take("adversarialMode", validateAdversarialMode);
   return preserved;
 }
 
