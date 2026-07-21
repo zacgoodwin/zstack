@@ -1,12 +1,9 @@
 // Lane scheduling for /z-loop (C6): which ticket is claimable next (dependency
 // order), lane-cap enforcement, watchdog expiry, and merge ordering for a set of
 // finished lanes. Every function here is pure and clock-injected (no Date.now()),
-// so the loop's scheduling decisions are deterministic space (PRINCIPLES.md) --
-// the skill shells in via the CLI below and never re-derives any of this in
-// prose. Types live in lib/loop.ts (the state machine); importing them as
-// type-only keeps the loop<->lanes import cycle erased at runtime.
-import { readFileSync } from "node:fs";
-import { handleCliError } from "./cli.ts";
+// so the loop's scheduling decisions are deterministic space (PRINCIPLES.md).
+// Types live in lib/loop.ts (the state machine); importing them as type-only
+// keeps the loop<->lanes import cycle erased at runtime.
 import { TERMINAL_STATUSES, ZError } from "./config.ts";
 import type { BoardStatus, LaneState, Stage, TicketSnapshot } from "./loop.ts";
 
@@ -138,39 +135,4 @@ export function mergeOrder(finished: MergeInput[]): MergeStep[] {
     steps.push({ ticket: ready[0], stackedOn: deps.get(ready[0])! });
   }
   return steps;
-}
-
-// -- CLI ---------------------------------------------------------------------
-const USAGE = `lanes <command> [args]
-
-  depends-on <body.md>          print the issue numbers a ticket body depends on, as JSON
-  merge-order <finished.json>   print MergeStep[] for [{ticket, dependsOn}] lanes, as JSON`;
-
-export function main(argv: string[]): number {
-  const cmd = argv[0];
-  if (!cmd || cmd === "--help" || cmd === "-h") {
-    console.log(USAGE);
-    return cmd ? 0 : 1;
-  }
-  try {
-    if (cmd === "depends-on") {
-      if (!argv[1]) throw new ZError("Usage: lanes depends-on <body.md>");
-      console.log(JSON.stringify(parseDependsOn(readFileSync(argv[1], "utf8"))));
-      return 0;
-    }
-    if (cmd === "merge-order") {
-      if (!argv[1]) throw new ZError("Usage: lanes merge-order <finished.json>");
-      const finished = JSON.parse(readFileSync(argv[1], "utf8")) as MergeInput[];
-      console.log(JSON.stringify(mergeOrder(finished)));
-      return 0;
-    }
-    console.error(`Unknown command "${cmd}".\n\n${USAGE}`);
-    return 1;
-  } catch (e) {
-    return handleCliError(e);
-  }
-}
-
-if (import.meta.main) {
-  process.exit(main(process.argv.slice(2)));
 }
