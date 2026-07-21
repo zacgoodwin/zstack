@@ -12,7 +12,7 @@
 // Idempotence is structural, not a flag: readState -> diffState -> apply. A board
 // that already matches the desired shape produces an empty action list, so a
 // re-run plans (and executes) exactly zero mutations.
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 import { handleCliError, parseFlags, requireFlag, str } from "./cli.ts";
@@ -29,7 +29,14 @@ import {
   configPath,
   ZError,
 } from "./config.ts";
-import { requirePositiveNumber, validateConfig } from "./config-schema.ts";
+import {
+  requirePositiveNumber,
+  validateAdversarialMode,
+  validateConfig,
+  validateNotifications,
+  validateQuota,
+  validateStageModels,
+} from "./config-schema.ts";
 import { ghExecutor, type GraphQLData, type GraphQLExecutor } from "./board.ts";
 import {
   type BoardShape,
@@ -320,6 +327,11 @@ export interface ApplyOptions {
   maxLanes?: number;
   watchdogMinutes?: number;
   force?: boolean; // adopt even when non-canonical single-select options still hold items
+  // Override for where ~/.zstack lives (issue #97: buildConfig reads the prior
+  // config.json from here to preserve hand-added optional fields). Tests pass
+  // an isolated temp dir; production omits it and buildConfig falls back to
+  // the real homedir(), matching writeConfig's own default.
+  home?: string;
 }
 
 // A non-canonical single-select option that had items when it was replaced
@@ -486,8 +498,10 @@ export class SetupBoard {
   }
 
   // Creates or adopts the project, executes exactly the planned mutations, then
-  // re-reads and builds the validated BoardConfig. Does not touch the filesystem
-  // (see writeConfig) so it stays unit-testable.
+  // re-reads and builds the validated BoardConfig. Never WRITES the filesystem
+  // (see writeConfig); it does READ the prior config.json (issue #97, via
+  // buildConfig) to preserve hand-added optional fields, tolerating an absent
+  // or unreadable file, so it stays unit-testable with an isolated `opts.home`.
   async apply(owner: string, repo: string, opts: ApplyOptions): Promise<ApplyResult> {
     // F9: every user-supplied input is checked before the FIRST GraphQL call.
     // Validation used to live only in validateConfig AFTER the mutations, so a
@@ -636,6 +650,62 @@ function requireFieldId(state: ProjectState, name: string): string {
   return f.id;
 }
 
+// The four optional fields a re-apply must never silently reset (issue #97): a
+// user who hand-edits one of these into config.json (stageModels, issue #82;
+// or quota/notifications/adversarialMode) must have it survive the next
+// board-shape-drift re-apply, since buildConfig otherwise assembles the whole
+// config fresh from the live board every time.
+//
+// Reads the RAW prior file rather than lib/config.ts's loadConfig(): loadConfig
+// fills quota and adversarialMode with defaults even when the key is absent
+// from disk (by design, for every other caller), which would inject a key that
+// was never there and break the byte-identical no-drift contract (a re-apply
+// over a config with none of these four fields must reproduce today's output
+// exactly). Tolerates a missing or unparsable prior file -- first-time setup
+// and a corrupt hand-edit both fall back to "nothing to preserve", never a
+// crash.
+//
+// Each field is ALSO shape-validated with config-schema.ts's per-field
+// validators before being preserved (issue #97 review finding 1): apply()
+// runs the board's GraphQL mutations (lines 580-594) before buildConfig ->
+// validateConfig ever sees this value, so a validly-parsed but wrong-shape
+// hand-edit (e.g. `{"quota":"banana"}`) must not reach validateConfig and
+// throw AFTER the board already changed -- the config.json would never get
+// written and the live board and file would go out of sync. A field that
+// fails its own shape check falls back to "nothing to preserve for that
+// field" (same tolerant treatment as a missing/unparsable file), leaving the
+// other three fields' preservation unaffected.
+type PreservedOptionalFields = Partial<
+  Pick<BoardConfig, "stageModels" | "quota" | "notifications" | "adversarialMode">
+>;
+
+function priorOptionalFields(slug: string, home: string): PreservedOptionalFields {
+  const path = configPath(slug, home);
+  if (!existsSync(path)) return {};
+  let raw: Partial<BoardConfig>;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return {};
+  }
+  const preserved: PreservedOptionalFields = {};
+  const take = <K extends keyof PreservedOptionalFields>(key: K, validate: (v: unknown) => void): void => {
+    const value = raw[key];
+    if (value === undefined) return;
+    try {
+      validate(value);
+    } catch {
+      return; // wrong-shape hand-edit: nothing to preserve for this field
+    }
+    preserved[key] = value as PreservedOptionalFields[K];
+  };
+  take("stageModels", validateStageModels);
+  take("quota", validateQuota);
+  take("notifications", validateNotifications);
+  take("adversarialMode", validateAdversarialMode);
+  return preserved;
+}
+
 function buildConfig(
   state: ProjectState,
   ctx: { owner: string; repo: string; repositoryId: string } & ApplyOptions,
@@ -645,7 +715,9 @@ function buildConfig(
   // project's config is left exactly as buildConfig would otherwise produce
   // it -- no stageModels key at all -- so a re-run against an already-set-up
   // board never injects (or silently drops) the knob; a user who wants it on
-  // an existing project adds it to config.json by hand (documented).
+  // an existing project adds it to config.json by hand (documented). That
+  // hand-added value, once on disk, then wins over this default on every
+  // later re-apply regardless of `created` (see priorOptionalFields, #97).
   created = false
 ): BoardConfig {
   const status = state.fields.find((f) => f.name === STATUS_FIELD_NAME);
@@ -661,6 +733,8 @@ function buildConfig(
         : { id: f.id, dataType: df.dataType };
   }
 
+  const prior = priorOptionalFields(ctx.slug, ctx.home ?? homedir());
+
   return {
     slug: ctx.slug,
     owner: ctx.owner,
@@ -675,6 +749,7 @@ function buildConfig(
     watchdogMinutes: ctx.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES,
     quota: { ...DEFAULT_QUOTA },
     ...(created ? { stageModels: { merge: "haiku" } } : {}),
+    ...prior, // issue #97: a hand-added value in the prior config.json wins over every default above
   };
 }
 

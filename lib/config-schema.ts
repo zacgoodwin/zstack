@@ -148,11 +148,7 @@ export function validateConfig(cfg: unknown): BoardConfig {
   // and stage-prompts trusts the loaded value is one of the three. Validated
   // only when present so a config that omits it (loadConfig defaults it to
   // "non-trivial") still passes.
-  if (c.adversarialMode !== undefined && !ADVERSARIAL_MODES.includes(c.adversarialMode)) {
-    throw new ZError(
-      `Config "adversarialMode" must be one of "off", "non-trivial", "always", got ${JSON.stringify(c.adversarialMode)}.`
-    );
-  }
+  if (c.adversarialMode !== undefined) validateAdversarialMode(c.adversarialMode);
   // minReviewerConfidence / reviewerBelowThresholdAction (issue #62): the
   // reviewer-confidence safety gate. minReviewerConfidence is an integer
   // percentage 0-100, so requirePositiveNumber (which rejects 0 and accepts
@@ -189,23 +185,7 @@ export function validateConfig(cfg: unknown): BoardConfig {
       `Config "maxReviewBounces" must be a positive integer (>= 1), got ${JSON.stringify(c.maxReviewBounces)}.`
     );
   }
-  if (c.quota !== undefined) {
-    if (typeof c.quota !== "object" || c.quota === null) {
-      throw new ZError(`Config "quota" must be an object.`);
-    }
-    // Number.isFinite matters (issue #14 item 18): a NaN threshold passed the
-    // old typeof/negative checks, and `remaining >= NaN` is always false -- the
-    // quota guard would trip on EVERY call, sleeping or aborting forever.
-    if (
-      c.quota.threshold !== undefined &&
-      (typeof c.quota.threshold !== "number" || !Number.isFinite(c.quota.threshold) || c.quota.threshold < 0)
-    ) {
-      throw new ZError(`Config "quota.threshold" must be a non-negative number.`);
-    }
-    if (c.quota.mode !== undefined && c.quota.mode !== "sleep" && c.quota.mode !== "abort") {
-      throw new ZError(`Config "quota.mode" must be "sleep" or "abort", got ${JSON.stringify(c.quota.mode)}.`);
-    }
-  }
+  if (c.quota !== undefined) validateQuota(c.quota);
 
   // humanNeededPercent (issue #63): the mid-run breakdown notification's trip
   // threshold. `0` is a legitimate "disable" value (unlike maxLanes etc.), so
@@ -224,40 +204,7 @@ export function validateConfig(cfg: unknown): BoardConfig {
   // never echoes the value -- a pasted bare token or a leaked URL must not land
   // in a log line. This is the single enforcement point: z-setup writes through
   // it, loadConfig reads through it.
-  if (c.notifications !== undefined) {
-    const n = c.notifications;
-    if (typeof n !== "object" || n === null) {
-      throw new ZError(`Config "notifications" must be an object.`);
-    }
-    if (n.enabled !== undefined && typeof n.enabled !== "boolean") {
-      throw new ZError(`Config "notifications.enabled" must be a boolean.`);
-    }
-    // A bare token (no scheme) is the classic paste error; require https:// so it
-    // is rejected loudly. Value is never interpolated into the message.
-    if (
-      n.discordWebhookUrl !== undefined &&
-      (typeof n.discordWebhookUrl !== "string" || !n.discordWebhookUrl.startsWith("https://"))
-    ) {
-      throw new ZError(
-        `Config "notifications.discordWebhookUrl" must be a non-empty string beginning with "https://" (a bare token is not a webhook URL).`
-      );
-    }
-    if (n.events !== undefined) {
-      if (typeof n.events !== "object" || n.events === null) {
-        throw new ZError(`Config "notifications.events" must be an object of {event: boolean}.`);
-      }
-      for (const [k, v] of Object.entries(n.events)) {
-        if (!(EVENT_KEYS as readonly string[]).includes(k)) {
-          throw new ZError(
-            `Config "notifications.events.${k}" is not a known event. Valid: ${EVENT_KEYS.join(", ")}`
-          );
-        }
-        if (typeof v !== "boolean") {
-          throw new ZError(`Config "notifications.events.${k}" must be a boolean.`);
-        }
-      }
-    }
-  }
+  if (c.notifications !== undefined) validateNotifications(c.notifications);
 
   // stageModels (issue #82): per-stage model routing. Validated only when
   // present -- absent means lib/loop.ts's resolveStageModel applies the pack
@@ -267,30 +214,100 @@ export function validateConfig(cfg: unknown): BoardConfig {
   // (resolveRate in lib/estimate.ts), so a typo'd model name fails here --
   // at config-write (z-setup) / config-load (loadConfig) time -- instead of
   // silently at spawn time.
-  if (c.stageModels !== undefined) {
-    if (typeof c.stageModels !== "object" || c.stageModels === null) {
-      throw new ZError(`Config "stageModels" must be an object of {stage: model}.`);
+  if (c.stageModels !== undefined) validateStageModels(c.stageModels);
+
+  return c as BoardConfig;
+}
+
+// quota (issue #2)/notifications (#60)/adversarialMode (#59)/stageModels
+// (#82): each extracted to its own exported validator so a second caller can
+// shape-check ONE field in isolation. issue #97's priorOptionalFields (in
+// lib/setup-board.ts) is that second caller: a hand-edited config.json may
+// carry a validly-parsed but wrong-shape value in exactly one of these four
+// fields, and that field alone must fall back to "nothing to preserve" rather
+// than these throwing past a caller who only wants a per-field yes/no.
+export function validateAdversarialMode(mode: unknown): void {
+  if (!ADVERSARIAL_MODES.includes(mode as any)) {
+    throw new ZError(
+      `Config "adversarialMode" must be one of "off", "non-trivial", "always", got ${JSON.stringify(mode)}.`
+    );
+  }
+}
+
+export function validateQuota(quota: unknown): void {
+  if (typeof quota !== "object" || quota === null) {
+    throw new ZError(`Config "quota" must be an object.`);
+  }
+  const q = quota as any;
+  // Number.isFinite matters (issue #14 item 18): a NaN threshold passed the
+  // old typeof/negative checks, and `remaining >= NaN` is always false -- the
+  // quota guard would trip on EVERY call, sleeping or aborting forever.
+  if (q.threshold !== undefined && (typeof q.threshold !== "number" || !Number.isFinite(q.threshold) || q.threshold < 0)) {
+    throw new ZError(`Config "quota.threshold" must be a non-negative number.`);
+  }
+  if (q.mode !== undefined && q.mode !== "sleep" && q.mode !== "abort") {
+    throw new ZError(`Config "quota.mode" must be "sleep" or "abort", got ${JSON.stringify(q.mode)}.`);
+  }
+}
+
+// notifications (#60): the discordWebhookUrl is a SECRET, so its error text
+// names the field ONLY and never echoes the value -- a pasted bare token or a
+// leaked URL must not land in a log line.
+export function validateNotifications(notifications: unknown): void {
+  const n = notifications as any;
+  if (typeof n !== "object" || n === null) {
+    throw new ZError(`Config "notifications" must be an object.`);
+  }
+  if (n.enabled !== undefined && typeof n.enabled !== "boolean") {
+    throw new ZError(`Config "notifications.enabled" must be a boolean.`);
+  }
+  // A bare token (no scheme) is the classic paste error; require https:// so it
+  // is rejected loudly. Value is never interpolated into the message.
+  if (
+    n.discordWebhookUrl !== undefined &&
+    (typeof n.discordWebhookUrl !== "string" || !n.discordWebhookUrl.startsWith("https://"))
+  ) {
+    throw new ZError(
+      `Config "notifications.discordWebhookUrl" must be a non-empty string beginning with "https://" (a bare token is not a webhook URL).`
+    );
+  }
+  if (n.events !== undefined) {
+    if (typeof n.events !== "object" || n.events === null) {
+      throw new ZError(`Config "notifications.events" must be an object of {event: boolean}.`);
     }
-    const rates = loadRates();
-    for (const [stage, model] of Object.entries(c.stageModels)) {
-      if (!STAGE_NAMES.includes(stage)) {
-        throw new ZError(
-          `Config "stageModels.${stage}" is not a known stage. Valid: ${STAGE_NAMES.join(", ")}.`
-        );
+    for (const [k, v] of Object.entries(n.events)) {
+      if (!(EVENT_KEYS as readonly string[]).includes(k)) {
+        throw new ZError(`Config "notifications.events.${k}" is not a known event. Valid: ${EVENT_KEYS.join(", ")}`);
       }
-      if (typeof model !== "string" || !model) {
-        throw new ZError(`Config "stageModels.${stage}" must be a non-empty string.`);
-      }
-      try {
-        resolveRate(model, rates);
-      } catch {
-        throw new ZError(
-          `Config "stageModels.${stage}" is not a known model rate key, got ${JSON.stringify(model)}. ` +
-            `Known: ${Object.keys(rates.rates).join(", ")}.`
-        );
+      if (typeof v !== "boolean") {
+        throw new ZError(`Config "notifications.events.${k}" must be a boolean.`);
       }
     }
   }
+}
 
-  return c as BoardConfig;
+// stageModels (issue #82): keys restricted to the four stage names; values
+// must resolve through the SAME rate-key lookup z-cost/z-estimate use
+// (resolveRate in lib/estimate.ts), so a typo'd model name fails here.
+export function validateStageModels(stageModels: unknown): void {
+  if (typeof stageModels !== "object" || stageModels === null) {
+    throw new ZError(`Config "stageModels" must be an object of {stage: model}.`);
+  }
+  const rates = loadRates();
+  for (const [stage, model] of Object.entries(stageModels as Record<string, unknown>)) {
+    if (!STAGE_NAMES.includes(stage)) {
+      throw new ZError(`Config "stageModels.${stage}" is not a known stage. Valid: ${STAGE_NAMES.join(", ")}.`);
+    }
+    if (typeof model !== "string" || !model) {
+      throw new ZError(`Config "stageModels.${stage}" must be a non-empty string.`);
+    }
+    try {
+      resolveRate(model, rates);
+    } catch {
+      throw new ZError(
+        `Config "stageModels.${stage}" is not a known model rate key, got ${JSON.stringify(model)}. ` +
+          `Known: ${Object.keys(rates.rates).join(", ")}.`
+      );
+    }
+  }
 }

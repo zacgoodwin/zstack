@@ -5,7 +5,7 @@
 // creation vs adoption, idempotence (a re-run plans zero mutations), and schema
 // validation that fails loudly with the field named.
 import { test, expect, describe, afterEach } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -24,6 +24,27 @@ import { loadConfig, type BoardConfig } from "../lib/config.ts";
 import { validateConfig } from "../lib/config-schema.ts";
 import { loadBoardTemplate, deriveShape, DEFAULT_TEMPLATE } from "../lib/board-template.ts";
 import type { GraphQLData, GraphQLExecutor } from "../lib/board.ts";
+
+// -- filesystem isolation for SetupBoard.apply() -----------------------------
+// buildConfig now reads ~/.zstack/projects/<slug>/config.json to preserve
+// hand-added optional fields across a re-apply (issue #97), so every
+// SetupBoard.apply() call that reaches buildConfig touches the filesystem at
+// whatever `home` resolves to. Without an explicit override, a test would
+// silently read (and become coupled to) whatever real
+// ~/.zstack/projects/<slug>/config.json happens to sit on the machine running
+// the suite -- exactly the non-determinism the gate-test discipline
+// (deterministic, local, never flaky) forbids. testHome() hands each such call
+// an isolated, empty-by-default temp dir; the module-level afterEach sweeps
+// every one this file creates.
+const testHomes: string[] = [];
+afterEach(() => {
+  while (testHomes.length) rmSync(testHomes.pop()!, { recursive: true, force: true });
+});
+function testHome(): string {
+  const dir = mkdtempSync(join(tmpdir(), "zstack-setup-test-home-"));
+  testHomes.push(dir);
+  return dir;
+}
 
 // -- helpers -----------------------------------------------------------------
 function opName(query: string): string {
@@ -314,6 +335,7 @@ describe("SetupBoard.apply — creation path", () => {
       slug: "zstack",
       title: "zstack",
       epicStyle: "milestones",
+      home: testHome(),
     });
 
     expect(result.created).toBe(true);
@@ -353,10 +375,11 @@ describe("SetupBoard.apply — creation path", () => {
   test("a second apply against the now-set-up board plans zero mutations (end-to-end idempotence)", async () => {
     const backend = setupBackend();
     const setup = new SetupBoard(backend.exec);
-    await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    const home = testHome();
+    await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
 
     const before = backend.calls.length;
-    const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
     expect(second.created).toBe(false);
     expect(second.actions).toEqual([]);
     const mutationsAfter = backend.calls
@@ -370,7 +393,7 @@ describe("SetupBoard.apply — adoption path", () => {
   test("adopts an existing correct board with zero mutations", async () => {
     const backend = setupBackend(fullProjectSpec());
     const setup = new SetupBoard(backend.exec);
-    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home: testHome() });
     expect(result.created).toBe(false);
     expect(result.actions).toEqual([]);
     expect(backend.calls.some((c) => c.op.startsWith("Create") || c.op.startsWith("Update"))).toBe(false);
@@ -385,6 +408,7 @@ describe("SetupBoard.apply — adoption path", () => {
       slug: "zstack",
       title: "ignored-when-number-given",
       projectNumber: 3,
+      home: testHome(),
     });
     expect(result.created).toBe(false);
     expect(backend.calls.some((c) => c.op === "ProjectByNumber")).toBe(true);
@@ -430,7 +454,7 @@ describe("SetupBoard.apply — destructive adopt guard", () => {
   test("adopt with --force proceeds, reports what was dropped, and replaces Status", async () => {
     const backend = setupBackend(legacyProject(["Todo", "In Progress", "Done"]));
     const setup = new SetupBoard(backend.exec);
-    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", force: true });
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", force: true, home: testHome() });
     expect(result.created).toBe(false);
     expect(result.dropped).toEqual([
       { field: "Status", name: "Todo", count: 1 },
@@ -444,7 +468,7 @@ describe("SetupBoard.apply — destructive adopt guard", () => {
   test("adopt with no items in non-canonical options proceeds without --force", async () => {
     const backend = setupBackend(legacyProject(["Done", null]));
     const setup = new SetupBoard(backend.exec);
-    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home: testHome() });
     expect(result.created).toBe(false);
     expect(result.dropped).toEqual([]);
     expect(backend.calls.some((c) => c.op === "UpdateFieldOptions")).toBe(true);
@@ -519,7 +543,7 @@ describe("SetupBoard.apply — guard covers Model / Model Effort (F7)", () => {
   test("--force proceeds, reports the dropped Model option per field, and replaces the options", async () => {
     const backend = setupBackend(modelDriftProject([{ Model: "gpt4" }]));
     const setup = new SetupBoard(backend.exec);
-    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", force: true });
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", force: true, home: testHome() });
     expect(result.dropped).toEqual([{ field: "Model", name: "gpt4", count: 1 }]);
     expect(backend.project!.fields.find((f) => f.name === "Model")!.options).toEqual([
       "haiku",
@@ -532,7 +556,7 @@ describe("SetupBoard.apply — guard covers Model / Model Effort (F7)", () => {
   test("an unpopulated non-canonical Model option proceeds without --force", async () => {
     const backend = setupBackend(modelDriftProject([{ Model: "opus" }]));
     const setup = new SetupBoard(backend.exec);
-    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home: testHome() });
     expect(result.dropped).toEqual([]);
     expect(backend.calls.some((c) => c.op === "UpdateFieldOptions")).toBe(true);
   });
@@ -567,7 +591,7 @@ describe("SetupBoard pagination of lookups (F8)", () => {
       return backend.exec(q, v);
     };
     const setup = new SetupBoard(exec);
-    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home: testHome() });
     expect(result.created).toBe(false); // found on page 2 -> adopted
     expect(result.config.projectId).toBe("PVT_full");
     expect(backend.calls.some((c) => c.op === "CreateProject")).toBe(false);
@@ -651,22 +675,12 @@ describe("SetupBoard.apply — usage recheck before replace (F10)", () => {
 
 // -- writeConfig round-trip --------------------------------------------------
 describe("writeConfig", () => {
-  const homes: string[] = [];
-  afterEach(() => {
-    while (homes.length) rmSync(homes.pop()!, { recursive: true, force: true });
-  });
-  function makeHome(): string {
-    const dir = mkdtempSync(join(tmpdir(), "zstack-setup-home-"));
-    homes.push(dir);
-    return dir;
-  }
-
   test("writes a config that loadConfig reads back cleanly", async () => {
     const backend = setupBackend();
     const setup = new SetupBoard(backend.exec);
-    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    const home = testHome();
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
 
-    const home = makeHome();
     const path = writeConfig(result.config, home);
     expect(path).toContain(join(".zstack", "projects", "zstack", "config.json"));
 
@@ -691,7 +705,7 @@ describe("writeConfig", () => {
   test("a brand-new project's config includes the stageModels default and passes validateConfig", async () => {
     const backend = setupBackend();
     const setup = new SetupBoard(backend.exec);
-    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home: testHome() });
     expect(result.created).toBe(true);
     expect(result.config.stageModels).toEqual({ merge: "haiku" });
     expect(() => validateConfig(result.config)).not.toThrow();
@@ -701,26 +715,147 @@ describe("writeConfig", () => {
   // stageModels -- neither injecting the default nor stripping a key the
   // config didn't have. Simulates a config written BEFORE this ticket (no
   // stageModels key at all): a second apply/write against the now-existing
-  // project must leave the file byte-identical.
+  // project must leave the file byte-identical. Also issue #97 AC2 (no-drift
+  // re-run over a prior config carrying none of the four preserved optional
+  // fields stays byte-identical): the second apply() now reads this SAME
+  // `home`'s config.json (via buildConfig's priorOptionalFields), so this test
+  // doubles as proof that reading it back injects nothing new.
   test("re-running setup against an existing config without stageModels leaves it byte-identical", async () => {
     const backend = setupBackend();
     const setup = new SetupBoard(backend.exec);
+    const home = testHome();
 
     // First run creates the project; strip stageModels to simulate a config
     // that predates this ticket, then write it -- the "existing config
     // without the key" AC6 names.
-    const first = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    const first = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
     delete (first.config as any).stageModels;
-    const home = makeHome();
     const path = writeConfig(first.config, home);
     const before = readFileSync(path, "utf8");
 
-    // Second run adopts the now-existing project (created === false).
-    const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    // Second run adopts the now-existing project (created === false) and reads
+    // the file just written above from the same `home`.
+    const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
     expect(second.created).toBe(false);
     expect(second.config.stageModels).toBeUndefined(); // adoption never injects the default
     writeConfig(second.config, home);
     expect(readFileSync(path, "utf8")).toBe(before);
+  });
+
+  // -- issue #97 AC1: a re-apply that genuinely rewrites the config (the board
+  // shape drifted) preserves every hand-added optional field, not just
+  // stageModels -----------------------------------------------------------
+  test("a re-apply over a drifted board preserves hand-added stageModels/quota/notifications/adversarialMode", async () => {
+    const backend = setupBackend();
+    const setup = new SetupBoard(backend.exec);
+    const home = testHome();
+
+    // First run creates the project and its config.
+    const first = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
+    const handEdited: BoardConfig = {
+      ...first.config,
+      stageModels: { merge: "haiku", qa: "haiku" },
+      quota: { threshold: 250, mode: "abort" },
+      notifications: { enabled: true },
+      adversarialMode: "always",
+    };
+    writeConfig(handEdited, home);
+
+    // Simulate board-shape drift: the live board's Model field lost the
+    // "fable" option (e.g. someone edited it directly on github.com), so the
+    // next apply's diffState plans a real set-field-options mutation and
+    // buildConfig runs on a freshly re-read state -- the "writeConfig branch"
+    // the ticket names, not the no-op re-run.
+    backend.project!.fields.find((f) => f.name === "Model")!.options = ["haiku", "sonnet", "opus"];
+
+    const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
+    expect(second.actions.some((a) => a.kind === "set-field-options" && a.name === "Model")).toBe(true);
+    expect(second.config.stageModels).toEqual({ merge: "haiku", qa: "haiku" });
+    expect(second.config.quota).toEqual({ threshold: 250, mode: "abort" });
+    expect(second.config.notifications).toEqual({ enabled: true });
+    expect(second.config.adversarialMode).toBe("always");
+
+    const path = writeConfig(second.config, home);
+    const written = JSON.parse(readFileSync(path, "utf8"));
+    expect(written.stageModels).toEqual({ merge: "haiku", qa: "haiku" });
+    expect(written.quota).toEqual({ threshold: 250, mode: "abort" });
+    expect(written.notifications).toEqual({ enabled: true });
+    expect(written.adversarialMode).toBe("always");
+  });
+
+  // -- issue #97 AC3: first-time setup, no prior config.json on disk at all --
+  test("first-time setup with no prior config.json tolerates the absent file (no crash, unchanged default)", async () => {
+    const backend = setupBackend();
+    const setup = new SetupBoard(backend.exec);
+    const home = testHome(); // guaranteed empty: no ~/.zstack/projects/<slug>/config.json at all
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
+    expect(result.created).toBe(true);
+    expect(result.config.quota).toEqual({ threshold: 100, mode: "sleep" });
+    expect(result.config.stageModels).toEqual({ merge: "haiku" });
+    expect(result.config.notifications).toBeUndefined();
+    expect(result.config.adversarialMode).toBeUndefined();
+    expect(() => writeConfig(result.config, home)).not.toThrow();
+  });
+
+  // A hand-edited config.json that is not valid JSON must not crash setup --
+  // tolerated the same as an absent file, falling back to fresh defaults.
+  test("a corrupt prior config.json is tolerated (fresh defaults, no crash)", async () => {
+    const backend = setupBackend();
+    const setup = new SetupBoard(backend.exec);
+    const home = testHome();
+    const first = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
+    const path = writeConfig(first.config, home);
+    writeFileSync(path, "{ not valid json"); // corrupt it directly, bypassing writeConfig's validation
+
+    const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
+    expect(second.config.quota).toEqual({ threshold: 100, mode: "sleep" }); // fresh default, nothing preserved
+    expect(second.config.stageModels).toBeUndefined(); // adoption path -- no default injected either
+  });
+
+  // Reviewer finding 1 (blocker): a validly-parsed JSON value whose SHAPE is
+  // wrong for one of the four preserved fields (a string where an object is
+  // required, or an explicit null) used to reach validateConfig unfiltered --
+  // and apply() runs the board's GraphQL mutations BEFORE buildConfig/
+  // validateConfig, so that crash landed AFTER the live board already changed,
+  // with config.json never written. A wrong-shape field must instead fall
+  // back to "nothing to preserve for that field" -- the same tolerant
+  // treatment priorOptionalFields already gives a missing/unparsable file --
+  // while a correctly-shaped sibling field is unaffected.
+  test("a validly-parsed but wrong-shape preserved field does not crash apply() after board mutations run; falls back per-field, siblings still preserved", async () => {
+    const backend = setupBackend();
+    const setup = new SetupBoard(backend.exec);
+    const home = testHome();
+
+    const first = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
+    const path = writeConfig(first.config, home);
+    // Hand-edit the file directly (bypassing writeConfig's own validateConfig
+    // call) to a validly-parsed JSON document carrying two bad-shape fields
+    // (a string "quota", an explicit-null "adversarialMode") alongside a
+    // correctly-shaped "stageModels" -- a realistic typo that leaves the rest
+    // of the file intact.
+    const onDisk = JSON.parse(readFileSync(path, "utf8"));
+    onDisk.quota = "banana"; // wrong shape: a string, not {threshold, mode}
+    onDisk.adversarialMode = null; // valid JSON, explicit null -- also wrong shape
+    onDisk.stageModels = { merge: "haiku", qa: "haiku" }; // correctly-shaped sibling
+    writeFileSync(path, JSON.stringify(onDisk, null, 2) + "\n");
+
+    // Force board-shape drift so apply()'s mutation loop (lines 580-594)
+    // actually executes GraphQL calls before buildConfig/validateConfig run --
+    // reproducing the exact hazard finding 1 reported (mutate the board, then
+    // throw before config.json is written).
+    backend.project!.fields.find((f) => f.name === "Model")!.options = ["haiku", "sonnet", "opus"];
+
+    // The bug: this used to throw (validateConfig rejecting the unfiltered
+    // "banana" quota) AFTER the set-field-options mutation above already ran.
+    // Awaiting it directly here means any regression fails this test the same
+    // way it fails production -- an uncaught throw, not a silent pass.
+    const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
+
+    expect(second.actions.some((a) => a.kind === "set-field-options" && a.name === "Model")).toBe(true);
+    expect(second.config.quota).toEqual({ threshold: 100, mode: "sleep" }); // default wins, not "banana"
+    expect(second.config.adversarialMode).toBeUndefined(); // null wasn't preserved, no default either
+    expect(second.config.stageModels).toEqual({ merge: "haiku", qa: "haiku" }); // sibling untouched
+    expect(() => validateConfig(second.config)).not.toThrow();
   });
 });
 
@@ -735,7 +870,7 @@ describe("board template override", () => {
 
     const backend = setupBackend();
     const setup = new SetupBoard(backend.exec, shape);
-    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home: testHome() });
     expect(result.created).toBe(true);
 
     // The Status field is set via UpdateFieldOptions on the create path; its
@@ -754,7 +889,7 @@ describe("board template override", () => {
   test("the default emitted status literal is byte-identical to the old position-cycled shape (1:1)", async () => {
     const backend = setupBackend();
     const setup = new SetupBoard(backend.exec); // default shape
-    await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack" });
+    await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home: testHome() });
     const statusUpdate = backend.calls.find((c) => c.op === "UpdateFieldOptions")!;
     // Backlog=GRAY, Ready=BLUE, ... Done wraps back to GRAY; all descriptions "".
     expect(statusUpdate.query).toContain('{name: "Backlog", color: GRAY, description: ""}');

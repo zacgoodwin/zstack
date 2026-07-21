@@ -178,6 +178,14 @@ config. An adopted or already-configured project keeps whatever it already
 has — add the key by hand to opt in (see
 [z-setup.md → Config knobs](z-setup.md#config-knobs-hand-edit-configjson-after-setup)).
 
+**It survives a later `z-setup` re-apply (issue #97).** Re-running `/z-setup`
+against an already-set-up project can still genuinely rewrite `config.json`
+(the board's shape drifted — a field was added, a status renamed). That
+re-apply preserves whatever `stageModels` already sits in the file instead of
+resetting it to the pack default or dropping it; the same holds for
+`quota`/`notifications`/`adversarialMode`. Only a board that has never had a
+config written for it (first-time setup) starts from the default above.
+
 ## Notifications
 
 The loop can run for hours unattended. Point it at a Discord webhook and it posts
