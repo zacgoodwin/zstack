@@ -175,3 +175,38 @@ describe("Ticket #85: lockfile exclusion in reviewer diff", () => {
     expect(reviewerRow).toMatch(/fall.*back|fallback/i);
   });
 });
+
+// ============================================================================
+// Issue #118 -- the throwaway review worktree must never resolve under
+// ~/.zstack: the reviewer runs the full `bun test` suite inside it, and
+// several tests write to/delete real ~/.zstack subtrees (notify.test.ts was
+// one), so a worktree rooted there lets that suite's cleanup destroy the
+// loop's own live state.json/locks/transcripts mid-run.
+// ============================================================================
+describe("Issue #118: throwaway review worktree is placed outside ~/.zstack", () => {
+  test("AC1: the reviewer row's worktree add path is NOT under $TMP / ~/.zstack", () => {
+    const md = zLoop();
+    const reviewerRow = section(md, "| `reviewer` |");
+    expect(reviewerRow).not.toBe("");
+    // The old, dangerous placement must be gone.
+    expect(reviewerRow).not.toContain('"$TMP/review-<N>"');
+    // git worktree add's target for the throwaway review worktree, extracted
+    // the same way section() extracts the reviewer row: find the exact
+    // command and check ITS path argument, not just any mention of ".worktrees".
+    const m = reviewerRow.match(/git worktree add "([^"]+)" <head-sha>/);
+    expect(m).not.toBeNull();
+    const worktreePath = m![1];
+    // Must resolve outside ~/.zstack (repo .worktrees/ or an OS temp dir) --
+    // verified by path prefix, per AC1's own wording.
+    expect(worktreePath.startsWith(".worktrees/")).toBe(true);
+    expect(worktreePath).not.toContain("$TMP");
+    expect(worktreePath).not.toContain(".zstack");
+  });
+
+  test("AC1: the reviewer row still documents removing the throwaway worktree after the stage", () => {
+    const md = zLoop();
+    const reviewerRow = section(md, "| `reviewer` |");
+    expect(reviewerRow).toMatch(/remove it after the stage/);
+    expect(reviewerRow).toContain('git worktree remove ".worktrees/review-<N>"');
+  });
+});
