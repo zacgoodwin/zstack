@@ -924,8 +924,16 @@ describe("transitions and reducers", () => {
 // outcome would hand applyAction an advance whose setStatus is illegal from the
 // stale status (the qa-pass lane still showing Building -> the Building->Review
 // that threw an unhandled ZError and killed every lane's progress with it).
+//
+// #116 refined the one-hop-behind case (the qa-pass-lagging-at-Building fixture
+// below): rather than stop-lane for every desync, it is now resynced and
+// advanced when the gap is explainable by the loop's own still-propagating
+// write -- see the "resync-on-lag vs genuine move-back (#116)" block below for
+// the side-by-side pinning. The two tests here are updated in place (same
+// fixtures, corrected expectations) since they ARE that exact scenario; AC3
+// (a two-hop, unambiguous human move) is untouched.
 describe("stage/status desync fails soft (#110)", () => {
-  test("AC1: a qa-pass lane whose board status lags at Building stops its own lane, does not throw, leaves the other lane untouched", () => {
+  test("AC1: a qa-pass lane whose board status lags at Building resyncs and advances (#116), does not throw, leaves the other lane untouched", () => {
     let s = state(
       [ticket(1, "Building"), ticket(2, "QA")],
       [
@@ -934,31 +942,33 @@ describe("stage/status desync fails soft (#110)", () => {
       ]
     );
     const a = nextAction(s.tickets, s.lanes, OPTS(s));
-    // The desynced lane is resolved deterministically -- NOT the illegal
-    // advance-to-reviewer that used to throw.
-    expect(a).toMatchObject({ kind: "stop-lane", ticket: 1 });
-    expect((a as { note: string }).note).toContain("disagrees");
-    expect((a as { note: string }).note).toContain("Building");
+    // One hop behind (Building is qa's own preceding status) -- resync-on-lag
+    // (#116), not the old stop-lane, and NOT the illegal advance-to-reviewer
+    // that used to throw before #110's guard existed.
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "reviewer", resyncStatus: "QA" });
     expect(() => applyAction(s, a, 0)).not.toThrow(); // the tick does not abort
     s = applyAction(s, a, 0);
-    expect(s.lanes.map((l) => l.ticket)).toEqual([2]); // desynced lane dropped
-    expect(s.lanes[0]).toEqual(lane(2, "qa")); // #2 untouched (still mid-stage, no outcome)
+    expect(s.tickets.find((t) => t.number === 1)!.status).toBe("Review"); // resynced, then advanced
+    expect(s.lanes.find((l) => l.ticket === 1)).toMatchObject({ stage: "reviewer" });
+    expect(s.lanes.find((l) => l.ticket === 1)!.outcome).toBeUndefined();
+    expect(s.lanes.find((l) => l.ticket === 2)).toEqual(lane(2, "qa")); // #2 untouched (still mid-stage, no outcome)
   });
 
-  test("AC2: the QA-skip walk invariant holds -- the ticket never lands in Review directly from Building", () => {
+  test("AC2: the QA-skip walk invariant holds -- an un-resynced advance never lands the ticket in Review directly from Building", () => {
     // The guard exists precisely because this transition is (and stays) illegal.
     expect(canTransition("Building", "Review")).toBe(false);
-    // The raw advance the reducer would have produced still throws -- proving the
-    // soft-stop, not a loosened transition, is what keeps the tick alive.
+    // The raw advance without nextAction's resync correction still throws --
+    // proving the resyncStatus write, not a loosened transition, is what makes
+    // the corrected advance below legal.
     const desynced = state([ticket(1, "Building")], [lane(1, "qa", { outcome: { kind: "qa-pass" } })]);
     expect(() => applyAction(desynced, { kind: "advance", ticket: 1, to: "reviewer" }, 0)).toThrow(ZError);
-    // Through nextAction, the same lane resolves to a soft stop and the ticket
-    // never reaches Review.
+    // Through nextAction, the same lane now resolves to a resync-on-lag advance
+    // (#116) and actually reaches Review, instead of the old soft stop.
     const a = nextAction(desynced.tickets, desynced.lanes, OPTS(desynced));
-    expect(a.kind).toBe("stop-lane");
+    expect(a).toMatchObject({ kind: "advance", to: "reviewer", resyncStatus: "QA" });
     const after = applyAction(desynced, a, 0);
-    expect(after.tickets[0].status).toBe("Building"); // still Building, never Review
-    expect(after.lanes).toEqual([]);
+    expect(after.tickets[0].status).toBe("Review");
+    expect(after.lanes[0]).toMatchObject({ ticket: 1, stage: "reviewer" });
   });
 
   test("AC3: a lane a human dragged back to Building parks only its own lane; other lanes continue", () => {
@@ -976,6 +986,44 @@ describe("stage/status desync fails soft (#110)", () => {
     expect(s.lanes.map((l) => l.ticket)).toEqual([2]); // only #1's lane stopped
     // The other lane continues on the very next tick.
     expect(nextAction(s.tickets, s.lanes, OPTS(s))).toMatchObject({ kind: "advance", ticket: 2, to: "qa" });
+  });
+});
+
+// -- #116: resync-on-lag instead of stop-lane rebuild, when the board status --
+// merely lags the loop's own write -----------------------------------------
+// A lagged board write (GitHub eventual consistency) and a genuine human
+// move-back produce the IDENTICAL snapshot for a mid-pipeline stage -- the
+// discriminator #116 uses is distance: the board only ever moves one column
+// per advance, so a gap of exactly one hop behind the lane's own stage is
+// treated as our own write still propagating (resync + advance, no rebuild,
+// no wasted QA re-run); a gap of more than one hop cannot be explained by a
+// single write in flight and stays #110's safe stop-lane.
+describe("resync-on-lag vs genuine move-back (#116)", () => {
+  test("AC1: one hop behind (qa lane lagging at Building) resyncs to QA and advances to reviewer -- no stop-lane, no rebuild", () => {
+    const s = state(
+      [ticket(1, "Building")],
+      [lane(1, "qa", { outcome: { kind: "qa-pass" } })] // the loop's own QA-move write has not landed yet
+    );
+    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "reviewer", resyncStatus: "QA" });
+    const after = applyAction(s, a, 0);
+    expect(after.tickets[0].status).toBe("Review");
+    expect(after.lanes[0]).toMatchObject({ ticket: 1, stage: "reviewer" });
+    expect(after.lanes[0].outcome).toBeUndefined();
+  });
+
+  test("AC2: two hops behind (reviewer lane at Building) is a genuine move-back -- stop-lane, and the ticket re-claims as a fresh builder", () => {
+    let s = state(
+      [ticket(1, "Building")],
+      [lane(1, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } })] // human dragged Review -> Building
+    );
+    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(a).toMatchObject({ kind: "stop-lane", ticket: 1 });
+    s = applyAction(s, a, 0);
+    expect(s.lanes).toEqual([]);
+    expect(s.tickets[0].status).toBe("Building"); // the human's move is honored, not overwritten
+    // Re-claimed as a fresh builder next tick -- the full build+QA cycle re-runs.
+    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toMatchObject({ kind: "claim", ticket: 1, stage: "builder" });
   });
 });
 
