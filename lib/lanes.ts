@@ -55,7 +55,7 @@ export function isWorkableStatus(status: BoardStatus): boolean {
 
 // A dependency is satisfied when it is Done on this board, or absent from the
 // snapshot entirely (already merged/closed in an earlier batch).
-export function depsSatisfied(t: TicketSnapshot, byNumber: Map<number, TicketSnapshot>): boolean {
+function depsSatisfied(t: TicketSnapshot, byNumber: Map<number, TicketSnapshot>): boolean {
   return t.dependsOn.every((d) => {
     const dep = byNumber.get(d);
     return dep === undefined || dep.status === "Done";

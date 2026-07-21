@@ -63,7 +63,7 @@ export interface Orphans {
 }
 
 // Worktree directories, one per `ticket-<N>`. Tolerates a missing dir.
-export function listWorktrees(worktreesDir: string): { ticket: number; path: string }[] {
+function listWorktrees(worktreesDir: string): { ticket: number; path: string }[] {
   let entries: import("node:fs").Dirent[];
   try {
     entries = readdirSync(worktreesDir, { withFileTypes: true });
