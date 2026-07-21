@@ -86,6 +86,18 @@ them. Add them by hand on github.com after setup.
 Beyond the board IDs, `config.json` carries optional per-project tuning knobs,
 each defaulted by `loadConfig` when absent:
 
+**A re-apply preserves your hand-edits (issue #97).** `z-setup-board apply`
+assembles the rest of the config fresh from the live board every run, but four
+fields have no CLI flag and exist only because you hand-edited them in:
+`stageModels`, `quota`, `notifications`, `adversarialMode`. Whatever value one
+of these carries in the config file on disk wins over the freshly-assembled
+default the next time `apply` genuinely rewrites the file (a board-shape
+change forced a real `writeConfig`, not the common no-op re-run). A field you
+never added stays exactly as it would today. `maxLanes`/`watchdogMinutes` are
+not in this set — they have a `--max-lanes`/`--watchdog-minutes` CLI flag, so
+re-running `/z-setup` with (or without) that flag is the supported way to
+change them.
+
 - `maxLanes` (default 3) — concurrent worktree lanes.
 - `watchdogMinutes` (default 10) — silent-worker timeout.
 - `lockStalenessMinutes` (default 60) — when a crashed loop's lock is judged stale.
@@ -144,7 +156,8 @@ each defaulted by `loadConfig` when absent:
   rate key in `references/rates.json` (the same lookup `z-cost`/`z-estimate`
   use), checked by `validateConfig`. An already-set-up project that predates
   this knob (or was adopted) never gets it auto-added — add it to
-  `config.json` by hand to opt in. Full semantics:
+  `config.json` by hand to opt in, and it survives every later `z-setup`
+  re-apply (issue #97 — see the note above). Full semantics:
   [z-loop.md → Per-stage model routing](z-loop.md#per-stage-model-routing).
 - `notifications` (absent = off) — Discord notifications for the seven loop/plan
   events (including `human-needed` — issue #63). Shape: `{ "enabled": true, "discordWebhookUrl": "https://…",
