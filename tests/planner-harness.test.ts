@@ -463,28 +463,51 @@ describe("lintTicketBody", () => {
   // issue #103 regression: a raw path.join lintBin (native separator -- a
   // backslash on Windows) broke bin/z-ticket-lint's own `dirname "$0"`,
   // silently no-opping the grounding gate (exit 0/PASS) instead of catching
-  // the bad `## Files` path (exit 1/FAIL). Force EVERY separator in both
-  // lintBin and checkPathsRoot to a backslash -- regardless of this OS's
-  // native path.sep -- so the test exercises lintTicketBody's normalize
-  // fix directly instead of relying on this machine's path.join already
-  // producing backslashes. On POSIX (and on a Windows bash flavor that
-  // already tolerates backslashes) this is a no-op-equivalent that still
-  // asserts the correct FAIL, so it's green cross-platform; on the Windows
-  // bash flavor the loop's regression run hit, removing the normalize call
-  // in lintTicketBody makes this fail loudly instead of production silently
-  // passing a hallucinated path.
-  test("issue #103: a backslash-separated lintBin/checkPathsRoot still fails the grounding gate (regression pin)", () => {
+  // the bad `## Files` path (exit 1/FAIL).
+  //
+  // QA bounce on this ticket: an earlier version of this test asserted only
+  // `r.ok === false` after driving a real `bash` spawn with a backslash
+  // lintBin/checkPathsRoot. On this dev box's git-bash/MSYS2 build, `bash`
+  // (and the `dirname "$0"` it runs) already tolerates backslash-separated
+  // script paths, so that assertion stayed green even with the normalize
+  // call deleted from lintTicketBody -- an environmental quirk of one bash
+  // flavor, not proof the fix does anything. The sibling "checkPathsRoot arg
+  // appends --check-paths" test above (line ~420) caught the same revert
+  // because it inspects the command array itself rather than trusting a
+  // particular bash's tolerance.
+  //
+  // Fixed here the same way: assert the DETERMINISTIC evidence of the
+  // normalize -- the literal forward-slash command handed to spawn -- via an
+  // injected spy that still delegates to defaultSpawn, so both the
+  // construction (this OS/bash-independent) and the real end-to-end
+  // behavior (this OS's actual bash) are checked in one test. Deleting
+  // lintTicketBody's `.replace(/\\/g, "/")` normalize makes the `seenCmd`
+  // assertions fail on every platform, regardless of bash flavor tolerance.
+  test("issue #103: a backslash-separated lintBin/checkPathsRoot is normalized to forward slashes before reaching bash (regression pin)", () => {
     const dir = tmpDir();
     const toBackslash = (p: string) => p.split(/[\\/]/).join("\\");
     const backslashLintBin = toBackslash(LINT_BIN);
     const backslashFilesRoot = toBackslash(DEFAULT_FILES_ROOT);
+    let seenCmd: string[] = [];
+    const spy: Spawn = (cmd) => {
+      seenCmd = cmd;
+      return defaultSpawn(cmd);
+    };
     const r = lintTicketBody(
       ticketBody({ files: "src/does-not-exist.ts" }),
       dir,
       backslashLintBin,
-      defaultSpawn,
+      spy,
       backslashFilesRoot
     );
+    // Deterministic: the exact command bash receives carries no backslashes
+    // at all, regardless of what this specific bash build would tolerate.
+    expect(seenCmd[1]).toBe(LINT_BIN.replace(/\\/g, "/"));
+    expect(seenCmd[1]).not.toContain("\\");
+    expect(seenCmd[4]).toBe(DEFAULT_FILES_ROOT.replace(/\\/g, "/"));
+    expect(seenCmd[4]).not.toContain("\\");
+    // And, on this OS's real bash, the normalized command still catches the
+    // bad `## Files` path -- the behavioral half of the regression.
     expect(r.ok).toBe(false);
     expect(r.output).toContain("src/does-not-exist.ts");
   });
