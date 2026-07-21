@@ -19,8 +19,10 @@ OUT="$(mktemp -d)"
 
 # 1. Materialize diff.patch into a real throwaway directory so `worktreePath`
 #    is a live filesystem path the reviewer can actually inspect and run tests
-#    in -- mirroring production's `git worktree add "$TMP/review-<N>" <head-sha>`
-#    (z-loop/SKILL.md) -- instead of the dead /tmp placeholder neither prompt's
+#    in -- mirroring production's `git worktree add ".worktrees/review-<N>" <head-sha>`
+#    (z-loop/SKILL.md, issue #118: outside ~/.zstack so the reviewer's full test
+#    suite run can never resolve onto live loop state) -- instead of the dead
+#    /tmp placeholder neither prompt's
 #    unconditional "run the typecheck and tests this diff touches here" could
 #    ever act on (#88). This fixture carries no real git history, so a plain
 #    `git apply` into a fresh scratch dir is the equivalent materialization.
