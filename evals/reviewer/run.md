@@ -84,3 +84,52 @@ Documentation only — the command; scheduling is the user's cron/routine:
 0 4 * * * cd /path/to/zstack-1 && evals/reviewer/run.sh 5
 ```
 
+## Results
+
+**2026-07-20, 5 trials, ticket #102 (real paid run, AC3 of #88).** Ran
+`evals/reviewer/run.sh 5` (real `claude -p`, `CLAUDE_CMD` not overridden to
+`mock-claude.sh`) against the post-#88 fixture. All 5 trials completed with a
+graded score and no harness or materialization error. Headline, `run.sh`'s
+own output: "adversarial surfaced the defect in 0/5 trials (pass threshold:
+4/5)" followed by "FAIL: below threshold" (exit 1).
+
+**Score: 0/5.** Per-trial grades (`grade-1.json` .. `grade-5.json`) are
+identical in shape across all 5 trials:
+
+```json
+{
+  "adversarialMarker": "REVIEW-FINDINGS",
+  "singlePassMarker": "REVIEW-FINDINGS",
+  "namesDefect": true,
+  "adversarialConfidence": 0,
+  "pass": false
+}
+```
+
+**Single-pass-vs-adversarial delta: none — single-pass also caught it.**
+Adversarial mode worked exactly as designed in all 5 trials —
+`REVIEW-FINDINGS: confidence=0`, 3/3 skeptics refuting, naming criterion 3's
+`<=`-vs-`<` boundary defect with file:line evidence and an executed
+counter-example (`withinWindow(1500,1000,500)` returns `true`, must be
+`false`). But per `rubric.md`'s per-trial contract, a trial only passes when
+adversarial catches the defect AND single-pass does not — and single-pass
+ALSO ended `REVIEW-FINDINGS` (never `REVIEW-APPROVE`) in all 5 trials,
+independently reproducing the same file:line, the same executed
+counter-example, and the same fix (e.g. single-1: "AC3 fails: the boundary
+is inclusive, not exclusive... Fix is `now < end`."). No trial shows the
+delta the fan-out is meant to buy, because there is none to show here.
+
+**Interpretation (AC3): the fixture does not discriminate.** Not a harness
+defect — #88's AC1/AC2 fixes hold, and all 5 trials completed cleanly
+against a real materialized worktree. Not an adversarial-mode failure —
+adversarial named the defect correctly, with below-100 confidence, every
+single time. The planted `<=`-vs-`<` boundary defect is too mechanically
+obvious for a frontier single-pass reviewer with real code execution to
+miss, regardless of #88's de-spoiled AC3 prose: the reviewer runs the
+function against the stated acceptance criteria and the boundary case
+fails, full stop. The ≥4/5 threshold is unchanged and was NOT weakened to
+force a pass. **Follow-up filed:
+[#108](https://github.com/zacgoodwin/zstack/issues/108)** — design a
+subtler planted defect for this fixture, so the eval can actually
+discriminate adversarial from single-pass review quality.
+
