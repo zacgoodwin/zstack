@@ -19,6 +19,11 @@ afterAll(() => {
   while (roots.length) rmSync(roots.pop()!, { recursive: true, force: true });
 });
 
+// Each scenario spawns real bash/clone subprocesses (~1s each on Windows) and
+// the two-setup scenarios cross the 5s default under full-suite concurrency.
+// Give every test the same generous, non-flaky ceiling.
+const T = 30_000;
+
 // Scenario A (the reported bug): pack cloned straight into the skills dir,
 // run twice to also pin idempotence (the documented Windows update path).
 const scenarioA = (async () => {
@@ -106,7 +111,7 @@ describe("setup registers each skill one level deep", () => {
     expect(existsSync(join(packDir, "setup"))).toBe(true);
     expect(second.code).toBe(0);
     expect(existsSync(join(env.skills, "z-alpha", "SKILL.md"))).toBe(true);
-  });
+  }, T);
 
   test("cloned elsewhere: pack + z-* entries registered, and a re-run refreshes the copies", async () => {
     const { env, sentinel, first, second } = await scenarioB;
@@ -119,7 +124,7 @@ describe("setup registers each skill one level deep", () => {
       // The refresh replaced our stale copy — the sentinel is gone.
       expect(existsSync(sentinel)).toBe(false);
     }
-  });
+  }, T);
 
   test("colliding non-zstack skill dirs are left untouched, including a name-prefix near-miss", async () => {
     const { env, foreign, nearMiss, run } = await scenarioC;
@@ -129,21 +134,21 @@ describe("setup registers each skill one level deep", () => {
     expect(run.stderr).toContain("not registered by zstack setup");
     // The non-colliding sibling still registered.
     expect(existsSync(join(env.skills, "z-beta", "SKILL.md"))).toBe(true);
-  });
+  }, T);
 
   test("all skills colliding is a warning, not a fatal exit (set -e regression)", async () => {
     const { run } = await scenarioF;
     expect(run.code).toBe(0);
     expect(run.stdout).toContain("zstack setup complete.");
     expect(run.stderr).toContain("not registered by zstack setup");
-  });
+  }, T);
 
   test("a pack with no z-*/SKILL.md skills fails loudly instead of registering nothing", async () => {
     const { run } = await scenarioG;
     expect(run.code).toBe(1);
     expect(run.stderr).toContain("no z-*/SKILL.md skills found");
     expect(run.stdout).not.toContain("zstack setup complete.");
-  });
+  }, T);
 
   test.skipIf(process.platform === "win32")(
     "POSIX: an owned real dir at the destination is replaced by a symlink, not nested into",
@@ -162,6 +167,7 @@ describe("setup registers each skill one level deep", () => {
       expect(run.code).toBe(0);
       expect(lstatSync(stale).isSymbolicLink()).toBe(true);
       expect(readFileSync(join(stale, "SKILL.md"), "utf8")).toContain("test skill");
-    }
+    },
+    T
   );
 });
