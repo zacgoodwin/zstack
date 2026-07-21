@@ -332,6 +332,22 @@ describe("validateConfig: notifications block shapes", () => {
     );
   });
 
+  // Issue #106: `typeof [] === "object"` and `[] !== null`, so a bare array
+  // used to pass the old `typeof n !== "object" || n === null` guard as a
+  // valid notifications block. Must now throw naming "notifications", the
+  // same as any other wrong-shape value (AC2).
+  test("a bare array is rejected, not silently accepted as a valid object (AC2)", () => {
+    expect(() =>
+      validateConfig(cfgWith(["x"] as unknown as BoardConfig["notifications"]))
+    ).toThrow(/"notifications" must be an object/);
+  });
+
+  test("a bare array for notifications.events is rejected too", () => {
+    expect(() =>
+      validateConfig(cfgWith({ events: ["work-complete"] as unknown as Record<string, boolean> }))
+    ).toThrow(/"notifications\.events" must be an object/);
+  });
+
   test("an unknown events key throws naming the bad key", () => {
     let caught: unknown;
     try {

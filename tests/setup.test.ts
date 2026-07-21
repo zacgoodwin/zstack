@@ -857,6 +857,36 @@ describe("writeConfig", () => {
     expect(second.config.stageModels).toEqual({ merge: "haiku", qa: "haiku" }); // sibling untouched
     expect(() => validateConfig(second.config)).not.toThrow();
   });
+
+  // Issue #106 AC3: `typeof [] === "object"` and `[] !== null`, so a bare
+  // array used to pass validateQuota as a "valid" quota object -- it never
+  // threw, so priorOptionalFields' per-field try/catch (above) never caught
+  // it and preserved the array verbatim across a re-apply instead of falling
+  // back to DEFAULT_QUOTA. Same reproduction shape as the wrong-shape test
+  // above (drift the board so apply()'s mutation loop runs before
+  // buildConfig/validateConfig), but specifically for the array hole.
+  test("a prior config carrying quota: [] falls back to DEFAULT_QUOTA on re-apply, not preserved as an array (AC3)", async () => {
+    const backend = setupBackend();
+    const setup = new SetupBoard(backend.exec);
+    const home = testHome();
+
+    const first = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
+    const path = writeConfig(first.config, home);
+    const onDisk = JSON.parse(readFileSync(path, "utf8"));
+    onDisk.quota = []; // the bare-array hole
+    writeFileSync(path, JSON.stringify(onDisk, null, 2) + "\n");
+
+    // Drift the board so apply()'s mutation loop runs before buildConfig --
+    // the mutate-then-fail hazard finding 1 (#97) reported.
+    backend.project!.fields.find((f) => f.name === "Model")!.options = ["haiku", "sonnet", "opus"];
+
+    const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
+
+    expect(second.actions.some((a) => a.kind === "set-field-options" && a.name === "Model")).toBe(true);
+    expect(second.config.quota).toEqual({ threshold: 100, mode: "sleep" }); // DEFAULT_QUOTA, array not preserved
+    expect(Array.isArray(second.config.quota)).toBe(false);
+    expect(() => validateConfig(second.config)).not.toThrow(); // no post-mutation crash
+  });
 });
 
 // -- board template override (issue #20 AC2 + AC5) ---------------------------
@@ -970,6 +1000,26 @@ describe("validateConfig", () => {
     expect(() => validateConfig(cfg)).toThrow(/fields\.Model\.options/);
   });
 
+  // Issue #106: the array-as-object hole applies to every
+  // `typeof x === "object"` guard in the file, not just quota/notifications --
+  // a bare config, a bare `fields` map, a bare field, and a bare options map
+  // all pass `typeof [] === "object" && [] !== null` the same way.
+  test("a bare array is rejected at every object-shaped site: the whole config, fields, a field, and an options map", () => {
+    expect(() => validateConfig([])).toThrow(/Config must be a JSON object/);
+
+    const badFields = goodConfig() as any;
+    badFields.fields = [];
+    expect(() => validateConfig(badFields)).toThrow(/"fields" must be an object/);
+
+    const badField = goodConfig() as any;
+    badField.fields.Model = [];
+    expect(() => validateConfig(badField)).toThrow(/"fields\.Model" must be an object/);
+
+    const badOptions = goodConfig() as any;
+    badOptions.fields.Model.options = ["opt_opus"];
+    expect(() => validateConfig(badOptions)).toThrow(/fields\.Model\.options/);
+  });
+
   test("a non-integer projectNumber fails, naming the field", () => {
     const cfg = goodConfig() as any;
     cfg.projectNumber = "1";
@@ -1047,6 +1097,17 @@ describe("validateConfig", () => {
         cfg.quota = bad;
         expect(() => validateConfig(cfg)).toThrow(/"quota" must be an object/);
       }
+    });
+
+    // Issue #106: `typeof [] === "object"` and `[] !== null`, so a bare array
+    // used to pass the old `typeof quota !== "object" || quota === null`
+    // guard as a valid quota object -- `quota.threshold`/`quota.mode` then
+    // read as undefined off the array instead of the config failing loudly.
+    // Must throw naming "quota", the same as any other wrong-shape value (AC1).
+    test("a bare array is rejected, not silently accepted as a valid object (AC1)", () => {
+      const cfg = goodConfig() as any;
+      cfg.quota = [];
+      expect(() => validateConfig(cfg)).toThrow(/"quota" must be an object/);
     });
 
     // NaN matters here: `remaining >= NaN` is always false, so a NaN threshold
@@ -1276,6 +1337,15 @@ describe("validateConfig", () => {
     test("a non-object stageModels fails", () => {
       const cfg = goodConfig() as any;
       cfg.stageModels = "haiku";
+      expect(() => validateConfig(cfg)).toThrow(/"stageModels" must be an object/);
+    });
+
+    // Issue #106: same array-as-object hole as quota/notifications, fixed
+    // consistently across every `typeof x === "object"` guard in
+    // config-schema.ts -- validateStageModels is the named sibling.
+    test("a bare array is rejected, not silently accepted as a valid object", () => {
+      const cfg = goodConfig() as any;
+      cfg.stageModels = ["haiku"];
       expect(() => validateConfig(cfg)).toThrow(/"stageModels" must be an object/);
     });
   });
