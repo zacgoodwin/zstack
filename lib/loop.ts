@@ -759,7 +759,12 @@ export function ingestBoardItems(
   // ingest (the confirmation tick that just re-observes that same finished
   // batch, nothing new committed) would wrongly read as "fresh", wiping
   // initialReadyCount/humanNeededNotified for a crossing that just happened on
-  // that final ticket. A drained prev has, by definition, zero Building
+  // that final ticket. mergedThisRun (issue #119) is per-batch state for the
+  // same reason -- it feeds the merge gate's stacked-parent check (line ~444),
+  // and a stale entry from a batch that finished loops ago points a new
+  // ticket's PR at a parent branch that no longer exists -- so it resets on
+  // the same startingFreshBatch boundary as the other two. A drained prev has,
+  // by definition, zero Building
   // tickets belonging to THIS batch (drainComplete explicitly permits a
   // Building ticket to remain when claimedByOther -- it belongs to another
   // session's batch, not this one); so a fresh batch is when there is no
@@ -790,7 +795,7 @@ export function ingestBoardItems(
       cfg?.reviewerBelowThresholdAction ?? prev?.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
     maxReviewBounces: cfg?.maxReviewBounces ?? prev?.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES,
     humanNeededPercent: cfg?.humanNeededPercent ?? prev?.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT,
-    mergedThisRun: [...(prev?.mergedThisRun ?? [])],
+    mergedThisRun: startingFreshBatch ? [] : [...(prev?.mergedThisRun ?? [])],
     initialReadyCount: startingFreshBatch ? buildingCount : (prev!.initialReadyCount ?? 0),
     humanNeededNotified: startingFreshBatch ? false : (prev!.humanNeededNotified ?? false),
   };
