@@ -1161,6 +1161,46 @@ describe("ingestBoardItems", () => {
     expect(s.humanNeededNotified).toBe(false); // reset
   });
 
+  // -- issue #119: mergedThisRun resets at the same startingFreshBatch boundary
+  // as initialReadyCount/humanNeededNotified. Before this fix mergedThisRun
+  // carried forward unconditionally (lib/loop.ts:793 used to be
+  // `[...(prev?.mergedThisRun ?? [])]` with no fresh-batch branch), so a merge
+  // from batches ago stayed visible to the merge gate's runParents check
+  // forever, since state.json is never deleted between /z-loop invocations.
+  test("issue #119 AC2: a mid-batch re-ingest (startingFreshBatch false) preserves mergedThisRun unchanged", () => {
+    const prev: LoopState = {
+      tickets: [ticket(5, "QA"), ticket(7, "Building")],
+      lanes: [lane(5, "qa")],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      mergedThisRun: [50],
+    };
+    const items = [
+      { number: 5, title: "A", fields: { Status: "QA" } },
+      { number: 7, title: "B", fields: { Status: "Building" } },
+    ];
+    const bodies = { "5": "no deps", "7": "no deps" };
+    const s = ingestBoardItems(prev, items, bodies);
+    expect(s.mergedThisRun).toEqual([50]); // preserved -- a merge earlier in this batch is not lost
+  });
+
+  test("issue #119 AC1: a re-ingest after the prior batch fully drained resets mergedThisRun (drainComplete + new Building is the fresh-batch boundary)", () => {
+    const prev: LoopState = {
+      tickets: [ticket(5, "Done"), ticket(7, "Blocked")],
+      lanes: [],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      mergedThisRun: [50],
+    };
+    expect(drainComplete(prev.tickets, prev.lanes)).toBe(true); // sanity: prev IS fully drained
+    const items = [
+      { number: 200, title: "New", fields: { Status: "Building" } },
+    ];
+    const bodies = { "200": "Depends on: #50" };
+    const s = ingestBoardItems(prev, items, bodies);
+    expect(s.mergedThisRun).toEqual([]); // reset, not [50] -- #50 merged batches ago and has no branch left
+  });
+
   // Regression (issue #63 review bounce, ticket #63): AC9/AC10 above only ever
   // drove ingestBoardItems against hand-authored `prev` fixtures. The real
   // production sequence is ingest -> applyAction (park/skip/complete) ->
