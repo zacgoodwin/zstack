@@ -42,6 +42,15 @@ import type { BoardStatus } from "../lib/loop.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 
+// -- source pinning -----------------------------------------------------------
+
+test("lib/lanes.ts has no CLI entrypoint (import.meta.main is removed)", () => {
+  const source = readFileSync(join(REPO_ROOT, "lib", "lanes.ts"), "utf8");
+  expect(source).not.toContain("import.meta.main");
+  expect(source).not.toContain("export function main");
+  expect(source).not.toContain("const USAGE");
+});
+
 // -- fixture builders ---------------------------------------------------------
 
 function ticket(number: number, status: TicketSnapshot["status"], dependsOn: number[] = [], over: Partial<TicketSnapshot> = {}): TicketSnapshot {
