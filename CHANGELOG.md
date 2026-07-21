@@ -4,6 +4,14 @@ All notable changes to zstack are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Fixed
+
+- A lane whose board status lags its stage now fails soft (a per-lane `stop-lane`) instead of aborting the whole tick with `Illegal status transition: Building -> Review` (#110). The guard sits at the single producer of advance actions in `lib/loop.ts`, so it covers every stage-driven advance, not just the reported QA case; `LEGAL_TRANSITIONS` is untouched (skip-QA stays illegal). Regression tests in `tests/loop.test.ts`. PR #115.
+
+### Changed
+
+- ponytail-audit follow-up (#109): `lib/config-schema.ts`'s six bespoke numeric guards folded into one `requireNumber(key, v, {min, exclusiveMin, max, integer, desc})`, and the `export` keyword dropped on five confirmed dead-export symbols (`depsSatisfied`, `releaseLoopLock`, `isEventKey`, `listWorktrees`, `lastTickPath`). No behavior change; config rejection messages are byte-identical. PR #117.
+
 ## [1.0.0.0] - 2026-07-20
 
 First stable release. zstack is a self-contained Claude Code skill pack for the develop stage of a project: `/z-setup` provisions the GitHub ProjectV2 board, `/z-plan` turns a spec into codebase-grounded, fielded tickets, and `/z-loop` drains the Ready queue through fresh-agent builder → QA → adversarial-review → merge lanes, then runs an end-of-loop regression / ship / audit pass — every scheduling and transition decision computed in `lib/`, never in prose. This release folds in the full mid-run safety-control suite (tick throttling #58, GraphQL quota #61, adversarial-review #59 and confidence #62 gates, human-needed trip #63, review-bounce cap #76), Discord notifications for every loop event (#60/#68), per-stage model routing with `z-cost --by-file` / spend-by-stage reporting (#82/#83), plan-time cost-saving suggestions (#64), and the `/z-update` (#36) and `/z-uninstall` (#37) lifecycle commands. 943 gate tests green; typecheck clean.
