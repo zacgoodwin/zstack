@@ -425,7 +425,11 @@ describe("lintTicketBody", () => {
       return { exitCode: 0, stdout: "", stderr: "" };
     };
     lintTicketBody(ticketBody(), dir, LINT_BIN, fake, "/fake/repo/root");
-    expect(seenCmd).toEqual(["bash", LINT_BIN, seenCmd[2], "--check-paths", "/fake/repo/root"]);
+    // issue #103: lintTicketBody normalizes lintBin to forward slashes before
+    // it reaches spawn (LINT_BIN is backslash-separated on Windows, since
+    // it's built via a native path.join), so the seen command carries the
+    // normalized form, not the raw LINT_BIN constant.
+    expect(seenCmd).toEqual(["bash", LINT_BIN.replace(/\\/g, "/"), seenCmd[2], "--check-paths", "/fake/repo/root"]);
   });
 
   test("no checkPathsRoot arg (default): no --check-paths on the spawned command", () => {
@@ -452,6 +456,35 @@ describe("lintTicketBody", () => {
   test("real bin/z-ticket-lint --check-paths against fixture-app: a plausible-but-wrong Files path fails, naming it", () => {
     const dir = tmpDir();
     const r = lintTicketBody(ticketBody({ files: "src/does-not-exist.ts" }), dir, LINT_BIN, defaultSpawn, DEFAULT_FILES_ROOT);
+    expect(r.ok).toBe(false);
+    expect(r.output).toContain("src/does-not-exist.ts");
+  });
+
+  // issue #103 regression: a raw path.join lintBin (native separator -- a
+  // backslash on Windows) broke bin/z-ticket-lint's own `dirname "$0"`,
+  // silently no-opping the grounding gate (exit 0/PASS) instead of catching
+  // the bad `## Files` path (exit 1/FAIL). Force EVERY separator in both
+  // lintBin and checkPathsRoot to a backslash -- regardless of this OS's
+  // native path.sep -- so the test exercises lintTicketBody's normalize
+  // fix directly instead of relying on this machine's path.join already
+  // producing backslashes. On POSIX (and on a Windows bash flavor that
+  // already tolerates backslashes) this is a no-op-equivalent that still
+  // asserts the correct FAIL, so it's green cross-platform; on the Windows
+  // bash flavor the loop's regression run hit, removing the normalize call
+  // in lintTicketBody makes this fail loudly instead of production silently
+  // passing a hallucinated path.
+  test("issue #103: a backslash-separated lintBin/checkPathsRoot still fails the grounding gate (regression pin)", () => {
+    const dir = tmpDir();
+    const toBackslash = (p: string) => p.split(/[\\/]/).join("\\");
+    const backslashLintBin = toBackslash(LINT_BIN);
+    const backslashFilesRoot = toBackslash(DEFAULT_FILES_ROOT);
+    const r = lintTicketBody(
+      ticketBody({ files: "src/does-not-exist.ts" }),
+      dir,
+      backslashLintBin,
+      defaultSpawn,
+      backslashFilesRoot
+    );
     expect(r.ok).toBe(false);
     expect(r.output).toContain("src/does-not-exist.ts");
   });

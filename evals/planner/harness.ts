@@ -89,6 +89,16 @@ export interface LintResult {
 // issue #84's grounding gate: if the ticket carries a `## Files` section,
 // every path must exist under that root. No second lint implementation here;
 // this just threads the flag bin/z-ticket-lint already understands.
+//
+// issue #103: `lintBin` and `checkPathsRoot` are normalized to forward
+// slashes right here, defensively, before they ever reach `bash` --
+// mirroring `ghCmdShimContent`'s repoRoot normalize above. A backslash-only
+// path (native `path.join` on Windows, e.g. `main()` below before its own
+// normalize) has no "/" in it at all, so `bin/z-ticket-lint`'s own
+// `dirname "$0"` can't split it, silently resolving the wrong directory --
+// the script then no-ops instead of failing, so a hallucinated `## Files`
+// path passed the grounding gate. Normalizing here too (not just in
+// `main()`) keeps any other caller safe as well.
 export function lintTicketBody(
   body: string,
   tmpDir: string,
@@ -98,7 +108,11 @@ export function lintTicketBody(
 ): LintResult {
   const file = join(tmpDir, `lint-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`);
   writeFileSync(file, body, "utf8");
-  const cmd = checkPathsRoot ? ["bash", lintBin, file, "--check-paths", checkPathsRoot] : ["bash", lintBin, file];
+  const normalizedLintBin = lintBin.replace(/\\/g, "/");
+  const normalizedCheckPathsRoot = checkPathsRoot?.replace(/\\/g, "/");
+  const cmd = normalizedCheckPathsRoot
+    ? ["bash", normalizedLintBin, file, "--check-paths", normalizedCheckPathsRoot]
+    : ["bash", normalizedLintBin, file];
   const result = spawn(cmd);
   return { ok: result.exitCode === 0, output: (result.stdout + result.stderr).trim() };
 }
@@ -337,7 +351,11 @@ export function main(argv: string[]): number {
     console.error(`<runs> must be a positive integer, got "${runsArg}".`);
     return 1;
   }
-  const lintBin = process.env.Z_LINT ?? join(import.meta.dir, "..", "..", "bin", "z-ticket-lint");
+  // issue #103: normalized to forward slashes here at the single choke point
+  // where the value is built -- see lintTicketBody's doc comment for why a
+  // raw path.join (backslash on Windows) silently breaks the --check-paths
+  // grounding gate instead of failing it.
+  const lintBin = (process.env.Z_LINT ?? join(import.meta.dir, "..", "..", "bin", "z-ticket-lint")).replace(/\\/g, "/");
   let report: CheckReport;
   try {
     report = checkRun(outDir, runs, lintBin);
