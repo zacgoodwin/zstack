@@ -1797,4 +1797,50 @@ describe("graceful stop (#132)", () => {
     expect(fresh.stopRequested).toBe(false);
     expect(fresh.initialReadyCount).toBe(1);
   });
+
+  // AC5 regression (review bounce): the shipped AC5 test above used an
+  // all-terminal drainedPrev (1:Done), a shape a real graceful stop never
+  // produces. A stop RETURNS unworked tickets to Ready (a workable status), so
+  // the persisted post-stop state is Done + Ready stragglers, on which plain
+  // drainComplete(prev) reads false -- and pre-fix that permanently wedged
+  // stopRequested (and the sibling per-batch counters) into the NEXT /z-loop.
+  // This test's prev is that REAL post-stop shape; it FAILS against the pre-fix
+  // startingFreshBatch (drainComplete-gated) code.
+  test("a REAL post-stop prev (Done + Ready stragglers) resets stopRequested and the per-batch counters on the next run (AC5 regression)", () => {
+    const item = (n: number, status: BoardStatus) => ({ number: n, title: `T${n}`, fields: { Status: status } });
+    const bodies = {};
+
+    // Stop a running batch: latch stopRequested, then observe the drained board
+    // the stop leaves -- #1 finished to Done, #2/#3 returned to Ready.
+    const stopped = ingestBoardItems(
+      null,
+      [item(1, "Building"), item(2, "Building"), item(3, "Building")],
+      bodies,
+      { stopRequested: true }
+    );
+    const postStop = ingestBoardItems(stopped, [item(1, "Done"), item(2, "Ready"), item(3, "Ready")], bodies, {});
+    // In-run behavior preserved: the latch holds across the stopped batch, and
+    // this Done+Ready shape is (correctly) NOT drainComplete.
+    expect(postStop.stopRequested).toBe(true);
+    expect(drainComplete(postStop.tickets, postStop.lanes)).toBe(false);
+
+    // The exact wedge the reviewer reproduced: a persisted post-stop state with
+    // stale per-batch counters (initialReadyCount 0, a prior human-needed
+    // crossing, a merged entry from the stopped batch).
+    const stalePostStop: LoopState = { ...postStop, initialReadyCount: 0, humanNeededNotified: true, mergedThisRun: [99] };
+
+    // NEXT /z-loop: planning commits the returned Ready stragglers to Building.
+    // The next ingest carries NO --stop-requested flag, so stopRequested and ALL
+    // the sibling per-batch counters must reset for the fresh batch.
+    const nextRun = ingestBoardItems(
+      stalePostStop,
+      [item(1, "Done"), item(2, "Building"), item(3, "Building")],
+      bodies,
+      {}
+    );
+    expect(nextRun.stopRequested).toBe(false); // no longer wedged
+    expect(nextRun.initialReadyCount).toBe(2); // fresh count from the new Building batch, not stale 0
+    expect(nextRun.humanNeededNotified).toBe(false); // reset alongside (#63)
+    expect(nextRun.mergedThisRun).toEqual([]); // reset alongside (#119)
+  });
 });

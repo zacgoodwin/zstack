@@ -963,7 +963,27 @@ export function ingestBoardItems(
   // unclaimed Building tickets is the SAME batch's final state, not a new one
   // -- preserve its counters.
   const buildingCount = tickets.filter((t) => t.status === "Building" && !t.claimedByOther).length;
-  const startingFreshBatch = !prev || (drainComplete(prev.tickets, prev.lanes) && buildingCount > 0);
+  // #132: a graceful stop returns unworked tickets to Ready (a workable status),
+  // so a REAL post-stop drained state.json carries Ready stragglers next to the
+  // Done tickets (e.g. 1:Done 2:Ready 3:Ready). Plain drainComplete(prev) counts
+  // Ready as work remaining, so it reads false on that shape forever -- which
+  // permanently wedges stopRequested (and the sibling per-batch counters
+  // initialReadyCount/mergedThisRun/humanNeededNotified) into the NEXT /z-loop:
+  // startingFreshBatch stays false, the stop latch stays true with no
+  // --stop-requested flag present, and the next run return-readys its freshly
+  // committed batch and drain-completes doing zero work. Ready tickets are queue
+  // items, not in-flight work; a NORMAL drained run never leaves them with no lane
+  // (nextAction step 5 claims a Ready straggler), so only the stop path produces
+  // this Done+Ready shape. So for the fresh-batch boundary ONLY, treat Ready as
+  // spent (drainComplete's own verdict elsewhere must still count Ready as work
+  // remaining). An unclaimed Building/QA/Review ticket in prev still blocks a fresh
+  // read, so #119's mid-batch preserve semantics are untouched; buildingCount>0 in
+  // the incoming snapshot still gates the reset to an actual new committed batch.
+  const prevBatchSpent =
+    prev !== null &&
+    prev.lanes.length === 0 &&
+    prev.tickets.every((t) => !isWorkableStatus(t.status) || t.status === "Ready" || t.claimedByOther === true);
+  const startingFreshBatch = !prev || (prevBatchSpent && buildingCount > 0);
 
   return {
     tickets: tickets.sort((a, b) => a.number - b.number),
