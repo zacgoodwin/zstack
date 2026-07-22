@@ -17,13 +17,28 @@
 // fixed notify.test.ts now does) -- so the gate below allows that shape and
 // fails on every other one.
 import { test, expect, describe } from "bun:test";
-import { readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { join, relative } from "node:path";
 
 const TESTS_DIR = join(import.meta.dir);
 
-function testFiles(): string[] {
-  return readdirSync(TESTS_DIR).filter((f) => f.endsWith(".test.ts"));
+// Recursive walk, not Bun.Glob: lib/spec-sources.ts already hit the reason
+// (Windows quirk, issue #22) -- Bun.Glob does not match absolute
+// drive-letter patterns like TESTS_DIR on Windows, so a "**/*.test.ts"
+// pattern against this absolute dir would silently match nothing there.
+// readdirSync + withFileTypes recursion sidesteps that platform gap and is
+// the same idiom lib/reconcile.ts already uses for directory walks.
+function testFiles(dir: string = TESTS_DIR): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...testFiles(full));
+    } else if (entry.isFile() && entry.name.endsWith(".test.ts")) {
+      out.push(full);
+    }
+  }
+  return out;
 }
 
 // A line of CODE (comments are prose, not risk) that calls the real
@@ -48,16 +63,24 @@ function unsafeHomedirZstackLines(source: string): string[] {
   return violations;
 }
 
+// Shared by the real gate check below AND the issue #122 regression test, so
+// the regression test exercises the exact same scan the gate runs -- not a
+// parallel reimplementation that could drift and pass while the real gate
+// stays broken.
+function scanViolations(): string[] {
+  const violations: string[] = [];
+  for (const file of testFiles()) {
+    const source = readFileSync(file, "utf8");
+    for (const line of unsafeHomedirZstackLines(source)) {
+      violations.push(`${relative(TESTS_DIR, file)}: ${line.trim()}`);
+    }
+  }
+  return violations;
+}
+
 describe("Issue #118 AC2: no test resolves the real ~/.zstack for a write/delete", () => {
   test("grep -rn \"homedir()\" tests/: every hit that also names .zstack is a read-only existsSync check", () => {
-    const violations: string[] = [];
-    for (const file of testFiles()) {
-      const source = readFileSync(join(TESTS_DIR, file), "utf8");
-      for (const line of unsafeHomedirZstackLines(source)) {
-        violations.push(`${file}: ${line.trim()}`);
-      }
-    }
-    expect(violations).toEqual([]);
+    expect(scanViolations()).toEqual([]);
   });
 
   // Pins the one file this fix actually touched: notify.test.ts's CLI "send"
@@ -69,5 +92,41 @@ describe("Issue #118 AC2: no test resolves the real ~/.zstack for a write/delete
     expect(source).toContain("env.USERPROFILE = fakeHome");
     expect(source).not.toContain('mkdirSync(join(homedir()');
     expect(source).not.toContain('rmSync(join(homedir()');
+  });
+});
+
+describe("Issue #122: the scan is recursive, not just top-level tests/", () => {
+  // Plants a real offender nested under tests/helpers/ (issue #122's named
+  // example), created and removed within this test, and asserts the
+  // production scan (testFiles + unsafeHomedirZstackLines, via
+  // scanViolations) finds it. Before this fix, testFiles() called flat
+  // readdirSync(TESTS_DIR), which never descends into helpers/ -- this
+  // offender would silently pass.
+  test("a .test.ts under tests/helpers/ that writes to the real home's .zstack dir is caught, named with its nested path", () => {
+    const relPath = join("helpers", "__nested-offender-fixture.test.ts");
+    const offenderPath = join(TESTS_DIR, relPath);
+    // Assembled by concatenation, not written verbatim: the gate is a naive
+    // text scan, so if THIS file's own source literally had "homedir()" and
+    // ".zstack" on one line, the gate would flag itself the moment it scans
+    // tests/zstack-home-safety.test.ts.
+    const dangerousLine =
+      "mkdirSync(join(homedir" + '(), ".zstack", "projects", "evil"), { recursive: true });';
+    const offenderSource = [
+      'import { homedir } from "node:os";',
+      'import { mkdirSync } from "node:fs";',
+      'import { join } from "node:path";',
+      dangerousLine,
+      "",
+    ].join("\n");
+    writeFileSync(offenderPath, offenderSource);
+    try {
+      // The recursive walk must reach the nested file at all.
+      expect(testFiles()).toContain(offenderPath);
+      // And the scan must flag it, named with its path relative to tests/.
+      const violations = scanViolations();
+      expect(violations.some((v) => v.startsWith(`${relPath}:`))).toBe(true);
+    } finally {
+      rmSync(offenderPath, { force: true }); // never leave the offender behind
+    }
   });
 });
