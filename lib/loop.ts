@@ -78,18 +78,37 @@ export const STATUS_FOR_STAGE: Record<Stage, BoardStatus> = {
 
 // The board status one hop EARLIER in the fixed pipeline (builder -> qa ->
 // reviewer -> merge) than a stage's own STATUS_FOR_STAGE (issue #116, the
-// nextAction desync guard below). builder has no entry: a builder-stage lane
-// only ever reaches that guard after a CLAIM (Ready/Building -> Building,
-// never an async write in flight by the time a builder agent finishes), never
-// an ADVANCE, so there is no lagged-write story to resync from -- any mismatch
-// there stays #110's safe stop-lane. merge is omitted too: its own status is
-// ALSO "Review" (same as reviewer's), so a merge lane can never be one hop
-// behind its own expected status -- the guard's mismatch check already
-// excludes it.
+// nextAction desync guard below). Only the two FORWARD advances live in this
+// single-status map: each has ONE preceding status that is always present
+// (every qa lane came from Building, every reviewer lane from QA). builder is
+// deliberately absent here -- not because it is unreachable by an advance (the
+// #116 claim, wrong: reviewerBounceAction and the qa-bugs case both advance TO
+// builder), but because it is reached by a BOUNCE-back whose lagged status is
+// NOT unique: a qa-bugs bounce lags at QA, a review-findings bounce lags at
+// Review (issue #124). isOneHopLag handles builder directly, gating each source
+// on the matching bounce counter. merge is omitted too: its own status is ALSO
+// "Review" (same as reviewer's), so a merge lane can never be one hop behind
+// its own expected status -- the guard's mismatch check already excludes it.
 const PRECEDING_BOARD_STATUS: Partial<Record<Stage, BoardStatus>> = {
   qa: "Building",
   reviewer: "QA",
 };
+
+// True when a lane's lagging board status is exactly one advance-write behind
+// its own stage -- the loop's own not-yet-landed write, safe to resync (#116),
+// versus a genuine human move that must stop-lane. Forward advances (qa,
+// reviewer) have a single preceding status in PRECEDING_BOARD_STATUS. builder
+// is reached only by a bounce-back (#124): a qa-bugs bounce lags at QA, a
+// review-findings bounce lags at Review -- each a legal one-hop lag, but only
+// when that bounce actually happened (its counter > 0), so a human drag onto a
+// never-bounced builder lane (counters at 0, or a status that is neither) still
+// stop-lanes.
+function isOneHopLag(lane: LaneState, boardStatus: BoardStatus): boolean {
+  if (lane.stage === "builder") {
+    return (boardStatus === "QA" && lane.qaBounces > 0) || (boardStatus === "Review" && lane.reviewBounces > 0);
+  }
+  return boardStatus === PRECEDING_BOARD_STATUS[lane.stage];
+}
 
 // Per-stage model routing (issue #82). The merge stage is mechanical (`gh pr
 // create`, a conflict check, `gh pr merge`) and never needs the ticket's
@@ -464,7 +483,7 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
     // progress survives.
     const t = byNumber.get(lane.ticket);
     if (t && t.status !== STATUS_FOR_STAGE[lane.stage]) {
-      if (t.status === PRECEDING_BOARD_STATUS[lane.stage]) {
+      if (isOneHopLag(lane, t.status)) {
         resyncStatus.set(lane.ticket, STATUS_FOR_STAGE[lane.stage]);
       } else {
         return {
