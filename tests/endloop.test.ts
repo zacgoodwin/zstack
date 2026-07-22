@@ -26,15 +26,14 @@ import {
   peekLoopCounter,
   readLoopCounter,
   writeLoopCounter,
-  ZError,
   type EndLoopActionKind,
   type EndLoopReportInput,
   type Finding,
   type RegressionResult,
 } from "../lib/endloop.ts";
+import { ZError } from "../lib/config.ts";
 import {
-  createFileInvoker,
-  createRecordingInvoker,
+  createInvoker,
   SKILL_NAMES,
   type SkillInvoker,
   type SkillName,
@@ -117,7 +116,7 @@ describe("AC1: red regression -> zero deploy, bugs filed with repro", () => {
   test("driving the plan through the recording invoker logs zero calls", () => {
     const regression = redRegression();
     const plan = endLoopPlan(regression, 3);
-    const invoker = createRecordingInvoker();
+    const invoker = createInvoker();
     simulateEndOfLoop(plan, regression, 3, invoker);
     expect(invoker.log()).toEqual([]); // zero deploy invocations, full stop
   });
@@ -125,7 +124,7 @@ describe("AC1: red regression -> zero deploy, bugs filed with repro", () => {
   test("every finding becomes a bug draft with repro + first-suspect file", () => {
     const regression = redRegression();
     const plan = endLoopPlan(regression, 3);
-    const invoker = createRecordingInvoker();
+    const invoker = createInvoker();
     const { bugs } = simulateEndOfLoop(plan, regression, 3, invoker);
 
     expect(bugs).toHaveLength(2);
@@ -156,7 +155,7 @@ describe("AC2: green path -> land-and-deploy -> canary -> document-release, in o
 
   test("invoker log matches the deploy chain exactly, in order", () => {
     const plan = endLoopPlan(GREEN, 3);
-    const invoker = createRecordingInvoker();
+    const invoker = createInvoker();
     simulateEndOfLoop(plan, GREEN, 3, invoker);
     expect(invoker.log().map((c) => c.skill)).toEqual(["land-and-deploy", "canary", "document-release"]);
   });
@@ -164,22 +163,22 @@ describe("AC2: green path -> land-and-deploy -> canary -> document-release, in o
   test("invocation order is preserved even if the invoker is called out of plan order by a caller bug", () => {
     // Sanity: the invoker itself just records call order -- it does not
     // reorder. This pins that log() reflects call order, not insertion sort.
-    const invoker = createRecordingInvoker();
+    const invoker = createInvoker();
     invoker.invoke("canary");
     invoker.invoke("land-and-deploy");
     expect(invoker.log().map((c) => c.skill)).toEqual(["canary", "land-and-deploy"]);
   });
 
-  test("createFileInvoker rejects an unknown skill name", () => {
-    const invoker = createFileInvoker(join(tmp(), "log.jsonl"));
+  test("createInvoker rejects an unknown skill name", () => {
+    const invoker = createInvoker(join(tmp(), "log.jsonl"));
     expect(() => invoker.invoke("not-a-real-skill" as SkillName)).toThrow(ZError);
   });
 
-  test("createFileInvoker persists the invocation log to disk, in order", () => {
+  test("createInvoker persists the invocation log to disk, in order", () => {
     const dir = tmp();
     const logPath = join(dir, "reports", "invocations-1.jsonl");
     let t = 0;
-    const invoker = createFileInvoker(logPath, () => t++);
+    const invoker = createInvoker(logPath, () => t++);
     for (const s of ["land-and-deploy", "canary", "document-release"] as const) invoker.invoke(s);
 
     const lines = readFileSync(logPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));

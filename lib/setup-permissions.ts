@@ -27,8 +27,6 @@ import { join } from "node:path";
 import { atomicWrite, handleCliError, parseFlags, str } from "./cli.ts";
 import { ZError } from "./config.ts";
 
-export { ZError } from "./config.ts";
-
 // -- desired shape ------------------------------------------------------------
 // The allowlist tier: specific tool prefixes the loop actually shells out to and
 // nothing more. Deliberately EXCLUDES Bash(bash *) / Bash(claude *) (which are
@@ -95,10 +93,6 @@ export function hasBypassMode(settings: any): boolean {
 export function missingAllowRules(settings: any): string[] {
   const allow: unknown[] = Array.isArray(settings?.permissions?.allow) ? settings.permissions.allow : [];
   return ALLOW_RULES.filter((r) => !allow.includes(r));
-}
-
-export function hasAllowlist(settings: any): boolean {
-  return missingAllowRules(settings).length === 0;
 }
 
 export interface LayerCheck {

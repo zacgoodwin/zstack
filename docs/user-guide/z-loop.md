@@ -1,7 +1,8 @@
 # /z-loop
 
 The drain-and-exit orchestrator. Runs a planning pass over Ready tickets,
-batch-commits the workable ones to Building, then drives up to `maxLanes`
+leaves the workable ones in Ready and moves each to Building when its builder
+lane claims it, then drives up to `maxLanes`
 concurrent worktree lanes through four fresh-agent stages (builder → QA →
 adversarial reviewer → merge) until the batch is drained, runs the end-of-loop
 stage on the merged base, writes a report, and exits. No daemon.
@@ -95,6 +96,78 @@ records the result. It never re-derives a scheduling decision in prose.
   conflict check, `gh pr merge`) and doesn't need the ticket's build-tier
   model; the `stageModels` config knob (default `{"merge": "haiku"}`)
   downshifts it for a direct cost cut. See below.
+
+## Skip QA
+
+Add the `skip-qa` label to a GitHub issue and a finished builder advances
+straight to Review (Building → Review), skipping the QA stage entirely. Use it
+when QA adds little over the reviewer's own correctness pass — an error fix,
+answering a question, or resolving a blocker — where a human at triage has
+already decided the change is low-risk. The label rides the board snapshot, so
+the decision is a one-click human classification, not the builder's own call.
+
+The reviewer still runs: `skip-qa` skips QA, never the last correctness gate.
+Every ticket without the label runs the full builder → QA → reviewer → merge
+pipeline, and the QA bounce/investigate machinery is unchanged.
+
+## Ticket and context limits
+
+Two knobs cap a single `/z-loop` run so a large Ready queue or a long drain
+never runs away with itself. Both are hand-edited in
+`~/.zstack/projects/<slug>/config.json` (see
+[z-setup.md → Config knobs](z-setup.md#config-knobs-hand-edit-configjson-after-setup))
+and both default to today's behavior.
+
+### `ticketLimit` — a per-loop ticket cap
+
+`ticketLimit` (default `0` = no cap) caps how many tickets one run works. At the
+default, every gated Ready ticket is workable, exactly as before. Set it to `3`
+and the run flags **the batch**: a dependency-self-contained allow-list of at
+most three tickets, captured once at Step 3's ingest and held on
+`state.batchTickets`. The remaining Ready tickets stay Ready and are simply
+picked up by a future run — they are never claimed, never counted against this
+run's drain, and never mis-parked as blocked.
+
+The batch is chosen by a Kahn walk in ascending issue number: a ticket is
+flagged only when every dependency is already Done or already flagged, so a
+flagged ticket never depends on an un-flagged one. A dependent whose dependency
+doesn't fit under the cap just waits — it stays Ready (a Ready dependency is not
+terminal), so the dead-dependency park never touches it. The allow-list
+persists verbatim across every re-ingest and across a context clear, so the run
+always finishes the exact batch it started.
+
+### `contextTokenLimit` — a context ceiling with clear-and-resume
+
+The orchestrator is one long-lived session that holds no ticket context by
+design, but its own window still fills across a long drain (per-tick ticks,
+stage final messages, completion notes). `contextTokenLimit` (default `550000`,
+`0` disables) pauses the run before the harness auto-compacts.
+
+Every tick, `bin/z-loop-tick` measures the orchestrator's **current** window
+occupancy deterministically — the input side (input + cache-read +
+cache-creation tokens) of its session transcript's most recent request, via
+`lib/context-budget.ts`. This is *not* cumulative billed spend (that is
+`z-cost`); it is how full the window is right now, the only thing a context
+clear actually changes. The reading is **fail-open**: an unresolvable or
+unreadable transcript reads `0`, so a measurement hiccup degrades to no gating
+and never wedges a drain.
+
+When the reading reaches the limit, the scheduler stops **claiming** new
+tickets — no new ticket enters Building — while in-flight lanes keep draining
+normally to their terminal state. Once every lane is idle with batch work still
+remaining, `next` returns a `context-clear` action instead of waiting forever:
+the loop releases its lock, keeps every worktree, branch, and the un-drained
+`state.json`, and exits **without** running the end-of-loop stage (the batch
+isn't done, so nothing deploys). The operator or harness then clears the
+session's context and re-invokes `/z-loop`. The fresh orchestrator reads a small
+context on its first tick, so claiming resumes immediately — on the *same*
+batch, because the built tickets have left Ready and `batchTickets` persisted in
+`state.json`. If the batch happens to finish exactly at the ceiling, normal
+`drain-complete` wins; `context-clear` fires only when work genuinely remains.
+
+The two knobs are independent: the ticket cap bounds *which* tickets a run
+touches, the context ceiling bounds *when within* a run the orchestrator pauses
+to clear.
 
 ## End of loop
 
@@ -268,10 +341,12 @@ the board), the loop recomputes:
 (Blocked + Skipped + Questions) / initialReadyCount * 100
 ```
 
-`initialReadyCount` is the number of tickets the batch committed to Building
-at Step 2/3 — the batch's size at ingest-time-zero, captured once and carried
-across every re-ingest for the rest of that batch. The instant this percentage
-first exceeds `humanNeededPercent`, the control trips.
+`initialReadyCount` is the number of workable Ready tickets the batch committed
+to work, held in Ready until each is claimed — the batch's size at
+ingest-time-zero (Step 3's ingest, before Step 4 claims anything), captured once
+from the Ready count and carried across every re-ingest for the rest of that
+batch. The instant this percentage first exceeds `humanNeededPercent`, the
+control trips.
 
 **Once per batch.** The first tick that trips the control fires exactly one
 `human-needed` Discord notification — the exact parked counts and which
@@ -281,11 +356,11 @@ crossing. A fresh batch resets both the committed-size baseline and the
 fire-once flag, so the control is live again from zero — but "fresh" is a
 two-part test, not just "the prior batch fully drained": there must be no
 prior state at all, OR the prior state was fully drained **and** the
-incoming board snapshot shows new, **unclaimed** Building tickets (the
-batch-commit step moves the whole new batch to Building before its first
-ingest, so any unclaimed Building ticket in a post-drain snapshot IS that new
-batch; a lingering `claimedByOther` Building ticket belongs to another
-session's batch and does not count). The prior batch being drained is
+incoming board snapshot shows new, **unclaimed** Ready tickets (the committed
+queue now sits in Ready until each ticket is claimed, so any unclaimed Ready
+ticket in a post-drain snapshot IS that new batch; a lingering `claimedByOther`
+Ready ticket belongs to another session's batch and does not count). The prior
+batch being drained is
 necessary but not sufficient: a tick that merely re-confirms the SAME drained
 batch (no new, unclaimed tickets committed — e.g. the very tick right after
 that batch's own last ticket parks or completes, which is what first makes it

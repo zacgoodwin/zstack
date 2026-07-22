@@ -7,10 +7,8 @@
 // wall clock; bin/z-estimate supplies the real date at the CLI boundary.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { handleCliError } from "./cli.ts";
+import { handleCliError, parseFlags, str } from "./cli.ts";
 import { ZError } from "./config.ts";
-
-export { ZError } from "./config.ts";
 
 export interface ModelRate {
   input: number; // $ per 1M fresh input tokens
@@ -204,12 +202,9 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   try {
-    let bucketsPath: string | undefined;
-    let ratesFilePath = ratesPath();
-    for (let i = 0; i < argv.length; i++) {
-      if (argv[i] === "--rates") ratesFilePath = argv[++i];
-      else bucketsPath = argv[i];
-    }
+    const { positionals, flags } = parseFlags(argv);
+    const bucketsPath = positionals[0];
+    const ratesFilePath = str(flags, "rates") ?? ratesPath();
     if (!bucketsPath) throw new ZError(`Usage: ${USAGE}`);
 
     const buckets = loadBuckets(bucketsPath);

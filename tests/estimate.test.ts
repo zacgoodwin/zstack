@@ -14,10 +14,10 @@ import {
   resolveRate,
   roundCents,
   staleDays,
-  ZError,
   type Buckets,
   type RatesFile,
 } from "../lib/estimate.ts";
+import { ZError } from "../lib/config.ts";
 
 const RATES: RatesFile = {
   checked_at: "2026-07-01",

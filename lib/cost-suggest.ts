@@ -10,8 +10,6 @@ import { handleCliError, readJson } from "./cli.ts";
 import { ZError } from "./config.ts";
 import { roundCents } from "./estimate.ts";
 
-export { ZError } from "./config.ts";
-
 export interface PlannedTicket {
   number: number;
   title: string;

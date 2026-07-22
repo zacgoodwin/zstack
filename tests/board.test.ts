@@ -10,13 +10,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   Board,
-  ZError,
   ghExecutor,
   type GraphQLExecutor,
   type GraphQLData,
   type GhSpawn,
   type GhProc,
 } from "../lib/board.ts";
+import { ZError } from "../lib/config.ts";
 import { loadConfig, resolveSlug, type BoardConfig } from "../lib/config.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
@@ -260,7 +260,7 @@ describe("list", () => {
         },
       })
     );
-    await expect(board.list("Todo")).rejects.toThrow(/same endCursor/);
+    await expect(board.list("Todo")).rejects.toThrow(/endCursor "CUR_STUCK" twice in a row/);
     expect(fetches).toBe(2); // page 1 issued CUR_STUCK, page 2 repeated it
   });
 
@@ -355,8 +355,14 @@ describe("single-page ceiling guards", () => {
 
 // -- ticket #57: one-call drain snapshot (items + bodies) --------------------
 describe("snapshot", () => {
-  const nodeWithBody = (n: number, status: string, body: string | null) => ({
-    content: { number: n, title: `T${n}`, url: `http://x/${n}`, body },
+  const nodeWithBody = (n: number, status: string, body: string | null, labels: string[] = []) => ({
+    content: {
+      number: n,
+      title: `T${n}`,
+      url: `http://x/${n}`,
+      body,
+      labels: { pageInfo: { hasNextPage: false }, nodes: labels.map((name) => ({ name })) },
+    },
     fieldValues: {
       pageInfo: { hasNextPage: false },
       nodes: [{ __typename: "ProjectV2ItemFieldSingleSelectValue", name: status, field: { name: "Status" } }],
@@ -383,6 +389,36 @@ describe("snapshot", () => {
     // One query pass, no per-issue IssueLookup fan-out (bodies ride content.body).
     expect(calls.filter((c) => c.op === "ProjectItems").length).toBe(1);
     expect(calls.some((c) => c.op === "IssueLookup")).toBe(false);
+  });
+
+  test("carries issue labels from content.labels onto BoardItem.labels (#130)", async () => {
+    const board = new Board(
+      CFG,
+      makeExecutor({ overrides: { ProjectItems: boardPage([nodeWithBody(9, "Building", "b", ["skip-qa", "bug"])]) } })
+    );
+    const snap = await board.snapshot();
+    expect(snap.items[0].labels).toEqual(["skip-qa", "bug"]);
+    // An issue with no labels yields an empty array, never undefined.
+    const bare = new Board(
+      CFG,
+      makeExecutor({ overrides: { ProjectItems: boardPage([nodeWithBody(10, "Building", "b")]) } })
+    );
+    expect((await bare.snapshot()).items[0].labels).toEqual([]);
+  });
+
+  test("a labels connection past its single page throws instead of dropping skip-qa (#130)", async () => {
+    const overflowNode = {
+      content: {
+        number: 5,
+        title: "T5",
+        url: "http://x/5",
+        body: "b",
+        labels: { pageInfo: { hasNextPage: true }, nodes: [] },
+      },
+      fieldValues: { pageInfo: { hasNextPage: false }, nodes: [] },
+    };
+    const board = new Board(CFG, makeExecutor({ overrides: { ProjectItems: boardPage([overflowNode]) } }));
+    await expect(board.snapshot()).rejects.toThrow(/labels for issue #5.*truncated/);
   });
 
   test("a ticket with a null/absent body serializes as an empty string, never undefined", async () => {

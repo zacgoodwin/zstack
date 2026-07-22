@@ -15,6 +15,8 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
 export const SETUP_SRC = join(import.meta.dir, "..", "..", "setup");
+// setup sources this at startup, so a pack without it cannot run at all.
+export const REALPATH_SRC = join(import.meta.dir, "..", "..", "lib", "realpath.sh");
 
 const BASH = Bun.which("bash");
 if (!BASH) throw new Error("bash not found on PATH: required to exercise the setup script");
@@ -58,6 +60,8 @@ export function makeEnv(roots: string[], prefix = "zstack-setup-reg-"): SetupEnv
 export function makePack(dir: string, skillNames: string[]) {
   mkdirSync(dir, { recursive: true });
   copyFileSync(SETUP_SRC, join(dir, "setup"));
+  mkdirSync(join(dir, "lib"), { recursive: true });
+  copyFileSync(REALPATH_SRC, join(dir, "lib", "realpath.sh"));
   for (const name of skillNames) {
     mkdirSync(join(dir, name), { recursive: true });
     writeFileSync(

@@ -7,9 +7,10 @@
 // scheduling or transition decision in prose. No Date.now() outside the CLI
 // edge; every pure function takes nowMs.
 import { existsSync, readFileSync } from "node:fs";
-import { atomicWrite, handleCliError, readJson } from "./cli.ts";
+import { atomicWrite, handleCliError, parseFlags, readJson, str } from "./cli.ts";
 import {
   BOARD_STATUSES,
+  DEFAULT_CONTEXT_TOKEN_LIMIT,
   DEFAULT_HUMAN_NEEDED_PERCENT,
   DEFAULT_MAX_LANES,
   DEFAULT_MAX_QA_PASSES,
@@ -17,6 +18,7 @@ import {
   DEFAULT_MIN_REVIEWER_CONFIDENCE,
   DEFAULT_QA_INVESTIGATE_AFTER,
   DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
+  DEFAULT_TICKET_LIMIT,
   DEFAULT_WATCHDOG_MINUTES,
   loadConfig,
   ZError,
@@ -27,14 +29,12 @@ import {
   claimableTickets,
   deadDeps,
   isWorkableStatus,
-  laneCapReached,
   mergeOrder,
   parseDependsOn,
+  selectBatch,
   watchdogExpired,
 } from "./lanes.ts";
 import { reconcileBoardMoves } from "./reconcile.ts";
-
-export { ZError } from "./config.ts";
 
 // -- ticket states ------------------------------------------------------------
 
@@ -44,13 +44,21 @@ export { ZError } from "./config.ts";
 export { BOARD_STATUSES, TERMINAL_STATUSES } from "./config.ts";
 export type { BoardStatus } from "./config.ts";
 
+// The GitHub issue label a human sets at triage (#130) to route a finished
+// builder straight to Review, skipping the QA stage. Rides the board snapshot
+// onto TicketSnapshot.skipQa (see ingestBoardItems); the label is the whole
+// mechanism -- no board field, no per-project knob.
+const SKIP_QA_LABEL = "skip-qa";
+
 // Legal status transitions (PROCESS.md). Questions/Blocked/Skipped/Done exits
 // are the human's moves (bounce back to Ready, or return a parked ticket to its
 // stage) -- the loop itself only ever walks the workable path plus the parks.
+// Building -> Review is the #130 skip-QA walk: a label-gated advance past QA,
+// deliberately legal (Building -> Done stays absent -- never skip Review too).
 const LEGAL_TRANSITIONS: Record<BoardStatus, BoardStatus[]> = {
   Backlog: ["Ready"],
   Ready: ["Building", "Questions", "Blocked", "Skipped"],
-  Building: ["QA", "Questions", "Blocked", "Skipped"],
+  Building: ["QA", "Review", "Questions", "Blocked", "Skipped"],
   QA: ["Building", "Review", "Questions", "Blocked", "Skipped"],
   Review: ["Building", "Done", "Questions", "Blocked", "Skipped"],
   Questions: ["Ready", "Building", "QA", "Review"],
@@ -146,6 +154,7 @@ export interface TicketSnapshot {
   model?: string; // board Model field; the harness Agent spawn's model param
   modelEffort?: string; // board Model Effort field
   claimedByOther?: boolean; // z-board claim lost to another session
+  skipQa?: boolean; // #130: carries the `skip-qa` issue label -> builder advances straight to reviewer
 }
 
 // One concurrent lane. DELIBERATELY carries no conversation/session/context id:
@@ -211,6 +220,21 @@ export interface LoopState {
   // branch: pull no new work, drain in-flight lanes, return unclaimed tickets to
   // Ready, then drain-complete.
   stopRequested?: boolean;
+  // Per-loop ticket cap (issue #131): the flagged, dependency-self-contained
+  // allow-list of ticket numbers this run works (lib/lanes.ts selectBatch),
+  // captured ONCE at the fresh-batch boundary and preserved across every
+  // re-ingest and across a context clear (state.json survives both) -- same
+  // per-batch lifecycle as initialReadyCount/mergedThisRun. undefined = no cap
+  // (ticketLimit 0): every workable ticket is in the batch, byte-identical to
+  // pre-#131.
+  batchTickets?: number[];
+  // Context ceiling (issue #131). contextTokens is the LIVE orchestrator
+  // context-window occupancy, recomputed every tick by bin/z-loop-tick
+  // (lib/context-budget.ts) and threaded in fresh -- never preserved from
+  // prev, so the gate needs no sticky flag or reset. contextTokenLimit is the
+  // ceiling, captured once like the other knobs; 0/absent disables the gate.
+  contextTokens?: number;
+  contextTokenLimit?: number;
 }
 
 // -- stage outcomes -----------------------------------------------------------
@@ -311,13 +335,8 @@ export type Action =
   | { kind: "check-worker"; ticket: number }
   | { kind: "complete"; ticket: number; note: string }
   | { kind: "wait" }
+  | { kind: "context-clear" }
   | { kind: "drain-complete" };
-
-// Maximum QA passes before the ticket parks in Blocked (PROCESS.md step 16).
-// Kept exported as the default's named constant (issue #41): the cap is now a
-// per-project config knob (BoardConfig.maxQaPasses / DEFAULT_MAX_QA_PASSES),
-// but existing importers of MAX_QA_PASSES keep working, reading the default.
-export const MAX_QA_PASSES = DEFAULT_MAX_QA_PASSES;
 
 // The two config-driven QA bounce knobs resolveOutcome needs. Threaded in by
 // nextAction (already defaulted there) rather than read off a global, so the
@@ -362,12 +381,15 @@ function reviewerBounceAction(lane: LaneState, reviewerGate: ReviewerGate, note:
 // (dependency order, one merge at a time) resolved by nextAction's merge gate
 // below, not per-lane. A FAILING approve is resolved right here, same as any
 // other terminal outcome.
-function resolveOutcome(lane: LaneState, qaLimits: QaBounceLimits, reviewerGate: ReviewerGate): Action | null {
+function resolveOutcome(lane: LaneState, qaLimits: QaBounceLimits, reviewerGate: ReviewerGate, skipQa: boolean): Action | null {
   const o = lane.outcome!;
   const ticket = lane.ticket;
   switch (o.kind) {
     case "built":
-      return { kind: "advance", ticket, to: "qa" };
+      // #130: a `skip-qa`-labeled ticket walks straight to Review (Building ->
+      // Review, made legal above). Every other outcome is unchanged, so the
+      // qa-pass/qa-bugs/investigate/reviewer paths are identical for non-skip.
+      return { kind: "advance", ticket, to: skipQa ? "reviewer" : "qa" };
     case "needs-input":
     case "human-question":
       return { kind: "park", ticket, status: "Questions", note: o.note };
@@ -438,21 +460,33 @@ export interface LoopOpts {
 //   3. watchdog: a silent lane is probed (check-worker) or, once known dead,
 //      skipped with a note;
 //   4. park any unclaimed ticket whose dependency can no longer complete;
-//   5. claim the next claimable ticket if a lane is free;
+//   5. claim the next claimable ticket if a lane is free -- SUPPRESSED while the
+//      context ceiling is reached (#131): no new ticket enters Building, but
+//      steps 1-3 keep draining in-flight lanes; once every lane is idle with
+//      batch work remaining, return context-clear so the operator clears
+//      context and resumes the same batch;
 //   6. with all lanes idle and nothing claimable, break a dependency deadlock
 //      by parking the lowest stuck ticket to Blocked (no-token-burn rule);
 //   7. drain-complete when nothing workable remains; else wait.
-export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: LoopOpts): Action {
-  const maxLanes = opts.maxLanes ?? DEFAULT_MAX_LANES;
-  const wd = opts.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES;
+// "Workable" here is batch-scoped (#131): when state.batchTickets is set, a
+// Ready ticket outside the flagged allow-list is neither claimed nor counted
+// against the drain, so it waits for a future run instead of keeping this one
+// alive.
+// The knobs come straight off the state the caller already holds -- there is no
+// second options shape to keep in sync with LoopState (every caller used to
+// re-spread the same nine fields into one).
+export function nextAction(state: LoopState, nowMs: number): Action {
+  const { tickets, lanes } = state;
+  const maxLanes = state.maxLanes ?? DEFAULT_MAX_LANES;
+  const wd = state.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES;
   const qaLimits: QaBounceLimits = {
-    maxQaPasses: opts.maxQaPasses ?? DEFAULT_MAX_QA_PASSES,
-    qaInvestigateAfter: opts.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER,
+    maxQaPasses: state.maxQaPasses ?? DEFAULT_MAX_QA_PASSES,
+    qaInvestigateAfter: state.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER,
   };
   const reviewerGate: ReviewerGate = {
-    minConfidence: opts.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE,
-    belowAction: opts.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
-    maxReviewBounces: opts.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES,
+    minConfidence: state.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE,
+    belowAction: state.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
+    maxReviewBounces: state.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES,
   };
   const byNumber = new Map(tickets.map((t) => [t.number, t]));
   // Tickets this tick's desync guard judged as a lagged (not genuine) board
@@ -498,12 +532,12 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
     // re-run of QA that already passed). Everything else -- a further-back gap,
     // OR a one-hop gap with no in-flight write of ours (lastWroteStatus cleared/
     // absent = a genuine human move-back) -- keeps #110's safe stop-lane, honoring
-    // the human's move instead of silently overriding it. Stopping unresynced is
-    // also what keeps applyAction from an advance whose setStatus is illegal from
-    // the stale status (the qa-pass lane still showing Building -> the
-    // Building->Review that used to throw an unhandled ZError and abort the WHOLE
-    // tick). LEGAL_TRANSITIONS is untouched either way, so skip-QA stays illegal,
-    // and every other lane's progress survives.
+    // the human's move instead of silently overriding it. #130 made Building ->
+    // Review a legal, label-gated skip-QA walk, so the transition's own
+    // illegality no longer backstops a lagged write (the qa-pass lane still
+    // showing Building no longer throws on the Building->Review advance) -- so
+    // THIS origin-marker guard, not LEGAL_TRANSITIONS, is now what protects the
+    // lagged-write case, and every other lane's progress survives.
     const t = byNumber.get(lane.ticket);
     if (t && t.status !== STATUS_FOR_STAGE[lane.stage]) {
       if (
@@ -522,7 +556,7 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
     // A PASSING review-approve (or a disabled gate) resolves to null here and
     // falls through to the merge gate below, exactly as before #62; a FAILING
     // approve is resolved right here, same as any other terminal outcome.
-    const action = resolveOutcome(lane, qaLimits, reviewerGate);
+    const action = resolveOutcome(lane, qaLimits, reviewerGate, byNumber.get(lane.ticket)?.skipQa ?? false);
     if (action) return withResync(action, resyncStatus);
   }
 
@@ -537,7 +571,7 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
     // (its branch survives until batch-end cleanup, so the child's PR still
     // needs the step-18 retarget).
     const first = order[0];
-    const mergedThisRun = new Set(opts.mergedThisRun ?? []);
+    const mergedThisRun = new Set(state.mergedThisRun ?? []);
     const runParents = (byNumber.get(first.ticket)?.dependsOn ?? []).filter((d) => mergedThisRun.has(d));
     const stackedOn = [...new Set([...first.stackedOn, ...runParents])].sort((a, b) => a - b);
     return withResync({ kind: "advance", ticket: first.ticket, to: "merge", stackedOn }, resyncStatus);
@@ -546,7 +580,7 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
   // 3. Watchdog on silent lanes (an unresolved merge approval is not silent).
   for (const lane of lanes) {
     if (lane.outcome) continue;
-    if (!watchdogExpired(lane, opts.nowMs, wd)) continue;
+    if (!watchdogExpired(lane, nowMs, wd)) continue;
     if (lane.workerDead) {
       // A dead MERGE worker is never blind-skipped (issue #14 H9): `gh pr merge`
       // may have landed the PR before the worker died, and skipping would lose it
@@ -592,9 +626,14 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
   }
 
   // 4. A dependent whose dependency parked can never proceed in this batch.
+  //    Batch-scoped (#131): a workable ticket outside the flagged allow-list is
+  //    not this run's to work, so it is excluded here (never park-checked) and
+  //    from the drain count below -- it waits for a future run.
   const inLane = new Set(lanes.map((l) => l.ticket));
+  const inBatch = state.batchTickets ? new Set(state.batchTickets) : undefined;
   const unclaimed = tickets
     .filter((t) => isWorkableStatus(t.status) && !inLane.has(t.number) && !t.claimedByOther)
+    .filter((t) => inBatch === undefined || inBatch.has(t.number))
     .sort((a, b) => a.number - b.number);
   for (const t of unclaimed) {
     const dead = deadDeps(t, byNumber);
@@ -604,11 +643,31 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
     }
   }
 
-  // 5. Claim the next ticket into a free lane.
-  const claimable = claimableTickets(tickets, lanes);
-  if (claimable.length > 0 && !laneCapReached(lanes, maxLanes)) {
+  // Context ceiling gate (#131): when the orchestrator's own live context
+  // occupancy has reached the limit, stop CLAIMING new tickets. The claim step
+  // is skipped (no new ticket enters Building) while steps 1-3 above keep
+  // draining in-flight lanes to a terminal state. Off entirely at limit 0.
+  const contextTokenLimit = state.contextTokenLimit ?? 0;
+  const contextGated = contextTokenLimit > 0 && (state.contextTokens ?? 0) >= contextTokenLimit;
+
+  // 5. Claim the next ticket into a free lane -- unless context-gated.
+  const claimable = claimableTickets(tickets, lanes, state.batchTickets);
+  if (!contextGated && claimable.length > 0 && lanes.length < maxLanes) {
     const t = claimable[0];
     return { kind: "claim", ticket: t.number, stage: claimStage(t.status) };
+  }
+
+  // 5b. Context ceiling reached, every lane idle, batch work still remaining:
+  //     pause to clear-and-resume instead of falling through to a forever-wait
+  //     (#131). A fresh orchestrator reads a small context on its first tick,
+  //     so contextGated is false and claiming resumes on the SAME batch (the
+  //     built tickets have left Ready; batchTickets persisted in state.json).
+  //     If the batch happens to be fully drained here (unclaimed empty), the
+  //     normal drain-complete below wins -- context-clear fires only when work
+  //     genuinely remains. Only fires with lanes idle, so an in-flight lane is
+  //     never cut short (AC6).
+  if (contextGated && lanes.length === 0 && unclaimed.length > 0) {
+    return { kind: "context-clear" };
   }
 
   // 6. Lanes idle, nothing claimable, work remains. Two very different cases hide
@@ -640,9 +699,20 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
 
 // Batch drained = every ticket terminal for this batch (Done / Questions /
 // Blocked / Skipped) -- claimedByOther tickets belong to another session's
-// batch -- and no lane still running.
-export function drainComplete(tickets: TicketSnapshot[], lanes: LaneState[]): boolean {
-  return lanes.length === 0 && tickets.every((t) => !isWorkableStatus(t.status) || t.claimedByOther === true);
+// batch -- and no lane still running. Batch-scoped (#131): when batchTickets
+// is set, a workable ticket OUTSIDE the flagged allow-list is not this run's
+// work and never keeps the run alive (AC4).
+export function drainComplete(tickets: TicketSnapshot[], lanes: LaneState[], batchTickets?: number[]): boolean {
+  const inBatch = batchTickets ? new Set(batchTickets) : undefined;
+  return (
+    lanes.length === 0 &&
+    tickets.every(
+      (t) =>
+        !isWorkableStatus(t.status) ||
+        t.claimedByOther === true ||
+        (inBatch !== undefined && !inBatch.has(t.number))
+    )
+  );
 }
 
 // -- human-needed safety control (issue #63) ----------------------------------
@@ -796,6 +866,12 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
     }
     case "check-worker":
     case "wait":
+    // #131: context-clear is a mid-batch PAUSE, not a state transition -- the
+    // orchestrator releases the loop lock, keeps worktrees/branches and the
+    // un-drained state.json, and exits WITHOUT the end-of-loop stage. A pure
+    // no-op on state (like wait): batchTickets/lanes/tickets are untouched so
+    // the re-invoked, context-cleared orchestrator resumes the same batch.
+    case "context-clear":
     case "drain-complete":
       return next;
   }
@@ -850,6 +926,7 @@ export interface BoardItemLike {
   number: number;
   title: string;
   fields: Record<string, string | number>;
+  labels?: string[]; // #130: issue labels riding the snapshot (lib/board.ts BoardItem.labels)
 }
 
 // Builds/refreshes the ticket snapshot from z-board list output plus fetched
@@ -870,6 +947,9 @@ export function ingestBoardItems(
     maxReviewBounces?: number;
     humanNeededPercent?: number;
     stopRequested?: boolean; // #132: this tick's z-stop sentinel state (bin/z-loop-tick tests the file, passes --stop-requested)
+    ticketLimit?: number; // #131: cap used to compute batchTickets on a fresh batch
+    contextTokens?: number; // #131: live orchestrator context reading, stored fresh
+    contextTokenLimit?: number; // #131: context ceiling, captured once like the other knobs
   }
 ): LoopState {
   // #127 backstop: a transient GitHub hiccup can make `z-board snapshot` return
@@ -902,6 +982,7 @@ export function ingestBoardItems(
     if (typeof model === "string" && model) t.model = model;
     const effort = it.fields["Model Effort"];
     if (typeof effort === "string" && effort) t.modelEffort = effort;
+    if ((it.labels ?? []).includes(SKIP_QA_LABEL)) t.skipQa = true;
     if (prevByNumber.get(it.number)?.claimedByOther) t.claimedByOther = true;
     return t;
   });
@@ -945,24 +1026,29 @@ export function ingestBoardItems(
   // same reason -- it feeds the merge gate's stacked-parent check (line ~444),
   // and a stale entry from a batch that finished loops ago points a new
   // ticket's PR at a parent branch that no longer exists -- so it resets on
-  // the same startingFreshBatch boundary as the other two. A drained prev has,
-  // by definition, zero Building
-  // tickets belonging to THIS batch (drainComplete explicitly permits a
-  // Building ticket to remain when claimedByOther -- it belongs to another
-  // session's batch, not this one); so a fresh batch is when there is no
-  // prior state at all, OR the prior state was fully drained AND the incoming
-  // snapshot actually shows new, UNCLAIMED Building tickets (the batch-commit
-  // step moves the whole new batch to Building before its first ingest, so
-  // "any unclaimed Building tickets present" IS "a new batch was just
-  // committed"). buildingCount must exclude claimedByOther for the same
-  // reason every other workable-for-this-batch check in this file does
+  // the same startingFreshBatch boundary as the other two. #133 defers the
+  // board move to claim time: the committed queue now sits in READY until each
+  // ticket is claimed (the old batch-commit step that moved the whole batch to
+  // Building up front is gone), so ingest-time-zero -- Step 3's ingest, before
+  // Step 4 claims anything -- sees every committed ticket still Ready. A drained
+  // prev has, by definition, zero unclaimed Ready tickets belonging to THIS
+  // batch (drainComplete treats Ready as workable, so an own unclaimed Ready
+  // ticket means the batch is NOT drained; a Ready ticket may only linger past
+  // drain when claimedByOther -- it belongs to another session's batch, not
+  // this one); so a fresh batch is when there is no prior state at all, OR the
+  // prior state was fully drained AND the incoming snapshot actually shows new,
+  // UNCLAIMED Ready tickets (the committed queue lands in Ready before its first
+  // ingest, so "any unclaimed Ready ticket in a post-drain snapshot" IS "a new
+  // batch was just committed"). readyCount must exclude claimedByOther for the
+  // same reason every other workable-for-this-batch check in this file does
   // (nextAction's unclaimed filter, the deadlock discriminator, drainComplete
-  // itself) -- otherwise a lingering foreign Building ticket in the snapshot
+  // itself) -- otherwise a lingering foreign Ready ticket in the snapshot
   // masquerades as a new batch on the very re-ingest that should be preserving
   // this batch's counters. A drained prev whose incoming snapshot has no new
-  // unclaimed Building tickets is the SAME batch's final state, not a new one
+  // unclaimed Ready tickets is the SAME batch's final state, not a new one
   // -- preserve its counters.
   const buildingCount = tickets.filter((t) => t.status === "Building" && !t.claimedByOther).length;
+  const readyCount = tickets.filter((t) => t.status === "Ready" && !t.claimedByOther).length;
   // #132: a graceful stop returns unworked tickets to Ready (a workable status),
   // so a REAL post-stop drained state.json carries Ready stragglers next to the
   // Done tickets (e.g. 1:Done 2:Ready 3:Ready). Plain drainComplete(prev) counts
@@ -983,7 +1069,36 @@ export function ingestBoardItems(
     prev !== null &&
     prev.lanes.length === 0 &&
     prev.tickets.every((t) => !isWorkableStatus(t.status) || t.status === "Ready" || t.claimedByOther === true);
-  const startingFreshBatch = !prev || (prevBatchSpent && buildingCount > 0);
+  // Whether the PRIOR batch drained is judged against ITS OWN allow-list (#131):
+  // a leftover non-batch Ready ticket must not make prev look un-drained and so
+  // block the next batch's capture (AC4/AC11 use the same batch scoping).
+  //
+  // #131 review-bounce (finding 1/2): under a ticket cap the batch-scoped
+  // drainComplete becomes true the instant the FLAGGED tickets finish, while the
+  // deliberately-excluded leftover Ready tickets keep readyCount > 0. Left alone
+  // that combination re-fires startingFreshBatch on the very next per-tick
+  // ingest, which (a) recomputes batchTickets -- and z-loop-tick passes no
+  // --ticket-limit, so selectBatch(.., 0) returns undefined, DROPPING the
+  // allow-list and draining the whole queue in one invocation -- and (b) wipes
+  // mergedThisRun/initialReadyCount/humanNeededNotified mid-run (finding 2). The
+  // capped run must instead drain EXACTLY its batch, then return drain-complete
+  // so the operator re-invokes /z-loop for the next batch. The distinguishing
+  // signal: a NEW capped batch is captured only when --ticket-limit is explicitly
+  // on the ingest (Step 3, the start of an invocation, ALWAYS passes it), never
+  // on a bare per-tick z-loop-tick ingest (which never does). So once a batch is
+  // active (prev.batchTickets defined), a fresh batch starts only on a
+  // --ticket-limit-bearing ingest; without the cap (prev.batchTickets undefined)
+  // this is byte-identical to pre-#131. (A context-clear resume's Step 3 ingest
+  // DOES carry --ticket-limit, but its prev batch is un-drained, so
+  // drainComplete is false and batchTickets is preserved anyway -- AC11.)
+  const priorBatchActive = prev?.batchTickets !== undefined;
+  const ticketLimitProvided = cfg?.ticketLimit !== undefined;
+  const startingFreshBatch =
+    !prev ||
+    (prevBatchSpent && buildingCount > 0) ||
+    (drainComplete(prev.tickets, prev.lanes, prev.batchTickets) &&
+      readyCount > 0 &&
+      (!priorBatchActive || ticketLimitProvided));
 
   return {
     tickets: tickets.sort((a, b) => a.number - b.number),
@@ -998,7 +1113,7 @@ export function ingestBoardItems(
     maxReviewBounces: cfg?.maxReviewBounces ?? prev?.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES,
     humanNeededPercent: cfg?.humanNeededPercent ?? prev?.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT,
     mergedThisRun: startingFreshBatch ? [] : [...(prev?.mergedThisRun ?? [])],
-    initialReadyCount: startingFreshBatch ? buildingCount : (prev!.initialReadyCount ?? 0),
+    initialReadyCount: startingFreshBatch ? readyCount : (prev!.initialReadyCount ?? 0),
     humanNeededNotified: startingFreshBatch ? false : (prev!.humanNeededNotified ?? false),
     // #132: this tick's flag always wins true (a stop requested on a fresh
     // batch's first tick is honored); otherwise it LATCHES across the batch; and
@@ -1006,6 +1121,15 @@ export function ingestBoardItems(
     // above, so a persisted state.json from a prior stopped run never leaks stop
     // mode into the next /z-loop.
     stopRequested: !!cfg?.stopRequested || (!startingFreshBatch && prev?.stopRequested === true),
+    // #131: the flagged allow-list is captured ONCE at the fresh-batch boundary
+    // (same as initialReadyCount) and preserved verbatim across every re-ingest
+    // and context clear -- so a resume continues the same batch.
+    batchTickets: startingFreshBatch ? selectBatch(tickets, cfg?.ticketLimit ?? DEFAULT_TICKET_LIMIT) : prev!.batchTickets,
+    // contextTokens is a LIVE per-tick reading -- always taken fresh from cfg,
+    // never preserved from prev (an unresolvable/absent reading degrades to 0,
+    // which never gates). contextTokenLimit is captured once like the knobs.
+    contextTokens: cfg?.contextTokens ?? 0,
+    contextTokenLimit: cfg?.contextTokenLimit ?? prev?.contextTokenLimit ?? DEFAULT_CONTEXT_TOKEN_LIMIT,
   };
 }
 
@@ -1026,7 +1150,7 @@ const USAGE = `loop <command> [args]
   ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M]
                       [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N]
                       [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off]
-                      [--max-review-bounces N] [--stop-requested]
+                      [--max-review-bounces N] [--stop-requested] [--ticket-limit N] [--context-token-limit N] [--context-tokens N]
                                                      build/refresh the snapshot (creates state.json)
 
   --now defaults to the wall clock; tests pass it explicitly.`;
@@ -1067,10 +1191,24 @@ function readPrevState(path: string): LoopState | null {
   return s as LoopState;
 }
 
-function flagValue(argv: string[], flag: string): string | undefined {
-  const i = argv.indexOf(flag);
-  return i >= 0 ? argv[i + 1] : undefined;
-}
+// The numeric ingest knobs, in one table: each is optional, and each reaches
+// ingestBoardItems as a number or undefined. Adding a knob is one row here,
+// not a read + a ternary + a call-site line.
+const INGEST_NUMBERS = [
+  "max-lanes",
+  "watchdog-minutes",
+  "max-qa-passes",
+  "qa-investigate-after",
+  "human-needed-percent",
+  "min-reviewer-confidence",
+  "max-review-bounces",
+  "ticket-limit", // #131: per-loop ticket cap (0 = no cap); selects batchTickets on a fresh batch
+  "context-token-limit", // #131: context ceiling (0 = disabled), captured once
+  "context-tokens", // #131: live orchestrator context reading, threaded per tick by z-loop-tick
+] as const;
+
+// kebab-case CLI flag -> the camelCase key ingestBoardItems takes.
+const camel = (flag: string): string => flag.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 
 export function main(argv: string[]): number {
   const cmd = argv[0];
@@ -1079,67 +1217,60 @@ export function main(argv: string[]): number {
     return cmd ? 0 : 1;
   }
   try {
+    // Shared CLI plumbing (lib/cli.ts): one pass over argv splits positionals
+    // from --flag value pairs, so this file no longer hand-rolls an indexOf
+    // scan per flag.
+    const { positionals, flags } = parseFlags(argv.slice(1));
+
     // stage-model takes no state.json (it reads config, not loop state), so it
     // is handled before the generic statePath guard below applies to every
     // other command.
     if (cmd === "stage-model") {
       const stages: Stage[] = ["builder", "qa", "reviewer", "merge"];
-      const stage = argv[1] as Stage;
-      const ticketModel = argv[2];
+      const stage = positionals[0] as Stage;
+      const ticketModel = positionals[1];
       if (!stages.includes(stage) || !ticketModel) {
         throw new ZError(`Usage: loop stage-model <${stages.join("|")}> <ticketModel> --slug <s>`);
       }
       // --slug is optional here the same way it is everywhere else (H13):
       // loadConfig's resolveSlug falls back to ZSTACK_SLUG or the sole
       // configured project, and throws its own ZError when neither resolves.
-      console.log(resolveStageModel(stage, ticketModel, loadConfig(flagValue(argv, "--slug")).stageModels));
+      console.log(resolveStageModel(stage, ticketModel, loadConfig(str(flags, "slug")).stageModels));
       return 0;
     }
 
     // The only Date.now() in this file: the CLI boundary. Pure functions above
     // always take nowMs.
-    const nowMs = Number(flagValue(argv, "--now") ?? Date.now());
-    const statePath = argv[1];
+    const nowMs = Number(str(flags, "now") ?? Date.now());
+    const statePath = positionals[0];
     if (!statePath) throw new ZError(`Usage:\n${USAGE}`);
 
     if (cmd === "next") {
       const state = readJson(statePath) as LoopState;
-      const action = nextAction(state.tickets, state.lanes, {
-        nowMs,
-        maxLanes: state.maxLanes,
-        watchdogMinutes: state.watchdogMinutes,
-        maxQaPasses: state.maxQaPasses,
-        qaInvestigateAfter: state.qaInvestigateAfter,
-        minReviewerConfidence: state.minReviewerConfidence,
-        reviewerBelowThresholdAction: state.reviewerBelowThresholdAction,
-        maxReviewBounces: state.maxReviewBounces,
-        mergedThisRun: state.mergedThisRun,
-        stopRequested: state.stopRequested,
-      });
-      console.log(JSON.stringify(action));
+      console.log(JSON.stringify(nextAction(state, nowMs)));
       return 0;
     }
     if (cmd === "apply") {
-      if (!argv[2]) throw new ZError("Usage: loop apply <state.json> <action.json> [--now <ms>]");
+      if (!positionals[1]) throw new ZError("Usage: loop apply <state.json> <action.json> [--now <ms>]");
       const state = readJson(statePath) as LoopState;
-      const action = readJson(argv[2]) as Action;
+      const action = readJson(positionals[1]) as Action;
       atomicWrite(statePath, JSON.stringify(applyAction(state, action, nowMs), null, 2));
       console.log(`applied ${action.kind}${"ticket" in action ? ` #${action.ticket}` : ""}`);
       return 0;
     }
     if (cmd === "outcome") {
-      const ticket = Number(argv[2]);
-      if (!Number.isInteger(ticket) || !argv[3]) throw new ZError("Usage: loop outcome <state.json> <ticket> <msg.txt> [--now <ms>]");
+      const ticket = Number(positionals[1]);
+      if (!Number.isInteger(ticket) || !positionals[2]) throw new ZError("Usage: loop outcome <state.json> <ticket> <msg.txt> [--now <ms>]");
       const state = readJson(statePath) as LoopState;
-      const message = readFileSync(argv[3], "utf8");
+      const message = readFileSync(positionals[2], "utf8");
       const next = recordOutcome(state, ticket, message, nowMs);
       atomicWrite(statePath, JSON.stringify(next, null, 2));
       console.log(JSON.stringify(next.lanes.find((l) => l.ticket === ticket)!.outcome));
       return 0;
     }
     if (cmd === "probe") {
-      const ticket = Number(argv[2]);
-      const verdict = argv[3];
+      const ticket = Number(positionals[1]);
+      const verdict = positionals[2];
       if (!Number.isInteger(ticket) || (verdict !== "alive" && verdict !== "dead")) {
         throw new ZError("Usage: loop probe <state.json> <ticket> <alive|dead> [--now <ms>]");
       }
@@ -1149,7 +1280,7 @@ export function main(argv: string[]): number {
       return 0;
     }
     if (cmd === "claim-lost") {
-      const ticket = Number(argv[2]);
+      const ticket = Number(positionals[1]);
       if (!Number.isInteger(ticket)) throw new ZError("Usage: loop claim-lost <state.json> <ticket>");
       const state = readJson(statePath) as LoopState;
       atomicWrite(statePath, JSON.stringify(markClaimLost(state, ticket), null, 2));
@@ -1168,37 +1299,30 @@ export function main(argv: string[]): number {
       return 0;
     }
     if (cmd === "ingest") {
-      if (!argv[2] || !argv[3]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off] [--max-review-bounces N] [--stop-requested]");
+      if (!positionals[1] || !positionals[2]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off] [--max-review-bounces N] [--stop-requested] [--ticket-limit N] [--context-token-limit N] [--context-tokens N]");
       const prev = readPrevState(statePath);
-      const items = readJson(argv[2]) as BoardItemLike[];
-      const bodies = readJson(argv[3]) as Record<string, string>;
-      const maxLanes = flagValue(argv, "--max-lanes");
-      const watchdogMinutes = flagValue(argv, "--watchdog-minutes");
-      const maxQaPasses = flagValue(argv, "--max-qa-passes");
-      const qaInvestigateAfter = flagValue(argv, "--qa-investigate-after");
-      const humanNeededPercent = flagValue(argv, "--human-needed-percent");
-      const minReviewerConfidence = flagValue(argv, "--min-reviewer-confidence");
-      const reviewerBelowThresholdAction = flagValue(argv, "--reviewer-below-threshold-action");
-      const maxReviewBounces = flagValue(argv, "--max-review-bounces");
+      const items = readJson(positionals[1]) as BoardItemLike[];
+      const bodies = readJson(positionals[2]) as Record<string, string>;
+      const reviewerBelowThresholdAction = str(flags, "reviewer-below-threshold-action");
       if (
         reviewerBelowThresholdAction !== undefined &&
         !["block", "retry", "off"].includes(reviewerBelowThresholdAction)
       ) {
         throw new ZError(`--reviewer-below-threshold-action must be "block", "retry", or "off", got ${JSON.stringify(reviewerBelowThresholdAction)}.`);
       }
-      const state = ingestBoardItems(prev, items, bodies, {
-        maxLanes: maxLanes === undefined ? undefined : Number(maxLanes),
-        watchdogMinutes: watchdogMinutes === undefined ? undefined : Number(watchdogMinutes),
-        maxQaPasses: maxQaPasses === undefined ? undefined : Number(maxQaPasses),
-        qaInvestigateAfter: qaInvestigateAfter === undefined ? undefined : Number(qaInvestigateAfter),
-        humanNeededPercent: humanNeededPercent === undefined ? undefined : Number(humanNeededPercent),
-        minReviewerConfidence: minReviewerConfidence === undefined ? undefined : Number(minReviewerConfidence),
-        reviewerBelowThresholdAction: reviewerBelowThresholdAction as "block" | "retry" | "off" | undefined,
-        maxReviewBounces: maxReviewBounces === undefined ? undefined : Number(maxReviewBounces),
-        // #132: a boolean flag, not a value flag -- bin/z-loop-tick appends it
-        // when the stop sentinel exists next to state.json.
-        stopRequested: argv.includes("--stop-requested"),
-      });
+      const cfg: Record<string, number | string | boolean | undefined> = {
+        reviewerBelowThresholdAction,
+      };
+      for (const flag of INGEST_NUMBERS) {
+        const raw = str(flags, flag);
+        if (raw !== undefined) cfg[camel(flag)] = Number(raw);
+      }
+      // #132: a boolean flag, not a value flag -- bin/z-loop-tick appends it
+      // when the stop sentinel exists next to state.json.
+      if (str(flags, "stop-requested") !== undefined) {
+        cfg.stopRequested = true;
+      }
+      const state = ingestBoardItems(prev, items, bodies, cfg as Parameters<typeof ingestBoardItems>[3]);
       atomicWrite(statePath, JSON.stringify(state, null, 2));
       console.log(`${state.tickets.length} ticket(s), ${state.lanes.length} lane(s)`);
       return 0;

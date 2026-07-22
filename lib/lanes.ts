@@ -7,8 +7,6 @@
 import { TERMINAL_STATUSES, ZError } from "./config.ts";
 import type { BoardStatus, LaneState, Stage, TicketSnapshot } from "./loop.ts";
 
-export { ZError } from "./config.ts";
-
 // -- dependency parsing -------------------------------------------------------
 
 // Extracts the issue numbers a ticket waits on from its body's "Depends on"
@@ -70,21 +68,59 @@ export function deadDeps(t: TicketSnapshot, byNumber: Map<number, TicketSnapshot
   });
 }
 
+// Per-loop batch selection (issue #131): the dependency-self-contained
+// allow-list of at most `ticketLimit` tickets a single /z-loop run works.
+// `ticketLimit <= 0` returns undefined -- no allow-list, so every workable
+// ticket is in the batch and claimableTickets/nextAction gate nothing
+// (byte-identical to pre-#131). Otherwise a Kahn walk modeled on mergeOrder:
+// each round flags the LOWEST-numbered workable ticket whose every dependency
+// is already Done or already flagged, until the cap is hit or no further
+// ticket can be closed. This keeps the batch dependency-self-contained -- a
+// flagged ticket never depends on an un-flagged workable ticket -- so no
+// dependent can wedge waiting on work left out of the run; a dependent whose
+// dependency doesn't make the cap simply stays Ready (a Ready non-batch dep is
+// not terminal, so deadDeps never mis-parks it). Captured ONCE per batch in
+// ingestBoardItems (persisted on LoopState.batchTickets), not recomputed per
+// tick.
+export function selectBatch(tickets: TicketSnapshot[], ticketLimit: number): number[] | undefined {
+  if (ticketLimit <= 0) return undefined;
+  const byNumber = new Map(tickets.map((t) => [t.number, t]));
+  const workable = tickets
+    .filter((t) => isWorkableStatus(t.status) && !t.claimedByOther)
+    .sort((a, b) => a.number - b.number);
+  const flagged = new Set<number>();
+  while (flagged.size < ticketLimit) {
+    const ready = workable
+      .filter(
+        (t) =>
+          !flagged.has(t.number) &&
+          t.dependsOn.every((d) => {
+            const dep = byNumber.get(d);
+            return dep === undefined || dep.status === "Done" || flagged.has(d);
+          })
+      )
+      .map((t) => t.number);
+    if (ready.length === 0) break; // nothing further can be closed within the cap
+    flagged.add(Math.min(...ready)); // lowest ready first, exactly like mergeOrder
+  }
+  return [...flagged].sort((a, b) => a - b);
+}
+
 // Tickets a free lane may claim right now, in claim order: workable status, not
-// already in a lane, not claimed by another session, every dependency
-// Done/merged. Deterministic order = ascending issue number; dependency order
-// falls out because a dependent is simply not claimable until its deps are Done.
-export function claimableTickets(tickets: TicketSnapshot[], lanes: LaneState[]): TicketSnapshot[] {
+// already in a lane, not claimed by another session, in the batch allow-list
+// (#131 -- when one is set), every dependency Done/merged. Deterministic order
+// = ascending issue number; dependency order falls out because a dependent is
+// simply not claimable until its deps are Done. `batchTickets` undefined = no
+// cap (every workable ticket is in the batch).
+export function claimableTickets(tickets: TicketSnapshot[], lanes: LaneState[], batchTickets?: number[]): TicketSnapshot[] {
   const inLane = new Set(lanes.map((l) => l.ticket));
+  const allow = batchTickets ? new Set(batchTickets) : undefined;
   const byNumber = new Map(tickets.map((t) => [t.number, t]));
   return tickets
     .filter((t) => isWorkableStatus(t.status) && !inLane.has(t.number) && !t.claimedByOther)
+    .filter((t) => allow === undefined || allow.has(t.number))
     .filter((t) => depsSatisfied(t, byNumber))
     .sort((a, b) => a.number - b.number);
-}
-
-export function laneCapReached(lanes: LaneState[], maxLanes: number): boolean {
-  return lanes.length >= maxLanes;
 }
 
 // -- watchdog -----------------------------------------------------------------

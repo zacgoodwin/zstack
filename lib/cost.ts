@@ -31,11 +31,10 @@
 // with a mutated-fixture canary).
 import { readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
-import { handleCliError } from "./cli.ts";
+import { handleCliError, parseFlags, str } from "./cli.ts";
 import { ZError } from "./config.ts";
 import { loadRates, priceTokens, priceTokensUnrounded, ratesPath, resolveRate, roundCents, type RatesFile } from "./estimate.ts";
 
-export { ZError } from "./config.ts";
 export { loadRates, ratesPath } from "./estimate.ts";
 
 // The exact wire keys Claude Code writes on an assistant message's `usage`
@@ -463,16 +462,11 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   try {
-    let pattern: string | undefined;
-    let ratesFilePath = ratesPath();
-    let jsonOut = false;
-    let byFile = false;
-    for (let i = 0; i < argv.length; i++) {
-      if (argv[i] === "--rates") ratesFilePath = argv[++i];
-      else if (argv[i] === "--json") jsonOut = true;
-      else if (argv[i] === "--by-file") byFile = true;
-      else pattern = argv[i];
-    }
+    const { positionals, flags } = parseFlags(argv, ["json", "by-file"]);
+    const pattern = positionals[0];
+    const ratesFilePath = str(flags, "rates") ?? ratesPath();
+    const jsonOut = flags.json === true;
+    const byFile = flags["by-file"] === true;
     if (!pattern) throw new ZError(`Usage: ${USAGE}`);
 
     const files = expandGlob(pattern);
