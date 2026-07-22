@@ -941,12 +941,18 @@ describe("z-plan/SKILL.md: --reestimate re-estimates Backlog + Ready (issue #134
     expect(dryRun).toBeGreaterThan(step12);
   });
 
-  test("Step 12 scans BOTH Backlog and Ready, leaving every other status untouched (AC2)", () => {
+  test("Step 12 scans BOTH Backlog and Ready, and the exclusion sentence NAMES every excluded status (AC2, review finding 3)", () => {
     const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
     expect(step12).not.toBe("");
     expect(step12).toContain('"$Z_BOARD" list --status Backlog --json --slug "$SLUG"');
     expect(step12).toContain('"$Z_BOARD" list --status Ready --json --slug "$SLUG"');
-    expect(step12).toMatch(/left\s*\n?\s*untouched/);
+    // Tightened: a decoy "left ... untouched" sentence with no status names
+    // must NOT satisfy this -- the excluded statuses have to be named right
+    // next to "left ... untouched" (review finding 3: the old
+    // /left\s*\n?\s*untouched/ regex alone was too generic).
+    expect(step12).toMatch(
+      /\(Building\/QA\/Review\/Blocked\/Skipped\/Done\)\s+is\s+left\s*\n?\s*untouched/
+    );
   });
 
   test("Step 12 skips split parents via the durable `## Subtasks (in order)` heading, same signal as Step 10 item 4 (AC8)", () => {
@@ -970,22 +976,85 @@ describe("z-plan/SKILL.md: --reestimate re-estimates Backlog + Ready (issue #134
     expect(step12).toMatch(/is a no-op \(idempotent, reproducible\)/);
   });
 
-  test("changed estimate with a prior value present: field-set + one comment, old -> new and why (AC4/AC5)", () => {
+  test("changed estimate with a prior value present: the FIELD-WRITE is instructed, not just the comment (AC4/AC5, review finding 1)", () => {
     const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
     expect(step12).toMatch(/\*\*Different, and a prior Estimate was present:\*\*/);
+    // Pin the actual field-set CLI calls. The prior canary here only checked
+    // the comment-template wording, so deleting the field-write instruction
+    // sentence at SKILL.md:676-684 and leaving only the comment template
+    // left this test green (review finding 1) -- these three exact CLI
+    // lines must survive.
+    expect(step12).toContain(
+      '"$Z_BOARD" field-set <N> Estimate <new> --slug "$SLUG"'
+    );
+    expect(step12).toContain(
+      '"$Z_BOARD" field-set <N> Model <newmodel> --slug "$SLUG"'
+    );
+    expect(step12).toContain(
+      '"$Z_BOARD" field-set <N> "Model Effort" <neweffort> --slug "$SLUG"'
+    );
+    expect(step12).toMatch(/field-set` those two as well/);
     expect(step12).toContain("recommended tier changed");
-    expect(step12).toMatch(/scope grew per the current\s*\n?\s*body\)/);
-    expect(step12).toMatch(/scope shrank per the current\s*\n?\s*body\)/);
+    expect(step12).toMatch(/scope grew per the current body\)/);
+    expect(step12).toMatch(/scope shrank per the current body\)/);
     expect(step12).toMatch(/recalibration \(same <tier>\s*\n?\s*tier;/);
     expect(step12).toContain(
       "z-plan/tiers.json buckets or references/rates.json updated"
     );
   });
 
-  test("changed estimate with NO prior value: fields all three, posts no comment (AC7)", () => {
+  test("changed estimate with NO prior value: the FIELD-WRITE covers all three fields, posts no comment (AC7, review finding 2)", () => {
     const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
     expect(step12).toMatch(/\*\*Different, but no prior Estimate\*\* \(the field was empty\)/);
-    expect(step12).toMatch(/post \*\*no\*\* "changed" comment/);
+    // Pin the actual "field-set all three fields" instruction and its CLI
+    // template, not just the header phrase + "no comment" (review finding
+    // 2: deleting SKILL.md:706-711's write instruction left this green).
+    expect(step12).toMatch(/`field-set`\s*\n?\s*all three fields — Estimate, Model, and Model Effort/);
+    expect(step12).toContain(
+      '"$Z_BOARD" field-set <N> <Field> <value> --slug "$SLUG"'
+    );
+    expect(step12).toMatch(/post \*\*no\*\*\s*\n?\s*"changed" comment/);
+  });
+
+  test('tier-changed direction is decided by TIER RANK, never by the dollar delta (review finding 4, real logic bug)', () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    // Pins the fixed escalation order used to decide grew/shrank.
+    expect(step12).toContain(
+      "haiku-low < sonnet-medium < opus-high < opus-xhigh < fable-xhigh"
+    );
+    expect(step12).toContain("never** by comparing $OLD to $NEW");
+    // Old, buggy contract this replaces must not be present: deciding the
+    // word from whether the new total is numerically higher/lower than the
+    // old one (tiers.json dollars are not monotonic by rank, so that logic
+    // prints the wrong direction on a real tier escalation).
+    expect(step12).not.toMatch(/when the new\s*\n?\s*total is higher than the old/);
+    // Worked example where the dollar direction disagrees with the tier
+    // direction: sonnet-medium ($10.27) -> opus-high ($9.44) is a tier
+    // ESCALATION even though the dollar total drops. The comment must read
+    // "grew", never "shrank", right next to this worked example -- proves
+    // the fix is rank-based, not dollar-based.
+    const idx = step12.indexOf(
+      "`sonnet-medium` → `opus-high` is an ESCALATION"
+    );
+    expect(idx).toBeGreaterThan(-1);
+    const window = step12.slice(idx, idx + 400);
+    expect(window).toMatch(
+      /recommended tier changed sonnet-medium → opus-high \(scope grew per the current body\)\.`,\s*\n?\s*never\s*\n?\s*`\(scope shrank per the current body\)\.`/
+    );
+  });
+
+  test("board comment is always prefixed literally `Estimate $OLD -> $NEW:` (review finding 5)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toContain("prefixed literally `Estimate $OLD → $NEW:`");
+  });
+
+  test("Terminal summary states it does not invoke z-cost-suggest (SKILL.md:717-721, review finding 5)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toMatch(/\*\*Terminal summary\.\*\*/);
+    expect(step12).toMatch(
+      /does \*\*not\*\* invoke Step 11's\s*\n?\s*`z-cost-suggest` helper/
+    );
+    expect(step12).toMatch(/per-ticket file lists Step 5 builds/);
   });
 
   test("Step 12 never promotes to Ready and never edits a body (AC9)", () => {

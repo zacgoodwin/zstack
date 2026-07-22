@@ -673,24 +673,42 @@ For each ticket number `<N>` in the combined Backlog + Ready list:
    - **Equal:** write nothing — no field-set, no comment. Same body + same
      tier → same dollars, so a second `--reestimate` over an unchanged board
      is a no-op (idempotent, reproducible).
-   - **Different, and a prior Estimate was present:** `field-set` Estimate to
-     the new number (`"$Z_BOARD" field-set <N> Estimate <new> --slug
-     "$SLUG"`). If the newly picked tier differs from the stored Model +
-     Model Effort, `field-set` those two as well, so the fields keep
-     selecting the number they price (Step 6 writes all three together).
-     Then post exactly one board comment naming the change and its cause
-     (`"$Z_BOARD" comment <N> --body-file ... --slug "$SLUG"`):
-     - tier changed → `Estimate $OLD → $NEW: recommended tier changed
-       <oldtier> → <newtier> (scope grew per the current body).` when the new
-       total is higher than the old, or `(scope shrank per the current
-       body).` when it is lower.
-     - tier unchanged → `Estimate $OLD → $NEW: recalibration (same <tier>
-       tier; z-plan/tiers.json buckets or references/rates.json updated
-       since the last estimate).`
+   - **Different, and a prior Estimate was present:** write the fields
+     FIRST, then comment:
+     - `field-set` Estimate to the new number:
+       `"$Z_BOARD" field-set <N> Estimate <new> --slug "$SLUG"`.
+     - If the newly picked tier differs from the stored Model + Model
+       Effort, `field-set` those two as well, so the fields keep selecting
+       the number they price (Step 6 writes all three together):
+       `"$Z_BOARD" field-set <N> Model <newmodel> --slug "$SLUG"` and
+       `"$Z_BOARD" field-set <N> "Model Effort" <neweffort> --slug "$SLUG"`.
+     - Then post exactly one board comment naming the change and its cause
+       (`"$Z_BOARD" comment <N> --body-file ... --slug "$SLUG"`), always
+       prefixed literally `Estimate $OLD → $NEW:`:
+       - tier changed → grew/shrank is decided by the tier's RANK in the
+         fixed escalation order `haiku-low < sonnet-medium < opus-high < opus-xhigh < fable-xhigh`
+         (Step 6's table row order, `z-plan/tiers.json`'s key order) —
+         **never** by comparing $OLD to $NEW. Tier dollars are NOT
+         monotonic by rank (`sonnet-medium` prices at $10.27, MORE than
+         `opus-high` at $9.44), so a genuine tier escalation can lower the
+         total; deciding the word from the dollar delta would post the
+         wrong direction on a live comment. Worked example where the
+         dollar direction disagrees with the tier direction: `sonnet-medium` → `opus-high` is an ESCALATION (rank 2 → rank 3) even
+         though the total drops $10.27 → $9.44 — the comment reads
+         `Estimate $10.27 → $9.44: recommended tier changed sonnet-medium → opus-high (scope grew per the current body).`, never `(scope shrank per the current body).`.
+         General rule: `Estimate $OLD → $NEW: recommended tier changed
+         <oldtier> → <newtier> (scope grew per the current body).` when the
+         new tier's rank is HIGHER than the old tier's rank, or `(scope
+         shrank per the current body).` when it is LOWER.
+       - tier unchanged → `Estimate $OLD → $NEW: recalibration (same <tier>
+         tier; z-plan/tiers.json buckets or references/rates.json updated
+         since the last estimate).`
    - **Different, but no prior Estimate** (the field was empty): `field-set`
-     all three fields, exactly like Step 10 item 4's empty-field path, but
-     post **no** "changed" comment — the comment fires only when an estimate
-     was already present and the number differs.
+     all three fields — Estimate, Model, and Model Effort, the same
+     `"$Z_BOARD" field-set <N> <Field> <value> --slug "$SLUG"` calls as
+     above — exactly like Step 10 item 4's empty-field path, but post **no**
+     "changed" comment — the comment fires only when an estimate was
+     already present and the number differs.
 5. **Never promote, never re-draft.** Like Step 10 item 6, this step never
    moves a ticket to Ready and never edits a body — Status is unchanged and
    the body is unchanged; it only writes the three number/tier fields and,
