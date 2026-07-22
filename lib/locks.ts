@@ -11,7 +11,10 @@
 //     second /z-loop on the same project reads it and refuses to start, naming
 //     the live session. Liveness: a verifiable pid decides; with no pid, a lock
 //     older than the configured staleness threshold is judged stale (crashed)
-//     rather than live, so a dead loop never wedges the next run.
+//     rather than live, so a dead loop never wedges the next run. The one-shot
+//     `loop.lock.reconcile` claim that serializes --reconcile's clear-and-replace
+//     carries the same payload and gets the same judgment, so a claim orphaned by a
+//     crash inside the claimed section self-heals too (issue #144).
 //
 // Same discipline as lib/setup-permissions.ts: EVERY path is a parameter here.
 // Only main() computes the real ~/.zstack directory, so every test in
@@ -22,6 +25,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, hostname } from "node:os";
@@ -307,14 +311,11 @@ export function acquireLoopLock(
   // exclusive-create of the claim, and only under it does it re-inspect + clear a
   // STILL-stale lock and take the loop lock (also exclusive-create). Every loser
   // -- of the claim, or of a fresh lock a racer wrote first -- re-inspects and
-  // defers. ponytail: a process killed inside the (synchronous) claimed section
-  // could orphan the claim file and wedge future reconciles; the window is one
-  // uninterrupted burst of sync fs calls, so this is a documented ceiling.
+  // defers. A process killed inside the claimed section orphans the claim, so the
+  // claim carries the SAME payload as the loop lock and claimReconcile judges it with
+  // the same liveness rules: a dead claim is cleared, never wedged (issue #144).
   const claimPath = `${path}.reconcile`;
-  try {
-    writeFileSync(claimPath, `${lock.session}\n`, { flag: "wx", mode: 0o600 });
-  } catch (e: any) {
-    if (e?.code !== "EEXIST") throw e; // another reconcile holds the claim: defer to it
+  if (!claimReconcile(claimPath, body, opts)) {
     const again = inspectLoopLock(locksDir, opts.nowMs, opts.stalenessMs, opts.isAlive);
     return { acquired: false, held: again.lock, reason: again.state === "live" ? "live" : "stale" };
   }
@@ -335,6 +336,61 @@ export function acquireLoopLock(
   } finally {
     rmSync(claimPath, { force: true });
   }
+}
+
+// Take the one-shot reconcile claim, or report that a live reconcile holds it
+// (issue #144). Exclusive-create is still the mutex; the only addition is that an
+// EEXIST claim is judged for liveness exactly like the loop lock, so a claim orphaned
+// by a process killed inside the claimed section (dead/recycled pid, or older than the
+// staleness window) is cleared and the create retried ONCE instead of wedging every
+// future --reconcile. The retry is the same exclusive create, so two racers that both
+// cleared the same dead claim still serialize -- and the loop lock's own exclusive
+// create behind it is the CAS that keeps "exactly one acquires" true regardless.
+// ponytail: a racer can still unlink a claim another racer created in the microseconds
+// between judging it dead and the unlink; the loop-lock exclusive create absorbs that,
+// and closing it for real needs a fencing token, not a file.
+function claimReconcile(
+  claimPath: string,
+  body: string,
+  opts: { nowMs: number; stalenessMs: number; isAlive?: (pid: number) => boolean }
+): boolean {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      writeFileSync(claimPath, body, { flag: "wx", mode: 0o600 }); // exclusive create, owner-only
+      return true;
+    } catch (e: any) {
+      if (e?.code !== "EEXIST") throw e;
+      // Already retried once, or a live reconcile holds the claim: defer to it.
+      if (attempt > 0 || claimLiveness(claimPath, opts) === "live") return false;
+      rmSync(claimPath, { force: true }); // orphaned claim: clear it and retry the create
+    }
+  }
+}
+
+// Liveness of an existing claim file. A claim written before #144 holds a bare session
+// string with no payload, so only its mtime is legible -- age alone then decides, which
+// is the same fallback a pid-less loop lock gets. A claim that vanished under us reads
+// stale: the retried exclusive create is what actually decides the winner.
+function claimLiveness(
+  claimPath: string,
+  opts: { nowMs: number; stalenessMs: number; isAlive?: (pid: number) => boolean }
+): LockLiveness {
+  let text: string;
+  let mtimeMs: number;
+  try {
+    text = readFileSync(claimPath, "utf8");
+    mtimeMs = statSync(claimPath).mtimeMs;
+  } catch {
+    return "stale";
+  }
+  let claim: LoopLock = { session: "legacy claim", startedAt: mtimeMs };
+  try {
+    const raw = JSON.parse(text) as any;
+    if (typeof raw?.session === "string" && typeof raw?.startedAt === "number") claim = raw as LoopLock;
+  } catch {
+    // not JSON: keep the mtime fallback
+  }
+  return loopLockLiveness(claim, opts.nowMs, opts.stalenessMs, opts.isAlive);
 }
 
 function releaseLoopLock(locksDir: string): void {

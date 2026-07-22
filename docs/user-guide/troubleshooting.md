@@ -55,6 +55,14 @@ the same tickets and worktrees. Options:
 A **live** lock never clears via reconcile — you cannot reconcile over a running
 loop, by design.
 
+`--reconcile` serializes its clear-and-replace through a one-shot claim file,
+`locks/loop.lock.reconcile`. If a run is killed mid-reconcile the claim can be left
+behind; it carries the same payload as the loop lock, so the next `--reconcile`
+judges it the same way — a claim whose process is dead (or that is older than
+`lockStalenessMinutes`) is cleared automatically and the run proceeds. Do not delete
+it by hand; a claim that is *not* cleared belongs to a reconcile that is still
+running.
+
 ## /z-loop refuses to start: orphans present
 
 A crashed prior run left lane locks with no live loop, worktrees with no lock, or

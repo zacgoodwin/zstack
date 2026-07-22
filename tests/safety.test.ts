@@ -283,6 +283,89 @@ describe("stale+reconcile keeps the exclusive-create guard (H11)", () => {
   });
 });
 
+// ============================================================================
+// issue #144 -- an orphaned loop.lock.reconcile claim must self-heal, not wedge
+// every future --reconcile. The claim carries the loop lock's payload and gets the
+// loop lock's liveness rules.
+// ============================================================================
+describe("orphaned reconcile claim self-heals (#144)", () => {
+  const LOCKS = join(REPO_ROOT, "lib", "locks.ts");
+  const STALE = 60 * 60_000;
+  const NOW = STALE + 1; // every seeded no-pid lock/claim is stale at NOW
+
+  function seedStale(dir: string): void {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(loopLockPath(dir), JSON.stringify({ session: "crashed", startedAt: 0 }) + "\n");
+  }
+  function seedClaim(dir: string, claim: object): string {
+    const p = `${loopLockPath(dir)}.reconcile`;
+    writeFileSync(p, JSON.stringify(claim) + "\n");
+    return p;
+  }
+  function reconcile(dir: string, session: string) {
+    return acquireLoopLock(dir, { session, startedAt: NOW }, { nowMs: NOW, stalenessMs: STALE, reconcile: true });
+  }
+
+  // pid <= 0 is never a live process (processAlive rejects it), so this is a
+  // deterministic dead pid on every platform.
+  test("a claim whose recorded pid is dead is cleared and the reconcile acquires", () => {
+    const dir = tmp();
+    seedStale(dir);
+    const claimPath = seedClaim(dir, { session: "killed", startedAt: NOW, pid: -1, host: hostname(), startTime: "x" });
+
+    const res = reconcile(dir, "fresh");
+    expect(res.acquired).toBe(true); // the orphan no longer wedges
+    expect(readLoopLock(dir)!.session).toBe("fresh"); // stale lock replaced
+    expect(existsSync(claimPath)).toBe(false); // stale claim gone too
+  });
+
+  test("a claim older than the staleness window is cleared and the reconcile acquires", () => {
+    const dir = tmp();
+    seedStale(dir);
+    const claimPath = seedClaim(dir, { session: "abandoned", startedAt: 0 }); // no pid -> age decides
+
+    const res = reconcile(dir, "fresh");
+    expect(res.acquired).toBe(true);
+    expect(readLoopLock(dir)!.session).toBe("fresh");
+    expect(existsSync(claimPath)).toBe(false);
+  });
+
+  // The claim of a process that is provably alive (this very process: same host,
+  // matching OS start-time) stays untouched even PAST the staleness window.
+  test("a claim held by a live process still defers, and is left untouched", () => {
+    const dir = tmp();
+    seedStale(dir);
+    const claim = { session: "racer-A", startedAt: 0, pid: process.pid, host: hostname(), startTime: processStartTime(process.pid)! };
+    const claimPath = seedClaim(dir, claim);
+
+    const res = reconcile(dir, "racer-B");
+    expect(res.acquired).toBe(false);
+    expect(res.reason).toBe("stale"); // still stale under A's claim
+    expect(readLoopLock(dir)!.session).toBe("crashed"); // B did not overwrite the lock
+    expect(JSON.parse(readFileSync(claimPath, "utf8"))).toEqual(claim); // claim untouched
+  });
+
+  // Real processes, all seeing the same dead claim: every one of them clears it and
+  // retries the exclusive create, so the create -- not the clear -- picks the winner.
+  test("N concurrent reconciles over one DEAD claim: exactly one wins", async () => {
+    const dir = tmp();
+    seedStale(dir);
+    const claimPath = seedClaim(dir, { session: "killed", startedAt: 0, pid: -1, host: hostname(), startTime: "x" });
+    const now = 10 * 60_000; // --staleness-minutes 1 => the seeded lock is stale
+    const procs = Array.from({ length: 6 }, (_, i) =>
+      Bun.spawn(
+        ["bun", LOCKS, "acquire", "--dir", dir, "--session", `sess-${i}`, "--reconcile", "--now", String(now), "--staleness-minutes", "1"],
+        { stdout: "pipe", stderr: "pipe" }
+      )
+    );
+    const codes = await Promise.all(procs.map((p) => p.exited));
+    expect(codes.filter((c) => c === 0).length).toBe(1); // never two loops on one project
+    expect(readLoopLock(dir)!.session).toMatch(/^sess-\d$/);
+    expect(existsSync(claimPath)).toBe(false); // the winner released the claim
+  });
+
+});
+
 describe("staleness-minutes validation (M19)", () => {
   const LOCKS = join(REPO_ROOT, "lib", "locks.ts");
   test("a non-numeric --staleness-minutes throws instead of yielding NaN", () => {
