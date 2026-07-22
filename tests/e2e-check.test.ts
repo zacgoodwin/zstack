@@ -4,7 +4,7 @@
 // runAllAssertions against the hand-authored sample-run (all green), then against
 // temp copies with one artifact each mutated, asserting the RIGHT named assertion
 // flips to fail. Deterministic, no network, well under the 2s gate budget.
-import { test, expect, describe, afterEach } from "bun:test";
+import { test, expect, describe, afterEach, spyOn } from "bun:test";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -184,7 +184,7 @@ describe("mutated runs: the checker catches the specific break", () => {
     expect(r.detail).toContain("!= sum of board Actuals");
   });
 
-  test("check.ts main() exits 1 on a broken run", () => {
+  test("check.ts main() exits 1 on a broken run, and prints no FAIL line to the real console", () => {
     const dir = mkdtempSync(join(tmpdir(), "zstack-e2e-check-"));
     tmps.push(dir);
     cpSync(SAMPLE_RUN, dir, { recursive: true });
@@ -192,7 +192,23 @@ describe("mutated runs: the checker catches the specific break", () => {
     const s = readJson(p);
     s.mergedThisRun = [3, 2, 1];
     writeJson(p, s);
-    expect(main([dir])).toBe(1);
+
+    // main() on a deliberately-broken run legitimately prints "FAIL  merge-order ...".
+    // That's indistinguishable from a real test failure in the suite console (#128), so
+    // capture console.log for this call instead of letting it reach the terminal --
+    // while still proving the checker actually caught the break (the captured line
+    // contains FAIL), not just that logging was skipped.
+    const logs = spyOn(console, "log").mockImplementation(() => {});
+    let exitCode: number;
+    let captured: string;
+    try {
+      exitCode = main([dir]);
+      captured = logs.mock.calls.map((args) => args.join(" ")).join("\n");
+    } finally {
+      logs.mockRestore(); // clears mock.calls, so read it before restoring
+    }
+    expect(exitCode).toBe(1);
+    expect(captured).toContain("FAIL");
   });
 });
 
