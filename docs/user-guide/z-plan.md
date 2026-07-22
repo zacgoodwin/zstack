@@ -85,6 +85,34 @@ except Done), and leaves every other Backlog ticket untouched. A ticket
 number that isn't on the board, or that's already Done, fails loud with no
 board writes rather than silently skipping.
 
+Separately, whenever a stale dollar figure needs correcting — a ticket's
+scope grew or shrank under a human's edit, or `z-plan/tiers.json` was
+recalibrated (as it was 2026-07-20, issue #81) — run:
+
+```bash
+/z-plan --reestimate
+```
+
+This re-runs the Model + Model Effort + Estimate chain (below) for **every**
+ticket in Backlog and Ready, from what is currently in its body, even one
+that already has an Estimate — unlike `--backlog`, which only fields a
+ticket when a field is empty. Needs no spec file. When the recomputed number
+differs from what's on the board: the new number is written and, if a prior
+Estimate was already present, a board comment states the change and why
+(`Estimate $OLD → $NEW: recommended tier changed <old> → <new> ...` when the
+tier itself moved, or `... recalibration (same <tier> tier; ...)` when only
+the bucket/rate numbers did). A ticket whose recomputed number matches what's
+already on the board gets zero writes — same body + same tier always yields
+the same dollars, so a second `--reestimate` over an unchanged board is a
+no-op. A ticket with no prior Estimate gets all three fields written but no
+"changed" comment (there was nothing to compare against). Split parents
+(`## Subtasks (in order)`) are skipped, same as the Backlog scan. It never
+promotes a ticket to Ready and never edits a body — only the Model / Model
+Effort / Estimate fields and, at most, one comment change. Every other
+status (Building, QA, Review, Blocked, Skipped, Done) is left untouched.
+`/z-plan --dry-run --reestimate` previews the run with no board writes and no
+comments (below).
+
 ## What it does
 
 1. **Grounds in the codebase first.** Reads the files the spec touches; every
@@ -171,6 +199,11 @@ offline. This is what the planner eval (`evals/planner/`) runs through local
 needed a change, emitted to stdout as one markdown block. `/z-plan --dry-run
 --ticket <N>` composes the same way, scoped to that one ticket.
 
+`/z-plan --dry-run --reestimate` composes like `--dry-run --backlog`: each
+ticket whose recomputed Estimate would change is emitted to stdout as one
+block (its number, `$OLD → $NEW`, and the why line) — no `z-board` writes, no
+comments.
+
 ## Done when
 
 Every filed ticket passes the lint gate, carries Model/Effort/Estimate via
@@ -184,3 +217,8 @@ a `## Subtasks (in order)` list and both-direction links to its filed
 children, and stays open and un-promoted for a human to close once every
 child lands. A run that plants at least one Estimate this run also ends with
 the cost-saving report above, printed once, after everything else is written.
+`/z-plan --reestimate` re-runs the tier chain over every Backlog and Ready
+ticket, even one that already carries an Estimate; a changed number is
+written and commented (old → new, and why), an unchanged one gets zero
+writes, a split parent is skipped, and it never promotes a ticket or edits
+its body.

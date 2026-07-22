@@ -892,3 +892,119 @@ describe("z-plan/SKILL.md: Step 4 `## Files` section + --check-paths (issue #84 
     expect(zPlan()).toContain('REPO_ROOT="$(pwd -P)"');
   });
 });
+
+// -- Step 12 --reestimate scan (issue #134) ----------------------------------
+// The SKILL is executed by an agent, not this test suite, so these are doc
+// canaries: they pin the exact contract strings in z-plan/SKILL.md that make
+// --reestimate's ACs true, and fail loudly if a future edit silently drops
+// the flag, waters down "re-runs unconditionally even when an Estimate
+// already exists" back to Step 10 item 4's empty-field-only behavior, or
+// drops the old -> new comment contract (CLAUDE.md: weakening a planned AC
+// is never a silent edit).
+describe("z-plan/SKILL.md: --reestimate re-estimates Backlog + Ready (issue #134)", () => {
+  const zPlan = () => readFileSync(join(import.meta.dir, "..", "z-plan", "SKILL.md"), "utf8");
+
+  function section(md: string, heading: string): string {
+    const start = md.indexOf(heading);
+    if (start < 0) return "";
+    const rest = md.slice(start + heading.length);
+    const next = rest.indexOf("\n## ");
+    return next < 0 ? rest : rest.slice(0, next);
+  }
+
+  test("--reestimate is parsed as its own flag alongside --backlog/--ticket/--dry-run", () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toContain("--reestimate) REESTIMATE_ONLY=1");
+    expect(step1).toContain("REESTIMATE_ONLY=\"\"");
+    // The pre-existing flags must survive unweakened alongside the new one.
+    expect(step1).toContain("BACKLOG_ONLY=1");
+    expect(step1).toContain("TICKET_ONLY");
+    expect(step1).toContain("SPECS=()");
+  });
+
+  test('--reestimate bypasses spec resolution with no "No spec file found", and skips Steps 2-9 + Step 10 (AC1)', () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toMatch(/When `--reestimate` is set/);
+    expect(step1).toMatch(/skip straight to the reestimate scan \(Step\s*\n?\s*12\)/);
+    expect(step1).toMatch(/no "No spec file found" failure/);
+    expect(step1).toMatch(/does \*\*not\*\* run Steps\s*\n?\s*2–9/);
+    expect(step1).toMatch(/does \*\*not\*\* run Step 10's Backlog gate/);
+  });
+
+  test("Step 12 exists, after Step 11, before Dry-run/eval mode", () => {
+    const md = zPlan();
+    const step11 = md.indexOf("## Step 11 — Cost-saving");
+    const step12 = md.indexOf("## Step 12 — Reestimate scan");
+    const dryRun = md.indexOf("## Dry-run / eval mode");
+    expect(step11).toBeGreaterThan(-1);
+    expect(step12).toBeGreaterThan(step11);
+    expect(dryRun).toBeGreaterThan(step12);
+  });
+
+  test("Step 12 scans BOTH Backlog and Ready, leaving every other status untouched (AC2)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).not.toBe("");
+    expect(step12).toContain('"$Z_BOARD" list --status Backlog --json --slug "$SLUG"');
+    expect(step12).toContain('"$Z_BOARD" list --status Ready --json --slug "$SLUG"');
+    expect(step12).toMatch(/left\s*\n?\s*untouched/);
+  });
+
+  test("Step 12 skips split parents via the durable `## Subtasks (in order)` heading, same signal as Step 10 item 4 (AC8)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toContain("## Subtasks (in order)");
+    expect(step12).toMatch(/Step 10 item 4's durable signal/);
+    expect(step12).toMatch(/skip it: no estimate, no field-set, no\s*\n?\s*comment/);
+  });
+
+  test("Step 12 re-runs the tier chain unconditionally, even when an Estimate is already present (AC3)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toMatch(/This runs even when the ticket already has an Estimate/);
+    expect(step12).toMatch(
+      /unlike Step 10 item 4, which only re-fields a ticket when a field is\s*\n?\s*empty/
+    );
+  });
+
+  test("equal estimate: zero writes -- idempotent, reproducible re-run (AC6)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toMatch(/\*\*Equal:\*\* write nothing — no field-set, no comment/);
+    expect(step12).toMatch(/is a no-op \(idempotent, reproducible\)/);
+  });
+
+  test("changed estimate with a prior value present: field-set + one comment, old -> new and why (AC4/AC5)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toMatch(/\*\*Different, and a prior Estimate was present:\*\*/);
+    expect(step12).toContain("recommended tier changed");
+    expect(step12).toMatch(/scope grew per the current\s*\n?\s*body\)/);
+    expect(step12).toMatch(/scope shrank per the current\s*\n?\s*body\)/);
+    expect(step12).toMatch(/recalibration \(same <tier>\s*\n?\s*tier;/);
+    expect(step12).toContain(
+      "z-plan/tiers.json buckets or references/rates.json updated"
+    );
+  });
+
+  test("changed estimate with NO prior value: fields all three, posts no comment (AC7)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toMatch(/\*\*Different, but no prior Estimate\*\* \(the field was empty\)/);
+    expect(step12).toMatch(/post \*\*no\*\* "changed" comment/);
+  });
+
+  test("Step 12 never promotes to Ready and never edits a body (AC9)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toMatch(
+      /never\s*\n?\s*moves a ticket to Ready and never edits a body/
+    );
+  });
+
+  test("--dry-run --reestimate emits changes to stdout with no board writes (AC10)", () => {
+    const dryRun = section(zPlan(), "## Dry-run / eval mode");
+    expect(dryRun).toContain("--dry-run --reestimate");
+    expect(dryRun).toMatch(/composes like `--dry-run --backlog`/);
+    expect(dryRun).toMatch(/No board writes, no\s*\n?\s*GitHub writes/);
+  });
+
+  test("Done criteria names --reestimate", () => {
+    const done = section(zPlan(), "## Done criteria");
+    expect(done).toMatch(/`\/z-plan --reestimate`/);
+    expect(done).toMatch(/re-runs Step 6's tier chain over every\s*\n?\s*Backlog and Ready ticket/);
+  });
+});
