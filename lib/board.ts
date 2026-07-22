@@ -36,6 +36,17 @@ const defaultSleep: Sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const SNAPSHOT_EMPTY_RETRIES = 3;
 const SNAPSHOT_RETRY_MS = 500;
 
+// #147: sleeping to resetAt and then proceeding unconditionally trusts the
+// clock -- skew between GitHub and this machine, or any early wake, sends the
+// very next call into a possible hard 403 with no re-check. enforceQuota
+// re-probes after every wake instead. A still-low reading means the wait
+// already proved insufficient, so every retry after the first adds this fixed
+// buffer atop the freshest resetAt rather than re-waking on the exact same
+// skewed edge. ponytail: fixed 3-round cap / 1s buffer, not adaptive -- upgrade
+// path is backing off the buffer if real clock skew ever exceeds it.
+const QUOTA_REPROBE_ROUNDS = 3;
+const QUOTA_REPROBE_BUFFER_MS = 1000;
+
 // One cursor-pagination loop for every connection the pack walks: Board's
 // ProjectItems (below) and SetupBoard's Projects / ProjectFields / FieldUsage
 // (lib/setup-board.ts). Truncation is never cosmetic on any of them -- a
@@ -252,17 +263,14 @@ export class Board {
     return this.exec(query, variables);
   }
 
-  // Probes remaining points and either waits for the window to reset or aborts.
-  // Calls exec() directly (not gql) because the probe IS the guard -- gating it
-  // on itself would recurse. GitHub's rateLimit query costs 0 points, so the
-  // extra probe per call is free. ponytail: probes before every call rather
-  // than piggybacking rateLimit onto each query; upgrade path is inlining it.
-  private async enforceQuota(): Promise<void> {
+  // One probe reading, with the format-drift guard applied every time it is
+  // called (not just on the first probe of a call) -- same discipline as
+  // lib/cost.ts: a missing/renamed rateLimit must fail LOUDLY, never silently
+  // disable the guard. Failing open here means the loop hammers the API
+  // straight into a hard 403 with no pause.
+  private async probeRateLimit(): Promise<QuotaStatus> {
     const data = await this.exec(Q_RATE_LIMIT, {});
     const rl = data.rateLimit;
-    // Format-drift guard (same discipline as lib/cost.ts): a missing/renamed
-    // rateLimit must fail LOUDLY, never silently disable the guard. Failing open
-    // here means the loop hammers the API straight into a hard 403 with no pause.
     if (
       !rl ||
       typeof rl !== "object" ||
@@ -274,24 +282,53 @@ export class Board {
           `GitHub's rateLimit response may have changed -- refusing to run unguarded against the API quota.`
       );
     }
+    return rl as QuotaStatus;
+  }
+
+  // Sleeps until resetAt (+ bufferMs headroom). A malformed resetAt yields NaN;
+  // Math.max(0, NaN) is NaN, and setTimeout(NaN) fires immediately -- a
+  // busy-loop hammering the API instead of pausing. Refuse loudly rather than
+  // sleep(NaN).
+  private async sleepToReset(resetAt: string, bufferMs = 0): Promise<void> {
+    const resetMs = new Date(resetAt).getTime();
+    if (!Number.isFinite(resetMs)) {
+      throw new ZError(
+        `GraphQL rateLimit.resetAt is not a parseable timestamp: ${JSON.stringify(resetAt)}. ` +
+          `Refusing to sleep(NaN), which would busy-hammer the API instead of pausing for the window.`
+      );
+    }
+    await this.sleep(Math.max(0, resetMs - this.now()) + bufferMs);
+  }
+
+  // Probes remaining points and either waits for the window to reset or
+  // aborts. Calls exec() directly via probeRateLimit() (not gql) because the
+  // probe IS the guard -- gating it on itself would recurse. GitHub's
+  // rateLimit query costs 0 points, so the extra probe per call is free.
+  // ponytail: probes before every call rather than piggybacking rateLimit onto
+  // each query; upgrade path is inlining it.
+  private async enforceQuota(): Promise<void> {
+    let rl = await this.probeRateLimit();
     if (rl.remaining >= this.threshold) return;
     if (this.mode === "abort") {
       throw new ZError(
         `GraphQL quota exhausted: ${rl.remaining} < ${this.threshold} remaining. Resets at ${rl.resetAt}.`
       );
     }
-    // A malformed resetAt yields NaN; Math.max(0, NaN) is NaN, and setTimeout(NaN)
-    // fires immediately -- a busy-loop hammering the API instead of pausing. Refuse
-    // loudly rather than sleep(NaN).
-    const resetMs = new Date(rl.resetAt).getTime();
-    if (!Number.isFinite(resetMs)) {
-      throw new ZError(
-        `GraphQL rateLimit.resetAt is not a parseable timestamp: ${JSON.stringify(rl.resetAt)}. ` +
-          `Refusing to sleep(NaN), which would busy-hammer the API instead of pausing for the window.`
-      );
+    // #147: sleeping to resetAt and trusting it unconditionally is the bug --
+    // clock skew or an early wake sends the very next call into a possible
+    // hard 403 with no re-check. Re-probe after every wake and only proceed on
+    // a healthy reading. Bounded rounds, then fail loud naming both readings --
+    // never a tight retry loop hammering the API.
+    for (let round = 0; round < QUOTA_REPROBE_ROUNDS; round++) {
+      await this.sleepToReset(rl.resetAt, round === 0 ? 0 : QUOTA_REPROBE_BUFFER_MS);
+      rl = await this.probeRateLimit();
+      if (rl.remaining >= this.threshold) return;
     }
-    const ms = Math.max(0, resetMs - this.now());
-    await this.sleep(ms);
+    throw new ZError(
+      `GraphQL quota still below threshold after waking and re-probing ${QUOTA_REPROBE_ROUNDS} time(s): ` +
+        `${rl.remaining} < ${this.threshold} remaining. Resets at ${rl.resetAt}. Refusing to keep sleeping -- ` +
+        `clock skew or an early wake means the reset window may not actually be open yet.`
+    );
   }
 
   async quota(): Promise<QuotaStatus> {
