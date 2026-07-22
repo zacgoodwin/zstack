@@ -989,7 +989,32 @@ export function ingestBoardItems(
   // Whether the PRIOR batch drained is judged against ITS OWN allow-list (#131):
   // a leftover non-batch Ready ticket must not make prev look un-drained and so
   // block the next batch's capture (AC4/AC11 use the same batch scoping).
-  const startingFreshBatch = !prev || (drainComplete(prev.tickets, prev.lanes, prev.batchTickets) && readyCount > 0);
+  //
+  // #131 review-bounce (finding 1/2): under a ticket cap the batch-scoped
+  // drainComplete becomes true the instant the FLAGGED tickets finish, while the
+  // deliberately-excluded leftover Ready tickets keep readyCount > 0. Left alone
+  // that combination re-fires startingFreshBatch on the very next per-tick
+  // ingest, which (a) recomputes batchTickets -- and z-loop-tick passes no
+  // --ticket-limit, so selectBatch(.., 0) returns undefined, DROPPING the
+  // allow-list and draining the whole queue in one invocation -- and (b) wipes
+  // mergedThisRun/initialReadyCount/humanNeededNotified mid-run (finding 2). The
+  // capped run must instead drain EXACTLY its batch, then return drain-complete
+  // so the operator re-invokes /z-loop for the next batch. The distinguishing
+  // signal: a NEW capped batch is captured only when --ticket-limit is explicitly
+  // on the ingest (Step 3, the start of an invocation, ALWAYS passes it), never
+  // on a bare per-tick z-loop-tick ingest (which never does). So once a batch is
+  // active (prev.batchTickets defined), a fresh batch starts only on a
+  // --ticket-limit-bearing ingest; without the cap (prev.batchTickets undefined)
+  // this is byte-identical to pre-#131. (A context-clear resume's Step 3 ingest
+  // DOES carry --ticket-limit, but its prev batch is un-drained, so
+  // drainComplete is false and batchTickets is preserved anyway -- AC11.)
+  const priorBatchActive = prev?.batchTickets !== undefined;
+  const ticketLimitProvided = cfg?.ticketLimit !== undefined;
+  const startingFreshBatch =
+    !prev ||
+    (drainComplete(prev.tickets, prev.lanes, prev.batchTickets) &&
+      readyCount > 0 &&
+      (!priorBatchActive || ticketLimitProvided));
 
   return {
     tickets: tickets.sort((a, b) => a.number - b.number),

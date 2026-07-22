@@ -1802,7 +1802,7 @@ describe("selectBatch (#131 ticket cap)", () => {
 });
 
 describe("batch-scoped claiming + drain (#131)", () => {
-  test("AC2: with no cap (batchTickets undefined), the action stream equals a full-allow-list drain byte-for-byte", () => {
+  test("AC2: no cap drains all 5 (== a full allow-list, gating nothing); a PARTIAL allow-list gates the drain to exactly its batch -- the allow-list is load-bearing", () => {
     const mk = () => state([1, 2, 3, 4, 5].map((n) => ticket(n, "Ready")));
     const noCap = drainHappy(mk());
     const fullAllow = mk();
@@ -1810,6 +1810,26 @@ describe("batch-scoped claiming + drain (#131)", () => {
     const withAllow = drainHappy(fullAllow);
     expect(withAllow.log).toEqual(noCap.log); // identical schedule
     expect(noCap.state.tickets.every((t) => t.status === "Done")).toBe(true);
+    // Recorded golden for the no-cap drain: every ticket claimed and completed in
+    // ascending order. (This alone is NOT load-bearing -- reverting #131 keeps it
+    // green -- so the partial-allow-list case below is what actually pins gating.)
+    expect(noCap.log.filter((a) => a.kind === "claim").map((a) => (a as any).ticket)).toEqual([1, 2, 3, 4, 5]);
+    expect(noCap.log.filter((a) => a.kind === "complete").map((a) => (a as any).ticket)).toEqual([1, 2, 3, 4, 5]);
+
+    // LOAD-BEARING: a PARTIAL allow-list over the SAME board drains ONLY #1/#2 and
+    // stops -- #3/#4/#5 are never claimed and end still Ready. Reverting #131 (or
+    // the finding-1 bug that drops the allow-list mid-run) would drain all 5 here,
+    // so this golden fails the moment batch-gating regresses -- unlike the
+    // undefined-vs-full-allow-list compare, which both collapse to the same path.
+    const partial = mk();
+    partial.batchTickets = [1, 2];
+    const capped = drainHappy(partial);
+    expect(capped.log.filter((a) => a.kind === "claim").map((a) => (a as any).ticket)).toEqual([1, 2]);
+    expect(capped.log.filter((a) => a.kind === "complete").map((a) => (a as any).ticket)).toEqual([1, 2]);
+    expect(capped.state.tickets.filter((t) => t.status === "Done").map((t) => t.number)).toEqual([1, 2]);
+    expect(capped.state.tickets.filter((t) => t.status === "Ready").map((t) => t.number)).toEqual([3, 4, 5]);
+    // The capped schedule genuinely differs from the uncapped one.
+    expect(capped.log).not.toEqual(noCap.log);
   });
 
   test("AC1 (nextAction): a claim only ever targets an in-batch ticket", () => {
@@ -1829,6 +1849,66 @@ describe("batch-scoped claiming + drain (#131)", () => {
     expect(drainComplete(s.tickets, s.lanes, s.batchTickets)).toBe(true);
     // Without the batch scope those 8 Ready tickets WOULD keep it alive.
     expect(drainComplete(s.tickets, s.lanes)).toBe(false);
+  });
+
+  // #131 review-bounce finding 1 (SEVERE) + finding 2 (MEDIUM): the real
+  // ingest -> next sequence ACROSS the capped-batch drain boundary (the
+  // z-loop-tick path). Before the fix, the batch-scoped drainComplete turned
+  // true the instant the flagged tickets finished, while the leftover Ready
+  // kept readyCount > 0 -- so the very next per-tick ingest (which passes NO
+  // --ticket-limit) re-fired startingFreshBatch, dropped the allow-list
+  // (selectBatch(.., 0) -> undefined), and `next` returned `claim #3`, draining
+  // the WHOLE remaining queue in one /z-loop invocation. It also wiped
+  // mergedThisRun/initialReadyCount/humanNeededNotified (finding 2). The capped
+  // run must instead drain EXACTLY its batch, then return drain-complete so the
+  // operator re-invokes /z-loop for the next batch. Reverting the fix makes
+  // every assertion below fail (next -> claim #3, batchTickets undefined,
+  // mergedThisRun []).
+  test("finding 1/2 regression: after a capped batch drains, a per-tick re-ingest returns drain-complete (NOT claim of leftover Ready) and preserves batchTickets/mergedThisRun/counters", () => {
+    const nums = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const bodies = Object.fromEntries(nums.map((n) => [String(n), "no deps"]));
+    const readyItems = nums.map((n) => ({ number: n, title: `t${n}`, fields: { Status: "Ready" } }));
+
+    // Step 3 ingest WITH --ticket-limit 2 captures the batch [1,2].
+    let s = ingestBoardItems(null, readyItems, bodies, { ticketLimit: 2, humanNeededPercent: 30 });
+    expect(s.batchTickets).toEqual([1, 2]);
+    const capturedInitialReady = s.initialReadyCount; // 10 (all Ready at capture)
+
+    // Drive the batch to Done through the REAL reducer -- drainHappy claims only
+    // the flagged #1/#2 (batch-scoped), completes them (populating mergedThisRun
+    // via the `complete` reducer), and stops. #3..#10 stay Ready, un-flagged.
+    const drained = drainHappy(s).state;
+    expect(drained.tickets.filter((t) => t.status === "Done").map((t) => t.number)).toEqual([1, 2]);
+    expect(drained.tickets.filter((t) => t.status === "Ready").map((t) => t.number)).toEqual([3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(drained.mergedThisRun).toEqual([1, 2]);
+    expect(drainComplete(drained.tickets, drained.lanes, drained.batchTickets)).toBe(true); // batch-scoped: this IS the boundary prev
+
+    // THE BOUNDARY: the next per-tick ingest (z-loop-tick path -- NO
+    // --ticket-limit), against a fresh board snapshot showing #1/#2 Done and
+    // #3..#10 still Ready.
+    const drainedItems = [
+      { number: 1, title: "t1", fields: { Status: "Done" } },
+      { number: 2, title: "t2", fields: { Status: "Done" } },
+      ...[3, 4, 5, 6, 7, 8, 9, 10].map((n) => ({ number: n, title: `t${n}`, fields: { Status: "Ready" } })),
+    ];
+    const afterBoundary = ingestBoardItems(drained, drainedItems, bodies, { contextTokens: 0 });
+
+    // finding 1: the allow-list survives -- the run does NOT roll into leftover Ready.
+    expect(afterBoundary.batchTickets).toEqual([1, 2]);
+    expect(nextAction(afterBoundary, 0)).toEqual({ kind: "drain-complete" });
+    // finding 2: the per-batch counters survive the boundary (no spurious fresh batch).
+    expect(afterBoundary.mergedThisRun).toEqual([1, 2]);
+    expect(afterBoundary.initialReadyCount).toBe(capturedInitialReady);
+    expect(afterBoundary.humanNeededNotified).toBe(false);
+
+    // And a re-INVOCATION (Step 3 ingest, which DOES pass --ticket-limit) against
+    // that same drained state captures the NEXT batch [3,4] -- the operator's way
+    // to continue -- proving the run exits between batches rather than draining
+    // everything at once.
+    const nextRun = ingestBoardItems(afterBoundary, drainedItems, bodies, { ticketLimit: 2 });
+    expect(nextRun.batchTickets).toEqual([3, 4]);
+    expect(nextRun.mergedThisRun).toEqual([]); // fresh batch resets the counters
+    expect(nextAction(nextRun, 0)).toEqual({ kind: "claim", ticket: 3, stage: "builder" });
   });
 });
 
