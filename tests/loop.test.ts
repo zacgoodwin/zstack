@@ -37,6 +37,7 @@ import {
   claimStage,
   deadDeps,
   mergeOrder,
+  mergeOrderProbe,
   parseDependsOn,
   selectBatch,
   watchdogExpired,
@@ -613,6 +614,23 @@ describe("merge ordering", () => {
     expect(() => mergeOrder([{ ticket: 1, dependsOn: [2] }, { ticket: 2, dependsOn: [1] }])).toThrow(ZError);
   });
 
+  test("mergeOrderProbe never throws: a pure 2-cycle resolves nothing and reports both stuck", () => {
+    expect(mergeOrderProbe([{ ticket: 2, dependsOn: [1] }, { ticket: 1, dependsOn: [2] }])).toEqual({
+      order: [],
+      stuck: [1, 2],
+    });
+  });
+
+  test("mergeOrderProbe resolves an independent ticket before hitting a cycle elsewhere in the set", () => {
+    const result = mergeOrderProbe([
+      { ticket: 2, dependsOn: [1] },
+      { ticket: 1, dependsOn: [2] },
+      { ticket: 30, dependsOn: [] },
+    ]);
+    expect(result.order).toEqual([{ ticket: 30, stackedOn: [] }]);
+    expect(result.stuck).toEqual([1, 2]);
+  });
+
   test("one merge at a time, in dependency order across approved lanes", () => {
     let s = state(
       [ticket(20, "Review"), ticket(21, "Review", [20])],
@@ -631,6 +649,86 @@ describe("merge ordering", () => {
     s = applyAction(s, nextAction(s, 0), 0); // complete #20
     // Now the child advances, carrying its stacked parent for the merge prompt.
     expect(nextAction(s, 0)).toEqual({ kind: "advance", ticket: 21, to: "merge", stackedOn: [20] });
+  });
+});
+
+// -- merge-gate cycle among review-approved lanes (issue #146) ---------------
+// A dependency cycle discovered before merge (unclaimed tickets, no lane yet)
+// already parks gracefully (see "deadlock breaker" above). This is the OTHER
+// throw site: mergeOrder() called unguarded from the merge gate on lanes that
+// already passed review. Two review-approved lanes whose tickets each list
+// the other in `dependsOn` used to throw ZError out of nextAction and exit the
+// whole drain; it must park instead, same as every other unresolvable
+// situation (PROCESS.md's "park with a comment, never a stall").
+
+describe("merge-gate cycle parks instead of throwing (#146)", () => {
+  test("AC1: a 2-lane cycle parks the lowest ticket Blocked, naming both, and never throws", () => {
+    const s = state(
+      [ticket(10, "Review", [11]), ticket(11, "Review", [10])],
+      [
+        lane(10, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+        lane(11, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+      ]
+    );
+    expect(() => nextAction(s, 0)).not.toThrow();
+    const a = nextAction(s, 0);
+    expect(a).toMatchObject({
+      kind: "park",
+      ticket: 10,
+      status: "Blocked",
+      note: expect.stringContaining("Dependency cycle among review-approved lanes: #10, #11"),
+    });
+  });
+
+  test("AC2: a third, non-cycle review-approved lane still merges normally in the same drain", () => {
+    let s = state(
+      [ticket(10, "Review", [11]), ticket(11, "Review", [10]), ticket(30, "Review")],
+      [
+        lane(10, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+        lane(11, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+        lane(30, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+      ]
+    );
+    // The cycle doesn't block the independent lane: #30 merges this very tick.
+    const a = nextAction(s, 0);
+    expect(a).toEqual({ kind: "advance", ticket: 30, to: "merge", stackedOn: [] });
+    s = applyAction(s, a, 0);
+    s = recordOutcome(s, 30, HAPPY.merge, 0);
+    s = applyAction(s, nextAction(s, 0), 0); // complete #30
+    expect(s.tickets.find((t) => t.number === 30)!.status).toBe("Done");
+    // #30 out of the way: only the cycle remains, and it now parks.
+    expect(nextAction(s, 0)).toMatchObject({ kind: "park", ticket: 10, status: "Blocked" });
+  });
+
+  test("continuing the drain eventually parks BOTH cycle members, never merges the survivor", () => {
+    // Regression for the naive fix: once #10 parks Blocked, #11's dependency on
+    // #10 drops OUT of the merge-ready set (already merged, mergeOrder assumes)
+    // -- which would wrongly read #11 as free to merge. The merge gate must
+    // catch #11's now-dead dependency (#10 is terminal, never reaching Done)
+    // the same way step 4 catches a dead-dependency unclaimed ticket, before
+    // ever computing a merge order.
+    let s = state(
+      [ticket(10, "Review", [11]), ticket(11, "Review", [10])],
+      [
+        lane(10, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+        lane(11, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+      ]
+    );
+    const first = nextAction(s, 0);
+    expect(first).toMatchObject({ kind: "park", ticket: 10, status: "Blocked" });
+    s = applyAction(s, first, 0);
+    expect(s.tickets.find((t) => t.number === 10)!.status).toBe("Blocked");
+    // #11 is NOT merged next -- its dependency on the now-Blocked #10 parks it too.
+    const second = nextAction(s, 0);
+    expect(second).toMatchObject({
+      kind: "park",
+      ticket: 11,
+      status: "Blocked",
+      note: expect.stringContaining("#10 (Blocked)"),
+    });
+    s = applyAction(s, second, 0);
+    expect(s.tickets.find((t) => t.number === 11)!.status).toBe("Blocked");
+    expect(nextAction(s, 0)).toEqual({ kind: "drain-complete" });
   });
 });
 

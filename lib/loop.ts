@@ -29,7 +29,7 @@ import {
   claimableTickets,
   deadDeps,
   isWorkableStatus,
-  mergeOrder,
+  mergeOrderProbe,
   parseDependsOn,
   selectBatch,
   watchdogExpired,
@@ -542,9 +542,38 @@ export function nextAction(state: LoopState, nowMs: number): Action {
   const midMerge = lanes.some((l) => l.stage === "merge" && l.outcome?.kind !== "merged");
   const mergeReady = lanes.filter((l) => l.outcome?.kind === "review-approve");
   if (mergeReady.length > 0 && !midMerge) {
-    const order = mergeOrder(
+    // #146: a mergeReady lane whose dependency already died on a PRIOR tick
+    // (e.g. parked Blocked by the cycle park below) can never merge -- its dep
+    // will never reach Done -- so it is caught here the SAME way step 4 below
+    // catches a dead-dependency unclaimed ticket, same wording, BEFORE asking
+    // for a merge order at all. This is what turns a two-lane cycle's park
+    // (which only ever removes one lane per tick) into the whole cycle
+    // eventually parking: the survivor's dependency-turned-Blocked shows up
+    // here on its next tick instead of being read as "already merged" (the
+    // out-of-set assumption mergeOrderProbe below makes for every OTHER dep).
+    const deadMergeReady = mergeReady
+      .map((l) => ({ ticket: l.ticket, dead: deadDeps(byNumber.get(l.ticket)!, byNumber) }))
+      .filter((x) => x.dead.length > 0)
+      .sort((a, b) => a.ticket - b.ticket);
+    if (deadMergeReady.length > 0) {
+      const { ticket, dead } = deadMergeReady[0];
+      const states = dead.map((d) => `#${d} (${byNumber.get(d)!.status})`).join(", ");
+      return { kind: "park", ticket, status: "Blocked", note: `Blocked by dependencies that cannot complete in this batch: ${states}.` };
+    }
+    const { order, stuck } = mergeOrderProbe(
       mergeReady.map((l) => ({ ticket: l.ticket, dependsOn: byNumber.get(l.ticket)?.dependsOn ?? [] }))
     );
+    if (order.length === 0) {
+      // A genuine dependency cycle among review-approved lanes (a planning
+      // bug -- z-plan links deps both ways, but a bug can still produce one;
+      // see PROCESS.md's park-with-a-comment-never-a-stall rule). Nothing in
+      // the mergeReady set can resolve at all: park the lowest-numbered
+      // member (same "break with the lowest" convention as step 6's deadlock
+      // park below) naming every stuck ticket, not just its own dep, so the
+      // note reads as the cause. Any lane the cycle doesn't reach resolved
+      // into `order` above instead and merges normally this same tick.
+      return { kind: "park", ticket: stuck[0], status: "Blocked", note: `Dependency cycle among review-approved lanes: #${stuck.join(", #")}. Parking to keep the rest of the drain moving.` };
+    }
     // A stacked parent is one merging concurrently OR already merged this run
     // (its branch survives until batch-end cleanup, so the child's PR still
     // needs the step-18 retarget).

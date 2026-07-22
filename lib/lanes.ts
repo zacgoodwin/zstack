@@ -149,26 +149,49 @@ export interface MergeStep {
   stackedOn: number[];
 }
 
-// Topological merge order over a set of finished lanes. Deps outside the set
-// are ignored (already merged). Kahn's algorithm picking the lowest ready
-// ticket each round, so the order is total and deterministic. A cycle inside
-// the set is a planning bug and throws rather than merging anything.
-export function mergeOrder(finished: MergeInput[]): MergeStep[] {
+// Result of the non-throwing Kahn walk below: `order` is however much of the
+// topological order it managed to compute before it could make no further
+// progress, `stuck` is what's left (empty when the whole set resolved).
+export interface MergeOrderResult {
+  order: MergeStep[];
+  stuck: number[];
+}
+
+// Same Kahn walk as mergeOrder (lowest-ready-ticket-first, deps outside the
+// set ignored), but never throws: a cycle just stops the walk early and
+// reports the leftover tickets instead of blowing up the whole computation.
+// mergeOrder() below is a thin wrapper that throws on a non-empty `stuck`,
+// kept for existing direct callers; the merge gate in nextAction (#146) calls
+// this directly so a cycle among review-approved lanes parks those tickets
+// instead of throwing out of nextAction and killing the whole drain -- any
+// OTHER lane the cycle doesn't reach still resolves into `order` and merges
+// normally in the same tick.
+export function mergeOrderProbe(finished: MergeInput[]): MergeOrderResult {
   const inSet = new Set(finished.map((f) => f.ticket));
   const deps = new Map(finished.map((f) => [f.ticket, f.dependsOn.filter((d) => inSet.has(d))]));
   const merged = new Set<number>();
-  const steps: MergeStep[] = [];
-  while (steps.length < finished.length) {
+  const order: MergeStep[] = [];
+  while (order.length < finished.length) {
     const ready = [...deps]
       .filter(([t, d]) => !merged.has(t) && d.every((x) => merged.has(x)))
       .map(([t]) => t)
       .sort((a, b) => a - b);
     if (ready.length === 0) {
-      const stuck = [...deps.keys()].filter((t) => !merged.has(t));
-      throw new ZError(`Dependency cycle among finished lanes: #${stuck.join(", #")}.`);
+      const stuck = [...deps.keys()].filter((t) => !merged.has(t)).sort((a, b) => a - b);
+      return { order, stuck };
     }
     merged.add(ready[0]);
-    steps.push({ ticket: ready[0], stackedOn: deps.get(ready[0])! });
+    order.push({ ticket: ready[0], stackedOn: deps.get(ready[0])! });
   }
-  return steps;
+  return { order, stuck: [] };
+}
+
+// Topological merge order over a set of finished lanes. Deps outside the set
+// are ignored (already merged). Kahn's algorithm picking the lowest ready
+// ticket each round, so the order is total and deterministic. A cycle inside
+// the set is a planning bug and throws rather than merging anything.
+export function mergeOrder(finished: MergeInput[]): MergeStep[] {
+  const { order, stuck } = mergeOrderProbe(finished);
+  if (stuck.length > 0) throw new ZError(`Dependency cycle among finished lanes: #${stuck.join(", #")}.`);
+  return order;
 }

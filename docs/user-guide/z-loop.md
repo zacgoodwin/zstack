@@ -72,7 +72,12 @@ records the result. It never re-derives a scheduling decision in prose.
 - **Dependency-ordered, capped concurrency.** A dependent is not claimable until
   its dependencies are Done; at most `maxLanes` (default 3) lanes run at once;
   merges happen one at a time in topological order (stacked chains retarget the
-  base and delete branches only at batch end).
+  base and delete branches only at batch end). A dependency cycle among
+  review-approved lanes — a planning bug, since z-plan links deps both ways,
+  but a bug can still produce one — can't be ordered at all: it parks the
+  stuck tickets Blocked with a note naming the cycle instead of throwing and
+  killing the whole drain; any other lane the cycle doesn't reach still merges
+  normally in the same run.
 - **Optional tick throttle.** `bin/z-loop-tick` sleeps out the remainder of
   the `tickThrottleSeconds` config knob (default `0`, off) before starting its
   next snapshot+ingest+`next` cycle, once the knob is set above its default.
