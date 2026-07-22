@@ -831,3 +831,115 @@ describe("sumByStage", () => {
     expect(stages.find((s) => s.stage === "manual")).toBeUndefined();
   });
 });
+
+// -- cross-stage duplicate guard (ticket #152) --------------------------------
+//
+// sumByStage's attribution trusts each by_file entry's filename to say which
+// stage spent the money -- entirely dependent on the orchestrator copying the
+// RIGHT transcript to <stage>-<attempt>.jsonl (z-loop SKILL Step 4), with no
+// deterministic check before this ticket. A requestId (or message.id)
+// duplicated across two files bucketed under DIFFERENT stages is exactly the
+// mis-copy signature: before this guard, costOfFiles silently kept its
+// existing first-seen attribution. This only runs in --by-file mode (the only
+// mode stage attribution is even computed in) -- plain `z-cost <glob>` and
+// same-stage duplicates (two attempts of one stage) are both unaffected.
+describe("cross-stage duplicate guard (ticket #152)", () => {
+  const usage = (input: number, output: number) => ({
+    input_tokens: input,
+    output_tokens: output,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+  });
+  const line = (requestId: string, model = "claude-sonnet-4-5", input = 100, output = 100) =>
+    JSON.stringify({ type: "assistant", requestId, message: { model, usage: usage(input, output) } });
+
+  test("AC1: a requestId duplicated across two DIFFERENT stage buckets fails loud, naming the requestId and both files", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-xstage-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "builder-1.jsonl"), line("req_DUP") + "\n");
+    writeFileSync(join(dir, "qa-1.jsonl"), line("req_DUP") + "\n");
+
+    const files = expandGlob("*.jsonl", dir); // sorted: builder-1.jsonl, qa-1.jsonl
+    expect(() => costOfFiles(files, RATES, { byFile: true })).toThrow(ZError);
+    try {
+      costOfFiles(files, RATES, { byFile: true });
+      throw new Error("expected costOfFiles to throw ZError");
+    } catch (e) {
+      const msg = (e as Error).message;
+      expect(msg).toContain("req_DUP");
+      expect(msg).toContain("builder-1.jsonl");
+      expect(msg).toContain("qa-1.jsonl");
+      expect(msg).toContain("builder");
+      expect(msg).toContain("qa");
+    }
+  });
+
+  test("AC2: clean per-stage transcripts (distinct requestIds) -- no throw, by_file/sumByStage output unaffected", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-xstage-clean-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "builder-1.jsonl"), line("req_A") + "\n");
+    writeFileSync(join(dir, "qa-1.jsonl"), line("req_B") + "\n");
+
+    const files = expandGlob("*.jsonl", dir);
+    const result = costOfFiles(files, RATES, { byFile: true });
+    expect(result.by_file).toHaveLength(2);
+    const stages = sumByStage(result.by_file!);
+    expect(stages.find((s) => s.stage === "builder")!.dollars).toBeCloseTo(result.by_file!.find((f) => f.file.endsWith("builder-1.jsonl"))!.dollars);
+    expect(stages.find((s) => s.stage === "qa")).toBeDefined();
+  });
+
+  test("same-stage duplicate (attempt 1 vs attempt 2) is NOT flagged -- lands in one spend-by-stage row either way", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-xstage-samestage-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "builder-1.jsonl"), line("req_DUP") + "\n");
+    writeFileSync(join(dir, "builder-2.jsonl"), line("req_DUP") + "\n");
+
+    const files = expandGlob("*.jsonl", dir);
+    expect(() => costOfFiles(files, RATES, { byFile: true })).not.toThrow();
+  });
+
+  test("without --by-file, a cross-stage-duplicate-shaped input does not throw -- global dedup/total still unaffected", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-xstage-nobyfile-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "builder-1.jsonl"), line("req_DUP") + "\n");
+    writeFileSync(join(dir, "qa-1.jsonl"), line("req_DUP") + "\n");
+
+    const files = expandGlob("*.jsonl", dir);
+    expect(() => costOfFiles(files, RATES)).not.toThrow();
+    expect(costOfFiles(files, RATES).requests).toBe(1); // still deduped globally, unaffected total
+  });
+
+  test("also catches a cross-stage duplicate identified only by message.id (no requestId on the line)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-xstage-msgid-"));
+    tmpPaths.push(dir);
+    const blockLine = (msgId: string) =>
+      JSON.stringify({ type: "assistant", message: { id: msgId, model: "claude-sonnet-4-5", usage: usage(100, 100) } });
+    writeFileSync(join(dir, "builder-1.jsonl"), blockLine("msg_DUP") + "\n");
+    writeFileSync(join(dir, "reviewer-1.jsonl"), blockLine("msg_DUP") + "\n");
+
+    const files = expandGlob("*.jsonl", dir);
+    expect(() => costOfFiles(files, RATES, { byFile: true })).toThrow(ZError);
+    expect(() => costOfFiles(files, RATES, { byFile: true })).toThrow(/msg_DUP/);
+  });
+
+  test("main() surfaces the guard as a CLI failure (nonzero exit, error printed) instead of silently succeeding", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "zcost-xstage-cli-"));
+    tmpPaths.push(dir);
+    writeFileSync(join(dir, "builder-1.jsonl"), line("req_DUP") + "\n");
+    writeFileSync(join(dir, "merge-1.jsonl"), line("req_DUP") + "\n");
+    const ratesFile = tmpFile(JSON.stringify(RATES), "rates.json");
+    const pattern = join(dir, "*.jsonl").replaceAll("\\", "/");
+
+    const logs: string[] = [];
+    const origError = console.error;
+    console.error = (...a: unknown[]) => void logs.push(a.join(" "));
+    let code: number;
+    try {
+      code = await main(["--by-file", pattern, "--rates", ratesFile]);
+    } finally {
+      console.error = origError;
+    }
+    expect(code).not.toBe(0);
+    expect(logs.join("\n")).toContain("req_DUP");
+  });
+});
