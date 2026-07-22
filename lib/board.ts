@@ -117,7 +117,7 @@ const Q_PROJECT_ITEMS = `query ProjectItems($project: ID!, $cursor: String) {
       items(first: 100, after: $cursor) {
         pageInfo { hasNextPage endCursor }
         nodes {
-          content { ... on Issue { number title url body labels(first: 20) { pageInfo { hasNextPage } nodes { name } } } }
+          content { ... on Issue { number title url body milestone { title } labels(first: 20) { pageInfo { hasNextPage } nodes { name } } } }
           fieldValues(first: 20) {
             pageInfo { hasNextPage }
             nodes {
@@ -229,6 +229,12 @@ export interface BoardItem {
   // `gh issue view`. toItem always sets this (empty array when the issue has no
   // labels); optional only so hand-built BoardItem fixtures elsewhere compile.
   labels?: string[];
+  // Milestone title (#154), riding the same single ProjectItems pass -- never a
+  // per-issue lookup. toItem sets this to undefined (never null) when the issue
+  // is not on a milestone, so status-report's "(no milestone)" bucket has one
+  // falsy value to check, not two. Optional only so hand-built BoardItem
+  // fixtures elsewhere compile.
+  milestone?: string;
 }
 
 export interface CreatedIssue {
@@ -728,7 +734,11 @@ function toItem(node: any): BoardItem | null {
     if (v !== null) fields[name] = v;
   }
   const labels = (content.labels?.nodes ?? []).map((l: any) => l?.name).filter((n: any): n is string => !!n);
-  return { number: content.number, title: content.title, url: content.url, fields, labels };
+  // content.milestone is null (not absent) when the issue has no milestone --
+  // optional chaining collapses that to undefined so callers get one falsy
+  // value, never null vs undefined to juggle.
+  const milestone = content.milestone?.title;
+  return { number: content.number, title: content.title, url: content.url, fields, labels, milestone };
 }
 
 // Reads a scalar out of a ProjectV2ItemFieldValue union member.

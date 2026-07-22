@@ -3,8 +3,8 @@ name: z-status
 description: |
   Read-only board dashboard showing the current state between loop runs.
   Renders ticket counts per status, questions/blocked tickets waiting on
-  humans, in-flight lane activity with age, last loop result, and milestone
-  cost totals (Estimate vs Actual). No mutations; pure render of the board state.
+  humans, in-flight lane activity with age, last loop result, and Estimate vs
+  Actual cost totals grouped by milestone. No mutations; pure render of the board state.
 ---
 
 # /z-status — Read-only Board Dashboard
@@ -20,7 +20,8 @@ One-screen view of the board at any moment between loop runs. Shows:
   current stage, time elapsed since last activity).
 - **Last loop summary** (path to the report file + its verdict line) so you know
   what the prior run decided.
-- **Milestone totals** (Estimate vs Actual spend) for cost calibration.
+- **Milestone Totals** (Estimate vs Actual spend), one subtotal per milestone
+  plus a `(no milestone)` row and a `Board total` row, for cost calibration.
 
 **Read-only.** Zero mutations: the dashboard observes the board, locks dir, and
 prior reports. The /z-loop skill mutation gates ensure nothing in this code path
@@ -98,13 +99,24 @@ RED (regressions found, no deploy).
 
 ### Milestone Totals
 
-Sum of the **Estimate** and **Actual** fields across all tickets on the board.
+The **Estimate** and **Actual** fields, summed per milestone (the epic style is
+one milestone per epic, per `/z-setup`) rather than across the whole board:
+
+- One subtotal row per milestone that has at least one ticket on the board.
+- A `(no milestone)` row for tickets not on any milestone -- always rendered,
+  even at $0.00, so an unmilestoned ticket is never silently folded into a
+  milestone it isn't in, or dropped from the total.
+- A `Board total` row: the sum across every ticket, milestoned or not -- the
+  same whole-board figure this section showed before grouping existed.
+
 - **Estimate**: original cost estimate (set at planning time).
 - **Actual**: real cost observed (set by the loop, usually via `/z-cost` gate
   tests or manually).
 
-Use this to calibrate your estimates: if Actual routinely exceeds Estimate,
-your planning is undercharging (see docs/user-guide/spec/ESTIMATION.md).
+Use the `Board total` row to calibrate your estimates: if Actual routinely
+exceeds Estimate, your planning is undercharging (see
+docs/user-guide/spec/ESTIMATION.md). Use the per-milestone rows to see which
+epic is driving that gap.
 
 ## Done criteria
 
@@ -114,6 +126,7 @@ The dashboard is live when:
 - It lists Questions and Blocked tickets by number + title.
 - It shows in-flight lanes with age (from lock timestamps).
 - It displays the last loop's verdict line (if a prior loop exists).
-- It sums Estimate and Actual totals correctly.
+- It sums Estimate and Actual totals correctly, grouped by milestone, with a
+  `(no milestone)` row and a `Board total` row.
 - Zero mutations: the grep gate test confirms no z-board mutating commands
   (move/field-set/create/comment/claim/release) appear in the code.

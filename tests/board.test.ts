@@ -365,12 +365,19 @@ describe("single-page ceiling guards", () => {
 
 // -- ticket #57: one-call drain snapshot (items + bodies) --------------------
 describe("snapshot", () => {
-  const nodeWithBody = (n: number, status: string, body: string | null, labels: string[] = []) => ({
+  const nodeWithBody = (
+    n: number,
+    status: string,
+    body: string | null,
+    labels: string[] = [],
+    milestone: string | null = null
+  ) => ({
     content: {
       number: n,
       title: `T${n}`,
       url: `http://x/${n}`,
       body,
+      milestone: milestone ? { title: milestone } : null,
       labels: { pageInfo: { hasNextPage: false }, nodes: labels.map((name) => ({ name })) },
     },
     fieldValues: {
@@ -479,6 +486,25 @@ describe("snapshot", () => {
     expect(snap.items.map((i) => i.number)).toEqual([4]); // the retry's items, not the empty first read
     expect(snap.bodies).toEqual({ "4": "b4" });
     expect(reads).toBe(2); // retried exactly once past the empty read
+  });
+
+  // -- #154: milestone title rides the same single ProjectItems pass ----------
+  test("carries the milestone title from content.milestone onto BoardItem.milestone (#154)", async () => {
+    const board = new Board(
+      CFG,
+      makeExecutor({ overrides: { ProjectItems: boardPage([nodeWithBody(11, "Building", "b", [], "Epic Alpha")]) } })
+    );
+    const snap = await board.snapshot();
+    expect(snap.items[0].milestone).toBe("Epic Alpha");
+
+    // content.milestone is null (not absent) when unmilestoned -- toItem must
+    // collapse that to undefined, never leave a null on BoardItem, so callers
+    // (status-report's grouping) check one falsy value, not two.
+    const bare = new Board(
+      CFG,
+      makeExecutor({ overrides: { ProjectItems: boardPage([nodeWithBody(12, "Building", "b")]) } })
+    );
+    expect((await bare.snapshot()).items[0].milestone).toBeUndefined();
   });
 
   test("a genuinely empty board still returns [] once the bounded retries exhaust", async () => {

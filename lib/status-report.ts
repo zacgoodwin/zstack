@@ -19,7 +19,8 @@ export interface StatusReportInput {
 // Pure markdown render of the board status at this moment: ticket counts per
 // all nine statuses, Questions and Blocked tickets listed, in-flight lanes with
 // their age, last loop report summary (path + verdict line), and Estimate vs
-// Actual totals for the milestone. No mutations, deterministic.
+// Actual totals grouped by milestone (the epic style is one milestone per
+// epic, per /z-setup), plus a Board total. No mutations, deterministic.
 export function buildStatusReport(input: StatusReportInput): string {
   const { laneLocks, lastReport, nowMs } = input;
 
@@ -57,15 +58,48 @@ export function buildStatusReport(input: StatusReportInput): string {
     return `- Ticket #${lock.ticket} (${lock.stage}): ${ageStr}`;
   });
 
-  // Estimate vs Actual totals: sum the Estimate and Actual fields across all items
-  let totalEstimate = 0;
-  let totalActual = 0;
+  // Estimate vs Actual totals, grouped by milestone (#154): the heading used to
+  // sum the whole board while claiming to be per-milestone -- a lie on any
+  // multi-milestone board, where the number then reads as one epic's spend
+  // when it is every epic's. Buckets in first-seen order. Unmilestoned items
+  // land in an ALWAYS-rendered "(no milestone)" bucket -- never silently
+  // folded into a milestone they aren't in, and never silently dropped from
+  // the total either. Board total is the same whole-board sum this section
+  // rendered before grouping existed, so single-milestone boards see numbers
+  // unchanged, just labeled honestly.
+  const NO_MILESTONE = "(no milestone)";
+  const milestoneOrder: string[] = [];
+  const milestoneTotals = new Map<string, { estimate: number; actual: number }>();
+  const noMilestoneTotal = { estimate: 0, actual: 0 };
   for (const item of boardItems) {
     const est = item.fields["Estimate"];
     const act = item.fields["Actual"];
-    if (typeof est === "number") totalEstimate += est;
-    if (typeof act === "number") totalActual += act;
+    const estNum = typeof est === "number" ? est : 0;
+    const actNum = typeof act === "number" ? act : 0;
+    let bucket = noMilestoneTotal;
+    if (item.milestone) {
+      if (!milestoneTotals.has(item.milestone)) {
+        milestoneOrder.push(item.milestone);
+        milestoneTotals.set(item.milestone, { estimate: 0, actual: 0 });
+      }
+      bucket = milestoneTotals.get(item.milestone)!;
+    }
+    bucket.estimate += estNum;
+    bucket.actual += actNum;
   }
+  let totalEstimate = noMilestoneTotal.estimate;
+  let totalActual = noMilestoneTotal.actual;
+  for (const b of milestoneTotals.values()) {
+    totalEstimate += b.estimate;
+    totalActual += b.actual;
+  }
+  const milestoneBlock = (name: string, b: { estimate: number; actual: number }): string =>
+    `### ${name}\n- Estimate: $${b.estimate.toFixed(2)}\n- Actual: $${b.actual.toFixed(2)}`;
+  const milestoneSection = [
+    ...milestoneOrder.map((name) => milestoneBlock(name, milestoneTotals.get(name)!)),
+    milestoneBlock(NO_MILESTONE, noMilestoneTotal),
+    milestoneBlock("Board total", { estimate: totalEstimate, actual: totalActual }),
+  ].join("\n\n");
 
   // Last loop report summary: read the file and extract the verdict line.
   // Only a MISSING file means "no prior loops" (fresh board); any other read
@@ -131,8 +165,7 @@ ${reportSection}
 
 ## Milestone Totals
 
-- Estimate: $${totalEstimate.toFixed(2)}
-- Actual: $${totalActual.toFixed(2)}
+${milestoneSection}
 `;
 }
 

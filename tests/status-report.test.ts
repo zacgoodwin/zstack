@@ -28,12 +28,26 @@ afterEach(() => {
 
 // Hand-built board: 1 Done, 1 Questions, 1 Blocked, 2 Building, rest empty.
 // Estimate sum = 1.50 + 3.00 + 2.00 = 6.50; Actual sum = 2.25 + 0.75 = 3.00.
+// None of these carry a milestone, so they all land in the "(no milestone)"
+// bucket -- this fixture doubles as the no-milestone-bucket gate test.
 const ITEMS: BoardItem[] = [
   { number: 1, title: "Ship the estimator", url: "u1", fields: { Status: "Done", Estimate: 1.5, Actual: 2.25 } },
   { number: 2, title: "Ambiguous schema question", url: "u2", fields: { Status: "Questions", Estimate: 3 } },
   { number: 3, title: "Stuck on CI runner", url: "u3", fields: { Status: "Blocked", Actual: 0.75 } },
   { number: 4, title: "Building now", url: "u4", fields: { Status: "Building", Estimate: 2 } },
   { number: 5, title: "Also building", url: "u5", fields: { Status: "Building" } },
+];
+
+// #154: two milestones plus one unmilestoned ticket, for the grouping AC.
+// Milestone Alpha: Estimate 5+3=8.00, Actual 4+0=4.00.
+// Milestone Beta: Estimate 0.00, Actual 2.00.
+// (no milestone): Estimate 1.00, Actual 1.00.
+// Board total: Estimate 9.00, Actual 7.00.
+const MILESTONE_ITEMS: BoardItem[] = [
+  { number: 101, title: "Alpha A", url: "ma1", fields: { Status: "Done", Estimate: 5, Actual: 4 }, milestone: "Milestone Alpha" },
+  { number: 102, title: "Alpha B", url: "ma2", fields: { Status: "Building", Estimate: 3 }, milestone: "Milestone Alpha" },
+  { number: 103, title: "Beta A", url: "mb1", fields: { Status: "Done", Actual: 2 }, milestone: "Milestone Beta" },
+  { number: 104, title: "Unmilestoned", url: "mu1", fields: { Status: "Ready", Estimate: 1, Actual: 1 } },
 ];
 
 describe("buildStatusReport (item 15): renderer is the single source of numbers", () => {
@@ -96,6 +110,53 @@ describe("buildStatusReport (item 15): renderer is the single source of numbers"
   test("no duplicates: no warning line", () => {
     const report = buildStatusReport({ boardItems: ITEMS, laneLocks: [], lastReport: null, nowMs: 0 });
     expect(report).not.toMatch(/duplicate/i);
+  });
+
+  // -- #154: Milestone Totals grouped by milestone, not summed over the whole board --
+  describe("Milestone Totals grouping (#154)", () => {
+    test("AC1: two milestones plus one unmilestoned ticket produce two subtotal rows, a (no milestone) row, and a Board total equal to the whole-board sum", () => {
+      const report = buildStatusReport({ boardItems: MILESTONE_ITEMS, laneLocks: [], lastReport: null, nowMs: 0 });
+
+      expect(report).toContain("### Milestone Alpha\n- Estimate: $8.00\n- Actual: $4.00");
+      expect(report).toContain("### Milestone Beta\n- Estimate: $0.00\n- Actual: $2.00");
+      expect(report).toContain("### (no milestone)\n- Estimate: $1.00\n- Actual: $1.00");
+      expect(report).toContain("### Board total\n- Estimate: $9.00\n- Actual: $7.00");
+
+      // Milestone rows (first-seen order) precede (no milestone), which precedes the grand total.
+      const alphaIdx = report.indexOf("### Milestone Alpha");
+      const betaIdx = report.indexOf("### Milestone Beta");
+      const noMsIdx = report.indexOf("### (no milestone)");
+      const totalIdx = report.indexOf("### Board total");
+      expect(alphaIdx).toBeGreaterThan(-1);
+      expect(betaIdx).toBeGreaterThan(alphaIdx);
+      expect(noMsIdx).toBeGreaterThan(betaIdx);
+      expect(totalIdx).toBeGreaterThan(noMsIdx);
+    });
+
+    test("AC2: a single-milestone board's totals are unchanged from the old whole-board sum, now labeled per milestone, with an empty (no milestone) row still rendered", () => {
+      const singleMilestoneItems = ITEMS.map((item) => ({ ...item, milestone: "Solo Epic" }));
+      const report = buildStatusReport({ boardItems: singleMilestoneItems, laneLocks: [], lastReport: null, nowMs: 0 });
+
+      // Same numbers as the un-grouped whole-board sum documented on ITEMS above.
+      expect(report).toContain("### Solo Epic\n- Estimate: $6.50\n- Actual: $3.00");
+      expect(report).toContain("### Board total\n- Estimate: $6.50\n- Actual: $3.00");
+      // The unmilestoned bucket has zero items but is never silently omitted --
+      // a guard that swallows an (empty) group is worse than no guard.
+      expect(report).toContain("### (no milestone)\n- Estimate: $0.00\n- Actual: $0.00");
+    });
+
+    test("no-milestone bucket: boardItems with no milestone at all render zero milestone subtotal rows, just (no milestone) and Board total", () => {
+      const report = buildStatusReport({ boardItems: ITEMS, laneLocks: [], lastReport: null, nowMs: 0 });
+      expect(report).toContain("### (no milestone)\n- Estimate: $6.50\n- Actual: $3.00");
+      expect(report).toContain("### Board total\n- Estimate: $6.50\n- Actual: $3.00");
+
+      // No milestone-named row ever appears when nothing on the board is milestoned
+      // (### Questions / ### Blocked belong to the unrelated Waiting on Human section).
+      const headings = [...report.matchAll(/^### (.+)$/gm)]
+        .map((m) => m[1])
+        .filter((h) => h !== "Questions" && h !== "Blocked");
+      expect(headings).toEqual(["(no milestone)", "Board total"]);
+    });
   });
 
   // -- F13: only a MISSING last-report reads as "no prior loops" --------------
