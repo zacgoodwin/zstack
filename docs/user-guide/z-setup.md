@@ -126,6 +126,20 @@ change them.
   going sideways and a human is paged once, through the same notify transport
   as the other loop events (issue #63/#60). See
   [z-loop.md → Human-needed safety control](z-loop.md#human-needed-safety-control).
+- `ticketLimit` (default 0 = no cap, issue #131) — the maximum number of
+  tickets a single `/z-loop` run works. Non-zero caps the run to a
+  dependency-self-contained batch of at most that many tickets (the lowest
+  issue numbers whose dependencies close within the cap); the rest stay Ready
+  for a future run. Must be a non-negative integer — a fraction or negative is
+  a loud config error. See
+  [z-loop.md → Ticket and context limits](z-loop.md#ticket-and-context-limits).
+- `contextTokenLimit` (default 550000, 0 disables, issue #131) — the
+  orchestrator context-window occupancy (measured live each tick from its
+  session transcript) at/above which the loop stops claiming new tickets and,
+  once every lane is idle with batch work remaining, pauses with a
+  `context-clear` so the operator can clear context and re-invoke to resume the
+  same batch. Must be a non-negative integer. See
+  [z-loop.md → Ticket and context limits](z-loop.md#ticket-and-context-limits).
 - `quota.threshold` (default 100) — the GitHub GraphQL rate-limit guard trips
   when remaining points fall below this before any board call.
 - `quota.mode` (default `"sleep"`) — `"sleep"` waits until the rate-limit window

@@ -110,6 +110,65 @@ The reviewer still runs: `skip-qa` skips QA, never the last correctness gate.
 Every ticket without the label runs the full builder → QA → reviewer → merge
 pipeline, and the QA bounce/investigate machinery is unchanged.
 
+## Ticket and context limits
+
+Two knobs cap a single `/z-loop` run so a large Ready queue or a long drain
+never runs away with itself. Both are hand-edited in
+`~/.zstack/projects/<slug>/config.json` (see
+[z-setup.md → Config knobs](z-setup.md#config-knobs-hand-edit-configjson-after-setup))
+and both default to today's behavior.
+
+### `ticketLimit` — a per-loop ticket cap
+
+`ticketLimit` (default `0` = no cap) caps how many tickets one run works. At the
+default, every gated Ready ticket is workable, exactly as before. Set it to `3`
+and the run flags **the batch**: a dependency-self-contained allow-list of at
+most three tickets, captured once at Step 3's ingest and held on
+`state.batchTickets`. The remaining Ready tickets stay Ready and are simply
+picked up by a future run — they are never claimed, never counted against this
+run's drain, and never mis-parked as blocked.
+
+The batch is chosen by a Kahn walk in ascending issue number: a ticket is
+flagged only when every dependency is already Done or already flagged, so a
+flagged ticket never depends on an un-flagged one. A dependent whose dependency
+doesn't fit under the cap just waits — it stays Ready (a Ready dependency is not
+terminal), so the dead-dependency park never touches it. The allow-list
+persists verbatim across every re-ingest and across a context clear, so the run
+always finishes the exact batch it started.
+
+### `contextTokenLimit` — a context ceiling with clear-and-resume
+
+The orchestrator is one long-lived session that holds no ticket context by
+design, but its own window still fills across a long drain (per-tick ticks,
+stage final messages, completion notes). `contextTokenLimit` (default `550000`,
+`0` disables) pauses the run before the harness auto-compacts.
+
+Every tick, `bin/z-loop-tick` measures the orchestrator's **current** window
+occupancy deterministically — the input side (input + cache-read +
+cache-creation tokens) of its session transcript's most recent request, via
+`lib/context-budget.ts`. This is *not* cumulative billed spend (that is
+`z-cost`); it is how full the window is right now, the only thing a context
+clear actually changes. The reading is **fail-open**: an unresolvable or
+unreadable transcript reads `0`, so a measurement hiccup degrades to no gating
+and never wedges a drain.
+
+When the reading reaches the limit, the scheduler stops **claiming** new
+tickets — no new ticket enters Building — while in-flight lanes keep draining
+normally to their terminal state. Once every lane is idle with batch work still
+remaining, `next` returns a `context-clear` action instead of waiting forever:
+the loop releases its lock, keeps every worktree, branch, and the un-drained
+`state.json`, and exits **without** running the end-of-loop stage (the batch
+isn't done, so nothing deploys). The operator or harness then clears the
+session's context and re-invokes `/z-loop`. The fresh orchestrator reads a small
+context on its first tick, so claiming resumes immediately — on the *same*
+batch, because the built tickets have left Ready and `batchTickets` persisted in
+`state.json`. If the batch happens to finish exactly at the ceiling, normal
+`drain-complete` wins; `context-clear` fires only when work genuinely remains.
+
+The two knobs are independent: the ticket cap bounds *which* tickets a run
+touches, the context ceiling bounds *when within* a run the orchestrator pauses
+to clear.
+
 ## End of loop
 
 After the batch drains, the end-of-loop stage runs a regression on merged main

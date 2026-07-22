@@ -132,18 +132,30 @@ describe("z-loop-tick", () => {
 
     // The state file z-loop-tick wrote equals what the manual sequence produces:
     // the only step that writes state is `ingest`, so run it directly on the same
-    // fixture and compare byte-for-byte.
+    // fixture and compare byte-for-byte. #131: the wrapper now threads a live
+    // context reading as `--context-tokens N`; under the temp $HOME there is no
+    // ~/.claude/projects, so context-budget resolves nothing and reads 0
+    // (fail-open) -- the manual ingest passes the same `--context-tokens 0` so
+    // both states carry contextTokens:0 and the default contextTokenLimit.
     const items = join(dir, "items.json");
     const bodies = join(dir, "bodies.json");
     const expectedState = join(dir, "expected-state.json");
     writeFileSync(items, ITEMS);
     writeFileSync(bodies, BODIES);
     const ing = Bun.spawnSync(
-      ["bun", join(REPO_ROOT, "lib", "loop.ts"), "ingest", expectedState, items, bodies],
+      ["bun", join(REPO_ROOT, "lib", "loop.ts"), "ingest", expectedState, items, bodies, "--context-tokens", "0"],
       { stdout: "pipe", stderr: "pipe" }
     );
     expect(ing.exitCode).toBe(0);
     expect(readFileSync(tickState, "utf8")).toBe(readFileSync(expectedState, "utf8"));
+
+    // #131: this is the FAIL-OPEN branch -- under the temp $HOME there is no
+    // ~/.claude/projects transcript, so context-budget resolves nothing and reads
+    // 0. (The NONZERO, load-bearing reading -- proof the wrapper actually threads
+    // the value -- is the sibling test below, which plants a real transcript.)
+    const tickWritten = JSON.parse(readFileSync(tickState, "utf8"));
+    expect(tickWritten.contextTokens).toBe(0);
+    expect(tickWritten.contextTokenLimit).toBe(550000);
 
     // Human-needed safety control (issue #63): the first tick's ITEMS is one
     // Ready ticket, so #133's Ready-count capture makes initialReadyCount = 1
@@ -157,6 +169,69 @@ describe("z-loop-tick", () => {
     const loopDir = defaultLoopDir("demo", home);
     expect(existsSync(join(loopDir, "last-tick"))).toBe(true);
     expect(readLastTick(loopDir)).not.toBeNull();
+  });
+
+  // #131 review-bounce finding 3(b): the assertion above (contextTokens === 0)
+  // is NOT load-bearing on its own -- a reverted wrapper that never threads
+  // --context-tokens also yields 0. This drives the wrapper -> ingest -> state
+  // path with a NONZERO live reading: a real session transcript planted under a
+  // known cwd's ~/.claude/projects/<mangled-cwd>/ dir, so context-budget resolves
+  // a concrete number the wrapper MUST thread into ingest. If the wrapper stopped
+  // threading it (the reverted case), contextTokens would be 0, not this value.
+  test("the wrapper threads a NONZERO live context reading into the per-tick ingest (load-bearing #131)", () => {
+    const dir = mkTmp();
+    const stub = writeStubZBoard(dir);
+    const home = makeConfigHome();
+    // The wrapper reads context-budget for --project-dir "$PWD"; pin $PWD to a
+    // known cwd and plant that session's transcript under the fake home so the
+    // reading is deterministic (input 300000 + cache_read 100000 + cache_creation
+    // 50000 = 450000; output excluded).
+    const cwd = join(dir, "orch-cwd");
+    mkdirSync(cwd, { recursive: true });
+    const mangled = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+    const projDir = join(home, ".claude", "projects", mangled);
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(
+      join(projDir, "session.jsonl"),
+      JSON.stringify({
+        type: "assistant",
+        requestId: "req_1",
+        message: {
+          model: "claude-opus-4",
+          id: "msg_1",
+          usage: { input_tokens: 300000, output_tokens: 900, cache_read_input_tokens: 100000, cache_creation_input_tokens: 50000 },
+        },
+      }) + "\n"
+    );
+
+    const tickTmp = join(dir, "tick-tmp");
+    const tickState = join(dir, "tick-state.json");
+    const proc = Bun.spawnSync(
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp],
+      { cwd, env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
+    );
+    expect(proc.exitCode).toBe(0);
+
+    // The live reading landed on the state file -- proof the wrapper computed it
+    // AND threaded it through --context-tokens into the ingest.
+    const written = JSON.parse(readFileSync(tickState, "utf8"));
+    expect(written.contextTokens).toBe(450000);
+    expect(written.contextTokenLimit).toBe(550000); // default ceiling captured on first ingest
+
+    // Cross-check: the identical ingest run manually with --context-tokens 450000
+    // produces the same state, so the wrapper's only context-side effect is
+    // threading exactly this reading (nothing else moved).
+    const items = join(dir, "items.json");
+    const bodies = join(dir, "bodies.json");
+    const expectedState = join(dir, "expected-state.json");
+    writeFileSync(items, ITEMS);
+    writeFileSync(bodies, BODIES);
+    const ing = Bun.spawnSync(
+      ["bun", join(REPO_ROOT, "lib", "loop.ts"), "ingest", expectedState, items, bodies, "--context-tokens", "450000"],
+      { stdout: "pipe", stderr: "pipe" }
+    );
+    expect(ing.exitCode).toBe(0);
+    expect(readFileSync(tickState, "utf8")).toBe(readFileSync(expectedState, "utf8"));
   });
 
   test("missing a required flag fails loudly, prints no Action", () => {
@@ -306,6 +381,18 @@ describe("z-loop-tick", () => {
     const tick = readFileSync(Z_LOOP_TICK, "utf8");
     expect(tick).toContain('lib/throttle.ts" wait --slug "$SLUG"');
     expect(tick.indexOf('lib/throttle.ts" wait')).toBeLessThan(tick.indexOf("snapshot --slug"));
+  });
+
+  // #131: the wrapper computes the live context reading and threads it into the
+  // per-tick ingest as --context-tokens. Wiring canary: the context-budget call
+  // is best-effort (`|| echo 0`, fail-open) and precedes the ingest that
+  // consumes $CTX.
+  test("the context reading is computed fail-open and threaded into the per-tick ingest", () => {
+    const tick = readFileSync(Z_LOOP_TICK, "utf8");
+    expect(tick).toContain('lib/context-budget.ts" current');
+    expect(tick).toContain("|| echo 0"); // hard-error backstop -> never wedges the drain
+    expect(tick).toContain('--context-tokens "$CTX"');
+    expect(tick.indexOf("context-budget.ts")).toBeLessThan(tick.indexOf("loop.ts\" ingest"));
   });
 });
 

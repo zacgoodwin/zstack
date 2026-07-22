@@ -50,9 +50,21 @@ mkdir -p "$TMP"
 bun "$PACK/lib/throttle.ts" wait --slug "$SLUG" >/dev/null
 # 1. Snapshot: all-status items + each ticket's body, one call, to files.
 "$Z_BOARD" snapshot --slug "$SLUG" --out-items "$TMP/items.json" --out-bodies "$TMP/bodies.json" >/dev/null
+# 1b. Live context reading (issue #131): how full the orchestrator's OWN
+#     context window is right now, measured deterministically from its session
+#     transcript. Fail-open by construction -- an unresolvable/unreadable
+#     transcript prints 0, and the `|| echo 0` backstops any hard error -- so a
+#     bad reading degrades to pre-#131 behavior (no gating) and NEVER wedges the
+#     drain. Threaded into the ingest below as --context-tokens so the context
+#     gate lives in the pure state machine, not this wrapper. --project-dir is
+#     this wrapper's cwd = the orchestrator's cwd, whose mangled form names the
+#     transcript dir.
+CTX=$(bun "$PACK/lib/context-budget.ts" current --project-dir "$PWD" 2>/dev/null || echo 0)
+[ -z "$CTX" ] && CTX=0
 # 2. Ingest: refresh ticket statuses; preserves lanes + lost-claim flags (no
-#    config flags here -- Step 3's first ingest already set maxLanes/watchdog).
-bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" >/dev/null
+#    config flags here -- Step 3's first ingest already set maxLanes/watchdog);
+#    threads the fresh context reading (contextTokenLimit was captured at Step 3).
+bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" --context-tokens "$CTX" >/dev/null
 # 2b. Human-needed safety control (issue #63): recompute the parked-tickets
 # breakdown every tick (read-only) and fire the ONE-TIME mid-run breakdown
 # notification the instant it first crosses BoardConfig.humanNeededPercent.

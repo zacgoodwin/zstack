@@ -10,6 +10,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { atomicWrite, handleCliError, parseFlags, readJson, str } from "./cli.ts";
 import {
   BOARD_STATUSES,
+  DEFAULT_CONTEXT_TOKEN_LIMIT,
   DEFAULT_HUMAN_NEEDED_PERCENT,
   DEFAULT_MAX_LANES,
   DEFAULT_MAX_QA_PASSES,
@@ -17,6 +18,7 @@ import {
   DEFAULT_MIN_REVIEWER_CONFIDENCE,
   DEFAULT_QA_INVESTIGATE_AFTER,
   DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
+  DEFAULT_TICKET_LIMIT,
   DEFAULT_WATCHDOG_MINUTES,
   loadConfig,
   ZError,
@@ -29,6 +31,7 @@ import {
   isWorkableStatus,
   mergeOrder,
   parseDependsOn,
+  selectBatch,
   watchdogExpired,
 } from "./lanes.ts";
 import { reconcileBoardMoves } from "./reconcile.ts";
@@ -209,6 +212,21 @@ export interface LoopState {
   initialReadyCount?: number;
   humanNeededPercent?: number;
   humanNeededNotified?: boolean;
+  // Per-loop ticket cap (issue #131): the flagged, dependency-self-contained
+  // allow-list of ticket numbers this run works (lib/lanes.ts selectBatch),
+  // captured ONCE at the fresh-batch boundary and preserved across every
+  // re-ingest and across a context clear (state.json survives both) -- same
+  // per-batch lifecycle as initialReadyCount/mergedThisRun. undefined = no cap
+  // (ticketLimit 0): every workable ticket is in the batch, byte-identical to
+  // pre-#131.
+  batchTickets?: number[];
+  // Context ceiling (issue #131). contextTokens is the LIVE orchestrator
+  // context-window occupancy, recomputed every tick by bin/z-loop-tick
+  // (lib/context-budget.ts) and threaded in fresh -- never preserved from
+  // prev, so the gate needs no sticky flag or reset. contextTokenLimit is the
+  // ceiling, captured once like the other knobs; 0/absent disables the gate.
+  contextTokens?: number;
+  contextTokenLimit?: number;
 }
 
 // -- stage outcomes -----------------------------------------------------------
@@ -308,6 +326,7 @@ export type Action =
   | { kind: "check-worker"; ticket: number }
   | { kind: "complete"; ticket: number; note: string }
   | { kind: "wait" }
+  | { kind: "context-clear" }
   | { kind: "drain-complete" };
 
 // The two config-driven QA bounce knobs resolveOutcome needs. Threaded in by
@@ -419,10 +438,18 @@ function withResync(action: Action, resyncStatus: Map<number, BoardStatus>): Act
 //   3. watchdog: a silent lane is probed (check-worker) or, once known dead,
 //      skipped with a note;
 //   4. park any unclaimed ticket whose dependency can no longer complete;
-//   5. claim the next claimable ticket if a lane is free;
+//   5. claim the next claimable ticket if a lane is free -- SUPPRESSED while the
+//      context ceiling is reached (#131): no new ticket enters Building, but
+//      steps 1-3 keep draining in-flight lanes; once every lane is idle with
+//      batch work remaining, return context-clear so the operator clears
+//      context and resumes the same batch;
 //   6. with all lanes idle and nothing claimable, break a dependency deadlock
 //      by parking the lowest stuck ticket to Blocked (no-token-burn rule);
 //   7. drain-complete when nothing workable remains; else wait.
+// "Workable" here is batch-scoped (#131): when state.batchTickets is set, a
+// Ready ticket outside the flagged allow-list is neither claimed nor counted
+// against the drain, so it waits for a future run instead of keeping this one
+// alive.
 // The knobs come straight off the state the caller already holds -- there is no
 // second options shape to keep in sync with LoopState (every caller used to
 // re-spread the same nine fields into one).
@@ -548,9 +575,14 @@ export function nextAction(state: LoopState, nowMs: number): Action {
   }
 
   // 4. A dependent whose dependency parked can never proceed in this batch.
+  //    Batch-scoped (#131): a workable ticket outside the flagged allow-list is
+  //    not this run's to work, so it is excluded here (never park-checked) and
+  //    from the drain count below -- it waits for a future run.
   const inLane = new Set(lanes.map((l) => l.ticket));
+  const inBatch = state.batchTickets ? new Set(state.batchTickets) : undefined;
   const unclaimed = tickets
     .filter((t) => isWorkableStatus(t.status) && !inLane.has(t.number) && !t.claimedByOther)
+    .filter((t) => inBatch === undefined || inBatch.has(t.number))
     .sort((a, b) => a.number - b.number);
   for (const t of unclaimed) {
     const dead = deadDeps(t, byNumber);
@@ -560,11 +592,31 @@ export function nextAction(state: LoopState, nowMs: number): Action {
     }
   }
 
-  // 5. Claim the next ticket into a free lane.
-  const claimable = claimableTickets(tickets, lanes);
-  if (claimable.length > 0 && lanes.length < maxLanes) {
+  // Context ceiling gate (#131): when the orchestrator's own live context
+  // occupancy has reached the limit, stop CLAIMING new tickets. The claim step
+  // is skipped (no new ticket enters Building) while steps 1-3 above keep
+  // draining in-flight lanes to a terminal state. Off entirely at limit 0.
+  const contextTokenLimit = state.contextTokenLimit ?? 0;
+  const contextGated = contextTokenLimit > 0 && (state.contextTokens ?? 0) >= contextTokenLimit;
+
+  // 5. Claim the next ticket into a free lane -- unless context-gated.
+  const claimable = claimableTickets(tickets, lanes, state.batchTickets);
+  if (!contextGated && claimable.length > 0 && lanes.length < maxLanes) {
     const t = claimable[0];
     return { kind: "claim", ticket: t.number, stage: claimStage(t.status) };
+  }
+
+  // 5b. Context ceiling reached, every lane idle, batch work still remaining:
+  //     pause to clear-and-resume instead of falling through to a forever-wait
+  //     (#131). A fresh orchestrator reads a small context on its first tick,
+  //     so contextGated is false and claiming resumes on the SAME batch (the
+  //     built tickets have left Ready; batchTickets persisted in state.json).
+  //     If the batch happens to be fully drained here (unclaimed empty), the
+  //     normal drain-complete below wins -- context-clear fires only when work
+  //     genuinely remains. Only fires with lanes idle, so an in-flight lane is
+  //     never cut short (AC6).
+  if (contextGated && lanes.length === 0 && unclaimed.length > 0) {
+    return { kind: "context-clear" };
   }
 
   // 6. Lanes idle, nothing claimable, work remains. Two very different cases hide
@@ -596,9 +648,20 @@ export function nextAction(state: LoopState, nowMs: number): Action {
 
 // Batch drained = every ticket terminal for this batch (Done / Questions /
 // Blocked / Skipped) -- claimedByOther tickets belong to another session's
-// batch -- and no lane still running.
-export function drainComplete(tickets: TicketSnapshot[], lanes: LaneState[]): boolean {
-  return lanes.length === 0 && tickets.every((t) => !isWorkableStatus(t.status) || t.claimedByOther === true);
+// batch -- and no lane still running. Batch-scoped (#131): when batchTickets
+// is set, a workable ticket OUTSIDE the flagged allow-list is not this run's
+// work and never keeps the run alive (AC4).
+export function drainComplete(tickets: TicketSnapshot[], lanes: LaneState[], batchTickets?: number[]): boolean {
+  const inBatch = batchTickets ? new Set(batchTickets) : undefined;
+  return (
+    lanes.length === 0 &&
+    tickets.every(
+      (t) =>
+        !isWorkableStatus(t.status) ||
+        t.claimedByOther === true ||
+        (inBatch !== undefined && !inBatch.has(t.number))
+    )
+  );
 }
 
 // -- human-needed safety control (issue #63) ----------------------------------
@@ -742,6 +805,12 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
     }
     case "check-worker":
     case "wait":
+    // #131: context-clear is a mid-batch PAUSE, not a state transition -- the
+    // orchestrator releases the loop lock, keeps worktrees/branches and the
+    // un-drained state.json, and exits WITHOUT the end-of-loop stage. A pure
+    // no-op on state (like wait): batchTickets/lanes/tickets are untouched so
+    // the re-invoked, context-cleared orchestrator resumes the same batch.
+    case "context-clear":
     case "drain-complete":
       return next;
   }
@@ -816,6 +885,9 @@ export function ingestBoardItems(
     reviewerBelowThresholdAction?: "block" | "retry" | "off";
     maxReviewBounces?: number;
     humanNeededPercent?: number;
+    ticketLimit?: number; // #131: cap used to compute batchTickets on a fresh batch
+    contextTokens?: number; // #131: live orchestrator context reading, stored fresh
+    contextTokenLimit?: number; // #131: context ceiling, captured once like the other knobs
   }
 ): LoopState {
   // #127 backstop: a transient GitHub hiccup can make `z-board snapshot` return
@@ -914,7 +986,35 @@ export function ingestBoardItems(
   // unclaimed Ready tickets is the SAME batch's final state, not a new one
   // -- preserve its counters.
   const readyCount = tickets.filter((t) => t.status === "Ready" && !t.claimedByOther).length;
-  const startingFreshBatch = !prev || (drainComplete(prev.tickets, prev.lanes) && readyCount > 0);
+  // Whether the PRIOR batch drained is judged against ITS OWN allow-list (#131):
+  // a leftover non-batch Ready ticket must not make prev look un-drained and so
+  // block the next batch's capture (AC4/AC11 use the same batch scoping).
+  //
+  // #131 review-bounce (finding 1/2): under a ticket cap the batch-scoped
+  // drainComplete becomes true the instant the FLAGGED tickets finish, while the
+  // deliberately-excluded leftover Ready tickets keep readyCount > 0. Left alone
+  // that combination re-fires startingFreshBatch on the very next per-tick
+  // ingest, which (a) recomputes batchTickets -- and z-loop-tick passes no
+  // --ticket-limit, so selectBatch(.., 0) returns undefined, DROPPING the
+  // allow-list and draining the whole queue in one invocation -- and (b) wipes
+  // mergedThisRun/initialReadyCount/humanNeededNotified mid-run (finding 2). The
+  // capped run must instead drain EXACTLY its batch, then return drain-complete
+  // so the operator re-invokes /z-loop for the next batch. The distinguishing
+  // signal: a NEW capped batch is captured only when --ticket-limit is explicitly
+  // on the ingest (Step 3, the start of an invocation, ALWAYS passes it), never
+  // on a bare per-tick z-loop-tick ingest (which never does). So once a batch is
+  // active (prev.batchTickets defined), a fresh batch starts only on a
+  // --ticket-limit-bearing ingest; without the cap (prev.batchTickets undefined)
+  // this is byte-identical to pre-#131. (A context-clear resume's Step 3 ingest
+  // DOES carry --ticket-limit, but its prev batch is un-drained, so
+  // drainComplete is false and batchTickets is preserved anyway -- AC11.)
+  const priorBatchActive = prev?.batchTickets !== undefined;
+  const ticketLimitProvided = cfg?.ticketLimit !== undefined;
+  const startingFreshBatch =
+    !prev ||
+    (drainComplete(prev.tickets, prev.lanes, prev.batchTickets) &&
+      readyCount > 0 &&
+      (!priorBatchActive || ticketLimitProvided));
 
   return {
     tickets: tickets.sort((a, b) => a.number - b.number),
@@ -931,6 +1031,15 @@ export function ingestBoardItems(
     mergedThisRun: startingFreshBatch ? [] : [...(prev?.mergedThisRun ?? [])],
     initialReadyCount: startingFreshBatch ? readyCount : (prev!.initialReadyCount ?? 0),
     humanNeededNotified: startingFreshBatch ? false : (prev!.humanNeededNotified ?? false),
+    // #131: the flagged allow-list is captured ONCE at the fresh-batch boundary
+    // (same as initialReadyCount) and preserved verbatim across every re-ingest
+    // and context clear -- so a resume continues the same batch.
+    batchTickets: startingFreshBatch ? selectBatch(tickets, cfg?.ticketLimit ?? DEFAULT_TICKET_LIMIT) : prev!.batchTickets,
+    // contextTokens is a LIVE per-tick reading -- always taken fresh from cfg,
+    // never preserved from prev (an unresolvable/absent reading degrades to 0,
+    // which never gates). contextTokenLimit is captured once like the knobs.
+    contextTokens: cfg?.contextTokens ?? 0,
+    contextTokenLimit: cfg?.contextTokenLimit ?? prev?.contextTokenLimit ?? DEFAULT_CONTEXT_TOKEN_LIMIT,
   };
 }
 
@@ -951,7 +1060,7 @@ const USAGE = `loop <command> [args]
   ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M]
                       [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N]
                       [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off]
-                      [--max-review-bounces N]
+                      [--max-review-bounces N] [--ticket-limit N] [--context-token-limit N] [--context-tokens N]
                                                      build/refresh the snapshot (creates state.json)
 
   --now defaults to the wall clock; tests pass it explicitly.`;
@@ -1003,6 +1112,9 @@ const INGEST_NUMBERS = [
   "human-needed-percent",
   "min-reviewer-confidence",
   "max-review-bounces",
+  "ticket-limit", // #131: per-loop ticket cap (0 = no cap); selects batchTickets on a fresh batch
+  "context-token-limit", // #131: context ceiling (0 = disabled), captured once
+  "context-tokens", // #131: live orchestrator context reading, threaded per tick by z-loop-tick
 ] as const;
 
 // kebab-case CLI flag -> the camelCase key ingestBoardItems takes.
@@ -1097,7 +1209,7 @@ export function main(argv: string[]): number {
       return 0;
     }
     if (cmd === "ingest") {
-      if (!positionals[1] || !positionals[2]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off] [--max-review-bounces N]");
+      if (!positionals[1] || !positionals[2]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off] [--max-review-bounces N] [--ticket-limit N] [--context-token-limit N] [--context-tokens N]");
       const prev = readPrevState(statePath);
       const items = readJson(positionals[1]) as BoardItemLike[];
       const bodies = readJson(positionals[2]) as Record<string, string>;
