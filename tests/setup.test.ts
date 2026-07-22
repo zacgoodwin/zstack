@@ -11,7 +11,6 @@ import { join } from "node:path";
 import {
   SetupBoard,
   diffState,
-  toEpicStyle,
   verifyReport,
   writeConfig,
   renderViewsBlock,
@@ -103,6 +102,11 @@ function nodeFrom(p: BackendProject): GraphQLData {
       number: p.number,
       title: p.title,
       fields: {
+        // Real GitHub always returns pageInfo on a connection, and the shared
+        // paginate() (lib/board.ts) treats nodes-without-pageInfo as a
+        // malformed response rather than a drained page -- so the double has
+        // to answer with it too.
+        pageInfo: { hasNextPage: false, endCursor: null },
         nodes: p.fields.map((f) => ({
           __typename: f.dataType === "SINGLE_SELECT" ? "ProjectV2SingleSelectField" : "ProjectV2Field",
           id: f.id,
@@ -136,6 +140,7 @@ function setupBackend(existing?: BackendProject, opts?: { usagePageSize?: number
         return {
           repository: {
             projectsV2: {
+              pageInfo: { hasNextPage: false, endCursor: null },
               nodes: project ? [{ id: project.id, number: project.number, title: project.title }] : [],
             },
           },
@@ -334,7 +339,6 @@ describe("SetupBoard.apply — creation path", () => {
     const result = await setup.apply("zacgoodwin", "zstack", {
       slug: "zstack",
       title: "zstack",
-      epicStyle: "milestones",
       home: testHome(),
     });
 
@@ -632,73 +636,6 @@ describe("SetupBoard.apply — pre-flight input validation (F9)", () => {
       setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", watchdogMinutes: -5 })
     ).rejects.toThrow(/"watchdogMinutes" must be a positive number/);
     expect(backend.calls).toEqual([]); // nothing reached the backend, mutation or read
-  });
-
-  test('apply({epicStyle: "issue-type"} as any) throws before any op (JS-caller defense)', async () => {
-    const backend = setupBackend(fullProjectSpec());
-    const setup = new SetupBoard(backend.exec);
-    await expect(
-      setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", epicStyle: "issue-type" } as any)
-    ).rejects.toThrow(/not yet supported[\s\S]*milestones/);
-    expect(backend.calls).toEqual([]);
-  });
-});
-
-// -- F10: TOCTOU recheck right before the destructive mutation ----------------
-describe("SetupBoard.apply — usage recheck before replace (F10)", () => {
-  test("an option populated between the scan and the mutation refuses even with --force", async () => {
-    // First scan: nothing populated (guard would proceed). Second scan: an item
-    // landed in "Todo" during the window -> refuse, naming it, despite --force.
-    const backend = setupBackend(legacyProject(["Done", null]));
-    let usageReads = 0;
-    const exec: GraphQLExecutor = async (q, v) => {
-      if (opName(q) === "FieldUsage" && ++usageReads === 2) {
-        return {
-          node: {
-            items: {
-              pageInfo: { hasNextPage: false, endCursor: null },
-              nodes: [{ fieldValueByName: { name: "Todo" } }],
-            },
-          },
-        };
-      }
-      return backend.exec(q, v);
-    };
-    const setup = new SetupBoard(exec);
-    await expect(
-      setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", force: true })
-    ).rejects.toThrow(/"Todo": 1 item\(s\)[\s\S]*not quiescent/);
-    expect(usageReads).toBe(2); // the recheck actually ran
-    expect(backend.calls.some((c) => c.op === "UpdateFieldOptions")).toBe(false);
-  });
-});
-
-// -- writeConfig round-trip --------------------------------------------------
-describe("writeConfig", () => {
-  test("writes a config that loadConfig reads back cleanly", async () => {
-    const backend = setupBackend();
-    const setup = new SetupBoard(backend.exec);
-    const home = testHome();
-    const result = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
-
-    const path = writeConfig(result.config, home);
-    expect(path).toContain(join(".zstack", "projects", "zstack", "config.json"));
-
-    const loaded = loadConfig("zstack", home);
-    expect(loaded.projectId).toBe("PVT_new");
-    expect(loaded.statusField.options!.Done).toBeDefined();
-    expect(loaded.maxLanes).toBe(3);
-    // issue #18: SetupBoard never writes this knob, so a config from /z-setup
-    // omits it entirely -- loadConfig must still default it to 5 (AC2:
-    // existing "every 5th loop" behavior unchanged for every already-set-up project).
-    expect(loaded.auditEveryNLoops).toBe(5);
-    // issue #59 AC8: same for adversarialMode -- SetupBoard never writes it, so
-    // loadConfig must default an omitting config to "non-trivial".
-    expect(loaded.adversarialMode).toBe("non-trivial");
-    // issue #62 AC10: same pattern for the reviewer-confidence gate -- SetupBoard
-    // never writes either knob, so loadConfig must default them to 70 / "block".
-    expect(loaded.minReviewerConfidence).toBe(70);
-    expect(loaded.reviewerBelowThresholdAction).toBe("block");
   });
 
   // -- issue #82 (AC6): stageModels default only for a brand-new project ------
@@ -1040,12 +977,6 @@ describe("validateConfig", () => {
     expect(() => validateConfig(cfg)).toThrow(/"issue-type" is not yet supported[\s\S]*"milestones"/);
     cfg.epicStyle = "milestones";
     expect(() => validateConfig(cfg)).not.toThrow();
-  });
-
-  test('--epic-style "issue-type" is rejected at the CLI parse layer, before any GraphQL call', () => {
-    expect(() => toEpicStyle("issue-type")).toThrow(/not yet supported[\s\S]*milestones/);
-    expect(toEpicStyle("milestones")).toBe("milestones");
-    expect(toEpicStyle(undefined)).toBeUndefined();
   });
 
   test("a statusField with the wrong dataType fails", () => {

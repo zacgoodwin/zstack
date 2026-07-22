@@ -13,7 +13,7 @@ Global rules, if at any time a ticket becomes blocked by errors, dependencies or
 
 5. If there are any open questions or unknowns highlight them and move the ticket to "Questions" status. 
 6. If there are comments from a human fold in the suggestions and rebuild the plan if it changed. **If his comments raise new questions, do not start.** Post them as `## Needs input --`, move the ticket to "Questions" and stop. A ticket is only worked once every open question is answered.
-7. Move every ticket in the work batch to **Building** up front, all at once, so the board shows the full committed queue. 
+7. Read the work batch, decide the order (dependencies respected), and leave it in **Ready** — the deterministic claim order is the work order, so no board writes happen here. Each ticket moves to **Building** when its builder lane starts, so **Building** means "being built now" and **Ready** means "queued." 
 8. Complete them **one ticket at a time**; leverage worktree and to keep from agents stepping on each other. Order is my call, respecting dependencies. Ship the complete thing: tests + evals + docs in the same diff. If it will facilitate a better QA check and the work is related to one another, multiple tickets worth of work can exist in a single worktree. 
 9. Any ticket changing what users see or do updates the affected `docs/user-guide/` pages in the same PR: prose, formula/step appendix when those surfaces change, and re-captured screenshots (`scripts/capture-user-guide.mjs`) when visuals move. Need input mid-flight: move the ticket back "Questions" and comment exactly what's needed.
 

@@ -7,7 +7,8 @@ import { test, expect, describe, spyOn, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { costSuggestions, loadPlannedTickets, main, ZError, type PlannedTicket } from "../lib/cost-suggest.ts";
+import { costSuggestions, loadPlannedTickets, main, type PlannedTicket } from "../lib/cost-suggest.ts";
+import { ZError } from "../lib/config.ts";
 
 const FIXTURE_PATH = join(import.meta.dir, "..", "evals", "cost-suggest", "fixture-batch.json");
 const FIXTURE: PlannedTicket[] = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));

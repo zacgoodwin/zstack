@@ -19,8 +19,6 @@
 import { handleCliError, parseFlags, readJson } from "./cli.ts";
 import { loadConfig, ZError, type BoardConfig } from "./config.ts";
 
-export { ZError } from "./config.ts";
-
 // Per-event payload map: renderNotification is type-checked per event, and each
 // key is 1:1 with one of the orchestrator's trigger moments. `work-complete`
 // is a LOOP-drain report only (#68); a `/z-plan` run has no loop, no per-status

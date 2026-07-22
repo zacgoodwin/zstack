@@ -8,6 +8,7 @@
 // and never in a prompt.
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { parseFlags, str } from "./cli.ts";
 import { roundCents } from "./estimate.ts";
 
 export type TicketErrorCode = "missing" | "malformed" | "empty" | "bad-path";
@@ -320,23 +321,23 @@ const USAGE = `z-ticket-lint <ticket-body.md> [--check-paths <repoRoot>]
   Files path to exist under repoRoot (a bullet ending "(new)" is exempt).`;
 
 export function main(argv: string[]): number {
-  const rest: string[] = [];
-  let repoRoot: string | undefined;
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--check-paths") {
-      repoRoot = argv[++i];
-      if (repoRoot === undefined) {
-        console.error("--check-paths requires a <repoRoot> argument.");
-        return 1;
-      }
-      continue;
-    }
-    rest.push(argv[i]);
-  }
-  const path = rest[0];
-  if (!path || path === "-h" || path === "--help") {
+  // Help is answered BEFORE parseFlags: to the parser "--help" is just a flag
+  // that swallows the next token, so it would leave zero positionals and read
+  // as the no-argument case (exit 1) instead of an explicit help (exit 0).
+  if (!argv[0] || argv[0] === "-h" || argv[0] === "--help") {
     console.log(USAGE);
-    return path ? 0 : 1;
+    return argv[0] ? 0 : 1;
+  }
+  const { positionals, flags } = parseFlags(argv);
+  const repoRoot = str(flags, "check-paths");
+  if ("check-paths" in flags && repoRoot === undefined) {
+    console.error("--check-paths requires a <repoRoot> argument.");
+    return 1;
+  }
+  const path = positionals[0];
+  if (!path) {
+    console.log(USAGE);
+    return 1;
   }
 
   let md: string;

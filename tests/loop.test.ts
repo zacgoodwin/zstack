@@ -24,13 +24,13 @@ import {
   recordOutcome,
   recordProbe,
   resolveStageModel,
-  ZError,
   type Action,
   type LaneState,
   type LoopState,
   type Stage,
   type TicketSnapshot,
 } from "../lib/loop.ts";
+import { ZError } from "../lib/config.ts";
 import {
   claimableTickets,
   claimStage,
@@ -65,18 +65,6 @@ function state(tickets: TicketSnapshot[], lanes: LaneState[] = [], maxLanes = 3,
   return { tickets, lanes, maxLanes, watchdogMinutes, mergedThisRun: [] };
 }
 
-const OPTS = (s: LoopState, nowMs = 0) => ({
-  nowMs,
-  maxLanes: s.maxLanes,
-  watchdogMinutes: s.watchdogMinutes,
-  maxQaPasses: s.maxQaPasses,
-  qaInvestigateAfter: s.qaInvestigateAfter,
-  minReviewerConfidence: s.minReviewerConfidence,
-  reviewerBelowThresholdAction: s.reviewerBelowThresholdAction,
-  maxReviewBounces: s.maxReviewBounces,
-  mergedThisRun: s.mergedThisRun,
-});
-
 // The happy-path final message per stage, for simulation. The reviewer's
 // confidence=100 clears the default 70 floor (issue #62) so every existing
 // drain-to-Done flow below is unaffected by the gate.
@@ -93,7 +81,7 @@ function drainHappy(s: LoopState): { state: LoopState; log: Action[]; maxConcurr
   const log: Action[] = [];
   let maxConcurrent = 0;
   for (let i = 0; i < 500; i++) {
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     log.push(a);
     if (a.kind === "drain-complete") return { state: s, log, maxConcurrent };
     if (a.kind === "wait") {
@@ -154,10 +142,10 @@ describe("dependency-order claiming", () => {
 
   test("claim resumes at the stage matching the ticket's status", () => {
     const s = state([ticket(50, "QA"), ticket(51, "Review")]);
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(a).toEqual({ kind: "claim", ticket: 50, stage: "qa" });
     const s2 = applyAction(s, a, 0);
-    expect(nextAction(s2.tickets, s2.lanes, OPTS(s2))).toEqual({ kind: "claim", ticket: 51, stage: "reviewer" });
+    expect(nextAction(s2, 0)).toEqual({ kind: "claim", ticket: 51, stage: "reviewer" });
   });
 });
 
@@ -175,7 +163,7 @@ describe("Questions tickets", () => {
 
   test("a dependent of a Questions ticket parks in Blocked, not a busy-wait", () => {
     const s = state([ticket(5, "Questions"), ticket(7, "Building", [5])]);
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(a).toEqual({
       kind: "park",
       ticket: 7,
@@ -183,7 +171,7 @@ describe("Questions tickets", () => {
       note: expect.stringContaining("#5 (Questions)"),
     });
     const s2 = applyAction(s, a, 0);
-    expect(nextAction(s2.tickets, s2.lanes, OPTS(s2))).toEqual({ kind: "drain-complete" });
+    expect(nextAction(s2, 0)).toEqual({ kind: "drain-complete" });
   });
 });
 
@@ -228,24 +216,24 @@ describe("watchdog", () => {
     );
     const now = 11 * MIN;
     // Silent past the budget: probe first, never skip blind.
-    expect(nextAction(s.tickets, s.lanes, { ...OPTS(s), nowMs: now })).toEqual({ kind: "check-worker", ticket: 1 });
+    expect(nextAction(s, now)).toEqual({ kind: "check-worker", ticket: 1 });
     // Probe says dead: skip with a note.
     s = recordProbe(s, 1, false, now);
-    const skip = nextAction(s.tickets, s.lanes, { ...OPTS(s), nowMs: now });
+    const skip = nextAction(s, now);
     expect(skip).toEqual({ kind: "skip", ticket: 1, note: expect.stringContaining("watchdog") });
     s = applyAction(s, skip, now);
     expect(s.tickets.find((t) => t.number === 1)!.status).toBe("Skipped");
     // The loop continues with the other lane: ticket 2 finishes normally.
     s = recordOutcome(s, 2, HAPPY.builder, now);
-    expect(nextAction(s.tickets, s.lanes, { ...OPTS(s), nowMs: now })).toEqual({ kind: "advance", ticket: 2, to: "qa" });
+    expect(nextAction(s, now)).toEqual({ kind: "advance", ticket: 2, to: "qa" });
   });
 
   test("probe says alive: baseline refreshes and no skip fires", () => {
     let s = state([ticket(1, "Building")], [lane(1, "builder", { lastActivityMs: 0 })]);
     const now = 11 * MIN;
-    expect(nextAction(s.tickets, s.lanes, { ...OPTS(s), nowMs: now }).kind).toBe("check-worker");
+    expect(nextAction(s, now).kind).toBe("check-worker");
     s = recordProbe(s, 1, true, now);
-    expect(nextAction(s.tickets, s.lanes, { ...OPTS(s), nowMs: now })).toEqual({ kind: "wait" });
+    expect(nextAction(s, now)).toEqual({ kind: "wait" });
   });
 });
 
@@ -256,7 +244,7 @@ describe("stage transitions", () => {
     let s = state([ticket(1, "Building")], [lane(1, "builder")]);
     const step = (msg: string): Action => {
       s = recordOutcome(s, 1, msg, 0);
-      const a = nextAction(s.tickets, s.lanes, OPTS(s));
+      const a = nextAction(s, 0);
       s = applyAction(s, a, 0);
       return a;
     };
@@ -275,13 +263,13 @@ describe("stage transitions", () => {
     let s = state([ticket(3, "QA")], [lane(3, "qa")]);
     const bounce = (): Action => {
       s = recordOutcome(s, 3, "QA-BUGS: 1) save button 500s", 0);
-      const a = nextAction(s.tickets, s.lanes, OPTS(s));
+      const a = nextAction(s, 0);
       s = applyAction(s, a, 0);
       return a;
     };
     const backToQa = () => {
       s = recordOutcome(s, 3, HAPPY.builder, 0);
-      s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0); // advance qa
+      s = applyAction(s, nextAction(s, 0), 0); // advance qa
     };
     // Pass 1: straight back to the builder with notes.
     expect(bounce()).toMatchObject({ kind: "advance", to: "builder", note: "1) save button 500s", investigateFirst: false });
@@ -300,13 +288,13 @@ describe("stage transitions", () => {
   test("needs-input and human-question park to Questions; confused skips", () => {
     let s = state([ticket(1, "Building")], [lane(1, "builder")]);
     s = recordOutcome(s, 1, "NEEDS-INPUT: which currency should defaults use?", 0);
-    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toEqual({
+    expect(nextAction(s, 0)).toEqual({
       kind: "park", ticket: 1, status: "Questions", note: "which currency should defaults use?",
     });
 
     let s2 = state([ticket(2, "QA")], [lane(2, "qa")]);
     s2 = recordOutcome(s2, 2, "CONFUSED: ticket describes a service that does not exist", 0);
-    expect(nextAction(s2.tickets, s2.lanes, OPTS(s2))).toEqual({
+    expect(nextAction(s2, 0)).toEqual({
       kind: "skip", ticket: 2, note: "ticket describes a service that does not exist",
     });
   });
@@ -314,7 +302,7 @@ describe("stage transitions", () => {
   test("reviewer findings bounce to a fresh builder", () => {
     let s = state([ticket(1, "Review")], [lane(1, "reviewer")]);
     s = recordOutcome(s, 1, "REVIEW-FINDINGS: 1) AC3 assertion weakened in tests/x.test.ts:12", 0);
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(a).toMatchObject({ kind: "advance", to: "builder", note: expect.stringContaining("AC3") });
     s = applyAction(s, a, 0);
     expect(s.lanes[0].qaBounces).toBe(0); // review bounces do not consume QA passes
@@ -331,13 +319,13 @@ describe("QA bounce config knobs", () => {
     s.maxQaPasses = 5;
     const bounce = (): Action => {
       s = recordOutcome(s, 3, "QA-BUGS: 1) save button 500s", 0);
-      const a = nextAction(s.tickets, s.lanes, OPTS(s));
+      const a = nextAction(s, 0);
       s = applyAction(s, a, 0);
       return a;
     };
     const backToQa = () => {
       s = recordOutcome(s, 3, HAPPY.builder, 0);
-      s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+      s = applyAction(s, nextAction(s, 0), 0);
     };
     for (let pass = 1; pass <= 4; pass++) {
       const a = bounce();
@@ -359,7 +347,7 @@ describe("QA bounce config knobs", () => {
     let s = state([ticket(4, "QA")], [lane(4, "qa")]);
     s.qaInvestigateAfter = 1;
     s = recordOutcome(s, 4, "QA-BUGS: 1) flaky spinner", 0);
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(a).toMatchObject({ kind: "advance", to: "builder", investigateFirst: true });
   });
 
@@ -369,13 +357,13 @@ describe("QA bounce config knobs", () => {
     expect(s.qaInvestigateAfter).toBeUndefined();
     const bounce = (): Action => {
       s = recordOutcome(s, 9, "QA-BUGS: x", 0);
-      const a = nextAction(s.tickets, s.lanes, OPTS(s));
+      const a = nextAction(s, 0);
       s = applyAction(s, a, 0);
       return a;
     };
     const backToQa = () => {
       s = recordOutcome(s, 9, HAPPY.builder, 0);
-      s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+      s = applyAction(s, nextAction(s, 0), 0);
     };
     expect(bounce()).toMatchObject({ kind: "advance", to: "builder", investigateFirst: false });
     backToQa();
@@ -419,7 +407,7 @@ describe("reviewer confidence gate", () => {
     const s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: { kind: "review-approve", confidence } })]);
     s.minReviewerConfidence = minConfidence;
     s.reviewerBelowThresholdAction = belowAction;
-    return nextAction(s.tickets, s.lanes, OPTS(s));
+    return nextAction(s, 0);
   }
 
   // AC4: at/above the floor, the gate passes the outcome through to the merge
@@ -484,15 +472,15 @@ describe("reviewer bounce cap (issue #76)", () => {
     s.maxReviewBounces = 2;
     const bounceFromReview = (): Action => {
       s = recordOutcome(s, 1, "REVIEW-APPROVE: confidence=10 not convinced", 0);
-      const a = nextAction(s.tickets, s.lanes, OPTS(s));
+      const a = nextAction(s, 0);
       s = applyAction(s, a, 0);
       return a;
     };
     const backToReview = () => {
       s = recordOutcome(s, 1, HAPPY.builder, 0);
-      s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0); // builder -> qa
+      s = applyAction(s, nextAction(s, 0), 0); // builder -> qa
       s = recordOutcome(s, 1, HAPPY.qa, 0);
-      s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0); // qa -> reviewer
+      s = applyAction(s, nextAction(s, 0), 0); // qa -> reviewer
     };
     // Pass 1: bounces back to the builder same as before the cap.
     expect(bounceFromReview()).toMatchObject({ kind: "advance", to: "builder" });
@@ -520,21 +508,21 @@ describe("reviewer bounce cap (issue #76)", () => {
 
     // One bounce.
     s = recordOutcome(s, 1, "REVIEW-APPROVE: confidence=10 not convinced", 0);
-    s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+    s = applyAction(s, nextAction(s, 0), 0);
     expect(s.lanes[0].reviewBounces).toBe(1);
     expect(s.tickets[0].status).toBe("Building");
 
     // Builder + QA clear it back to Review, leaving the counter untouched.
     s = recordOutcome(s, 1, HAPPY.builder, 0);
-    s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+    s = applyAction(s, nextAction(s, 0), 0);
     s = recordOutcome(s, 1, HAPPY.qa, 0);
-    s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+    s = applyAction(s, nextAction(s, 0), 0);
     expect(s.lanes[0].reviewBounces).toBe(1);
 
     // An at-threshold approve merges normally -- the one prior bounce does
     // not block it.
     s = recordOutcome(s, 1, "REVIEW-APPROVE: confidence=70 now satisfied", 0);
-    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toMatchObject({ kind: "advance", ticket: 1, to: "merge" });
+    expect(nextAction(s, 0)).toMatchObject({ kind: "advance", ticket: 1, to: "merge" });
 
     // A second ticket claimed fresh starts its own lane at reviewBounces: 0 --
     // the counter lives on the lane, so it can never leak from #1's lane.
@@ -551,15 +539,15 @@ describe("reviewer bounce cap (issue #76)", () => {
     expect(s.maxReviewBounces).toBeUndefined();
     const bounceFromReview = (): Action => {
       s = recordOutcome(s, 9, "REVIEW-APPROVE: confidence=10 nope", 0);
-      const a = nextAction(s.tickets, s.lanes, OPTS(s));
+      const a = nextAction(s, 0);
       s = applyAction(s, a, 0);
       return a;
     };
     const backToReview = () => {
       s = recordOutcome(s, 9, HAPPY.builder, 0);
-      s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+      s = applyAction(s, nextAction(s, 0), 0);
       s = recordOutcome(s, 9, HAPPY.qa, 0);
-      s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+      s = applyAction(s, nextAction(s, 0), 0);
     };
     expect(bounceFromReview()).toMatchObject({ kind: "advance", to: "builder" });
     backToReview();
@@ -578,17 +566,17 @@ describe("reviewer bounce cap (issue #76)", () => {
     s.minReviewerConfidence = 70;
     s.maxReviewBounces = 2;
     s = recordOutcome(s, 1, "REVIEW-FINDINGS: 1) missing test", 0);
-    s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+    s = applyAction(s, nextAction(s, 0), 0);
     expect(s.lanes[0].reviewBounces).toBe(1);
     // Back to Review.
     s = recordOutcome(s, 1, HAPPY.builder, 0);
-    s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+    s = applyAction(s, nextAction(s, 0), 0);
     s = recordOutcome(s, 1, HAPPY.qa, 0);
-    s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0);
+    s = applyAction(s, nextAction(s, 0), 0);
     // A confidence-retry now, not another REVIEW-FINDINGS, still hits the cap
     // this bounce carried over from the FINDINGS path.
     s = recordOutcome(s, 1, "REVIEW-APPROVE: confidence=5 unconvinced", 0);
-    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toMatchObject({
+    expect(nextAction(s, 0)).toMatchObject({
       kind: "park",
       status: "Blocked",
       note: expect.stringContaining("review bounce cap reached (2/2)"),
@@ -631,15 +619,15 @@ describe("merge ordering", () => {
       ]
     );
     // The parent merges first even though the child's lane comes first in the array.
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(a).toEqual({ kind: "advance", ticket: 20, to: "merge", stackedOn: [] });
     s = applyAction(s, a, 0);
     // Child stays gated while the parent is mid-merge.
-    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toEqual({ kind: "wait" });
+    expect(nextAction(s, 0)).toEqual({ kind: "wait" });
     s = recordOutcome(s, 20, HAPPY.merge, 0);
-    s = applyAction(s, nextAction(s.tickets, s.lanes, OPTS(s)), 0); // complete #20
+    s = applyAction(s, nextAction(s, 0), 0); // complete #20
     // Now the child advances, carrying its stacked parent for the merge prompt.
-    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toEqual({ kind: "advance", ticket: 21, to: "merge", stackedOn: [20] });
+    expect(nextAction(s, 0)).toEqual({ kind: "advance", ticket: 21, to: "merge", stackedOn: [20] });
   });
 });
 
@@ -648,14 +636,14 @@ describe("merge ordering", () => {
 describe("drain-complete", () => {
   test("all terminal statuses and no lanes -> drain-complete", () => {
     const s = state([ticket(1, "Done"), ticket(2, "Questions"), ticket(3, "Blocked"), ticket(4, "Skipped")]);
-    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toEqual({ kind: "drain-complete" });
+    expect(nextAction(s, 0)).toEqual({ kind: "drain-complete" });
     expect(drainComplete(s.tickets, s.lanes)).toBe(true);
   });
 
   test("a workable ticket or a live lane blocks the drain", () => {
     const s = state([ticket(1, "Done"), ticket(2, "Building")]);
     expect(drainComplete(s.tickets, s.lanes)).toBe(false);
-    expect(nextAction(s.tickets, s.lanes, OPTS(s)).kind).toBe("claim");
+    expect(nextAction(s, 0).kind).toBe("claim");
     const s2 = state([ticket(1, "Done")], [lane(9, "builder", { lastActivityMs: 0 })]);
     expect(drainComplete(s2.tickets, s2.lanes)).toBe(false);
   });
@@ -664,12 +652,12 @@ describe("drain-complete", () => {
     let s = state([ticket(1, "Done"), ticket(2, "Building")]);
     s = markClaimLost(s, 2);
     expect(claimableTickets(s.tickets, s.lanes)).toEqual([]);
-    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toEqual({ kind: "drain-complete" });
+    expect(nextAction(s, 0)).toEqual({ kind: "drain-complete" });
   });
 
   test("a dependency cycle inside the batch parks instead of spinning forever", () => {
     const s = state([ticket(1, "Building", [2]), ticket(2, "Building", [1])]);
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(a).toMatchObject({ kind: "park", ticket: 1, status: "Blocked", note: expect.stringContaining("deadlock") });
   });
 });
@@ -750,12 +738,12 @@ describe("deadlock breaker excludes still-completable deps", () => {
     // on it. There is no in-batch cycle -- #2 will finish elsewhere -- so #1 must
     // WAIT, not be wrongly parked Blocked as a phantom cycle.
     const s = state([ticket(1, "Building", [2]), ticket(2, "Building", [], { claimedByOther: true })]);
-    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toEqual({ kind: "wait" });
+    expect(nextAction(s, 0)).toEqual({ kind: "wait" });
   });
 
   test("a genuine in-batch 2-cycle still parks the lowest ticket Blocked", () => {
     const s = state([ticket(1, "Building", [2]), ticket(2, "Building", [1])]);
-    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toMatchObject({
+    expect(nextAction(s, 0)).toMatchObject({
       kind: "park", ticket: 1, status: "Blocked", note: expect.stringContaining("cycle"),
     });
   });
@@ -765,7 +753,7 @@ describe("deadlock breaker excludes still-completable deps", () => {
     // into the batch and no other session owns it, so waiting would burn tokens
     // forever. It must park Blocked so a human notices -- NOT wait.
     const s = state([ticket(7, "Ready", [8]), ticket(8, "Backlog")]);
-    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toMatchObject({ kind: "park", ticket: 7, status: "Blocked" });
+    expect(nextAction(s, 0)).toMatchObject({ kind: "park", ticket: 7, status: "Blocked" });
   });
 
   test("a real cycle plus a cross-session dependent waits until the external work resolves", () => {
@@ -778,7 +766,7 @@ describe("deadlock breaker excludes still-completable deps", () => {
       ticket(3, "Building", [9]),
       ticket(9, "Building", [], { claimedByOther: true }),
     ]);
-    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toEqual({ kind: "wait" });
+    expect(nextAction(s, 0)).toEqual({ kind: "wait" });
   });
 });
 
@@ -790,7 +778,7 @@ describe("dead merge worker path", () => {
   test("a dead merge lane is held at check-worker, never blind-skipped", () => {
     const s = state([ticket(1, "Review")], [lane(1, "merge", { workerDead: true, lastActivityMs: 0 })]);
     // Silent past the watchdog AND probed dead: a normal stage would skip here.
-    const a = nextAction(s.tickets, s.lanes, { ...OPTS(s), nowMs: 11 * MIN });
+    const a = nextAction(s, 11 * MIN);
     expect(a).toEqual({ kind: "check-worker", ticket: 1 });
   });
 
@@ -798,7 +786,7 @@ describe("dead merge worker path", () => {
     let s = state([ticket(1, "Review")], [lane(1, "merge", { workerDead: true })]);
     // The SKILL's gh pr view found the PR landed before the worker died.
     s = recordOutcome(s, 1, "MERGED: https://pr/9", 0);
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(a).toMatchObject({ kind: "complete", ticket: 1 });
     s = applyAction(s, a, 0);
     expect(s.tickets[0].status).toBe("Done");
@@ -807,7 +795,7 @@ describe("dead merge worker path", () => {
 
   test("a dead non-merge worker still skips (regression guard)", () => {
     const s = state([ticket(1, "Building")], [lane(1, "builder", { workerDead: true, lastActivityMs: 0 })]);
-    expect(nextAction(s.tickets, s.lanes, { ...OPTS(s), nowMs: 11 * MIN }).kind).toBe("skip");
+    expect(nextAction(s, 11 * MIN).kind).toBe("skip");
   });
 });
 
@@ -828,7 +816,7 @@ describe("ingest drops a lane whose ticket vanished", () => {
     const s = ingestBoardItems(prev, [{ number: 1, title: "t1", fields: { Status: "Building" } }], { "1": "" });
     expect(s.tickets.map((t) => t.number)).toEqual([1]);
     expect(s.lanes.map((l) => l.ticket)).toEqual([1]); // lane #2 dropped
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(() => applyAction(s, a, 0)).not.toThrow();
   });
 });
@@ -853,7 +841,7 @@ describe("ingest preserves state on a transient empty snapshot (#127)", () => {
     expect(s.tickets.map((t) => t.number)).toEqual([119, 120]); // preserved, not wiped
     expect(s.lanes.map((l) => l.ticket)).toEqual([119, 120]); // in-flight lanes kept
     expect(drainComplete(s.tickets, s.lanes)).toBe(false);
-    expect(nextAction(s.tickets, s.lanes, OPTS(s)).kind).not.toBe("drain-complete");
+    expect(nextAction(s, 0).kind).not.toBe("drain-complete");
   });
 
   test("a genuine first ingest (no prev) of 0 items is still allowed to be empty", () => {
@@ -982,7 +970,7 @@ describe("stage/status desync fails soft (#110)", () => {
         lane(2, "qa"), // healthy, mid-stage (no outcome yet)
       ]
     );
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     // One hop behind (Building is qa's own preceding status) -- resync-on-lag
     // (#116), not the old stop-lane, and NOT the illegal advance-to-reviewer
     // that used to throw before #110's guard existed.
@@ -1007,7 +995,7 @@ describe("stage/status desync fails soft (#110)", () => {
     // The #116 resync-on-lag path is UNCHANGED for a real qa-pass lane: through
     // nextAction the lagged lane is still corrected to QA before it advances, so
     // the board reflects the QA the ticket actually passed (not a skip walk).
-    const a = nextAction(skip.tickets, skip.lanes, OPTS(skip));
+    const a = nextAction(skip, 0);
     expect(a).toMatchObject({ kind: "advance", to: "reviewer", resyncStatus: "QA" });
     const after = applyAction(skip, a, 0);
     expect(after.tickets[0].status).toBe("Review");
@@ -1022,13 +1010,13 @@ describe("stage/status desync fails soft (#110)", () => {
         lane(2, "builder", { outcome: { kind: "built" } }), // healthy, ready to advance
       ]
     );
-    const stop = nextAction(s.tickets, s.lanes, OPTS(s));
+    const stop = nextAction(s, 0);
     expect(stop).toMatchObject({ kind: "stop-lane", ticket: 1 });
     expect((stop as { note: string }).note).toContain("reviewer");
     s = applyAction(s, stop, 0);
     expect(s.lanes.map((l) => l.ticket)).toEqual([2]); // only #1's lane stopped
     // The other lane continues on the very next tick.
-    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toMatchObject({ kind: "advance", ticket: 2, to: "qa" });
+    expect(nextAction(s, 0)).toMatchObject({ kind: "advance", ticket: 2, to: "qa" });
   });
 });
 
@@ -1049,7 +1037,7 @@ describe("resync-on-lag vs genuine move-back (#116)", () => {
       [ticket(1, "Building")],
       [lane(1, "qa", { outcome: { kind: "qa-pass" }, lastWroteStatus: "QA" })] // the loop's own QA-move write has not landed yet
     );
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "reviewer", resyncStatus: "QA" });
     const after = applyAction(s, a, 0);
     expect(after.tickets[0].status).toBe("Review");
@@ -1062,13 +1050,13 @@ describe("resync-on-lag vs genuine move-back (#116)", () => {
       [ticket(1, "Building")],
       [lane(1, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } })] // human dragged Review -> Building
     );
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(a).toMatchObject({ kind: "stop-lane", ticket: 1 });
     s = applyAction(s, a, 0);
     expect(s.lanes).toEqual([]);
     expect(s.tickets[0].status).toBe("Building"); // the human's move is honored, not overwritten
     // Re-claimed as a fresh builder next tick -- the full build+QA cycle re-runs.
-    expect(nextAction(s.tickets, s.lanes, OPTS(s))).toMatchObject({ kind: "claim", ticket: 1, stage: "builder" });
+    expect(nextAction(s, 0)).toMatchObject({ kind: "claim", ticket: 1, stage: "builder" });
   });
 });
 
@@ -1088,7 +1076,7 @@ describe("one-hop resync: lagged write vs genuine move-back by origin (#125)", (
 
   test("AC1: a reviewer lane one hop behind (board QA) with the loop's Review write still in flight resyncs to Review and advances to merge", () => {
     const s = state([ticket(1, "QA")], [reviewerLane({ lastWroteStatus: "Review" })]);
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "merge", resyncStatus: "Review" });
     const after = applyAction(s, a, 0);
     expect(after.tickets[0].status).toBe("Review"); // resynced past the lag, merge runs under Review
@@ -1097,7 +1085,7 @@ describe("one-hop resync: lagged write vs genuine move-back by origin (#125)", (
 
   test("AC2: a reviewer lane a human dragged Review -> QA (loop observed its Review write land, marker cleared) stop-lanes -- the one-hop human move is honored, NOT silently overridden", () => {
     let s = state([ticket(1, "QA")], [reviewerLane()]); // no lastWroteStatus: the Review write already landed and was observed
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(a).toMatchObject({ kind: "stop-lane", ticket: 1 });
     expect((a as { note: string }).note).toContain("reviewer");
     s = applyAction(s, a, 0);
@@ -1106,9 +1094,8 @@ describe("one-hop resync: lagged write vs genuine move-back by origin (#125)", (
   });
 
   test("AC1 vs AC2: the IDENTICAL one-hop snapshot yields opposite outcomes -- marker present resyncs, marker absent stop-lanes (origin, not distance)", () => {
-    const opts = OPTS(state([]));
-    const lagged = nextAction([ticket(1, "QA")], [reviewerLane({ lastWroteStatus: "Review" })], opts);
-    const human = nextAction([ticket(1, "QA")], [reviewerLane()], opts);
+    const lagged = nextAction(state([ticket(1, "QA")], [reviewerLane({ lastWroteStatus: "Review" })]), 0);
+    const human = nextAction(state([ticket(1, "QA")], [reviewerLane()]), 0);
     expect(lagged.kind).toBe("advance");
     expect(human.kind).toBe("stop-lane");
   });
@@ -1145,7 +1132,7 @@ describe("resync-on-lag covers advance->builder bounce-backs (#124)", () => {
       [ticket(1, "QA")], // the loop's own bounce-to-Building write has not landed yet
       [lane(1, "builder", { qaBounces: 1, outcome: { kind: "built" }, lastWroteStatus: "Building" })] // rebuild passing; #125 origin marker: the bounce write is in flight
     );
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "qa", resyncStatus: "Building" });
     const after = applyAction(s, a, 0);
     expect(after.tickets[0].status).toBe("QA"); // resynced to Building, then advanced -- not stopped, not re-claimed
@@ -1158,7 +1145,7 @@ describe("resync-on-lag covers advance->builder bounce-backs (#124)", () => {
       [ticket(1, "Review")], // the bounce-to-Building write from Review has not landed yet
       [lane(1, "builder", { reviewBounces: 1, outcome: { kind: "built" }, lastWroteStatus: "Building" })] // #125 origin marker: the bounce write is in flight
     );
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "qa", resyncStatus: "Building" });
     const after = applyAction(s, a, 0);
     expect(after.tickets[0].status).toBe("QA");
@@ -1172,7 +1159,7 @@ describe("resync-on-lag covers advance->builder bounce-backs (#124)", () => {
       [ticket(1, "Ready")],
       [lane(1, "builder", { qaBounces: 1, outcome: { kind: "built" } })]
     );
-    expect(nextAction(farMove.tickets, farMove.lanes, OPTS(farMove))).toMatchObject({ kind: "stop-lane", ticket: 1 });
+    expect(nextAction(farMove, 0)).toMatchObject({ kind: "stop-lane", ticket: 1 });
 
     // One hop by status, but no lane-driven bounce ever happened (counters at 0),
     // so QA/Review on a builder lane is a genuine move, not a lagged bounce.
@@ -1180,7 +1167,7 @@ describe("resync-on-lag covers advance->builder bounce-backs (#124)", () => {
       [ticket(1, "QA")],
       [lane(1, "builder", { qaBounces: 0, reviewBounces: 0, outcome: { kind: "built" } })]
     );
-    expect(nextAction(noBounce.tickets, noBounce.lanes, OPTS(noBounce))).toMatchObject({ kind: "stop-lane", ticket: 1 });
+    expect(nextAction(noBounce, 0)).toMatchObject({ kind: "stop-lane", ticket: 1 });
   });
 });
 
@@ -1206,7 +1193,7 @@ describe("skip-qa label short-circuits QA (#130)", () => {
   test("AC1: a skip-qa builder advances straight to reviewer and lands in Review, no throw", () => {
     let s = builtLane(true);
     expect(s.tickets[0].skipQa).toBe(true);
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(a).toEqual({ kind: "advance", ticket: 1, to: "reviewer" });
     expect(() => applyAction(s, a, 0)).not.toThrow();
     s = applyAction(s, a, 0);
@@ -1218,7 +1205,7 @@ describe("skip-qa label short-circuits QA (#130)", () => {
   test("AC2: the same fixture without the label takes the normal builder -> qa path", () => {
     let s = builtLane(false);
     expect(s.tickets[0].skipQa).toBeFalsy();
-    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a = nextAction(s, 0);
     expect(a).toEqual({ kind: "advance", ticket: 1, to: "qa" });
     s = applyAction(s, a, 0);
     expect(s.tickets[0].status).toBe("QA");
@@ -1318,20 +1305,56 @@ describe("ingestBoardItems", () => {
   });
 
   // -- issue #63: initialReadyCount / humanNeededNotified capture-once + reset -
-  test("AC8: a genuinely first ingest captures initialReadyCount from Building tickets only, defaults humanNeededPercent, humanNeededNotified false", () => {
+  test("AC8: a genuinely first ingest captures initialReadyCount from Ready tickets only, defaults humanNeededPercent, humanNeededNotified false", () => {
     const items = [
-      { number: 1, title: "a", fields: { Status: "Building" } },
-      { number: 2, title: "b", fields: { Status: "Building" } },
-      { number: 3, title: "c", fields: { Status: "Building" } },
-      { number: 4, title: "d", fields: { Status: "Building" } },
+      { number: 1, title: "a", fields: { Status: "Ready" } },
+      { number: 2, title: "b", fields: { Status: "Ready" } },
+      { number: 3, title: "c", fields: { Status: "Ready" } },
+      { number: 4, title: "d", fields: { Status: "Ready" } },
       { number: 5, title: "e", fields: { Status: "Done" } },
       { number: 6, title: "f", fields: { Status: "Done" } },
     ];
     const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
     const s = ingestBoardItems(null, items, bodies);
-    expect(s.initialReadyCount).toBe(4); // only the Building count
+    expect(s.initialReadyCount).toBe(4); // #133: the Ready committed queue, not Building
     expect(s.humanNeededPercent).toBe(30); // default
     expect(s.humanNeededNotified).toBe(false);
+  });
+
+  // #133 AC3: with the batch-commit move deferred to claim time, the committed
+  // queue sits in Ready at ingest-time-zero and Building is NOT the fresh-batch
+  // signal. A stray Building ticket (e.g. a crash-resume mid-flight) must not be
+  // counted as this batch's committed work -- the denominator is the Ready count.
+  test("AC3 (#133): first ingest captures initialReadyCount from the Ready committed queue; Building tickets are not the signal", () => {
+    const items = [
+      { number: 1, title: "a", fields: { Status: "Ready" } },
+      { number: 2, title: "b", fields: { Status: "Ready" } },
+      { number: 3, title: "c", fields: { Status: "Ready" } },
+      { number: 4, title: "d", fields: { Status: "Ready" } },
+      { number: 5, title: "e", fields: { Status: "Building" } }, // in flight, not part of this fresh batch's committed count
+      { number: 6, title: "f", fields: { Status: "Done" } },
+    ];
+    const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
+    const s = ingestBoardItems(null, items, bodies);
+    expect(s.initialReadyCount).toBe(4); // the 4 Ready, NOT the Building #5
+    expect(s.humanNeededNotified).toBe(false);
+  });
+
+  // #133 AC4: the Ready-count denominator is behavior-equivalent to the old
+  // Building-count one. Step 1 parks 3 of 10 planned to Questions; the 7
+  // committed sit in Ready (they used to sit in Building after Step 2). Numerator
+  // = 3 Questions in both models, denominator = 7 in both -> identical trip.
+  test("AC4 (#133): denominator equals the old Building-count semantics when Step 1 parks tickets to Questions", () => {
+    const items = [
+      ...[1, 2, 3, 4, 5, 6, 7].map((n) => ({ number: n, title: `r${n}`, fields: { Status: "Ready" } })),
+      ...[8, 9, 10].map((n) => ({ number: n, title: `q${n}`, fields: { Status: "Questions" } })),
+    ];
+    const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
+    const s = ingestBoardItems(null, items, bodies, { humanNeededPercent: 30 });
+    expect(s.initialReadyCount).toBe(7); // the 7 Ready committed, not counting the 3 parked Questions
+    const hn = humanNeededStatus(s);
+    expect(hn.questions).toBe(3);
+    expect(hn.tripped).toBe(true); // 3/7 = 42.8% > 30, identical to the pre-#133 Building-count result
   });
 
   test("AC9: a mid-batch re-ingest (prev has a live lane) preserves initialReadyCount/humanNeededNotified unchanged", () => {
@@ -1364,12 +1387,12 @@ describe("ingestBoardItems", () => {
     };
     expect(drainComplete(prev.tickets, prev.lanes)).toBe(true); // sanity: prev IS fully drained
     const items = [
-      { number: 10, title: "New1", fields: { Status: "Building" } },
-      { number: 11, title: "New2", fields: { Status: "Building" } },
+      { number: 10, title: "New1", fields: { Status: "Ready" } },
+      { number: 11, title: "New2", fields: { Status: "Ready" } },
     ];
     const bodies = { "10": "no deps", "11": "no deps" };
     const s = ingestBoardItems(prev, items, bodies);
-    expect(s.initialReadyCount).toBe(2); // recomputed from the NEW batch, not the stale 7
+    expect(s.initialReadyCount).toBe(2); // recomputed from the NEW batch's Ready count, not the stale 7
     expect(s.humanNeededNotified).toBe(false); // reset
   });
 
@@ -1396,7 +1419,7 @@ describe("ingestBoardItems", () => {
     expect(s.mergedThisRun).toEqual([50]); // preserved -- a merge earlier in this batch is not lost
   });
 
-  test("issue #119 AC1: a re-ingest after the prior batch fully drained resets mergedThisRun (drainComplete + new Building is the fresh-batch boundary)", () => {
+  test("issue #119 AC1: a re-ingest after the prior batch fully drained resets mergedThisRun (drainComplete + new Ready is the fresh-batch boundary)", () => {
     const prev: LoopState = {
       tickets: [ticket(5, "Done"), ticket(7, "Blocked")],
       lanes: [],
@@ -1406,7 +1429,7 @@ describe("ingestBoardItems", () => {
     };
     expect(drainComplete(prev.tickets, prev.lanes)).toBe(true); // sanity: prev IS fully drained
     const items = [
-      { number: 200, title: "New", fields: { Status: "Building" } },
+      { number: 200, title: "New", fields: { Status: "Ready" } },
     ];
     const bodies = { "200": "Depends on: #50" };
     const s = ingestBoardItems(prev, items, bodies);
@@ -1427,9 +1450,9 @@ describe("ingestBoardItems", () => {
   test("regression: final-tick confirmation preserves counters (real ingest -> applyAction -> ingest chain, not a hand-built prev)", () => {
     const bodies = { "1": "no deps", "2": "no deps", "3": "no deps" };
     const items1 = [
-      { number: 1, title: "a", fields: { Status: "Building" } },
-      { number: 2, title: "b", fields: { Status: "Building" } },
-      { number: 3, title: "c", fields: { Status: "Building" } },
+      { number: 1, title: "a", fields: { Status: "Ready" } },
+      { number: 2, title: "b", fields: { Status: "Ready" } },
+      { number: 3, title: "c", fields: { Status: "Ready" } },
     ];
     let s = ingestBoardItems(null, items1, bodies, { humanNeededPercent: 30 });
     s.lanes = [lane(1, "builder"), lane(2, "builder"), lane(3, "builder")];
@@ -1452,7 +1475,7 @@ describe("ingestBoardItems", () => {
     expect(drainComplete(s.tickets, s.lanes)).toBe(true); // this state IS the next tick's `prev`
 
     // Next tick: a fresh board snapshot just confirms #1 is now Skipped too --
-    // nothing new committed to Building. The bug reset initialReadyCount to 0
+    // nothing new committed to Ready. The bug reset initialReadyCount to 0
     // here (recomputed from an all-terminal snapshot) and humanNeededNotified
     // to false, which by itself looks harmless, but initialReadyCount=0 makes
     // humanNeededTripped's initialReady<=0 guard force tripped=false forever.
@@ -1472,7 +1495,7 @@ describe("ingestBoardItems", () => {
 
   test("regression: fire-once flag survives a same-batch confirmation re-ingest, resets only for a genuinely new batch", () => {
     const bodies = { "1": "no deps" };
-    let s = ingestBoardItems(null, [{ number: 1, title: "a", fields: { Status: "Building" } }], bodies, { humanNeededPercent: 30 });
+    let s = ingestBoardItems(null, [{ number: 1, title: "a", fields: { Status: "Ready" } }], bodies, { humanNeededPercent: 30 });
     s.lanes = [lane(1, "builder")];
     s = applyAction(s, { kind: "skip", ticket: 1, note: "dead" }, 1000);
     expect(drainComplete(s.tickets, s.lanes)).toBe(true);
@@ -1481,70 +1504,70 @@ describe("ingestBoardItems", () => {
     s = markHumanNeededNotified(s);
 
     // Another confirmation tick on the same drained batch: still no new
-    // Building tickets. Must not re-arm the control.
+    // Ready tickets. Must not re-arm the control.
     s = ingestBoardItems(s, [{ number: 1, title: "a", fields: { Status: "Skipped" } }], bodies);
     expect(s.humanNeededNotified).toBe(true);
     expect(humanNeededStatus(s).alreadyNotified).toBe(true);
 
-    // A genuinely NEW batch (fresh Building tickets) DOES reset, even though
+    // A genuinely NEW batch (fresh Ready tickets) DOES reset, even though
     // the old ticket #1 is still present in the snapshot.
     s = ingestBoardItems(s, [
       { number: 1, title: "a", fields: { Status: "Skipped" } },
-      { number: 2, title: "b", fields: { Status: "Building" } },
+      { number: 2, title: "b", fields: { Status: "Ready" } },
     ], { ...bodies, "2": "no deps" });
-    expect(s.initialReadyCount).toBe(1); // only the new batch's Building count
+    expect(s.initialReadyCount).toBe(1); // only the new batch's Ready count
     expect(s.humanNeededNotified).toBe(false);
   });
 
-  // Regression (issue #63 second review bounce): the two tests above only
-  // ever left a foreign lane's ticket in a terminal status by the time the
-  // batch drained. But drainComplete permits a claimedByOther ticket to remain in
-  // *Building* -- it belongs to another session's batch, not this one. The
-  // bounce-1 fix's buildingCount didn't exclude claimedByOther, so a lingering
-  // foreign Building ticket in the snapshot made startingFreshBatch wrongly
-  // true on the confirmation re-ingest after THIS session's own last ticket
-  // resolved, silently resetting initialReadyCount/humanNeededNotified from a
-  // ticket this session never committed.
-  test("regression: claimedByOther Building does not start a fresh batch, but a new unclaimed Building ticket does", () => {
+  // Regression (issue #63 second review bounce), sharpened for #133: with the
+  // committed queue now in Ready, drainComplete permits a claimedByOther ticket
+  // to linger in a workable status -- here *Ready* -- because it belongs to
+  // another session's batch, not this one. readyCount must exclude
+  // claimedByOther for the same reason buildingCount did: a lingering foreign
+  // Ready ticket in the snapshot must not make startingFreshBatch wrongly true
+  // on the confirmation re-ingest after THIS session's own last ticket resolved,
+  // silently resetting initialReadyCount/humanNeededNotified from a ticket this
+  // session never committed.
+  test("regression: a claimedByOther Ready ticket does not start a fresh batch, but a new unclaimed Ready ticket does", () => {
     const bodies = { "1": "no deps", "9": "no deps" };
     const prev: LoopState = {
-      tickets: [ticket(1, "Done"), ticket(9, "Building", [], { claimedByOther: true })],
+      tickets: [ticket(1, "Done"), ticket(9, "Ready", [], { claimedByOther: true })],
       lanes: [],
       maxLanes: 3,
       watchdogMinutes: 10,
       initialReadyCount: 5,
       humanNeededNotified: true,
     };
-    // sanity: OWN batch is drained (ticket 1 terminal); #9 is another
-    // session's Building ticket, which drainComplete explicitly permits.
+    // sanity: OWN batch is drained (ticket 1 terminal); #9 is another session's
+    // Ready ticket, workable-but-foreign, which drainComplete explicitly permits.
     expect(drainComplete(prev.tickets, prev.lanes)).toBe(true);
 
-    // Confirmation tick: the same foreign Building ticket #9 is still there,
-    // nothing new committed. Must NOT read as a fresh batch.
+    // Confirmation tick: the same foreign Ready ticket #9 is still there,
+    // nothing new committed. Must NOT read as a fresh batch (readyCount excludes it).
     const same = ingestBoardItems(
       prev,
       [
         { number: 1, title: "a", fields: { Status: "Done" } },
-        { number: 9, title: "z", fields: { Status: "Building" } },
+        { number: 9, title: "z", fields: { Status: "Ready" } },
       ],
       bodies
     );
     expect(same.initialReadyCount).toBe(5); // preserved, not recomputed from the foreign ticket
     expect(same.humanNeededNotified).toBe(true); // preserved, not silently reset
 
-    // A genuinely new batch -- an UNCLAIMED Building ticket appears alongside
+    // A genuinely new batch -- an UNCLAIMED Ready ticket appears alongside
     // the still-foreign #9 -- DOES reset, same as the AC10 and fire-once-flag
     // regression tests above.
     const fresh = ingestBoardItems(
       prev,
       [
         { number: 1, title: "a", fields: { Status: "Done" } },
-        { number: 9, title: "z", fields: { Status: "Building" } },
-        { number: 10, title: "New", fields: { Status: "Building" } },
+        { number: 9, title: "z", fields: { Status: "Ready" } },
+        { number: 10, title: "New", fields: { Status: "Ready" } },
       ],
       { ...bodies, "10": "no deps" }
     );
-    expect(fresh.initialReadyCount).toBe(1); // only the new UNCLAIMED Building ticket, not the foreign #9
+    expect(fresh.initialReadyCount).toBe(1); // only the new UNCLAIMED Ready ticket, not the foreign #9
     expect(fresh.humanNeededNotified).toBe(false); // reset
   });
 });

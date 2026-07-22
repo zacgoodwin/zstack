@@ -19,10 +19,9 @@
 // blindness gate is untouched.
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { handleCliError } from "./cli.ts";
+import { handleCliError, parseFlags, str } from "./cli.ts";
 import { ADVERSARIAL_MODES, DEFAULT_ADVERSARIAL_MODE, ZError, type AdversarialMode } from "./config.ts";
 
-export { ZError } from "./config.ts";
 // Re-exported so importers of this module get the enum from the one file that
 // owns the prompt-side adversarial helpers (config.ts is the definitional home).
 export type { AdversarialMode } from "./config.ts";
@@ -364,23 +363,19 @@ const USAGE = `stage-prompts <command> [args]
   plan-edges <edges.json>                           print the plan-time "Needs input" edges comment
                                                     (CompletionEdge[]); prints nothing for an empty list`;
 
-// A single "--flag value" lookup for the reviewer's two optional flags. Returns
-// the token after the flag, or undefined when the flag is absent (defaults apply).
-function flagValue(argv: string[], flag: string): string | undefined {
-  const i = argv.indexOf(flag);
-  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
-}
-
 export function main(argv: string[]): number {
   const cmd = argv[0];
   if (!cmd || cmd === "--help" || cmd === "-h") {
     console.log(USAGE);
     return cmd ? 0 : 1;
   }
+  // Shared CLI plumbing (lib/cli.ts): the reviewer's two optional flags
+  // (--adversarial-mode, --labels) split out here, positionals keep their order.
+  const { positionals, flags } = parseFlags(argv.slice(1));
   try {
     if (cmd === "prompt") {
-      const stage = argv[1];
-      const path = argv[2];
+      const stage = positionals[0];
+      const path = positionals[1];
       if (!stage || !path) throw new ZError("Usage: stage-prompts prompt <builder|qa|reviewer|merge> <input.json>");
       let input: any;
       try {
@@ -394,7 +389,7 @@ export function main(argv: string[]): number {
         // configured mode, the diff's OWN changed-line count, and the card's
         // labels. Mode + labels arrive as FLAGS, never as a fifth input key --
         // the blinded four-key input-<N>.json is untouched (blindness intact).
-        const modeArg = flagValue(argv, "--adversarial-mode");
+        const modeArg = str(flags, "adversarial-mode");
         const mode = (modeArg ?? DEFAULT_ADVERSARIAL_MODE) as AdversarialMode;
         if (!ADVERSARIAL_MODES.includes(mode)) {
           throw new ZError(
@@ -402,7 +397,7 @@ export function main(argv: string[]): number {
           );
         }
         let labels: string[] = [];
-        const labelsArg = flagValue(argv, "--labels");
+        const labelsArg = str(flags, "labels");
         if (labelsArg !== undefined) {
           let parsed: unknown;
           try {
@@ -437,14 +432,14 @@ export function main(argv: string[]): number {
       return 0;
     }
     if (cmd === "note") {
-      if (!argv[1]) throw new ZError("Usage: stage-prompts note <input.json>");
-      const input = JSON.parse(readFileSync(argv[1], "utf8")) as CompletionNoteInput;
+      if (!positionals[0]) throw new ZError("Usage: stage-prompts note <input.json>");
+      const input = JSON.parse(readFileSync(positionals[0], "utf8")) as CompletionNoteInput;
       console.log(completionNote(input));
       return 0;
     }
     if (cmd === "plan-edges") {
-      if (!argv[1]) throw new ZError("Usage: stage-prompts plan-edges <edges.json>");
-      const edges = JSON.parse(readFileSync(argv[1], "utf8")) as CompletionEdge[];
+      if (!positionals[0]) throw new ZError("Usage: stage-prompts plan-edges <edges.json>");
+      const edges = JSON.parse(readFileSync(positionals[0], "utf8")) as CompletionEdge[];
       const out = planEdgesComment(edges);
       // Empty list -> no output, so a caller's "post only if non-empty" check
       // ($(...) truthiness on the captured string) sees nothing to post.

@@ -7,8 +7,6 @@
 import { TERMINAL_STATUSES, ZError } from "./config.ts";
 import type { BoardStatus, LaneState, Stage, TicketSnapshot } from "./loop.ts";
 
-export { ZError } from "./config.ts";
-
 // -- dependency parsing -------------------------------------------------------
 
 // Extracts the issue numbers a ticket waits on from its body's "Depends on"
@@ -81,10 +79,6 @@ export function claimableTickets(tickets: TicketSnapshot[], lanes: LaneState[]):
     .filter((t) => isWorkableStatus(t.status) && !inLane.has(t.number) && !t.claimedByOther)
     .filter((t) => depsSatisfied(t, byNumber))
     .sort((a, b) => a.number - b.number);
-}
-
-export function laneCapReached(lanes: LaneState[], maxLanes: number): boolean {
-  return lanes.length >= maxLanes;
 }
 
 // -- watchdog -----------------------------------------------------------------

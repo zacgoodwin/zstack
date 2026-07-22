@@ -139,7 +139,7 @@ export function simulateDrain(nTickets: number): DrainStats {
   const spawns: { ticket: number; stage: Stage }[] = [];
   let iterations = 0;
   for (let i = 0; i < 5000; i++) {
-    const a = nextAction(s.tickets, s.lanes, { nowMs: 0, maxLanes: s.maxLanes, watchdogMinutes: s.watchdogMinutes, mergedThisRun: s.mergedThisRun });
+    const a = nextAction(s, 0);
     iterations++;
     if (a.kind === "drain-complete") return { spawns, iterations, ticketsDrained: nTickets };
     if (a.kind === "wait") {

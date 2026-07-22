@@ -9,7 +9,8 @@ import { test, expect, describe, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
-import { costOfFiles, expandGlob, main, parseLine, sumByStage, ZError } from "../lib/cost.ts";
+import { costOfFiles, expandGlob, main, parseLine, sumByStage } from "../lib/cost.ts";
+import { ZError } from "../lib/config.ts";
 import type { FileSpend } from "../lib/cost.ts";
 import type { RatesFile } from "../lib/estimate.ts";
 
