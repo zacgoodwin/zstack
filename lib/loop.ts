@@ -160,6 +160,14 @@ export interface LaneState {
   reviewBounces: number; // completed reviewer->builder bounces (issue #76)
   workerDead?: boolean; // set by the orchestrator after an aliveness probe
   outcome?: StageOutcome; // set when the stage agent's final message is parsed
+  // #125: the board status the loop itself last wrote for this lane (set by
+  // applyAction's claim/advance). It is the ORIGIN marker the one-hop desync
+  // guard needs: while set, the loop's own write is still in flight and has NOT
+  // been observed to land; ingestBoardItems clears it the moment the board
+  // shows that status. A one-hop-behind read only resyncs when this still
+  // points at the lane's own stage status (a genuine human move-back, which the
+  // loop never wrote, leaves it cleared -> safe stop-lane). See the guard below.
+  lastWroteStatus?: BoardStatus;
 }
 
 export interface LoopState {
@@ -461,29 +469,37 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
         note: `A human moved #${lane.ticket} to ${byNumber.get(lane.ticket)!.status} during the run; stopping its lane cleanly at the ${lane.stage} boundary (other lanes continue).`,
       };
     }
-    // Stage/status desync guard (#110, resync-on-lag #116). t.status is
-    // re-read from the live board each tick (ingestBoardItems), while the
-    // advance resolveOutcome/merge-gate derives comes from lane.stage. When the
-    // two disagree at a boundary, a single snapshot cannot prove WHY: a human
-    // could have dragged the card back, or the loop's own prior advance simply
-    // has not landed on the board yet (GitHub eventual consistency). The board
-    // only ever moves one column per advance, though, so a gap of EXACTLY one
-    // hop behind, along the fixed pipeline (PRECEDING_BOARD_STATUS) is what our
-    // own still-propagating write looks like -- anything further back (or
-    // sideways/ahead) is not explainable by a single write in flight and is
-    // treated as a genuine move. A one-hop gap resyncs: the ticket is corrected
-    // to the lane's own expected status and the tick proceeds with the normal
-    // advance (no rebuild, no re-run of QA that already passed) instead of
-    // stopping the lane. Anything else keeps #110's safe stop-lane: letting the
-    // outcome resolve unresynced would hand applyAction an advance whose
-    // setStatus is illegal from the stale status (the qa-pass lane still
-    // showing Building -> the Building->Review that used to throw an
-    // unhandled ZError and abort the WHOLE tick). LEGAL_TRANSITIONS is
-    // untouched either way, so skip-QA stays illegal, and every other lane's
-    // progress survives.
+    // Stage/status desync guard (#110, resync-on-lag #116, origin marker #125).
+    // t.status is re-read from the live board each tick (ingestBoardItems),
+    // while the advance resolveOutcome/merge-gate derives comes from lane.stage.
+    // When the two disagree at a boundary, a single snapshot cannot prove WHY: a
+    // human could have dragged the card back, or the loop's own prior advance
+    // simply has not landed on the board yet (GitHub eventual consistency).
+    // Distance alone cannot tell these apart at ONE hop (#116's blind spot,
+    // #125): a reviewer lane reading QA is IDENTICAL whether the loop's own
+    // Review write is still in flight or a human genuinely dragged Review->QA.
+    // ORIGIN settles it: the loop records the status it wrote (lane.lastWroteStatus,
+    // cleared by ingest the moment the board shows it land), so a one-hop-behind
+    // read (isOneHopLag, incl. #124's advance->builder bounce lag) resyncs ONLY
+    // when that marker still points at this lane's own stage status -- proof the
+    // gap is the loop's own still-propagating write, not a human move the loop
+    // never made. Resync corrects the ticket to the lane's
+    // expected status and proceeds with the normal advance (no rebuild, no
+    // re-run of QA that already passed). Everything else -- a further-back gap,
+    // OR a one-hop gap with no in-flight write of ours (lastWroteStatus cleared/
+    // absent = a genuine human move-back) -- keeps #110's safe stop-lane, honoring
+    // the human's move instead of silently overriding it. Stopping unresynced is
+    // also what keeps applyAction from an advance whose setStatus is illegal from
+    // the stale status (the qa-pass lane still showing Building -> the
+    // Building->Review that used to throw an unhandled ZError and abort the WHOLE
+    // tick). LEGAL_TRANSITIONS is untouched either way, so skip-QA stays illegal,
+    // and every other lane's progress survives.
     const t = byNumber.get(lane.ticket);
     if (t && t.status !== STATUS_FOR_STAGE[lane.stage]) {
-      if (isOneHopLag(lane, t.status)) {
+      if (
+        isOneHopLag(lane, t.status) &&
+        lane.lastWroteStatus === STATUS_FOR_STAGE[lane.stage]
+      ) {
         resyncStatus.set(lane.ticket, STATUS_FOR_STAGE[lane.stage]);
       } else {
         return {
@@ -676,7 +692,9 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
     case "claim": {
       const t = findTicket(next, action.ticket);
       setStatus(t, STATUS_FOR_STAGE[action.stage]);
-      next.lanes.push({ ticket: action.ticket, stage: action.stage, lastActivityMs: nowMs, qaBounces: 0, reviewBounces: 0 });
+      // #125: record the status we just wrote as the lane's origin marker (see
+      // LaneState.lastWroteStatus); ingest clears it once the board shows it land.
+      next.lanes.push({ ticket: action.ticket, stage: action.stage, lastActivityMs: nowMs, qaBounces: 0, reviewBounces: 0, lastWroteStatus: STATUS_FOR_STAGE[action.stage] });
       return next;
     }
     case "advance": {
@@ -688,6 +706,10 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
       lane.lastActivityMs = nowMs;
       delete lane.outcome;
       delete lane.workerDead;
+      // #125: this advance writes STATUS_FOR_STAGE[to] below; record it as the
+      // lane's origin marker so a lagged board write can be told from a human
+      // move-back on the next tick (ingest clears it once the board shows it land).
+      lane.lastWroteStatus = STATUS_FOR_STAGE[action.to];
       const t = findTicket(next, action.ticket);
       if (action.resyncStatus !== undefined) {
         // #116: nextAction's desync guard already established this ticket's
@@ -839,7 +861,23 @@ export function ingestBoardItems(
   // (if any) is left for the SKILL to tear down; the loop simply stops tracking a
   // ticket the board no longer knows about.
   const present = new Set(tickets.map((t) => t.number));
-  const lanes = (prev?.lanes ?? []).filter((l) => present.has(l.ticket));
+  const statusByNumber = new Map(tickets.map((t) => [t.number, t.status]));
+  // #125: the moment the freshly-read board shows the status the loop last
+  // wrote for a lane, that write has LANDED -- drop the origin marker. From
+  // then on a one-hop-behind read for that lane is a genuine human move-back
+  // (the desync guard's safe stop-lane), not a still-propagating write of ours
+  // (resync). While the write lags (board != lastWroteStatus) the marker
+  // survives so the guard still resyncs.
+  const lanes = (prev?.lanes ?? [])
+    .filter((l) => present.has(l.ticket))
+    .map((l) => {
+      if (l.lastWroteStatus !== undefined && statusByNumber.get(l.ticket) === l.lastWroteStatus) {
+        const cleared = { ...l };
+        delete cleared.lastWroteStatus;
+        return cleared;
+      }
+      return l;
+    });
 
   // Safety control (issue #63): initialReadyCount/humanNeededNotified are
   // per-BATCH state, not a per-project setting, so they need a different
