@@ -145,3 +145,84 @@ force a pass. **Follow-up filed:
 subtler planted defect for this fixture, so the eval can actually
 discriminate adversarial from single-pass review quality.
 
+**2026-07-22, ticket #108 (fixture redesigned twice; paid 5-trial score still
+pending).** The fixture was redesigned, then redesigned AGAIN after one real
+paid trial disproved the first design. The paid 5-trial score could not be
+recorded from this unattended builder lane; the exact command a human must
+run is at the end of this entry.
+
+**Round 1 (disproven by a real trial).** Salvaged from the prior #108
+attempt (dangling commit c5d70a8): `windowStartFor(now, d)` computed
+`(Math.ceil(now / d) - 1) * d` — equal to the correct
+`Math.floor(now / d) * d` everywhere except exact multiples of `d`, one
+window early there — and criterion 3 stated the universal invariant
+`withinWindow(now, windowStartFor(now, d), d) === true`. One real paid trial
+killed it: the single-pass reviewer executed the stated invariant as a
+property check in the throwaway worktree and caught the defect immediately.
+Its transcript opens "Confirmed a real defect. Running the AC3 property
+myself in the throwaway worktree." and names the exact mechanism ("on every
+boundary tick `ceil(now/d) === now/d`, so it subtracts a whole step and
+returns the **previous** window's start"). The lesson, now twice-confirmed
+(#102's printed failing example, this round's stated invariant): **a
+code-executing single-pass reviewer runs every acceptance criterion that is
+stated executably** — a literal failing example or a universal property is
+caught every time, no matter how the defective expression is camouflaged.
+
+**Round 2 (shipped).** The defect moved to where executing the stated
+criteria cannot reach: a stateful interaction between two code paths.
+`src/window.ts` now ships `windowStartFor` and `withinWindow` both fully
+CORRECT — their half-open boundary semantics are pinned by criterion 3's
+(passing) examples and visibly tested, exact-boundary cases included — plus
+the ticket's real deliverable, `FixedWindowLimiter.allow(now)`. The planted
+defect is `allow()`'s inlined window-currency check
+`now - this.windowStart <= this.durationMs` ("still inside the open
+window"), where the half-open contract requires `<`. It is literally the
+`<=`-vs-`<` end check `rubric.md`'s grading contract names, in
+`src/window.ts` — but it sits in a code path no criterion states executably,
+and it only misbehaves when an EXHAUSTED window meets a request landing
+EXACTLY on the boundary tick:
+
+- wrongful reject: `limit 2` — `allow(1400)` T, `allow(1450)` T, then
+  `allow(1500)` → `false` (judged against the full old window) where
+  criterion 3 requires `true` (1500 opens a fresh window);
+- limit slip: `allow(1400)` T, `allow(1500)` T (silently charged to the OLD
+  window), `allow(1600)` T, `allow(1700)` T — three admits land in the
+  window `[1500, 2000)` against `limit 2`.
+
+Proven mechanically before shipping: the defective code is green on all 13
+shipped tests and every literal AC example; the one-character fix (`<=` →
+`<`) flips both killer sequences above and stays green on all 13 tests. The
+shipped test file even carries a boundary-NAMED test ("a request landing on
+a window boundary is admitted": 1400 then 1500, budget to spare) that passes
+on the defective code — surfacing the defect requires CONSTRUCTING the
+full-window × boundary-tick sequence or tracing the inline check against the
+helpers' algebra, which no literal read of the criteria builds (#108 AC1).
+The mock structural smoke
+(`CLAUDE_CMD=evals/reviewer/mock-claude.sh evals/reviewer/run.sh 5`) exits 0
+on the new fixture, and exits 1 with `MOCK_CLAUDE_PASS=false` — plumbing and
+threshold both exercised.
+
+**Why the paid score is pending.** Two full `run.sh 5` runs were started and
+had to be killed: this builder's harness can not carry a ~30-60 minute run
+to completion (background children are untracked and never re-invoke the
+agent; a foreground call is capped at 10 minutes, and one adversarial trial
+with its 3-skeptic fan-out can exceed that alone). The one trial that DID
+complete (round 1's single-pass, quoted above) is folded in as evidence. To
+record the score, run on any normal shell and append the result here:
+
+```bash
+evals/reviewer/run.sh 5
+```
+
+Two notes for the runner: (1) if the shell exports `FORCE_COLOR` (this
+builder harness does), run `env -u FORCE_COLOR evals/reviewer/run.sh 5` —
+bun's forced-color `console.log` otherwise breaks run.sh's per-trial
+pass-count string compare and silently scores 0; (2) `run.sh`, `rubric.md`,
+and the ≥4/5 threshold are untouched per #108 AC3. rubric.md's
+"## The planted defect" description substantively matches the shipped defect
+(a `<=`-vs-`<` end check in `src/window.ts` violating criterion 3's
+half-open boundary, untested by the shipped suite); one stale parenthetical
+(`withinWindow(1500, 1000, 500)` — that helper is now correct) survives from
+the old fixture, and the grading contract's "or the untested boundary case"
+disjunct covers the shipped defect regardless.
+

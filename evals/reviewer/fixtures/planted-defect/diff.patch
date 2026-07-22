@@ -1,33 +1,122 @@
-diff --git a/src/window.ts b/src/window.ts
-new file mode 100644
-index 0000000..1a2b3c4
---- /dev/null
-+++ b/src/window.ts
-@@ -0,0 +1,9 @@
-+// Membership test for a fixed rate-limit window that opens at `start` and lasts
-+// `durationMs`. The window is half-open [start, start + durationMs): the start
-+// tick is inside, the end tick belongs to the next window.
-+export function withinWindow(now: number, start: number, durationMs: number): boolean {
-+  if (durationMs <= 0) return false;
-+  const end = start + durationMs;
-+  // A request is in this window when it is at/after the open and before the end.
-+  return now >= start && now <= end;
-+}
 diff --git a/src/window.test.ts b/src/window.test.ts
 new file mode 100644
-index 0000000..5d6e7f8
+index 0000000..a276cfc
 --- /dev/null
 +++ b/src/window.test.ts
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,65 @@
 +import { test, expect } from "bun:test";
-+import { withinWindow } from "./window.ts";
++import { FixedWindowLimiter, windowStartFor, withinWindow } from "./window.ts";
 +
-+test("a request at the exact window open is inside", () => {
++// -- helpers: half-open membership (criterion 3) --
++test("the open tick is inside its window", () => {
 +  expect(withinWindow(1000, 1000, 500)).toBe(true);
 +});
-+test("a request one ms before the boundary is inside", () => {
++test("one ms before the next boundary is still this window", () => {
 +  expect(withinWindow(1499, 1000, 500)).toBe(true);
 +});
-+test("a request before the window is outside", () => {
++test("the end tick belongs to the next window, never this one", () => {
++  expect(withinWindow(1500, 1000, 500)).toBe(false);
++});
++test("a tick before the window is outside", () => {
 +  expect(withinWindow(999, 1000, 500)).toBe(false);
 +});
++
++// -- helpers: window selection (criterion 3) --
++test("a mid-window tick maps to that window's start", () => {
++  expect(windowStartFor(1300, 500)).toBe(1000);
++});
++test("a boundary tick opens its own window", () => {
++  expect(windowStartFor(1500, 500)).toBe(1500);
++});
++test("every tick is a member of the window it selects", () => {
++  for (const now of [0, 1, 499, 500, 1300, 1500, 2999]) {
++    expect(withinWindow(now, windowStartFor(now, 500), 500)).toBe(true);
++  }
++});
++test("degenerate durations are guarded", () => {
++  expect(withinWindow(1000, 1000, 0)).toBe(false);
++  expect(windowStartFor(1000, 0)).toBe(1000);
++});
++
++// -- limiter: the window budget (criteria 1, 2) --
++test("admits up to the limit inside one window, then rejects", () => {
++  const l = new FixedWindowLimiter(2, 500);
++  expect(l.allow(1100)).toBe(true);
++  expect(l.allow(1200)).toBe(true);
++  expect(l.allow(1300)).toBe(false);
++});
++test("a fresh window restores the budget", () => {
++  const l = new FixedWindowLimiter(2, 500);
++  expect(l.allow(1100)).toBe(true);
++  expect(l.allow(1200)).toBe(true);
++  expect(l.allow(1600)).toBe(true);
++});
++test("a request landing on a window boundary is admitted", () => {
++  const l = new FixedWindowLimiter(2, 500);
++  expect(l.allow(1400)).toBe(true);
++  expect(l.allow(1500)).toBe(true);
++});
++test("a long idle gap rolls to the window the request falls in", () => {
++  const l = new FixedWindowLimiter(1, 500);
++  expect(l.allow(1000)).toBe(true);
++  expect(l.allow(5000)).toBe(true);
++});
++
++// -- limiter: constructor contract (criterion 4) --
++test("rejects a non-positive or non-integer limit or duration", () => {
++  expect(() => new FixedWindowLimiter(0, 500)).toThrow(RangeError);
++  expect(() => new FixedWindowLimiter(2, 0)).toThrow(RangeError);
++  expect(() => new FixedWindowLimiter(1.5, 500)).toThrow(RangeError);
++  expect(() => new FixedWindowLimiter(2, -500)).toThrow(RangeError);
++});
+diff --git a/src/window.ts b/src/window.ts
+new file mode 100644
+index 0000000..fd8505e
+--- /dev/null
++++ b/src/window.ts
+@@ -0,0 +1,45 @@
++// Fixed-window rate limiting. The timeline is tiled into windows of
++// `durationMs` starting at tick 0; window k is the HALF-OPEN interval
++// [k*durationMs, (k+1)*durationMs). The tick (k+1)*durationMs OPENS window
++// k+1: it is a member of the next window, never the one it ends.
++
++// The start tick of the window that `now` falls in.
++export function windowStartFor(now: number, durationMs: number): number {
++  if (durationMs <= 0) return now;
++  return Math.floor(now / durationMs) * durationMs;
++}
++
++// Membership test for the half-open window [start, start + durationMs): the
++// start tick is inside, the end tick belongs to the next window.
++export function withinWindow(now: number, start: number, durationMs: number): boolean {
++  if (durationMs <= 0) return false;
++  return now >= start && now < start + durationMs;
++}
++
++// Counts requests against the budget of the window each request's tick falls
++// in. Callers pass a monotonic clock: `now` never decreases across calls.
++export class FixedWindowLimiter {
++  private windowStart: number | undefined;
++  private count = 0;
++
++  constructor(private readonly limit: number, private readonly durationMs: number) {
++    if (!Number.isInteger(limit) || limit <= 0)
++      throw new RangeError(`limit must be a positive integer, got ${limit}`);
++    if (!Number.isInteger(durationMs) || durationMs <= 0)
++      throw new RangeError(`durationMs must be a positive integer, got ${durationMs}`);
++  }
++
++  // Admit the request at tick `now` when the window it falls in has budget left.
++  allow(now: number): boolean {
++    // Still inside the open window while `now` is at most a full duration past
++    // its open -- cheaper than recomputing windowStartFor on every request.
++    const inCurrentWindow = this.windowStart !== undefined && now - this.windowStart <= this.durationMs;
++    if (!inCurrentWindow) {
++      this.windowStart = windowStartFor(now, this.durationMs);
++      this.count = 0;
++    }
++    if (this.count >= this.limit) return false;
++    this.count += 1;
++    return true;
++  }
++}
