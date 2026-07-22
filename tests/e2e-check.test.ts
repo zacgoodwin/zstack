@@ -4,12 +4,14 @@
 // runAllAssertions against the hand-authored sample-run (all green), then against
 // temp copies with one artifact each mutated, asserting the RIGHT named assertion
 // flips to fail. Deterministic, no network, well under the 2s gate budget.
-import { test, expect, describe, afterEach, spyOn } from "bun:test";
+import { test, expect, describe, afterEach } from "bun:test";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runAllAssertions, type AssertionResult } from "../evals/e2e/assertions.ts";
 import { main, SAMPLE_RUN } from "../evals/e2e/check.ts";
+
+const CHECK_CLI = join(import.meta.dir, "..", "evals", "e2e", "check.ts");
 
 const REPO_ROOT = join(import.meta.dir, "..");
 
@@ -194,21 +196,23 @@ describe("mutated runs: the checker catches the specific break", () => {
     writeJson(p, s);
 
     // main() on a deliberately-broken run legitimately prints "FAIL  merge-order ...".
-    // That's indistinguishable from a real test failure in the suite console (#128), so
-    // capture console.log for this call instead of letting it reach the terminal --
-    // while still proving the checker actually caught the break (the captured line
-    // contains FAIL), not just that logging was skipped.
-    const logs = spyOn(console, "log").mockImplementation(() => {});
-    let exitCode: number;
-    let captured: string;
-    try {
-      exitCode = main([dir]);
-      captured = logs.mock.calls.map((args) => args.join(" ")).join("\n");
-    } finally {
-      logs.mockRestore(); // clears mock.calls, so read it before restoring
-    }
-    expect(exitCode).toBe(1);
-    expect(captured).toContain("FAIL");
+    // That's indistinguishable from a real test failure in the suite console (#128).
+    // A console.log/mock.calls spy can't prove suppression: bun:test spies record
+    // every call whether or not .mockImplementation overrides the real behavior, so
+    // a dropped override would still leave `mock.calls` (and the assertion) green
+    // while the real console.log printed anyway -- that's the bug this test used to
+    // have (review bounce). Run the checker as a real subprocess instead, with
+    // stdout/stderr piped rather than inherited: the OS pipe is ground truth, not a
+    // mock, so the FAIL line can never reach the real bun test console regardless of
+    // how check.ts prints internally. Proven: switching `stdout: "pipe"` to
+    // "inherit" here leaks the line to the terminal AND fails this assertion, since
+    // `result.stdout` is only populated when the pipe is in effect.
+    const result = Bun.spawnSync([process.execPath, CHECK_CLI, dir], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout.toString()).toContain("FAIL");
   });
 });
 
