@@ -76,13 +76,19 @@ interface Call {
 // Fixture-routing executor. Overrides win; otherwise RateLimit uses the named
 // rate-limit fixture (healthy by default) and every other op maps to its
 // recorded response. `calls` records the exact operations a subcommand issues.
+// rateLimit accepts a sequence (e.g. ["rate-limit-low", "rate-limit-ok"]) so
+// the quota re-probe loop (#147) can be exercised against successive probes;
+// a plain string behaves as before (same fixture every probe). The sequence
+// repeats its last entry once exhausted, so a "stays low forever" test can
+// supply a single low fixture.
 function makeExecutor(
   opts: {
-    rateLimit?: string;
+    rateLimit?: string | string[];
     overrides?: Record<string, GraphQLData | ((vars: any) => GraphQLData)>;
     calls?: Call[];
   } = {}
 ): GraphQLExecutor {
+  let rateLimitCall = 0;
   return async (query, variables) => {
     const op = opName(query);
     opts.calls?.push({ op, vars: variables });
@@ -90,7 +96,11 @@ function makeExecutor(
     if (override !== undefined) {
       return typeof override === "function" ? override(variables) : override;
     }
-    if (op === "RateLimit") return loadFixture(opts.rateLimit ?? "rate-limit-healthy");
+    if (op === "RateLimit") {
+      const seq = opts.rateLimit ?? "rate-limit-healthy";
+      const name = Array.isArray(seq) ? seq[Math.min(rateLimitCall++, seq.length - 1)] : seq;
+      return loadFixture(name);
+    }
     const fixture = FIXTURE_BY_OP[op];
     if (!fixture) throw new Error(`no fixture registered for op ${op}`);
     const data = loadFixture(fixture);
@@ -868,17 +878,57 @@ describe("quota subcommand", () => {
 describe("quota guard", () => {
   const at = (iso: string) => Date.parse(iso);
 
-  test("remaining below threshold: sleeps until reset, then proceeds", async () => {
+  test("remaining below threshold: sleeps until reset, re-probes healthy, then proceeds (#147)", async () => {
     const slept: number[] = [];
+    // First probe is low; the re-probe after waking comes back healthy, so
+    // exactly one sleep happens before the call proceeds.
     const board = new Board(
       CFG,
-      makeExecutor({ rateLimit: "rate-limit-low" }),
+      makeExecutor({ rateLimit: ["rate-limit-low", "rate-limit-ok"] }),
       async (ms) => void slept.push(ms),
       () => at("2026-07-18T23:00:00Z")
     );
     const items = await board.list("In progress");
     expect(slept).toEqual([at("2026-07-18T23:30:00Z") - at("2026-07-18T23:00:00Z")]);
     expect(items.length).toBeGreaterThan(0); // call still went through after the wait
+  });
+
+  // #147: proceeding unconditionally after the first sleep is the bug -- clock
+  // skew or an early wake sends the very next call into a possible hard 403
+  // with no re-check. A still-low re-probe must sleep again (toward the
+  // freshest resetAt, plus a fixed buffer) rather than trust the clock.
+  test("clock skew: a still-low re-probe sleeps again (with a buffer) before proceeding (#147)", async () => {
+    const slept: number[] = [];
+    const board = new Board(
+      CFG,
+      // low -> low (new resetAt) -> healthy: two sleeps expected, no throw.
+      makeExecutor({ rateLimit: ["rate-limit-low", "rate-limit-low-2", "rate-limit-ok"] }),
+      async (ms) => void slept.push(ms),
+      () => at("2026-07-18T23:00:00Z")
+    );
+    const items = await board.list("In progress");
+    expect(slept).toEqual([
+      at("2026-07-18T23:30:00Z") - at("2026-07-18T23:00:00Z"), // first sleep: no buffer
+      at("2026-07-18T23:35:00Z") - at("2026-07-18T23:00:00Z") + 1000, // re-probe sleep: freshest resetAt + 1s buffer
+    ]);
+    expect(items.length).toBeGreaterThan(0); // the call proceeded once the second re-probe came back healthy
+  });
+
+  // #147: a reset window that never actually clears (or keeps waking early)
+  // must not retry forever. Bounded rounds, then a loud ZError naming both
+  // readings -- never a tight loop hammering the API.
+  test("clock skew: a probe that stays low past the bounded rounds aborts loudly, never loops forever (#147)", async () => {
+    const slept: number[] = [];
+    const board = new Board(
+      CFG,
+      makeExecutor({ rateLimit: "rate-limit-low" }), // every probe reports the same low reading
+      async (ms) => void slept.push(ms),
+      () => at("2026-07-18T23:00:00Z")
+    );
+    await expect(board.list("In progress")).rejects.toThrow(
+      /quota still below threshold after waking and re-probing 3 time\(s\).*150 < 200 remaining/s
+    );
+    expect(slept.length).toBe(3); // bounded: initial sleep + 2 re-probe sleeps, then it gives up -- never unbounded
   });
 
   test("remaining above threshold: proceeds without sleeping", async () => {
