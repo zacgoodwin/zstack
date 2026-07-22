@@ -15,7 +15,9 @@
 // transcript line that is not even valid JSON, i.e. a live file caught
 // mid-write (#157) -- returns 0 or the last well-formed reading, which never
 // gates, so the run degrades to pre-#131 behavior (drains to real
-// drain-complete) rather than wedging. Only a transcript whose lines ARE valid
+// drain-complete) rather than wedging. Every such 0 is reported on stderr as
+// UNKNOWN (#157), because a 0 here is never a measurement of an empty window.
+// Only a transcript whose lines ARE valid
 // JSON but whose usage keys were renamed still fails loud, via parseLine's
 // format-drift assertion (reused from lib/cost.ts): the tolerance below is
 // scoped to unparseable text and never swallows format drift.
@@ -64,6 +66,21 @@ export function resolveSessionTranscript(cwd: string, home = homedir()): string 
   return newest?.path;
 }
 
+// Every 0 this module returns is an unmeasured window, never a measured-small
+// one: nothing here can read a window as genuinely empty. #157: each of those
+// paths says so on stderr (which bin/z-loop-tick no longer discards), so the
+// operator can tell "could not measure" from a real small reading. Nothing
+// downstream can: lib/loop.ts gates on the integer alone and treats an unknown
+// 0 exactly like a real small one -- that IS the fail-open intent, and the
+// stderr line is the only place the difference exists.
+function unknown(reason: string): number {
+  console.error(
+    `context-budget: ${reason}, so this reading is 0. That 0 means the context size is UNKNOWN here, ` +
+      `not known-small: the context ceiling cannot gate on it and the run drains as if the ceiling were off.`
+  );
+  return 0;
+}
+
 function parsesAsJson(line: string): boolean {
   try {
     JSON.parse(line);
@@ -85,9 +102,10 @@ function parsesAsJson(line: string): boolean {
 // the earlier, complete lines still carry. Skipping is bounded: a surviving
 // well-formed usage line is a real measurement of an earlier turn, at most one
 // turn stale, which is the same lag resolveSessionTranscript already documents.
-// When NOTHING well-formed survives, the 0 returned means UNKNOWN, not
-// known-small, so that case (and only that case) says so on stderr rather than
-// passing silently for a healthy small window.
+// When NOTHING well-formed survives -- whatever the cause: an unreadable file,
+// an empty transcript, one with no assistant-usage line, or one whose only
+// lines were skipped -- the 0 returned means UNKNOWN, not known-small, and says
+// so on stderr rather than passing silently for a healthy small window.
 //
 // parseLine keeps its hardened parse + fail-loud key assertion for every line
 // that IS valid JSON, so a renamed usage key still throws rather than silently
@@ -97,7 +115,7 @@ export function currentContextTokens(path: string): number {
   try {
     text = readFileSync(path, "utf8");
   } catch {
-    return 0; // unreadable -> fail-open
+    return unknown(`${path} could not be read`); // fail-open
   }
   let last: ReturnType<typeof parseLine> = null;
   let skipped = 0;
@@ -115,24 +133,24 @@ export function currentContextTokens(path: string): number {
     if (parsed) last = parsed;
   }
   if (!last) {
-    if (skipped > 0) {
-      console.error(
-        `context-budget: ${path}: skipped ${skipped} line(s) that are not valid JSON (first at line ${firstSkippedLine}) ` +
-          `and no well-formed assistant usage line remains, so this reading is 0. That 0 means the context size is UNKNOWN here, ` +
-          `not known-small: the context ceiling cannot gate on it and the run drains as if the ceiling were off.`
-      );
-    }
-    return 0;
+    return unknown(
+      skipped > 0
+        ? `${path} has no well-formed assistant usage line: ${skipped} line(s) are not valid JSON (first at line ${firstSkippedLine})`
+        : `${path} carries no assistant usage line at all`
+    );
   }
   const u = last.usage;
   return u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
 }
 
 // The whole measurement: resolve the orchestrator's transcript from its cwd,
-// read current occupancy. 0 whenever the transcript can't be resolved/read.
+// read current occupancy. 0 whenever the transcript can't be resolved/read --
+// reported as UNKNOWN on stderr, like every other unmeasurable path.
 export function contextBudget(cwd: string, home = homedir()): number {
   const path = resolveSessionTranscript(cwd, home);
-  return path === undefined ? 0 : currentContextTokens(path);
+  return path === undefined
+    ? unknown(`no session transcript resolved under ${join(home, ".claude", "projects", mangleProjectDir(cwd))}`)
+    : currentContextTokens(path);
 }
 
 // -- CLI ---------------------------------------------------------------------

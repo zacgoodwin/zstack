@@ -62,8 +62,9 @@ bun "$PACK/lib/throttle.ts" wait --slug "$SLUG" >/dev/null
 #     form names the transcript dir.
 #     stderr is NOT discarded (#157): command substitution captures stdout only,
 #     so a diagnostic here reaches the operator's tick output without touching
-#     $CTX -- and the two things worth seeing (context-budget reporting that it
-#     could not read a size at all, and the fail-loud usage-key drift assertion)
+#     $CTX -- and the two things worth seeing (context-budget reporting UNKNOWN,
+#     i.e. that the 0 it printed is no measurement at all, on any of its unknown
+#     paths; and the fail-loud usage-key drift assertion)
 #     were the exact things a blanket 2>/dev/null hid while `|| echo 0` quietly
 #     substituted a 0 that reads as "context is fine".
 CTX=$(bun "$PACK/lib/context-budget.ts" current --project-dir "$PWD" || echo 0)

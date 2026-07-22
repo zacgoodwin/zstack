@@ -2,7 +2,8 @@
 // live-context measurement the loop's context ceiling gates on. Covers
 // currentContextTokens over a committed transcript fixture (input + cache-read
 // + cache-creation of the LAST assistant usage line, output excluded), the
-// empty/missing-file 0 fallback (fail-open), newest-mtime session resolution,
+// empty/missing-file 0 fallback (fail-open, each reported UNKNOWN on stderr
+// since a 0 here is never a measured-empty window), newest-mtime resolution,
 // and the CLI's 0-on-unresolvable behavior. No LLM calls -- pure transcript
 // arithmetic + filesystem resolution.
 import { test, expect, describe, afterEach } from "bun:test";
@@ -34,6 +35,29 @@ function mangle(cwd: string): string {
   return cwd.replace(/[^a-zA-Z0-9]/g, "-");
 }
 
+function captureStderr(fn: () => void): string {
+  const orig = console.error;
+  let out = "";
+  console.error = (...args: unknown[]) => {
+    out += args.join(" ") + "\n";
+  };
+  try {
+    fn();
+  } finally {
+    console.error = orig;
+  }
+  return out;
+}
+
+// #157: every 0 this module returns is an unmeasured window, so every 0 path
+// must say UNKNOWN on stderr -- an operator who cannot tell "could not measure"
+// from "nearly empty" is the whole reason the reporting exists.
+function expectUnknown(err: string, path?: string): void {
+  expect(err).toContain("UNKNOWN");
+  expect(err).toContain("cannot gate on it");
+  if (path) expect(err).toContain(path);
+}
+
 describe("currentContextTokens (AC9)", () => {
   test("sums input + cache_read + cache_creation of the LAST assistant usage line, excluding output", () => {
     // Fixture's last assistant usage is
@@ -42,25 +66,41 @@ describe("currentContextTokens (AC9)", () => {
     expect(currentContextTokens(FIXTURE)).toBe(550000); // 400000 + 120000 + 30000, output 900 excluded
   });
 
-  test("a transcript with no assistant/usage line returns 0", () => {
+  test("a transcript with no assistant/usage line returns 0 AND reports UNKNOWN (#157)", () => {
     const dir = mkTmp();
     const p = join(dir, "user-only.jsonl");
     writeFileSync(
       p,
       JSON.stringify({ type: "user", message: { role: "user", content: [] }, uuid: "x" }) + "\n"
     );
-    expect(currentContextTokens(p)).toBe(0);
+    let got = -1;
+    const err = captureStderr(() => {
+      got = currentContextTokens(p);
+    });
+    expect(got).toBe(0);
+    expectUnknown(err, p);
   });
 
-  test("an empty transcript returns 0", () => {
+  test("an empty transcript returns 0 AND reports UNKNOWN (#157)", () => {
     const dir = mkTmp();
     const p = join(dir, "empty.jsonl");
     writeFileSync(p, "");
-    expect(currentContextTokens(p)).toBe(0);
+    let got = -1;
+    const err = captureStderr(() => {
+      got = currentContextTokens(p);
+    });
+    expect(got).toBe(0);
+    expectUnknown(err, p);
   });
 
-  test("a missing file returns 0 (fail-open, never throws)", () => {
-    expect(currentContextTokens(join(mkTmp(), "does-not-exist.jsonl"))).toBe(0);
+  test("a missing file returns 0 (fail-open, never throws) AND reports UNKNOWN (#157)", () => {
+    const p = join(mkTmp(), "does-not-exist.jsonl");
+    let got = -1;
+    const err = captureStderr(() => {
+      got = currentContextTokens(p);
+    });
+    expect(got).toBe(0);
+    expectUnknown(err, p);
   });
 
   // -- #157: partial-line tolerance (fail-open in the FUNCTION, not just the
@@ -72,20 +112,6 @@ describe("currentContextTokens (AC9)", () => {
       requestId: `req_${input}`,
       message: { model: "claude-opus-4", id: `msg_${input}`, usage: { input_tokens: input, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
     });
-
-  function captureStderr(fn: () => void): string {
-    const orig = console.error;
-    let out = "";
-    console.error = (...args: unknown[]) => {
-      out += args.join(" ") + "\n";
-    };
-    try {
-      fn();
-    } finally {
-      console.error = orig;
-    }
-    return out;
-  }
 
   test("#157 AC3: a truncated FINAL line does not throw -- the last well-formed usage line is returned", () => {
     const p = join(mkTmp(), "mid-write.jsonl");
@@ -112,8 +138,8 @@ describe("currentContextTokens (AC9)", () => {
     // ...but that 0 is NOT silently indistinguishable from a healthy small
     // window: the operator is told the reading is unknown and cannot gate.
     expect(err).toContain("not valid JSON");
-    expect(err).toContain("UNKNOWN");
-    expect(err).toContain(p);
+    expect(err).toContain("first at line 1");
+    expectUnknown(err, p);
   });
 
   test("#157: the skip is scoped to unparseable text -- a renamed usage key (valid JSON) still fails LOUD", () => {
@@ -172,8 +198,14 @@ describe("contextBudget (resolve + read end to end)", () => {
     expect(contextBudget(cwd, home)).toBe(550000);
   });
 
-  test("an unresolvable session degrades to 0 (fail-open)", () => {
-    expect(contextBudget("D:\\no\\such\\repo", mkTmp())).toBe(0);
+  test("an unresolvable session degrades to 0 (fail-open) AND reports UNKNOWN (#157)", () => {
+    let got = -1;
+    const err = captureStderr(() => {
+      got = contextBudget("D:\\no\\such\\repo", mkTmp());
+    });
+    expect(got).toBe(0);
+    expectUnknown(err); // names the project dir it looked in, not a transcript path
+    expect(err).toContain("no session transcript resolved");
   });
 });
 
@@ -192,21 +224,30 @@ describe("CLI main", () => {
     return out.trim();
   }
 
-  test("`current --project-dir <unresolvable>` prints 0 and exits 0 (fail-open)", () => {
+  test("`current --project-dir <unresolvable>` prints 0 on stdout and exits 0 (fail-open)", () => {
     let code = -1;
-    const out = captureStdout(() => {
-      code = main(["current", "--project-dir", join(mkTmp(), "nope")]);
+    let out = "";
+    // The UNKNOWN report goes to stderr, which the wrapper's `CTX=$(...)`
+    // command substitution does NOT capture -- so it can never corrupt $CTX.
+    const err = captureStderr(() => {
+      out = captureStdout(() => {
+        code = main(["current", "--project-dir", join(mkTmp(), "nope")]);
+      });
     });
     expect(code).toBe(0);
     expect(out).toBe("0");
+    expectUnknown(err);
   });
 
   test("`current` defaults --project-dir to cwd; never throws for the real home", () => {
     // Whatever this machine's real ~/.claude/projects holds, the CLI must
     // return a non-negative integer, never crash the caller (fail-open).
     let code = -1;
-    const out = captureStdout(() => {
-      code = main(["current"]);
+    let out = "";
+    captureStderr(() => {
+      out = captureStdout(() => {
+        code = main(["current"]);
+      });
     });
     expect(code).toBe(0);
     expect(Number.isInteger(Number(out))).toBe(true);

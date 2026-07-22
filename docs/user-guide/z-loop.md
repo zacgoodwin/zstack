@@ -127,28 +127,51 @@ and both default to today's behavior.
 
 `ticketLimit` (default `0` = no cap) caps how many tickets one run works. At the
 default, every gated Ready ticket is workable, exactly as before. Set it to `3`
-and the run flags **the batch**: a dependency-self-contained allow-list of at
-most three tickets, captured once at Step 3's ingest and held on
+and the run flags **the batch**: an allow-list of at most three tickets —
+dependency-self-contained, with the one exception below — captured once at
+Step 3's ingest and held on
 `state.batchTickets`. The remaining Ready tickets stay Ready and are simply
 picked up by a future run — they are never claimed, never counted against this
 run's drain, and never mis-parked as blocked.
 
 The batch is chosen by a Kahn walk in ascending issue number: a ticket is
 flagged only when every dependency is already Done or already flagged, so a
-flagged ticket never depends on an un-flagged one. A dependent whose dependency
-doesn't fit under the cap just waits — it stays Ready (a Ready dependency is not
-terminal), so the dead-dependency park never touches it. The allow-list
-persists verbatim across every re-ingest and across a context clear, so the run
-always finishes the exact batch it started.
+flagged ticket never depends on an un-flagged one. **Whenever the walk flags at
+least one ticket**, a dependent whose dependency doesn't fit under the cap just
+waits — it stays Ready, outside the allow-list, and the loop's park steps only
+ever consider in-batch tickets, so the dead-dependency park never touches it.
+The allow-list persists verbatim across every re-ingest and across a context
+clear, so the run always finishes the exact batch it started.
 
-One case cannot be self-contained: when the walk can flag **nothing** because
-every workable ticket waits on another workable ticket — a dependency cycle, or
-a dependency another live session holds. An empty allow-list would read as
-"drained" and exit the run without ever surfacing that, so the cap admits the
-lowest `ticketLimit` stuck tickets instead and the run handles them exactly as
-an uncapped run does: it waits while another session's dependency is still
-in flight, and otherwise parks the cycle **Blocked** with a dependency-deadlock
-note, one ticket per tick until the batch is terminal.
+One case cannot be self-contained: when the walk can flag **nothing**, because
+every workable ticket depends on a board ticket that is not Done. That covers
+more than a cycle — the dependency can be one another live session is building,
+or one no run can start at all, such as a ticket still sitting in Backlog. An
+empty allow-list would read as "drained" and exit the run without ever surfacing
+that, so the cap admits the lowest `ticketLimit` workable tickets instead. What
+happens next is unchanged: the fallback only decides *which* tickets are in the
+batch, and the drain loop then treats them exactly as it treats an uncapped
+stuck set — a dependency that can never complete parks the dependent **Blocked**,
+a stuck set waiting on another session's in-flight ticket waits, and an
+otherwise unbreakable set is parked **Blocked** one ticket per tick, with a
+dependency-deadlock note, until the batch is terminal.
+
+The fallback is blunt on purpose, and it has three consequences worth knowing
+before you set a cap:
+
+- It parks tickets that a capped run used to leave alone. Before it existed, a
+  cap over a stuck set produced an empty allow-list and the run exited clean with
+  those tickets still Ready. Now a ticket whose only problem is a dependency
+  still sitting in **Backlog** is parked Blocked and a human has to move it back.
+  (An uncapped run has always parked that ticket — this makes the capped run
+  agree with it.)
+- It fires only when *nothing* is closable. A cap that still flags one closable
+  ticket leaves the stuck set for a later run, so a Ready queue that keeps
+  refilling can defer a cycle indefinitely.
+- If any admitted ticket waits on another session's in-flight ticket and none of
+  them can be parked, the whole stuck set waits — every tick, for as long as that
+  session holds it. An uncapped run does the same; the capped shape used to exit
+  clean instead.
 
 ### `contextTokenLimit` — a context ceiling with clear-and-resume
 
@@ -167,9 +190,14 @@ unreadable transcript reads `0`, so a measurement hiccup degrades to no gating
 and never wedges a drain. A transcript caught mid-write (its last line
 truncated) falls back to the last complete reading rather than failing — that
 value is a real measurement of an earlier turn. When *no* complete reading
-survives, the tick prints a line saying the size is unknown: the `0` it reports
-means "could not measure", not "the window is small", and the ceiling cannot
-gate on it. A renamed usage key still fails loud, as before.
+survives, the tick prints a line on stderr saying the size is unknown, and it
+does so on every such path: no transcript resolved, a transcript that can't be
+read, one with no assistant usage line at all, and one whose only lines were
+unparseable. A `0` here always means "could not measure", never "the window is
+small". Note that only the operator gets that distinction — the ceiling gates on
+the integer alone and treats an unknown `0` exactly like a genuine small
+reading, which is what keeps the run draining. A renamed usage key still fails
+loud, as before.
 
 When the reading reaches the limit, the scheduler stops **claiming** new
 tickets — no new ticket enters Building — while in-flight lanes keep draining
