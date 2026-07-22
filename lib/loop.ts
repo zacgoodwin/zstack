@@ -41,13 +41,21 @@ import { reconcileBoardMoves } from "./reconcile.ts";
 export { BOARD_STATUSES, TERMINAL_STATUSES } from "./config.ts";
 export type { BoardStatus } from "./config.ts";
 
+// The GitHub issue label a human sets at triage (#130) to route a finished
+// builder straight to Review, skipping the QA stage. Rides the board snapshot
+// onto TicketSnapshot.skipQa (see ingestBoardItems); the label is the whole
+// mechanism -- no board field, no per-project knob.
+const SKIP_QA_LABEL = "skip-qa";
+
 // Legal status transitions (PROCESS.md). Questions/Blocked/Skipped/Done exits
 // are the human's moves (bounce back to Ready, or return a parked ticket to its
 // stage) -- the loop itself only ever walks the workable path plus the parks.
+// Building -> Review is the #130 skip-QA walk: a label-gated advance past QA,
+// deliberately legal (Building -> Done stays absent -- never skip Review too).
 const LEGAL_TRANSITIONS: Record<BoardStatus, BoardStatus[]> = {
   Backlog: ["Ready"],
   Ready: ["Building", "Questions", "Blocked", "Skipped"],
-  Building: ["QA", "Questions", "Blocked", "Skipped"],
+  Building: ["QA", "Review", "Questions", "Blocked", "Skipped"],
   QA: ["Building", "Review", "Questions", "Blocked", "Skipped"],
   Review: ["Building", "Done", "Questions", "Blocked", "Skipped"],
   Questions: ["Ready", "Building", "QA", "Review"],
@@ -143,6 +151,7 @@ export interface TicketSnapshot {
   model?: string; // board Model field; the harness Agent spawn's model param
   modelEffort?: string; // board Model Effort field
   claimedByOther?: boolean; // z-board claim lost to another session
+  skipQa?: boolean; // #130: carries the `skip-qa` issue label -> builder advances straight to reviewer
 }
 
 // One concurrent lane. DELIBERATELY carries no conversation/session/context id:
@@ -344,12 +353,15 @@ function reviewerBounceAction(lane: LaneState, reviewerGate: ReviewerGate, note:
 // (dependency order, one merge at a time) resolved by nextAction's merge gate
 // below, not per-lane. A FAILING approve is resolved right here, same as any
 // other terminal outcome.
-function resolveOutcome(lane: LaneState, qaLimits: QaBounceLimits, reviewerGate: ReviewerGate): Action | null {
+function resolveOutcome(lane: LaneState, qaLimits: QaBounceLimits, reviewerGate: ReviewerGate, skipQa: boolean): Action | null {
   const o = lane.outcome!;
   const ticket = lane.ticket;
   switch (o.kind) {
     case "built":
-      return { kind: "advance", ticket, to: "qa" };
+      // #130: a `skip-qa`-labeled ticket walks straight to Review (Building ->
+      // Review, made legal above). Every other outcome is unchanged, so the
+      // qa-pass/qa-bugs/investigate/reviewer paths are identical for non-skip.
+      return { kind: "advance", ticket, to: skipQa ? "reviewer" : "qa" };
     case "needs-input":
     case "human-question":
       return { kind: "park", ticket, status: "Questions", note: o.note };
@@ -471,12 +483,12 @@ export function nextAction(state: LoopState, nowMs: number): Action {
     // re-run of QA that already passed). Everything else -- a further-back gap,
     // OR a one-hop gap with no in-flight write of ours (lastWroteStatus cleared/
     // absent = a genuine human move-back) -- keeps #110's safe stop-lane, honoring
-    // the human's move instead of silently overriding it. Stopping unresynced is
-    // also what keeps applyAction from an advance whose setStatus is illegal from
-    // the stale status (the qa-pass lane still showing Building -> the
-    // Building->Review that used to throw an unhandled ZError and abort the WHOLE
-    // tick). LEGAL_TRANSITIONS is untouched either way, so skip-QA stays illegal,
-    // and every other lane's progress survives.
+    // the human's move instead of silently overriding it. #130 made Building ->
+    // Review a legal, label-gated skip-QA walk, so the transition's own
+    // illegality no longer backstops a lagged write (the qa-pass lane still
+    // showing Building no longer throws on the Building->Review advance) -- so
+    // THIS origin-marker guard, not LEGAL_TRANSITIONS, is now what protects the
+    // lagged-write case, and every other lane's progress survives.
     const t = byNumber.get(lane.ticket);
     if (t && t.status !== STATUS_FOR_STAGE[lane.stage]) {
       if (
@@ -495,7 +507,7 @@ export function nextAction(state: LoopState, nowMs: number): Action {
     // A PASSING review-approve (or a disabled gate) resolves to null here and
     // falls through to the merge gate below, exactly as before #62; a FAILING
     // approve is resolved right here, same as any other terminal outcome.
-    const action = resolveOutcome(lane, qaLimits, reviewerGate);
+    const action = resolveOutcome(lane, qaLimits, reviewerGate, byNumber.get(lane.ticket)?.skipQa ?? false);
     if (action) return withResync(action, resyncStatus);
   }
 
@@ -784,6 +796,7 @@ export interface BoardItemLike {
   number: number;
   title: string;
   fields: Record<string, string | number>;
+  labels?: string[]; // #130: issue labels riding the snapshot (lib/board.ts BoardItem.labels)
 }
 
 // Builds/refreshes the ticket snapshot from z-board list output plus fetched
@@ -835,6 +848,7 @@ export function ingestBoardItems(
     if (typeof model === "string" && model) t.model = model;
     const effort = it.fields["Model Effort"];
     if (typeof effort === "string" && effort) t.modelEffort = effort;
+    if ((it.labels ?? []).includes(SKIP_QA_LABEL)) t.skipQa = true;
     if (prevByNumber.get(it.number)?.claimedByOther) t.claimedByOther = true;
     return t;
   });

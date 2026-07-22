@@ -106,7 +106,7 @@ const Q_PROJECT_ITEMS = `query ProjectItems($project: ID!, $cursor: String) {
       items(first: 100, after: $cursor) {
         pageInfo { hasNextPage endCursor }
         nodes {
-          content { ... on Issue { number title url body } }
+          content { ... on Issue { number title url body labels(first: 20) { pageInfo { hasNextPage } nodes { name } } } }
           fieldValues(first: 20) {
             pageInfo { hasNextPage }
             nodes {
@@ -213,6 +213,11 @@ export interface BoardItem {
   title: string;
   url: string;
   fields: Record<string, string | number>;
+  // Issue labels (#130): the drain snapshot now rides them alongside the body,
+  // so nextAction's pure reducer can see a `skip-qa` label without a per-lane
+  // `gh issue view`. toItem always sets this (empty array when the issue has no
+  // labels); optional only so hand-built BoardItem fixtures elsewhere compile.
+  labels?: string[];
 }
 
 export interface CreatedIssue {
@@ -675,6 +680,9 @@ function toItem(node: any): BoardItem | null {
   // fieldValues is nested per-item; overflow past first:20 (5 fields defined on
   // the canonical board) would drop Status/Model/etc. silently.
   assertSinglePage(node.fieldValues, `fieldValues for issue #${content.number} (ceiling: 20 values per item)`);
+  // labels rides content.labels (#130). Overflow past first:20 must throw, not
+  // silently drop a `skip-qa` that a lane's skip decision depends on.
+  assertSinglePage(content.labels, `labels for issue #${content.number} (ceiling: 20 labels per issue)`);
   const fields: Record<string, string | number> = {};
   for (const fv of node.fieldValues?.nodes ?? []) {
     const name = fv?.field?.name;
@@ -682,7 +690,8 @@ function toItem(node: any): BoardItem | null {
     const v = fieldValue(fv);
     if (v !== null) fields[name] = v;
   }
-  return { number: content.number, title: content.title, url: content.url, fields };
+  const labels = (content.labels?.nodes ?? []).map((l: any) => l?.name).filter((n: any): n is string => !!n);
+  return { number: content.number, title: content.title, url: content.url, fields, labels };
 }
 
 // Reads a scalar out of a ProjectV2ItemFieldValue union member.
