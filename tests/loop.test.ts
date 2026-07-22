@@ -1036,6 +1036,60 @@ describe("resync-on-lag vs genuine move-back (#116)", () => {
   });
 });
 
+// -- #124: resync-on-lag also covers advance->builder bounce-backs ------------
+// #116 mapped only the two FORWARD advances (qa lagging at Building, reviewer
+// at QA) and omitted builder on the false premise that no advance reaches it.
+// But a qa-bugs bounce and a review-findings bounce both advance TO builder, so
+// a lagged bounce-to-Building write can leave a builder-stage lane reading its
+// pre-bounce status. Distance alone can't discriminate here (the bounce lags at
+// QA or at Review, both a single write behind Building), so the source counter
+// gates it: resync only when the matching bounce actually happened, else a
+// genuine human move still stop-lanes.
+describe("resync-on-lag covers advance->builder bounce-backs (#124)", () => {
+  test("AC1: a qa-bugs bounce lane at builder lagging at QA resyncs to Building and proceeds -- no stop-lane, no second rebuild", () => {
+    const s = state(
+      [ticket(1, "QA")], // the loop's own bounce-to-Building write has not landed yet
+      [lane(1, "builder", { qaBounces: 1, outcome: { kind: "built" } })] // the rebuild finished, passing
+    );
+    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "qa", resyncStatus: "Building" });
+    const after = applyAction(s, a, 0);
+    expect(after.tickets[0].status).toBe("QA"); // resynced to Building, then advanced -- not stopped, not re-claimed
+    expect(after.lanes[0]).toMatchObject({ ticket: 1, stage: "qa" });
+    expect(after.lanes[0].outcome).toBeUndefined();
+  });
+
+  test("AC2: a review-findings bounce lane at builder lagging at Review resyncs to Building and proceeds -- same resync", () => {
+    const s = state(
+      [ticket(1, "Review")], // the bounce-to-Building write from Review has not landed yet
+      [lane(1, "builder", { reviewBounces: 1, outcome: { kind: "built" } })]
+    );
+    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "qa", resyncStatus: "Building" });
+    const after = applyAction(s, a, 0);
+    expect(after.tickets[0].status).toBe("QA");
+    expect(after.lanes[0]).toMatchObject({ ticket: 1, stage: "qa" });
+  });
+
+  test("AC3: a genuine human move-back stays stop-lane -- more than one hop, and one hop with no matching bounce", () => {
+    // More than one hop: a builder lane dragged back to Ready is nothing our own
+    // single bounce write could produce.
+    const farMove = state(
+      [ticket(1, "Ready")],
+      [lane(1, "builder", { qaBounces: 1, outcome: { kind: "built" } })]
+    );
+    expect(nextAction(farMove.tickets, farMove.lanes, OPTS(farMove))).toMatchObject({ kind: "stop-lane", ticket: 1 });
+
+    // One hop by status, but no lane-driven bounce ever happened (counters at 0),
+    // so QA/Review on a builder lane is a genuine move, not a lagged bounce.
+    const noBounce = state(
+      [ticket(1, "QA")],
+      [lane(1, "builder", { qaBounces: 0, reviewBounces: 0, outcome: { kind: "built" } })]
+    );
+    expect(nextAction(noBounce.tickets, noBounce.lanes, OPTS(noBounce))).toMatchObject({ kind: "stop-lane", ticket: 1 });
+  });
+});
+
 // -- board-snapshot ingest ----------------------------------------------------
 
 describe("ingestBoardItems", () => {
