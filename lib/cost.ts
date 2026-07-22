@@ -92,11 +92,16 @@ export interface CostResult {
 
 // Claude Code itself (not this repo, not z-loop's watchdog) writes a
 // synthetic assistant entry with this exact model string inline in the
-// transcript whenever an API call fails transiently mid-session (top-level
-// isApiErrorMessage: true and apiErrorStatus 429/500/529 fields on the
-// record -- rate limit or server error). It is not a real API response and
-// carries nothing billable. Confirmed against 11/11 real "<synthetic>"
-// occurrences in ~/.claude/projects/ transcripts. Must
+// transcript on a turn that produced no real API response. It is not a real
+// API response and carries nothing billable. Two shapes, measured over this
+// machine's ~/.claude/projects transcripts (27 occurrences, every one with all
+// four usage keys present and ZERO): 23 are a transient API failure, carrying
+// top-level isApiErrorMessage: true and an apiErrorStatus (19x 429, 2x 500, 2x
+// 529); the other 4 are an interrupted turn ("No response requested."),
+// carrying isApiErrorMessage: false and NO apiErrorStatus. So the model string
+// is the only field that catches both -- isApiErrorMessage alone misses the
+// interrupt shape (same finding drives lib/context-budget.ts's skip, #157).
+// Those counts are a measurement of one corpus, not a format guarantee. Must
 // skip BEFORE the rate lookup below so it never trips the fail-loud
 // unknown-model ZError that every genuinely-unrecognized model string
 // should still raise (resolveRate in lib/estimate.ts).

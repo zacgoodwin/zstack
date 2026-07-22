@@ -155,11 +155,19 @@ only the *direct* dependencies of what was admitted, so a bare cut at the cap
 can amputate the very ticket holding the dependency that explains the block —
 `#1 → #2 → #3`, with `#3` another session's in-flight work, admitted `#1` alone
 under a cap of 1 and parked it Blocked as a dependency cycle that does not
-exist. Closing over the dependencies keeps the decision the same at every cap,
-and keeps it right after the other session lands `#3`: `#2` is in the
-allow-list, so it becomes claimable and the chain drains instead of parking.
-Over-admitting costs nothing here — every ticket in the admitted set is stuck by
-definition, so none of them is claimable on the tick the fallback fires.
+exist. Closing over the dependencies makes every cap decide that shape the way
+no cap decides it (verified at caps 1–4 and uncapped), and keeps it right after
+the other session lands `#3`: `#2` is in the allow-list, so it becomes claimable
+and the chain drains instead of parking. That is a fix for the false park, not a
+general guarantee that a cap never changes the outcome — with two disjoint stuck
+components, a capped run can still park a genuine cycle on a tick where an
+uncapped run is still waiting on the unrelated component.
+
+On the tick the fallback fires, over-admitting changes nothing: every ticket in
+the admitted set is stuck by definition, so none of them is claimable. It is not
+free across the run, though — the allow-list is captured once and persisted, so
+whatever the closure admitted is what this run works. That is the first
+consequence below.
 
 What happens next is the ordinary drain loop, in this order: a dependency that
 can never complete in the batch (one already parked Blocked or Skipped) parks
@@ -171,9 +179,15 @@ dependency cycle` note. Only that *first* park carries the deadlock note — onc
 one cycle member is Blocked, the rest fall to the dead-dependency park above and
 carry its wording instead.
 
-The fallback is blunt on purpose, and it has three consequences worth knowing
+The fallback is blunt on purpose, and it has four consequences worth knowing
 before you set a cap:
 
+- **The cap can be exceeded by a lot.** The closure is persisted as the batch,
+  so once the block clears the run works all of it — not `ticketLimit` of it. A
+  50-long chain `#1 → … → #50` whose tail `#50` is another session's in-flight
+  ticket admits 49 tickets under `ticketLimit: 1`, and drains all 49 once `#50`
+  lands. That set is exactly what an uncapped run would work, which is the
+  point, but a cap of 1 is not a promise of one ticket on this path.
 - It parks tickets that a capped run used to leave alone. Before it existed, a
   cap over a stuck set produced an empty allow-list and the run exited clean with
   those tickets still Ready. Now a ticket whose only problem is a dependency

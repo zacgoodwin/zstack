@@ -15,10 +15,12 @@
 // transcript line that is not even valid JSON, i.e. a live file caught
 // mid-write (#157) -- returns 0 or the last well-formed reading, which never
 // gates, so the run degrades to pre-#131 behavior (drains to real
-// drain-complete) rather than wedging. Every 0 currentContextTokens and
-// contextBudget return goes through unknown() and says so on stderr (#157),
-// because a 0 from either is never a measurement of an empty window.
-// Only a transcript whose lines ARE valid
+// drain-complete) rather than wedging. Every SUCH 0 -- one returned because no
+// usable reading survived -- goes through unknown() and says so on stderr
+// (#157). A 0 that is the genuine sum of a real usage line returns silently and
+// is indistinguishable downstream; that it never happens is an empirical fact
+// about the transcripts, not a property of this code (unknown() below carries
+// the corpus count). Only a transcript whose lines ARE valid
 // JSON but whose usage keys were renamed still fails loud, via parseLine's
 // format-drift assertion (reused from lib/cost.ts): the tolerance below is
 // scoped to unparseable text and never swallows format drift.
