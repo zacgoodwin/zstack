@@ -26,8 +26,12 @@ what a finished loop left behind:
   when nothing is running.
 - **Last loop** — the path to the newest `reports/loop-*.md` and its verdict line
   (GREEN = deployed, RED = regressions filed, no deploy).
-- **Milestone totals** — summed Estimate vs Actual, for calibrating your
-  estimates (if Actual routinely exceeds Estimate, planning is undercharging).
+- **Milestone Totals** — Estimate vs Actual, grouped by milestone (the epic
+  style is one milestone per epic): one subtotal row per milestone, a
+  `(no milestone)` row for unmilestoned tickets (always shown, even at $0.00),
+  and a `Board total` row for the whole-board sum. Use `Board total` to
+  calibrate your estimates (if Actual routinely exceeds Estimate, planning is
+  undercharging); use the per-milestone rows to see which epic is driving it.
 
 ## Read-only guarantee
 
