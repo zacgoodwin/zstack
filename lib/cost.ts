@@ -222,6 +222,27 @@ function apportionCents(rawDollars: number[], targetCents: number): number[] {
   return cents;
 }
 
+// Stage encoded in a transcript file's name (`<stage>-<attempt>.jsonl`,
+// z-loop/SKILL.md Step 4's per-stage transcript copy): the segment of the
+// basename before its first "-". A name that doesn't match a KNOWN_STAGE (no
+// "-" at all, or a prefix that isn't one of the four real stages -- e.g. a
+// manually-dropped "notes.jsonl" or "manual-drop.jsonl") maps to "other"
+// rather than being dropped -- every dollar the batch spent must show up
+// somewhere in the end-of-loop spend-by-stage table (lib/endloop.ts
+// SPEND_STAGE_ORDER only ever renders these five row names; anything else
+// would silently vanish from the report, review bounce #83 finding 2). Shared
+// by sumByStage (buckets already-priced files) and costOfFiles's cross-stage
+// duplicate guard below (ticket #152, catches a transcript copied into the
+// wrong stage's file before it can silently misattribute spend).
+const STAGE_PREFIX = /^([^-]+)-/;
+const KNOWN_STAGES = new Set(["builder", "qa", "reviewer", "merge"]);
+
+function stageOfFile(file: string): string {
+  const base = file.replace(/\\/g, "/").split("/").pop()!.replace(/\.jsonl$/i, "");
+  const prefix = STAGE_PREFIX.exec(base)?.[1];
+  return prefix && KNOWN_STAGES.has(prefix) ? prefix : "other";
+}
+
 export function costOfFiles(paths: string[], rates: RatesFile, opts?: { byFile?: boolean }): CostResult {
   const byFile = opts?.byFile === true;
   const seenKeys = new Set<string>();
@@ -232,6 +253,13 @@ export function costOfFiles(paths: string[], rates: RatesFile, opts?: { byFile?:
   // the correct rate) and per-file request counts.
   const perFileModel = byFile ? new Map<string, Map<string, TokenTotals>>() : undefined;
   const perFileRequests = byFile ? new Map<string, number>() : undefined;
+  // First file each dedup key was ever seen in (ticket #152), only tracked in
+  // --by-file mode -- the only mode where "which file" (and so "which stage")
+  // a response is attributed to matters at all. Feeds the cross-stage
+  // duplicate guard below; same-stage duplicates (e.g. builder-1 vs
+  // builder-2, two attempts of one stage) land in the same spend-by-stage row
+  // either way and are never flagged.
+  const firstFileByKey = byFile ? new Map<string, string>() : undefined;
   let linesParsed = 0;
   let requests = 0;
   let skippedSynthetic = 0;
@@ -257,6 +285,31 @@ export function costOfFiles(paths: string[], rates: RatesFile, opts?: { byFile?:
       // either way, so a line linking requestId<->message.id also claims the
       // id its earlier sibling lacked (F14: mixed-id lines of one response).
       const duplicate = parsed.dedupKeys.some((k) => seenKeys.has(k));
+
+      // Cross-stage duplicate guard (ticket #152): spend-by-stage attribution
+      // depends entirely on the orchestrator copying each transcript to the
+      // RIGHT `<stage>-<attempt>.jsonl` file -- a deterministic-checkable fact
+      // that, before this guard, rode on prose alone (z-loop SKILL Step 4).
+      // If a dedup key (requestId or message.id) was already registered under
+      // a DIFFERENT file whose stage differs from this line's file, one of
+      // the two transcripts was copied into the wrong stage's bucket -- fail
+      // loud instead of silently keeping the existing first-seen attribution.
+      if (firstFileByKey) {
+        for (const k of parsed.dedupKeys) {
+          const firstFile = firstFileByKey.get(k);
+          if (firstFile && firstFile !== path && stageOfFile(firstFile) !== stageOfFile(path)) {
+            const isMsgId = k.startsWith("msgid:");
+            throw new ZError(
+              `Cross-stage duplicate: ${isMsgId ? "message id" : "requestId"} "${isMsgId ? k.slice(6) : k}" appears in ` +
+                `transcripts bucketed under two different stages -- "${firstFile}" (stage "${stageOfFile(firstFile)}") ` +
+                `and "${path}" (stage "${stageOfFile(path)}"). One of these transcripts was likely copied into the ` +
+                `wrong stage's file; refusing to silently attribute this response's cost to whichever file was seen first.`
+            );
+          }
+          if (!firstFileByKey.has(k)) firstFileByKey.set(k, path);
+        }
+      }
+
       for (const k of parsed.dedupKeys) seenKeys.add(k);
       if (duplicate) continue; // duplicate content-block line -- also never re-attributed to a later file
       requests++;
@@ -337,25 +390,12 @@ export function costOfFiles(paths: string[], rates: RatesFile, opts?: { byFile?:
   return result;
 }
 
-// Buckets by_file entries by the stage encoded in each file's name
-// (`<stage>-<attempt>.jsonl`, z-loop/SKILL.md Step 4's per-stage transcript
-// copy): the segment of the basename before its first "-". A name that
-// doesn't match a KNOWN_STAGE (no "-" at all, or a prefix that isn't one of
-// the four real stages -- e.g. a manually-dropped "notes.jsonl" or
-// "manual-drop.jsonl") goes to "other" rather than being dropped -- every
-// dollar the batch spent must show up somewhere in the end-of-loop
-// spend-by-stage table (lib/endloop.ts SPEND_STAGE_ORDER only ever renders
-// these five row names; anything else would silently vanish from the report,
-// review bounce #83 finding 2).
-const STAGE_PREFIX = /^([^-]+)-/;
-const KNOWN_STAGES = new Set(["builder", "qa", "reviewer", "merge"]);
-
+// Buckets by_file entries by the stage encoded in each file's name (see
+// stageOfFile above costOfFiles).
 export function sumByStage(byFile: FileSpend[]): { stage: string; dollars: number }[] {
   const totals = new Map<string, number>();
   for (const f of byFile) {
-    const base = f.file.replace(/\\/g, "/").split("/").pop()!.replace(/\.jsonl$/i, "");
-    const prefix = STAGE_PREFIX.exec(base)?.[1];
-    const stage = prefix && KNOWN_STAGES.has(prefix) ? prefix : "other";
+    const stage = stageOfFile(f.file);
     totals.set(stage, (totals.get(stage) ?? 0) + f.dollars);
   }
   return [...totals.entries()].map(([stage, dollars]) => ({ stage, dollars: roundCents(dollars) }));
@@ -449,7 +489,11 @@ const USAGE = `z-cost <glob-pattern> [--rates <path>] [--json] [--by-file]
   --by-file:    also attribute spend per input file (CostResult.by_file:
                 file, dollars, requests, tokens), sorted by path -- feeds
                 z-loop's end-of-loop spend-by-stage rollup (lib/endloop.ts
-                sumByStage / "spend-by-stage")`;
+                sumByStage / "spend-by-stage"). Throws if a requestId or
+                message id is duplicated across two files bucketed under
+                different stages (<stage>-<attempt>.jsonl) -- a transcript
+                copied into the wrong stage's file, instead of silently
+                keeping the first-seen attribution`;
 
 export async function main(argv: string[]): Promise<number> {
   if (!argv[0]) {
