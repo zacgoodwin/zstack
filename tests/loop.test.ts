@@ -1671,6 +1671,128 @@ describe("ingestBoardItems", () => {
     expect(fresh.initialReadyCount).toBe(1); // only the new UNCLAIMED Ready ticket, not the foreign #9
     expect(fresh.humanNeededNotified).toBe(false); // reset
   });
+
+  // -- issue #150: the human-needed numerator is scoped to THIS batch --------
+  test("#150 AC1: 3 pre-existing Blocked tickets from a prior drained batch do not inflate a fresh batch of 10 -- 0%, no notification", () => {
+    const prev: LoopState = {
+      tickets: [ticket(1, "Blocked"), ticket(2, "Blocked"), ticket(3, "Blocked")],
+      lanes: [],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      initialReadyCount: 5, // stale, from whatever batch parked these 3
+      initialBatchTickets: [], // that old batch is long gone; irrelevant here
+      humanNeededNotified: true,
+    };
+    expect(drainComplete(prev.tickets, prev.lanes)).toBe(true); // sanity: prev IS fully drained
+
+    // The 3 old Blocked tickets are still on the board, untouched, alongside a
+    // freshly-committed batch of 10 Ready tickets -- none parked yet.
+    const items = [
+      { number: 1, title: "old1", fields: { Status: "Blocked" } },
+      { number: 2, title: "old2", fields: { Status: "Blocked" } },
+      { number: 3, title: "old3", fields: { Status: "Blocked" } },
+      ...[4, 5, 6, 7, 8, 9, 10, 11, 12, 13].map((n) => ({ number: n, title: `r${n}`, fields: { Status: "Ready" } })),
+    ];
+    const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
+    const s = ingestBoardItems(prev, items, bodies, { humanNeededPercent: 30 });
+    expect(s.initialReadyCount).toBe(10); // only the new batch's 10, not the 3 old Blocked
+    expect(s.initialBatchTickets).toEqual([4, 5, 6, 7, 8, 9, 10, 11, 12, 13]); // the 3 old ones excluded
+    const hn = humanNeededStatus(s);
+    expect(hn.blocked).toBe(0); // the pre-existing parks are ignored
+    expect(hn.tripped).toBe(false);
+  });
+
+  test("#150 AC2: 3 of the batch's own 10 parking trips the control; the pre-existing parks stay excluded; fires exactly once", () => {
+    const oldParked = [ticket(1, "Blocked"), ticket(2, "Blocked"), ticket(3, "Blocked")];
+    const prev: LoopState = {
+      tickets: oldParked,
+      lanes: [],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      initialReadyCount: 5,
+      initialBatchTickets: [],
+      humanNeededNotified: true,
+    };
+    const items1 = [
+      { number: 1, title: "old1", fields: { Status: "Blocked" } },
+      { number: 2, title: "old2", fields: { Status: "Blocked" } },
+      { number: 3, title: "old3", fields: { Status: "Blocked" } },
+      ...[4, 5, 6, 7, 8, 9, 10, 11, 12, 13].map((n) => ({ number: n, title: `r${n}`, fields: { Status: "Ready" } })),
+    ];
+    const bodies = Object.fromEntries(items1.map((it) => [String(it.number), "no deps"]));
+    let s = ingestBoardItems(prev, items1, bodies, { humanNeededPercent: 20 }); // 3/10 = 30% > 20%, cleanly trips
+    expect(s.initialReadyCount).toBe(10);
+    expect(humanNeededStatus(s).tripped).toBe(false); // none of the batch's own tickets parked yet
+
+    // 3 of the batch's own 10 park; the 3 pre-existing Blocked stay untouched.
+    const items2 = [
+      { number: 1, title: "old1", fields: { Status: "Blocked" } },
+      { number: 2, title: "old2", fields: { Status: "Blocked" } },
+      { number: 3, title: "old3", fields: { Status: "Blocked" } },
+      { number: 4, title: "r4", fields: { Status: "Blocked" } },
+      { number: 5, title: "r5", fields: { Status: "Skipped" } },
+      { number: 6, title: "r6", fields: { Status: "Questions" } },
+      ...[7, 8, 9, 10, 11, 12, 13].map((n) => ({ number: n, title: `r${n}`, fields: { Status: "Building" } })),
+    ];
+    s = ingestBoardItems(s, items2, bodies);
+    const hn = humanNeededStatus(s);
+    expect(hn.blocked).toBe(1); // only #4 -- the 2 pre-existing Blocked (#1, #2) excluded
+    expect(hn.skipped).toBe(1);
+    expect(hn.questions).toBe(1);
+    expect(hn.tripped).toBe(true); // 3/10 = 30% > 20%
+
+    // Fires exactly once: ack, then a same-batch confirmation re-ingest must
+    // not re-trip or clear alreadyNotified.
+    s = markHumanNeededNotified(s);
+    expect(s.humanNeededNotified).toBe(true);
+    s = ingestBoardItems(s, items2, bodies); // nothing new committed, same batch
+    expect(s.humanNeededNotified).toBe(true); // preserved, not reset
+    expect(humanNeededStatus(s).alreadyNotified).toBe(true);
+    expect(humanNeededStatus(s).tripped).toBe(true); // still true -- alreadyNotified is what gates re-firing, not tripped
+  });
+
+  // #133 AC4's Step-1-park scenario still counts (genuinely this batch's own
+  // planned tickets, just already parked at the very first observation) --
+  // #150 only excludes tickets that predate the batch. prev === null here means
+  // there is no "before this batch" for any of these 10, so all 10 count, same
+  // as pre-#150.
+  test("#150 regression: a Step-1 pre-commit park (prev === null, #133 AC4) still counts toward this batch's own numerator", () => {
+    const items = [
+      ...[1, 2, 3, 4, 5, 6, 7].map((n) => ({ number: n, title: `r${n}`, fields: { Status: "Ready" } })),
+      ...[8, 9, 10].map((n) => ({ number: n, title: `q${n}`, fields: { Status: "Questions" } })),
+    ];
+    const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
+    const s = ingestBoardItems(null, items, bodies, { humanNeededPercent: 30 });
+    expect(s.initialBatchTickets).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]); // all 10, including the 3 parked at Step 1
+    expect(humanNeededStatus(s).questions).toBe(3);
+    expect(humanNeededStatus(s).tripped).toBe(true);
+  });
+
+  test("#150: a state file predating initialBatchTickets falls back to counting every ticket (graceful pre-feature decay)", () => {
+    const s: LoopState = {
+      tickets: [ticket(1, "Blocked"), ticket(2, "Ready")],
+      lanes: [],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      initialReadyCount: 4,
+      // initialBatchTickets deliberately omitted -- a pre-#150 state file
+    };
+    const hn = humanNeededStatus(s);
+    expect(hn.blocked).toBe(1); // undefined batch scope counts everything, same as before #150
+  });
+
+  test("#150: a foreign claimedByOther park is excluded from the numerator even when its number is in the batch", () => {
+    const s: LoopState = {
+      tickets: [ticket(1, "Blocked", [], { claimedByOther: true }), ticket(2, "Ready")],
+      lanes: [],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      initialReadyCount: 2,
+      initialBatchTickets: [1, 2],
+    };
+    const hn = humanNeededStatus(s);
+    expect(hn.blocked).toBe(0); // #1 is claimedByOther -- another session's park, not this batch's
+  });
 });
 
 // -- resolveStageModel (issue #82) --------------------------------------------

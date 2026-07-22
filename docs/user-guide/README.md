@@ -440,6 +440,7 @@ are managed by setup; don't hand-edit them. The tunables:
 | `maxQaPasses` | `3` | QA passes on a ticket before it parks Blocked instead of bouncing to a fresh builder. |
 | `qaInvestigateAfter` | `2` | QA-bounce count at/after which the rebuild runs `/investigate` first. |
 | `auditEveryNLoops` | `5` | How often (modulo loop count) the end-of-loop stage runs `/cso` + `/health` audits. Must be a positive integer. |
+| `humanNeededPercent` | `30` (`0` disables) | Mid-run breakdown notification's trip threshold: pages you once this batch's own Blocked/Skipped/Questions tickets cross this percent of this batch's tickets. A ticket parked before the batch started, or claimed by another session, is never counted. |
 
 Also on disk:
 

@@ -210,6 +210,20 @@ export interface LoopState {
   // re-ingests like lanes are; see ingestBoardItems below for the exact reset
   // boundary (a fresh batch after a full drain, not merely "prev is null").
   initialReadyCount?: number;
+  // #150: this batch's own ticket numbers, captured at the same ingest-time-
+  // zero boundary as initialReadyCount (same capture-once/preserve-across-
+  // re-ingest lifecycle) so humanNeededStatus's numerator can be scoped to
+  // THIS batch instead of the whole board. A ticket belongs here when it is
+  // brand new to the snapshot (absent from the prior state's tickets -- covers
+  // a Step-1 pre-commit park straight to Questions/Blocked/Skipped, same batch,
+  // #133 AC4) or currently Ready-and-unclaimed (the committed queue, same
+  // filter initialReadyCount uses). A ticket already sitting Blocked/Skipped/
+  // Questions from before this batch started, or a foreign claimedByOther
+  // park, is neither, so it never inflates this batch's trip. undefined = a
+  // state file that predates this field, which humanNeededStatus treats as
+  // "count every ticket" -- the old board-wide behavior -- for one transition
+  // batch until the next fresh-batch capture.
+  initialBatchTickets?: number[];
   humanNeededPercent?: number;
   humanNeededNotified?: boolean;
   // Per-loop ticket cap (issue #131): the flagged, dependency-self-contained
@@ -729,7 +743,16 @@ export interface HumanNeededStatus {
 // bookkeeping. Read-only -- the CLI wraps this with no writes, same contract
 // as `next`.
 export function humanNeededStatus(state: LoopState): HumanNeededStatus {
-  const byStatus = (s: BoardStatus) => state.tickets.filter((t) => t.status === s);
+  // #150: scope the numerator to this batch's own tickets (state.initialBatchTickets)
+  // and never count a foreign claimedByOther park -- a pre-existing park from
+  // before this batch started, or another session's parked ticket, was never
+  // this batch's to begin with and must not inflate the trip against
+  // initialReadyCount's denominator. undefined (a state file predating this
+  // field) falls back to every ticket, the same graceful pre-feature decay
+  // initialReadyCount's own <=0 guard already uses in humanNeededTripped.
+  const batch = state.initialBatchTickets;
+  const inBatch = (t: TicketSnapshot) => !t.claimedByOther && (batch === undefined || batch.includes(t.number));
+  const byStatus = (s: BoardStatus) => state.tickets.filter((t) => t.status === s && inBatch(t));
   const blocked = byStatus("Blocked");
   const skipped = byStatus("Skipped");
   const questions = byStatus("Questions");
@@ -1015,6 +1038,13 @@ export function ingestBoardItems(
   // unclaimed Ready tickets is the SAME batch's final state, not a new one
   // -- preserve its counters.
   const readyCount = tickets.filter((t) => t.status === "Ready" && !t.claimedByOther).length;
+  // #150: a ticket belongs to a freshly-captured batch when it is absent from
+  // the PRIOR state entirely (brand new -- covers a Step-1 pre-commit park
+  // straight to Questions/Blocked/Skipped, #133 AC4) or currently Ready-and-
+  // unclaimed (the committed queue, same filter as readyCount above). This is
+  // the predicate, not yet gated on startingFreshBatch -- applied below only
+  // when a fresh batch is actually starting.
+  const isNewBatchTicket = (t: TicketSnapshot) => !prevByNumber.has(t.number) || (t.status === "Ready" && !t.claimedByOther);
   // Whether the PRIOR batch drained is judged against ITS OWN allow-list (#131):
   // a leftover non-batch Ready ticket must not make prev look un-drained and so
   // block the next batch's capture (AC4/AC11 use the same batch scoping).
@@ -1059,6 +1089,10 @@ export function ingestBoardItems(
     humanNeededPercent: cfg?.humanNeededPercent ?? prev?.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT,
     mergedThisRun: startingFreshBatch ? [] : [...(prev?.mergedThisRun ?? [])],
     initialReadyCount: startingFreshBatch ? readyCount : (prev!.initialReadyCount ?? 0),
+    // #150: captured ONCE at the same fresh-batch boundary as initialReadyCount
+    // and preserved verbatim across every re-ingest -- humanNeededStatus's
+    // numerator scope for the life of this batch.
+    initialBatchTickets: startingFreshBatch ? tickets.filter(isNewBatchTicket).map((t) => t.number) : prev!.initialBatchTickets,
     humanNeededNotified: startingFreshBatch ? false : (prev!.humanNeededNotified ?? false),
     // #131: the flagged allow-list is captured ONCE at the fresh-batch boundary
     // (same as initialReadyCount) and preserved verbatim across every re-ingest
