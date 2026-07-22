@@ -210,3 +210,35 @@ describe("Issue #118: throwaway review worktree is placed outside ~/.zstack", ()
     expect(reviewerRow).toContain('git worktree remove ".worktrees/review-<N>"');
   });
 });
+
+// ============================================================================
+// Ticket #133 -- the batch-commit board move is deferred from Step 2 (up front,
+// all at once) to Step 4's claim row, so the committed queue sits in Ready until
+// each lane claims it. Doc-canaries: a silent revert (re-adding the Step 2 move,
+// dropping the claim-row move, or resurrecting PROCESS step 7's up-front move)
+// fails the suite. AC1/AC2 of the ticket.
+// ============================================================================
+describe("Ticket #133: the Building move is deferred to claim time, not batch-committed up front", () => {
+  test("AC1: Step 2 commits the queue in place -- no up-front `move <N> Building` (no board writes)", () => {
+    const step2 = section(zLoop(), "## Step 2");
+    expect(step2).not.toBe("");
+    expect(step2).not.toMatch(/move <N> Building/); // the old batch-commit loop is gone
+    expect(step2).toMatch(/[Ll]eave them in Ready/); // the committed queue stays in Ready
+  });
+
+  test("AC2: Step 4's claim row performs the deferred move AFTER a successful claim, BEFORE the lane lock", () => {
+    const claimRow = section(zLoop(), "| `claim N` |");
+    expect(claimRow).not.toBe("");
+    expect(claimRow).toContain("Deferred commit (#133)");
+    expect(claimRow).toContain('"$Z_BOARD" move <N> <status>'); // mirrors STATUS_FOR_STAGE[stage]
+    // Order: claim -> deferred move -> lane lock (a claim loser never moves a ticket).
+    expect(claimRow.indexOf('claim <N> "$ME"')).toBeLessThan(claimRow.indexOf("move <N> <status>"));
+    expect(claimRow.indexOf("move <N> <status>")).toBeLessThan(claimRow.indexOf("lane-write"));
+  });
+
+  test("PROCESS.md step 7 no longer moves the whole batch to Building up front", () => {
+    const process = readFileSync(join(REPO_ROOT, "docs", "user-guide", "spec", "PROCESS.md"), "utf8");
+    expect(process).not.toMatch(/Move every ticket in the work batch to \*\*Building\*\* up front/);
+    expect(process).toMatch(/leave it in \*\*Ready\*\*/);
+  });
+});

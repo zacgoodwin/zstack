@@ -1,7 +1,8 @@
 # /z-loop
 
 The drain-and-exit orchestrator. Runs a planning pass over Ready tickets,
-batch-commits the workable ones to Building, then drives up to `maxLanes`
+leaves the workable ones in Ready and moves each to Building when its builder
+lane claims it, then drives up to `maxLanes`
 concurrent worktree lanes through four fresh-agent stages (builder → QA →
 adversarial reviewer → merge) until the batch is drained, runs the end-of-loop
 stage on the merged base, writes a report, and exits. No daemon.
@@ -268,10 +269,12 @@ the board), the loop recomputes:
 (Blocked + Skipped + Questions) / initialReadyCount * 100
 ```
 
-`initialReadyCount` is the number of tickets the batch committed to Building
-at Step 2/3 — the batch's size at ingest-time-zero, captured once and carried
-across every re-ingest for the rest of that batch. The instant this percentage
-first exceeds `humanNeededPercent`, the control trips.
+`initialReadyCount` is the number of workable Ready tickets the batch committed
+to work, held in Ready until each is claimed — the batch's size at
+ingest-time-zero (Step 3's ingest, before Step 4 claims anything), captured once
+from the Ready count and carried across every re-ingest for the rest of that
+batch. The instant this percentage first exceeds `humanNeededPercent`, the
+control trips.
 
 **Once per batch.** The first tick that trips the control fires exactly one
 `human-needed` Discord notification — the exact parked counts and which
@@ -281,11 +284,11 @@ crossing. A fresh batch resets both the committed-size baseline and the
 fire-once flag, so the control is live again from zero — but "fresh" is a
 two-part test, not just "the prior batch fully drained": there must be no
 prior state at all, OR the prior state was fully drained **and** the
-incoming board snapshot shows new, **unclaimed** Building tickets (the
-batch-commit step moves the whole new batch to Building before its first
-ingest, so any unclaimed Building ticket in a post-drain snapshot IS that new
-batch; a lingering `claimedByOther` Building ticket belongs to another
-session's batch and does not count). The prior batch being drained is
+incoming board snapshot shows new, **unclaimed** Ready tickets (the committed
+queue now sits in Ready until each ticket is claimed, so any unclaimed Ready
+ticket in a post-drain snapshot IS that new batch; a lingering `claimedByOther`
+Ready ticket belongs to another session's batch and does not count). The prior
+batch being drained is
 necessary but not sufficient: a tick that merely re-confirms the SAME drained
 batch (no new, unclaimed tickets committed — e.g. the very tick right after
 that batch's own last ticket parks or completes, which is what first makes it

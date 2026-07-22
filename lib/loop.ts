@@ -878,25 +878,29 @@ export function ingestBoardItems(
   // same reason -- it feeds the merge gate's stacked-parent check (line ~444),
   // and a stale entry from a batch that finished loops ago points a new
   // ticket's PR at a parent branch that no longer exists -- so it resets on
-  // the same startingFreshBatch boundary as the other two. A drained prev has,
-  // by definition, zero Building
-  // tickets belonging to THIS batch (drainComplete explicitly permits a
-  // Building ticket to remain when claimedByOther -- it belongs to another
-  // session's batch, not this one); so a fresh batch is when there is no
-  // prior state at all, OR the prior state was fully drained AND the incoming
-  // snapshot actually shows new, UNCLAIMED Building tickets (the batch-commit
-  // step moves the whole new batch to Building before its first ingest, so
-  // "any unclaimed Building tickets present" IS "a new batch was just
-  // committed"). buildingCount must exclude claimedByOther for the same
-  // reason every other workable-for-this-batch check in this file does
+  // the same startingFreshBatch boundary as the other two. #133 defers the
+  // board move to claim time: the committed queue now sits in READY until each
+  // ticket is claimed (the old batch-commit step that moved the whole batch to
+  // Building up front is gone), so ingest-time-zero -- Step 3's ingest, before
+  // Step 4 claims anything -- sees every committed ticket still Ready. A drained
+  // prev has, by definition, zero unclaimed Ready tickets belonging to THIS
+  // batch (drainComplete treats Ready as workable, so an own unclaimed Ready
+  // ticket means the batch is NOT drained; a Ready ticket may only linger past
+  // drain when claimedByOther -- it belongs to another session's batch, not
+  // this one); so a fresh batch is when there is no prior state at all, OR the
+  // prior state was fully drained AND the incoming snapshot actually shows new,
+  // UNCLAIMED Ready tickets (the committed queue lands in Ready before its first
+  // ingest, so "any unclaimed Ready ticket in a post-drain snapshot" IS "a new
+  // batch was just committed"). readyCount must exclude claimedByOther for the
+  // same reason every other workable-for-this-batch check in this file does
   // (nextAction's unclaimed filter, the deadlock discriminator, drainComplete
-  // itself) -- otherwise a lingering foreign Building ticket in the snapshot
+  // itself) -- otherwise a lingering foreign Ready ticket in the snapshot
   // masquerades as a new batch on the very re-ingest that should be preserving
   // this batch's counters. A drained prev whose incoming snapshot has no new
-  // unclaimed Building tickets is the SAME batch's final state, not a new one
+  // unclaimed Ready tickets is the SAME batch's final state, not a new one
   // -- preserve its counters.
-  const buildingCount = tickets.filter((t) => t.status === "Building" && !t.claimedByOther).length;
-  const startingFreshBatch = !prev || (drainComplete(prev.tickets, prev.lanes) && buildingCount > 0);
+  const readyCount = tickets.filter((t) => t.status === "Ready" && !t.claimedByOther).length;
+  const startingFreshBatch = !prev || (drainComplete(prev.tickets, prev.lanes) && readyCount > 0);
 
   return {
     tickets: tickets.sort((a, b) => a.number - b.number),
@@ -911,7 +915,7 @@ export function ingestBoardItems(
     maxReviewBounces: cfg?.maxReviewBounces ?? prev?.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES,
     humanNeededPercent: cfg?.humanNeededPercent ?? prev?.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT,
     mergedThisRun: startingFreshBatch ? [] : [...(prev?.mergedThisRun ?? [])],
-    initialReadyCount: startingFreshBatch ? buildingCount : (prev!.initialReadyCount ?? 0),
+    initialReadyCount: startingFreshBatch ? readyCount : (prev!.initialReadyCount ?? 0),
     humanNeededNotified: startingFreshBatch ? false : (prev!.humanNeededNotified ?? false),
   };
 }

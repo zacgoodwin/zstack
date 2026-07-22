@@ -2,8 +2,9 @@
 name: z-loop
 description: |
   Drain-and-exit orchestrator for the zstack develop stage (PROCESS.md): runs a
-  planning pass over Ready tickets, batch-commits the workable ones to Building,
-  then drives up to maxLanes concurrent worktree lanes through four fresh-agent
+  planning pass over Ready tickets, leaves the workable ones in Ready and moves
+  each to Building when its builder lane claims it, then drives up to maxLanes
+  concurrent worktree lanes through four fresh-agent
   stages (builder, QA, adversarial reviewer, merge) until the batch is drained
   (every ticket Done, Questions, Blocked, or Skipped), then runs an end-of-loop
   stage on the merged base -- regression first; red files bugs and stops (no
@@ -144,15 +145,15 @@ For every ticket in Ready (`"$Z_BOARD" list --status Ready --json --slug "$SLUG"
    `$PACK/z-plan/tiers.json` into a buckets file, `"$Z_ESTIMATE"` it, and
    `field-set` the result. No arithmetic in prose.
 
-## Step 2 — Batch commit (PROCESS.md step 7)
+## Step 2 — Commit the queue (in place) (PROCESS.md step 7)
 
-Move EVERY Ready ticket that passed Step 1 (body gated, no open questions) to
-Building, all at once, before any lane starts — the board shows the full
-committed queue:
-
-```bash
-"$Z_BOARD" move <N> Building --slug "$SLUG"   # once per workable ticket
-```
+The committed queue is EVERY Ready ticket that passed Step 1 (body gated, no
+open questions). **Leave them in Ready — Step 2 issues NO `z-board move` (no
+board writes at all, #133).** Their work order is the deterministic claim order
+`next` already computes (dependency-gated, ascending issue number,
+`lib/lanes.ts` `claimableTickets`); no separate work-order list is needed. Each
+ticket moves to Building only when its builder lane actually claims it (Step 4's
+`claim` row), so Building means "being built now" and Ready means "queued."
 
 ## Step 3 — Build the state file
 
@@ -179,8 +180,9 @@ bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" \
 ```
 
 This is the ONE ingest call that captures `initialReadyCount` for the batch --
-Step 2 has already moved every workable Ready ticket to Building, so this is
-ingest-time-zero for the safety control below.
+the committed queue is the gated Ready tickets from Step 2, still in Ready
+(nothing has been claimed yet, #133), so `initialReadyCount` is captured from
+that Ready count and this is ingest-time-zero for the safety control below.
 
 `ingest` preserves lanes and lost-claim flags across re-ingests, so re-running
 it after board writes is always safe.
@@ -224,7 +226,7 @@ Perform exactly that action, then record it. Action → side effects:
 
 | Action | What you do |
 |---|---|
-| `claim N` | 1. `"$Z_BOARD" claim <N> "$ME"` **before anything else**. Claim lost → `bun "$PACK/lib/loop.ts" claim-lost "$STATE" <N>` and re-run `next` (next ticket). 2. **Write the lane lock ONLY after the claim succeeds** (C7 — a claim loser never leaves a lock): `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <stage> --session "$SESSION"`. 3. Worktree (skip if it exists — a resume claim at stage qa/reviewer reuses it): `TSLUG=$(bun -e "import {slugifyTitle} from '$PACK/lib/ticket-schema.ts'; console.log(slugifyTitle(process.argv[1]))" "<title>")` then `git worktree add ".worktrees/ticket-<N>" -b "z/ticket-<N>-$TSLUG" "$BASE"`. 4. Apply: write the action JSON to a file, `bun "$PACK/lib/loop.ts" apply "$STATE" action.json`. 5. Spawn the action's stage (table below). |
+| `claim N` | 1. `"$Z_BOARD" claim <N> "$ME"` **before anything else**. Claim lost → `bun "$PACK/lib/loop.ts" claim-lost "$STATE" <N>` and re-run `next` (next ticket). 2. **Deferred commit (#133) — move the ticket to its claimed stage's status, ONLY after the claim succeeds** (a claim loser must never move a ticket, same C7 reason as the lock below): `"$Z_BOARD" move <N> <status> --slug "$SLUG"` where `<status>` mirrors the reducer's `STATUS_FOR_STAGE[stage]` — `builder`→`Building`, `qa`→`QA`, `reviewer`→`Review`. A fresh `builder` claim moves Ready→Building (the old Step 2 up-front move, now deferred to here); a resume claim at `qa`/`reviewer` is already at its stage's status, so the move is a no-op. 3. **Write the lane lock** (C7 — a claim loser never leaves a lock): `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <stage> --session "$SESSION"`. 4. Worktree (skip if it exists — a resume claim at stage qa/reviewer reuses it): `TSLUG=$(bun -e "import {slugifyTitle} from '$PACK/lib/ticket-schema.ts'; console.log(slugifyTitle(process.argv[1]))" "<title>")` then `git worktree add ".worktrees/ticket-<N>" -b "z/ticket-<N>-$TSLUG" "$BASE"`. 5. Apply: write the action JSON to a file, `bun "$PACK/lib/loop.ts" apply "$STATE" action.json` (its `claim` reducer sets the state-file status to `STATUS_FOR_STAGE[stage]`, matching the board move above). 6. Spawn the action's stage (table below). |
 | `advance N to S` | **Re-stamp the lane lock** to the new stage: `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <S> --session "$SESSION"`. Apply, then spawn stage S fresh. Before applying, read the lane's CURRENT stage from the state file: an advance to `builder` from `qa` passes the action's `note` as `qaNotes` (+ `investigateFirst`); from `reviewer`, as `reviewNotes`. |
 | `park N Questions` | Comment the note as `## Needs input --` + the question, `"$Z_BOARD" move <N> Questions`, apply, then **remove the lane lock** (`bun "$PACK/lib/locks.ts" lane-remove --slug "$SLUG" <N>`). Tell the human in the comment which status to return the ticket to. Keep the worktree. **Notify** `human-pause` (`{ticket,title,note}`; see the Notify block below). |
 | `park N Blocked` | Comment the note (what was wrong + recommended next steps), `move <N> Blocked`, apply, remove the lane lock. **Notify** `token-burn` (`{ticket,detail:note}`) when the note begins `Dependency deadlock:` (the step-6 deadlock break); otherwise `ticket-parked` (`{ticket,title,status:"Blocked",note}`). |

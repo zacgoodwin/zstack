@@ -1247,20 +1247,56 @@ describe("ingestBoardItems", () => {
   });
 
   // -- issue #63: initialReadyCount / humanNeededNotified capture-once + reset -
-  test("AC8: a genuinely first ingest captures initialReadyCount from Building tickets only, defaults humanNeededPercent, humanNeededNotified false", () => {
+  test("AC8: a genuinely first ingest captures initialReadyCount from Ready tickets only, defaults humanNeededPercent, humanNeededNotified false", () => {
     const items = [
-      { number: 1, title: "a", fields: { Status: "Building" } },
-      { number: 2, title: "b", fields: { Status: "Building" } },
-      { number: 3, title: "c", fields: { Status: "Building" } },
-      { number: 4, title: "d", fields: { Status: "Building" } },
+      { number: 1, title: "a", fields: { Status: "Ready" } },
+      { number: 2, title: "b", fields: { Status: "Ready" } },
+      { number: 3, title: "c", fields: { Status: "Ready" } },
+      { number: 4, title: "d", fields: { Status: "Ready" } },
       { number: 5, title: "e", fields: { Status: "Done" } },
       { number: 6, title: "f", fields: { Status: "Done" } },
     ];
     const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
     const s = ingestBoardItems(null, items, bodies);
-    expect(s.initialReadyCount).toBe(4); // only the Building count
+    expect(s.initialReadyCount).toBe(4); // #133: the Ready committed queue, not Building
     expect(s.humanNeededPercent).toBe(30); // default
     expect(s.humanNeededNotified).toBe(false);
+  });
+
+  // #133 AC3: with the batch-commit move deferred to claim time, the committed
+  // queue sits in Ready at ingest-time-zero and Building is NOT the fresh-batch
+  // signal. A stray Building ticket (e.g. a crash-resume mid-flight) must not be
+  // counted as this batch's committed work -- the denominator is the Ready count.
+  test("AC3 (#133): first ingest captures initialReadyCount from the Ready committed queue; Building tickets are not the signal", () => {
+    const items = [
+      { number: 1, title: "a", fields: { Status: "Ready" } },
+      { number: 2, title: "b", fields: { Status: "Ready" } },
+      { number: 3, title: "c", fields: { Status: "Ready" } },
+      { number: 4, title: "d", fields: { Status: "Ready" } },
+      { number: 5, title: "e", fields: { Status: "Building" } }, // in flight, not part of this fresh batch's committed count
+      { number: 6, title: "f", fields: { Status: "Done" } },
+    ];
+    const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
+    const s = ingestBoardItems(null, items, bodies);
+    expect(s.initialReadyCount).toBe(4); // the 4 Ready, NOT the Building #5
+    expect(s.humanNeededNotified).toBe(false);
+  });
+
+  // #133 AC4: the Ready-count denominator is behavior-equivalent to the old
+  // Building-count one. Step 1 parks 3 of 10 planned to Questions; the 7
+  // committed sit in Ready (they used to sit in Building after Step 2). Numerator
+  // = 3 Questions in both models, denominator = 7 in both -> identical trip.
+  test("AC4 (#133): denominator equals the old Building-count semantics when Step 1 parks tickets to Questions", () => {
+    const items = [
+      ...[1, 2, 3, 4, 5, 6, 7].map((n) => ({ number: n, title: `r${n}`, fields: { Status: "Ready" } })),
+      ...[8, 9, 10].map((n) => ({ number: n, title: `q${n}`, fields: { Status: "Questions" } })),
+    ];
+    const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
+    const s = ingestBoardItems(null, items, bodies, { humanNeededPercent: 30 });
+    expect(s.initialReadyCount).toBe(7); // the 7 Ready committed, not counting the 3 parked Questions
+    const hn = humanNeededStatus(s);
+    expect(hn.questions).toBe(3);
+    expect(hn.tripped).toBe(true); // 3/7 = 42.8% > 30, identical to the pre-#133 Building-count result
   });
 
   test("AC9: a mid-batch re-ingest (prev has a live lane) preserves initialReadyCount/humanNeededNotified unchanged", () => {
@@ -1293,12 +1329,12 @@ describe("ingestBoardItems", () => {
     };
     expect(drainComplete(prev.tickets, prev.lanes)).toBe(true); // sanity: prev IS fully drained
     const items = [
-      { number: 10, title: "New1", fields: { Status: "Building" } },
-      { number: 11, title: "New2", fields: { Status: "Building" } },
+      { number: 10, title: "New1", fields: { Status: "Ready" } },
+      { number: 11, title: "New2", fields: { Status: "Ready" } },
     ];
     const bodies = { "10": "no deps", "11": "no deps" };
     const s = ingestBoardItems(prev, items, bodies);
-    expect(s.initialReadyCount).toBe(2); // recomputed from the NEW batch, not the stale 7
+    expect(s.initialReadyCount).toBe(2); // recomputed from the NEW batch's Ready count, not the stale 7
     expect(s.humanNeededNotified).toBe(false); // reset
   });
 
@@ -1325,7 +1361,7 @@ describe("ingestBoardItems", () => {
     expect(s.mergedThisRun).toEqual([50]); // preserved -- a merge earlier in this batch is not lost
   });
 
-  test("issue #119 AC1: a re-ingest after the prior batch fully drained resets mergedThisRun (drainComplete + new Building is the fresh-batch boundary)", () => {
+  test("issue #119 AC1: a re-ingest after the prior batch fully drained resets mergedThisRun (drainComplete + new Ready is the fresh-batch boundary)", () => {
     const prev: LoopState = {
       tickets: [ticket(5, "Done"), ticket(7, "Blocked")],
       lanes: [],
@@ -1335,7 +1371,7 @@ describe("ingestBoardItems", () => {
     };
     expect(drainComplete(prev.tickets, prev.lanes)).toBe(true); // sanity: prev IS fully drained
     const items = [
-      { number: 200, title: "New", fields: { Status: "Building" } },
+      { number: 200, title: "New", fields: { Status: "Ready" } },
     ];
     const bodies = { "200": "Depends on: #50" };
     const s = ingestBoardItems(prev, items, bodies);
@@ -1356,9 +1392,9 @@ describe("ingestBoardItems", () => {
   test("regression: final-tick confirmation preserves counters (real ingest -> applyAction -> ingest chain, not a hand-built prev)", () => {
     const bodies = { "1": "no deps", "2": "no deps", "3": "no deps" };
     const items1 = [
-      { number: 1, title: "a", fields: { Status: "Building" } },
-      { number: 2, title: "b", fields: { Status: "Building" } },
-      { number: 3, title: "c", fields: { Status: "Building" } },
+      { number: 1, title: "a", fields: { Status: "Ready" } },
+      { number: 2, title: "b", fields: { Status: "Ready" } },
+      { number: 3, title: "c", fields: { Status: "Ready" } },
     ];
     let s = ingestBoardItems(null, items1, bodies, { humanNeededPercent: 30 });
     s.lanes = [lane(1, "builder"), lane(2, "builder"), lane(3, "builder")];
@@ -1381,7 +1417,7 @@ describe("ingestBoardItems", () => {
     expect(drainComplete(s.tickets, s.lanes)).toBe(true); // this state IS the next tick's `prev`
 
     // Next tick: a fresh board snapshot just confirms #1 is now Skipped too --
-    // nothing new committed to Building. The bug reset initialReadyCount to 0
+    // nothing new committed to Ready. The bug reset initialReadyCount to 0
     // here (recomputed from an all-terminal snapshot) and humanNeededNotified
     // to false, which by itself looks harmless, but initialReadyCount=0 makes
     // humanNeededTripped's initialReady<=0 guard force tripped=false forever.
@@ -1401,7 +1437,7 @@ describe("ingestBoardItems", () => {
 
   test("regression: fire-once flag survives a same-batch confirmation re-ingest, resets only for a genuinely new batch", () => {
     const bodies = { "1": "no deps" };
-    let s = ingestBoardItems(null, [{ number: 1, title: "a", fields: { Status: "Building" } }], bodies, { humanNeededPercent: 30 });
+    let s = ingestBoardItems(null, [{ number: 1, title: "a", fields: { Status: "Ready" } }], bodies, { humanNeededPercent: 30 });
     s.lanes = [lane(1, "builder")];
     s = applyAction(s, { kind: "skip", ticket: 1, note: "dead" }, 1000);
     expect(drainComplete(s.tickets, s.lanes)).toBe(true);
@@ -1410,70 +1446,70 @@ describe("ingestBoardItems", () => {
     s = markHumanNeededNotified(s);
 
     // Another confirmation tick on the same drained batch: still no new
-    // Building tickets. Must not re-arm the control.
+    // Ready tickets. Must not re-arm the control.
     s = ingestBoardItems(s, [{ number: 1, title: "a", fields: { Status: "Skipped" } }], bodies);
     expect(s.humanNeededNotified).toBe(true);
     expect(humanNeededStatus(s).alreadyNotified).toBe(true);
 
-    // A genuinely NEW batch (fresh Building tickets) DOES reset, even though
+    // A genuinely NEW batch (fresh Ready tickets) DOES reset, even though
     // the old ticket #1 is still present in the snapshot.
     s = ingestBoardItems(s, [
       { number: 1, title: "a", fields: { Status: "Skipped" } },
-      { number: 2, title: "b", fields: { Status: "Building" } },
+      { number: 2, title: "b", fields: { Status: "Ready" } },
     ], { ...bodies, "2": "no deps" });
-    expect(s.initialReadyCount).toBe(1); // only the new batch's Building count
+    expect(s.initialReadyCount).toBe(1); // only the new batch's Ready count
     expect(s.humanNeededNotified).toBe(false);
   });
 
-  // Regression (issue #63 second review bounce): the two tests above only
-  // ever left a foreign lane's ticket in a terminal status by the time the
-  // batch drained. But drainComplete permits a claimedByOther ticket to remain in
-  // *Building* -- it belongs to another session's batch, not this one. The
-  // bounce-1 fix's buildingCount didn't exclude claimedByOther, so a lingering
-  // foreign Building ticket in the snapshot made startingFreshBatch wrongly
-  // true on the confirmation re-ingest after THIS session's own last ticket
-  // resolved, silently resetting initialReadyCount/humanNeededNotified from a
-  // ticket this session never committed.
-  test("regression: claimedByOther Building does not start a fresh batch, but a new unclaimed Building ticket does", () => {
+  // Regression (issue #63 second review bounce), sharpened for #133: with the
+  // committed queue now in Ready, drainComplete permits a claimedByOther ticket
+  // to linger in a workable status -- here *Ready* -- because it belongs to
+  // another session's batch, not this one. readyCount must exclude
+  // claimedByOther for the same reason buildingCount did: a lingering foreign
+  // Ready ticket in the snapshot must not make startingFreshBatch wrongly true
+  // on the confirmation re-ingest after THIS session's own last ticket resolved,
+  // silently resetting initialReadyCount/humanNeededNotified from a ticket this
+  // session never committed.
+  test("regression: a claimedByOther Ready ticket does not start a fresh batch, but a new unclaimed Ready ticket does", () => {
     const bodies = { "1": "no deps", "9": "no deps" };
     const prev: LoopState = {
-      tickets: [ticket(1, "Done"), ticket(9, "Building", [], { claimedByOther: true })],
+      tickets: [ticket(1, "Done"), ticket(9, "Ready", [], { claimedByOther: true })],
       lanes: [],
       maxLanes: 3,
       watchdogMinutes: 10,
       initialReadyCount: 5,
       humanNeededNotified: true,
     };
-    // sanity: OWN batch is drained (ticket 1 terminal); #9 is another
-    // session's Building ticket, which drainComplete explicitly permits.
+    // sanity: OWN batch is drained (ticket 1 terminal); #9 is another session's
+    // Ready ticket, workable-but-foreign, which drainComplete explicitly permits.
     expect(drainComplete(prev.tickets, prev.lanes)).toBe(true);
 
-    // Confirmation tick: the same foreign Building ticket #9 is still there,
-    // nothing new committed. Must NOT read as a fresh batch.
+    // Confirmation tick: the same foreign Ready ticket #9 is still there,
+    // nothing new committed. Must NOT read as a fresh batch (readyCount excludes it).
     const same = ingestBoardItems(
       prev,
       [
         { number: 1, title: "a", fields: { Status: "Done" } },
-        { number: 9, title: "z", fields: { Status: "Building" } },
+        { number: 9, title: "z", fields: { Status: "Ready" } },
       ],
       bodies
     );
     expect(same.initialReadyCount).toBe(5); // preserved, not recomputed from the foreign ticket
     expect(same.humanNeededNotified).toBe(true); // preserved, not silently reset
 
-    // A genuinely new batch -- an UNCLAIMED Building ticket appears alongside
+    // A genuinely new batch -- an UNCLAIMED Ready ticket appears alongside
     // the still-foreign #9 -- DOES reset, same as the AC10 and fire-once-flag
     // regression tests above.
     const fresh = ingestBoardItems(
       prev,
       [
         { number: 1, title: "a", fields: { Status: "Done" } },
-        { number: 9, title: "z", fields: { Status: "Building" } },
-        { number: 10, title: "New", fields: { Status: "Building" } },
+        { number: 9, title: "z", fields: { Status: "Ready" } },
+        { number: 10, title: "New", fields: { Status: "Ready" } },
       ],
       { ...bodies, "10": "no deps" }
     );
-    expect(fresh.initialReadyCount).toBe(1); // only the new UNCLAIMED Building ticket, not the foreign #9
+    expect(fresh.initialReadyCount).toBe(1); // only the new UNCLAIMED Ready ticket, not the foreign #9
     expect(fresh.humanNeededNotified).toBe(false); // reset
   });
 });

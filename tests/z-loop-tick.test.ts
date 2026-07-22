@@ -35,10 +35,11 @@ const ITEMS = JSON.stringify([
 const BODIES = JSON.stringify({ "1": "no deps" });
 
 // A board that trips the human-needed control on the very first tick: 1
-// Building ticket (the committed batch size) plus 2 Blocked + 1 Skipped
-// already parked -- (2+1)/1*100 = 300% > the default 30% threshold.
+// Ready ticket (the committed batch size, #133 -- the committed queue sits in
+// Ready until claimed) plus 2 Blocked + 1 Skipped already parked --
+// (2+1)/1*100 = 300% > the default 30% threshold.
 const TRIPPED_ITEMS = JSON.stringify([
-  { number: 1, title: "T1", url: "http://x/1", fields: { Status: "Building" } },
+  { number: 1, title: "T1", url: "http://x/1", fields: { Status: "Ready" } },
   { number: 2, title: "T2", url: "http://x/2", fields: { Status: "Blocked" } },
   { number: 3, title: "T3", url: "http://x/3", fields: { Status: "Blocked" } },
   { number: 4, title: "T4", url: "http://x/4", fields: { Status: "Skipped" } },
@@ -144,10 +145,12 @@ describe("z-loop-tick", () => {
     expect(ing.exitCode).toBe(0);
     expect(readFileSync(tickState, "utf8")).toBe(readFileSync(expectedState, "utf8"));
 
-    // Human-needed safety control (issue #63): a first tick with 0 tickets
-    // committed to Building never trips (initialReadyCount = 0, guarded).
+    // Human-needed safety control (issue #63): the first tick's ITEMS is one
+    // Ready ticket, so #133's Ready-count capture makes initialReadyCount = 1
+    // (was 0 under the old Building-count capture). With 0 parked it still never
+    // trips (0/1 = 0% < 30%).
     const hn = JSON.parse(readFileSync(join(tickTmp, "human-needed.json"), "utf8"));
-    expect(hn).toMatchObject({ tripped: false, alreadyNotified: false, blocked: 0, skipped: 0, questions: 0, initialReadyCount: 0 });
+    expect(hn).toMatchObject({ tripped: false, alreadyNotified: false, blocked: 0, skipped: 0, questions: 0, initialReadyCount: 1 });
 
     // The throttle step actually ran end to end (not just skipped): it stamped
     // a real last-tick file under the project's loop dir.
