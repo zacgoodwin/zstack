@@ -11,7 +11,11 @@
 //     second /z-loop on the same project reads it and refuses to start, naming
 //     the live session. Liveness: a verifiable pid decides; with no pid, a lock
 //     older than the configured staleness threshold is judged stale (crashed)
-//     rather than live, so a dead loop never wedges the next run.
+//     rather than live, so a dead loop never wedges the next run. The one-shot
+//     `loop.lock.reconcile` claim that serializes --reconcile's clear-and-replace
+//     carries the same payload and gets the same judgment, so a claim orphaned by a
+//     crash inside the claimed section self-heals too: the next run supersedes it with
+//     the next generation (`loop.lock.reconcile.1`, `.2`, ...) (issue #144).
 //
 // Same discipline as lib/setup-permissions.ts: EVERY path is a parameter here.
 // Only main() computes the real ~/.zstack directory, so every test in
@@ -22,10 +26,11 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { atomicWrite, handleCliError, parseFlags, requireFlag, str } from "./cli.ts";
 import {
   DEFAULT_LOCK_STALENESS_MINUTES,
@@ -307,14 +312,12 @@ export function acquireLoopLock(
   // exclusive-create of the claim, and only under it does it re-inspect + clear a
   // STILL-stale lock and take the loop lock (also exclusive-create). Every loser
   // -- of the claim, or of a fresh lock a racer wrote first -- re-inspects and
-  // defers. ponytail: a process killed inside the (synchronous) claimed section
-  // could orphan the claim file and wedge future reconciles; the window is one
-  // uninterrupted burst of sync fs calls, so this is a documented ceiling.
+  // defers. A process killed inside the claimed section orphans the claim, so the
+  // claim carries the SAME payload as the loop lock and claimReconcile judges it with
+  // the same liveness rules: a dead claim is superseded, never wedged (issue #144).
   const claimPath = `${path}.reconcile`;
-  try {
-    writeFileSync(claimPath, `${lock.session}\n`, { flag: "wx", mode: 0o600 });
-  } catch (e: any) {
-    if (e?.code !== "EEXIST") throw e; // another reconcile holds the claim: defer to it
+  const gen = claimReconcile(claimPath, body, opts);
+  if (gen === null) {
     const again = inspectLoopLock(locksDir, opts.nowMs, opts.stalenessMs, opts.isAlive);
     return { acquired: false, held: again.lock, reason: again.state === "live" ? "live" : "stale" };
   }
@@ -333,8 +336,101 @@ export function acquireLoopLock(
       return { acquired: false, held: again.lock, reason: again.state === "live" ? "live" : "stale" };
     }
   } finally {
-    rmSync(claimPath, { force: true });
+    releaseClaim(claimPath, gen);
   }
+}
+
+// Claims are GENERATIONAL: `loop.lock.reconcile`, then `.1`, `.2`, ... The claim in
+// force is the HIGHEST generation on disk; superseding a dead one is the exclusive
+// create of the NEXT generation, never an unlink of the current one.
+function claimGenPath(claimPath: string, gen: number): string {
+  return gen === 0 ? claimPath : `${claimPath}.${gen}`;
+}
+
+// Take the reconcile claim, or return null to defer (a live reconcile holds it, or a
+// racer superseded the same dead claim first). Returns the generation held (issue #144).
+//
+// Exclusive-create is the mutex and nothing ever unlinks a claim to take it over: an
+// unlink-then-create is NOT a compare-and-swap, because the interleave A.rm -> A.create
+// -> B.rm(deletes A's fresh claim) -> B.create hands the claim to both racers, and both
+// then reconcile the same loop lock. Superseding instead means every racer that judged
+// generation N dead races to create N+1, so exactly one wins and the losers see EEXIST.
+// A process killed inside the claimed section leaves its generation orphaned; the next
+// run judges it with the loop lock's own liveness rules (dead/recycled pid on this host,
+// or older than the staleness window) and supersedes it, so nothing wedges.
+function claimReconcile(
+  claimPath: string,
+  body: string,
+  opts: { nowMs: number; stalenessMs: number; isAlive?: (pid: number) => boolean }
+): number | null {
+  const current = currentClaimGen(claimPath);
+  if (current !== null && claimLiveness(claimGenPath(claimPath, current), opts) === "live") return null;
+  const gen = current === null ? 0 : current + 1;
+  try {
+    writeFileSync(claimGenPath(claimPath, gen), body, { flag: "wx", mode: 0o600 }); // exclusive create, owner-only
+    return gen;
+  } catch (e: any) {
+    if (e?.code !== "EEXIST") throw e;
+    return null; // a racer took this generation first: defer to it
+  }
+}
+
+// The generation in force, or null when no claim file exists at all. Highest wins, so a
+// racer reading mid-release (which drops superseded generations first) still sees the
+// live one and defers.
+function currentClaimGen(claimPath: string): number | null {
+  const base = basename(claimPath);
+  let names: string[];
+  try {
+    names = readdirSync(dirname(claimPath));
+  } catch {
+    return null; // no locks dir yet => no claim
+  }
+  let gen: number | null = null;
+  for (const name of names) {
+    if (!name.startsWith(base)) continue;
+    const suffix = name.slice(base.length);
+    const g = suffix === "" ? 0 : /^\.\d+$/.test(suffix) ? Number(suffix.slice(1)) : NaN;
+    if (Number.isInteger(g) && (gen === null || g > gen)) gen = g;
+  }
+  return gen;
+}
+
+// Drop the claim we hold. Our own generation goes LAST: while it is on disk it is the
+// generation in force, so a racer reading mid-release judges OUR claim (live, until we
+// finish) rather than a superseded one.
+function releaseClaim(claimPath: string, gen: number): void {
+  for (let g = 0; g < gen; g++) rmSync(claimGenPath(claimPath, g), { force: true }); // the orphans we superseded
+  rmSync(claimGenPath(claimPath, gen), { force: true });
+}
+
+// Liveness of an existing claim file. A claim written before #144 holds a bare session
+// string with no payload, so only its mtime is legible -- age alone then decides, which
+// is the same fallback a pid-less loop lock gets. A claim that vanished under us reads
+// stale: the exclusive create of the next generation is what decides the winner.
+function claimLiveness(
+  claimPath: string,
+  opts: { nowMs: number; stalenessMs: number; isAlive?: (pid: number) => boolean }
+): LockLiveness {
+  let text: string;
+  let mtimeMs: number;
+  try {
+    text = readFileSync(claimPath, "utf8");
+    mtimeMs = statSync(claimPath).mtimeMs;
+  } catch {
+    return "stale";
+  }
+  // mtime is wall-clock but opts.nowMs is injectable, so shift it into the caller's
+  // frame -- the age compared below is then real elapsed time under either clock.
+  // (Comparing a raw mtime to an injected nowMs read a day-old orphan as live.)
+  let claim: LoopLock = { session: "legacy claim", startedAt: mtimeMs - Date.now() + opts.nowMs };
+  try {
+    const raw = JSON.parse(text) as any;
+    if (typeof raw?.session === "string" && typeof raw?.startedAt === "number") claim = raw as LoopLock;
+  } catch {
+    // not JSON: keep the mtime fallback
+  }
+  return loopLockLiveness(claim, opts.nowMs, opts.stalenessMs, opts.isAlive);
 }
 
 function releaseLoopLock(locksDir: string): void {
