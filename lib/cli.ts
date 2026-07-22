@@ -7,8 +7,6 @@ import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "
 import { dirname } from "node:path";
 import { ZError } from "./config.ts";
 
-export { ZError } from "./config.ts";
-
 export interface ParsedArgs {
   positionals: string[];
   flags: Record<string, string | boolean>;

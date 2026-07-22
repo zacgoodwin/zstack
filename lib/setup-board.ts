@@ -50,7 +50,6 @@ import {
   loadBoardTemplate,
 } from "./board-template.ts";
 
-export { ZError } from "./config.ts";
 export type { DesiredField } from "./board-template.ts";
 
 // -- desired board shape (docs/user-guide/spec/PROCESS.md + issue #1) ---------

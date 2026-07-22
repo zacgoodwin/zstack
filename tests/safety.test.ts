@@ -29,9 +29,9 @@ import {
   removeLaneLock,
   sameHost,
   writeLaneLock,
-  ZError,
   type LoopLock,
 } from "../lib/locks.ts";
+import { ZError } from "../lib/config.ts";
 import {
   applyReconcile,
   hasOrphans,
@@ -78,7 +78,6 @@ function lane(ticketNumber: number, stage: Stage, over: Partial<LaneState> = {})
 function state(tickets: TicketSnapshot[], lanes: LaneState[] = [], maxLanes = 3): LoopState {
   return { tickets, lanes, maxLanes, watchdogMinutes: 10, mergedThisRun: [] };
 }
-const OPTS = (s: LoopState, nowMs = 0) => ({ nowMs, maxLanes: s.maxLanes, watchdogMinutes: s.watchdogMinutes, mergedThisRun: s.mergedThisRun });
 const HAPPY: Record<Stage, string> = {
   builder: "BUILT: ok",
   qa: "QA-PASS: ok",
@@ -606,7 +605,7 @@ describe("control 4: lane cap enforced at the locks layer", () => {
   function driveWithLocks(s: LoopState, locksDir: string): { peakLocks: number; end: LoopState } {
     let peakLocks = 0;
     for (let i = 0; i < 500; i++) {
-      const a = nextAction(s.tickets, s.lanes, OPTS(s));
+      const a = nextAction(s, 0);
       if (a.kind === "drain-complete") return { peakLocks, end: s };
       if (a.kind === "wait") {
         const idle = s.lanes.find((l) => !l.outcome);
@@ -718,12 +717,12 @@ describe("control 6: wave reconciliation (mid-loop human moves)", () => {
     // #5's ticket is Blocked but its builder is still running (no outcome yet):
     // the reducer must not kill it -- it schedules the other lane's work instead.
     let s = state([ticket(5, "Blocked"), ticket(6, "Building")], [lane(5, "builder"), lane(6, "builder")]);
-    const a1 = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a1 = nextAction(s, 0);
     expect(a1.kind).not.toBe("stop-lane"); // no boundary reached for #5 yet
 
     // #5's stage finishes (outcome recorded) -> now it is at a boundary.
     s = recordOutcome(s, 5, HAPPY.builder, 0);
-    const a2 = nextAction(s.tickets, s.lanes, OPTS(s));
+    const a2 = nextAction(s, 0);
     expect(a2).toMatchObject({ kind: "stop-lane", ticket: 5 });
   });
 
@@ -742,7 +741,7 @@ describe("control 6: wave reconciliation (mid-loop human moves)", () => {
     );
     expect(s.lanes.find((l) => l.ticket === 5)!.outcome).toBeDefined(); // ingest preserved the lane
 
-    const stop = nextAction(s.tickets, s.lanes, OPTS(s));
+    const stop = nextAction(s, 0);
     expect(stop).toMatchObject({ kind: "stop-lane", ticket: 5 });
     s = applyAction(s, stop, 0);
     expect(s.lanes.some((l) => l.ticket === 5)).toBe(false); // lane dropped
@@ -750,7 +749,7 @@ describe("control 6: wave reconciliation (mid-loop human moves)", () => {
 
     // #6 is untouched and drains to Done normally.
     for (let i = 0; i < 50 && s.lanes.length; i++) {
-      const a = nextAction(s.tickets, s.lanes, OPTS(s));
+      const a = nextAction(s, 0);
       if (a.kind === "drain-complete") break;
       if (a.kind === "wait") {
         const idle = s.lanes.find((l) => !l.outcome)!;

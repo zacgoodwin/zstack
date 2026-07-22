@@ -17,8 +17,6 @@ import { TERMINAL_STATUSES, loadConfig } from "./config.ts";
 import { defaultLocksDir, listLaneLocks, type LaneLock } from "./locks.ts";
 import { BOARD_STATUSES, type BoardStatus, type LaneState, type TicketSnapshot } from "./loop.ts";
 
-export { ZError } from "./config.ts";
-
 // -- orphan scan --------------------------------------------------------------
 
 // The in-flight board statuses. A leftover worktree whose ticket sits in one of

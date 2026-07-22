@@ -120,12 +120,7 @@ export function deriveRun(initial: LoopState, oracle = happyOutcome): SimTrace {
 
   for (let i = 0; i < 1000; i++) {
     now += 1;
-    const action: Action = nextAction(state.tickets, state.lanes, {
-      nowMs: now,
-      maxLanes: state.maxLanes,
-      watchdogMinutes: state.watchdogMinutes,
-      mergedThisRun: state.mergedThisRun,
-    });
+    const action: Action = nextAction(state, now);
     if (action.kind === "drain-complete") return { statusHistory, maxObservedLanes, completionOrder, finalState: state, laneKeySets };
     if (action.kind === "wait" || action.kind === "check-worker") {
       throw new Error(`Happy-path derivation hit an unexpected "${action.kind}" -- the recorded run is not the clean success this checker models.`);

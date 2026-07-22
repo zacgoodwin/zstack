@@ -9,7 +9,8 @@ import { test, expect, describe, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildStatusReport, ZError } from "../lib/status-report.ts";
+import { buildStatusReport } from "../lib/status-report.ts";
+import { ZError } from "../lib/config.ts";
 import type { BoardItem } from "../lib/board.ts";
 
 const LIB = join(import.meta.dir, "..", "lib", "status-report.ts");
@@ -45,7 +46,7 @@ describe("buildStatusReport (item 15): renderer is the single source of numbers"
         { path: "lock5", lock: { ticket: 5, stage: "qa", session: "s", claimedAt } },
       ],
       lastReport: null,
-      clock: () => claimedAt + 5 * 60_000, // 5 minutes after claim
+      nowMs: claimedAt + 5 * 60_000, // 5 minutes after claim
     });
 
     expect(report).toContain("- Done: 1");
@@ -71,7 +72,7 @@ describe("buildStatusReport (item 15): renderer is the single source of numbers"
       boardItems: [],
       laneLocks: [],
       lastReport: reportFile,
-      clock: () => 0,
+      nowMs: 0,
     });
     expect(report).toContain("loop-20260719-120000.md: GREEN — deployed.");
   });
@@ -84,7 +85,7 @@ describe("buildStatusReport (item 15): renderer is the single source of numbers"
       ...ITEMS,
       { number: 4, title: "Building now", url: "u4", fields: { Status: "QA", Estimate: 2, Actual: 9 } },
     ];
-    const report = buildStatusReport({ boardItems: dupItems, laneLocks: [], lastReport: null, clock: () => 0 });
+    const report = buildStatusReport({ boardItems: dupItems, laneLocks: [], lastReport: null, nowMs: 0 });
     expect(report).toContain("- Building: 2"); // first occurrence kept
     expect(report).toContain("- QA: 0"); // duplicate sighting NOT counted
     expect(report).toContain("- Estimate: $6.50"); // sums unchanged by the dupe
@@ -93,7 +94,7 @@ describe("buildStatusReport (item 15): renderer is the single source of numbers"
   });
 
   test("no duplicates: no warning line", () => {
-    const report = buildStatusReport({ boardItems: ITEMS, laneLocks: [], lastReport: null, clock: () => 0 });
+    const report = buildStatusReport({ boardItems: ITEMS, laneLocks: [], lastReport: null, nowMs: 0 });
     expect(report).not.toMatch(/duplicate/i);
   });
 
@@ -103,7 +104,7 @@ describe("buildStatusReport (item 15): renderer is the single source of numbers"
       boardItems: [],
       laneLocks: [],
       lastReport: join(tmpDir("zstatus-f13-"), "never-written.md"),
-      clock: () => 0,
+      nowMs: 0,
     });
     expect(report).toContain("(no prior loops)");
   });
@@ -112,7 +113,7 @@ describe("buildStatusReport (item 15): renderer is the single source of numbers"
     const dir = tmpDir("zstatus-f13-dir-"); // a DIRECTORY where a file is expected -> EISDIR, not ENOENT
     let caught: unknown;
     try {
-      buildStatusReport({ boardItems: [], laneLocks: [], lastReport: dir, clock: () => 0 });
+      buildStatusReport({ boardItems: [], laneLocks: [], lastReport: dir, nowMs: 0 });
     } catch (e) {
       caught = e;
     }

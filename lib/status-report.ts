@@ -1,5 +1,5 @@
 // Read-only board dashboard (C9): pure function to render the /z-status skill.
-// Takes a snapshot of the board + locks + last report + clock, returns markdown.
+// Takes a snapshot of the board + locks + last report + the current ms, returns markdown.
 // No mutations, no side effects: the SKILL assembles the snapshot and writes output.
 import { readFileSync } from "node:fs";
 import { handleCliError, parseFlags, readJson, requireFlag, str } from "./cli.ts";
@@ -9,13 +9,11 @@ import type { BoardItem } from "./board.ts";
 import type { LaneLock } from "./locks.ts";
 import { BOARD_STATUSES } from "./loop.ts";
 
-export { ZError } from "./config.ts";
-
 export interface StatusReportInput {
   boardItems: BoardItem[];
   laneLocks: { path: string; lock: LaneLock }[];
   lastReport: string | null; // path to newest reports/loop-*.md, or null if missing
-  clock: () => number; // injected for testing; returns current ms
+  nowMs: number; // injected for testing; the wall clock only enters at the CLI edge
 }
 
 // Pure markdown render of the board status at this moment: ticket counts per
@@ -23,8 +21,7 @@ export interface StatusReportInput {
 // their age, last loop report summary (path + verdict line), and Estimate vs
 // Actual totals for the milestone. No mutations, deterministic.
 export function buildStatusReport(input: StatusReportInput): string {
-  const { laneLocks, lastReport, clock } = input;
-  const nowMs = clock();
+  const { laneLocks, lastReport, nowMs } = input;
 
   // Belt-and-braces vs snapshot races (F11): the SKILL pipeline takes ONE
   // atomic z-board snapshot, but if a future caller ever feeds overlapping
@@ -171,7 +168,7 @@ export function main(argv: string[]): number {
         boardItems: boardItemsJson,
         laneLocks,
         lastReport: lastReportFile || null,
-        clock: () => Date.now(),
+        nowMs: Date.now(),
       });
 
       console.log(report);

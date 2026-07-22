@@ -16,8 +16,6 @@ import {
   ZError,
 } from "./config.ts";
 
-export { ZError } from "./config.ts";
-
 // data payload of a GraphQL response (the value under the top-level "data" key).
 export type GraphQLData = Record<string, any>;
 export type GraphQLExecutor = (

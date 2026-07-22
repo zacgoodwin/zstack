@@ -19,7 +19,6 @@ import {
   shSingleQuote,
   ADVERSARIAL_TRIGGER_LABELS,
   REVIEWER_INPUT_KEYS,
-  ZError,
   type BuilderPromptInput,
   type CompletionEdge,
   type CompletionNoteInput,
@@ -27,6 +26,7 @@ import {
   type QaPromptInput,
   type ReviewerPromptInput,
 } from "../lib/stage-prompts.ts";
+import { ZError } from "../lib/config.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 

@@ -7,7 +7,7 @@
 // scheduling or transition decision in prose. No Date.now() outside the CLI
 // edge; every pure function takes nowMs.
 import { existsSync, readFileSync } from "node:fs";
-import { atomicWrite, handleCliError, readJson } from "./cli.ts";
+import { atomicWrite, handleCliError, parseFlags, readJson, str } from "./cli.ts";
 import {
   BOARD_STATUSES,
   DEFAULT_HUMAN_NEEDED_PERCENT,
@@ -27,14 +27,11 @@ import {
   claimableTickets,
   deadDeps,
   isWorkableStatus,
-  laneCapReached,
   mergeOrder,
   parseDependsOn,
   watchdogExpired,
 } from "./lanes.ts";
 import { reconcileBoardMoves } from "./reconcile.ts";
-
-export { ZError } from "./config.ts";
 
 // -- ticket states ------------------------------------------------------------
 
@@ -296,12 +293,6 @@ export type Action =
   | { kind: "wait" }
   | { kind: "drain-complete" };
 
-// Maximum QA passes before the ticket parks in Blocked (PROCESS.md step 16).
-// Kept exported as the default's named constant (issue #41): the cap is now a
-// per-project config knob (BoardConfig.maxQaPasses / DEFAULT_MAX_QA_PASSES),
-// but existing importers of MAX_QA_PASSES keep working, reading the default.
-export const MAX_QA_PASSES = DEFAULT_MAX_QA_PASSES;
-
 // The two config-driven QA bounce knobs resolveOutcome needs. Threaded in by
 // nextAction (already defaulted there) rather than read off a global, so the
 // reducer stays a pure function of its inputs.
@@ -398,18 +389,6 @@ function withResync(action: Action, resyncStatus: Map<number, BoardStatus>): Act
   return status === undefined ? action : { ...action, resyncStatus: status };
 }
 
-export interface LoopOpts {
-  nowMs: number;
-  maxLanes?: number;
-  watchdogMinutes?: number;
-  maxQaPasses?: number;
-  qaInvestigateAfter?: number;
-  minReviewerConfidence?: number;
-  reviewerBelowThresholdAction?: "block" | "retry" | "off";
-  maxReviewBounces?: number;
-  mergedThisRun?: number[];
-}
-
 // The scheduler. Deterministic priority order:
 //   1. wave reconciliation + finished stages: a human move that parked a lane's
 //      ticket out from under it stops that lane cleanly at its boundary;
@@ -424,17 +403,21 @@ export interface LoopOpts {
 //   6. with all lanes idle and nothing claimable, break a dependency deadlock
 //      by parking the lowest stuck ticket to Blocked (no-token-burn rule);
 //   7. drain-complete when nothing workable remains; else wait.
-export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: LoopOpts): Action {
-  const maxLanes = opts.maxLanes ?? DEFAULT_MAX_LANES;
-  const wd = opts.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES;
+// The knobs come straight off the state the caller already holds -- there is no
+// second options shape to keep in sync with LoopState (every caller used to
+// re-spread the same nine fields into one).
+export function nextAction(state: LoopState, nowMs: number): Action {
+  const { tickets, lanes } = state;
+  const maxLanes = state.maxLanes ?? DEFAULT_MAX_LANES;
+  const wd = state.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES;
   const qaLimits: QaBounceLimits = {
-    maxQaPasses: opts.maxQaPasses ?? DEFAULT_MAX_QA_PASSES,
-    qaInvestigateAfter: opts.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER,
+    maxQaPasses: state.maxQaPasses ?? DEFAULT_MAX_QA_PASSES,
+    qaInvestigateAfter: state.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER,
   };
   const reviewerGate: ReviewerGate = {
-    minConfidence: opts.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE,
-    belowAction: opts.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
-    maxReviewBounces: opts.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES,
+    minConfidence: state.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE,
+    belowAction: state.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
+    maxReviewBounces: state.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES,
   };
   const byNumber = new Map(tickets.map((t) => [t.number, t]));
   // Tickets this tick's desync guard judged as a lagged (not genuine) board
@@ -511,7 +494,7 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
     // (its branch survives until batch-end cleanup, so the child's PR still
     // needs the step-18 retarget).
     const first = order[0];
-    const mergedThisRun = new Set(opts.mergedThisRun ?? []);
+    const mergedThisRun = new Set(state.mergedThisRun ?? []);
     const runParents = (byNumber.get(first.ticket)?.dependsOn ?? []).filter((d) => mergedThisRun.has(d));
     const stackedOn = [...new Set([...first.stackedOn, ...runParents])].sort((a, b) => a - b);
     return withResync({ kind: "advance", ticket: first.ticket, to: "merge", stackedOn }, resyncStatus);
@@ -520,7 +503,7 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
   // 3. Watchdog on silent lanes (an unresolved merge approval is not silent).
   for (const lane of lanes) {
     if (lane.outcome) continue;
-    if (!watchdogExpired(lane, opts.nowMs, wd)) continue;
+    if (!watchdogExpired(lane, nowMs, wd)) continue;
     if (lane.workerDead) {
       // A dead MERGE worker is never blind-skipped (issue #14 H9): `gh pr merge`
       // may have landed the PR before the worker died, and skipping would lose it
@@ -551,7 +534,7 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
 
   // 5. Claim the next ticket into a free lane.
   const claimable = claimableTickets(tickets, lanes);
-  if (claimable.length > 0 && !laneCapReached(lanes, maxLanes)) {
+  if (claimable.length > 0 && lanes.length < maxLanes) {
     const t = claimable[0];
     return { kind: "claim", ticket: t.number, stage: claimStage(t.status) };
   }
@@ -939,10 +922,21 @@ function readPrevState(path: string): LoopState | null {
   return s as LoopState;
 }
 
-function flagValue(argv: string[], flag: string): string | undefined {
-  const i = argv.indexOf(flag);
-  return i >= 0 ? argv[i + 1] : undefined;
-}
+// The numeric ingest knobs, in one table: each is optional, and each reaches
+// ingestBoardItems as a number or undefined. Adding a knob is one row here,
+// not a read + a ternary + a call-site line.
+const INGEST_NUMBERS = [
+  "max-lanes",
+  "watchdog-minutes",
+  "max-qa-passes",
+  "qa-investigate-after",
+  "human-needed-percent",
+  "min-reviewer-confidence",
+  "max-review-bounces",
+] as const;
+
+// kebab-case CLI flag -> the camelCase key ingestBoardItems takes.
+const camel = (flag: string): string => flag.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 
 export function main(argv: string[]): number {
   const cmd = argv[0];
@@ -951,66 +945,60 @@ export function main(argv: string[]): number {
     return cmd ? 0 : 1;
   }
   try {
+    // Shared CLI plumbing (lib/cli.ts): one pass over argv splits positionals
+    // from --flag value pairs, so this file no longer hand-rolls an indexOf
+    // scan per flag.
+    const { positionals, flags } = parseFlags(argv.slice(1));
+
     // stage-model takes no state.json (it reads config, not loop state), so it
     // is handled before the generic statePath guard below applies to every
     // other command.
     if (cmd === "stage-model") {
       const stages: Stage[] = ["builder", "qa", "reviewer", "merge"];
-      const stage = argv[1] as Stage;
-      const ticketModel = argv[2];
+      const stage = positionals[0] as Stage;
+      const ticketModel = positionals[1];
       if (!stages.includes(stage) || !ticketModel) {
         throw new ZError(`Usage: loop stage-model <${stages.join("|")}> <ticketModel> --slug <s>`);
       }
       // --slug is optional here the same way it is everywhere else (H13):
       // loadConfig's resolveSlug falls back to ZSTACK_SLUG or the sole
       // configured project, and throws its own ZError when neither resolves.
-      console.log(resolveStageModel(stage, ticketModel, loadConfig(flagValue(argv, "--slug")).stageModels));
+      console.log(resolveStageModel(stage, ticketModel, loadConfig(str(flags, "slug")).stageModels));
       return 0;
     }
 
     // The only Date.now() in this file: the CLI boundary. Pure functions above
     // always take nowMs.
-    const nowMs = Number(flagValue(argv, "--now") ?? Date.now());
-    const statePath = argv[1];
+    const nowMs = Number(str(flags, "now") ?? Date.now());
+    const statePath = positionals[0];
     if (!statePath) throw new ZError(`Usage:\n${USAGE}`);
 
     if (cmd === "next") {
       const state = readJson(statePath) as LoopState;
-      const action = nextAction(state.tickets, state.lanes, {
-        nowMs,
-        maxLanes: state.maxLanes,
-        watchdogMinutes: state.watchdogMinutes,
-        maxQaPasses: state.maxQaPasses,
-        qaInvestigateAfter: state.qaInvestigateAfter,
-        minReviewerConfidence: state.minReviewerConfidence,
-        reviewerBelowThresholdAction: state.reviewerBelowThresholdAction,
-        maxReviewBounces: state.maxReviewBounces,
-        mergedThisRun: state.mergedThisRun,
-      });
-      console.log(JSON.stringify(action));
+      console.log(JSON.stringify(nextAction(state, nowMs)));
       return 0;
     }
     if (cmd === "apply") {
-      if (!argv[2]) throw new ZError("Usage: loop apply <state.json> <action.json> [--now <ms>]");
+      if (!positionals[1]) throw new ZError("Usage: loop apply <state.json> <action.json> [--now <ms>]");
       const state = readJson(statePath) as LoopState;
-      const action = readJson(argv[2]) as Action;
+      const action = readJson(positionals[1]) as Action;
       atomicWrite(statePath, JSON.stringify(applyAction(state, action, nowMs), null, 2));
       console.log(`applied ${action.kind}${"ticket" in action ? ` #${action.ticket}` : ""}`);
       return 0;
     }
     if (cmd === "outcome") {
-      const ticket = Number(argv[2]);
-      if (!Number.isInteger(ticket) || !argv[3]) throw new ZError("Usage: loop outcome <state.json> <ticket> <msg.txt> [--now <ms>]");
+      const ticket = Number(positionals[1]);
+      if (!Number.isInteger(ticket) || !positionals[2]) throw new ZError("Usage: loop outcome <state.json> <ticket> <msg.txt> [--now <ms>]");
       const state = readJson(statePath) as LoopState;
-      const message = readFileSync(argv[3], "utf8");
+      const message = readFileSync(positionals[2], "utf8");
       const next = recordOutcome(state, ticket, message, nowMs);
       atomicWrite(statePath, JSON.stringify(next, null, 2));
       console.log(JSON.stringify(next.lanes.find((l) => l.ticket === ticket)!.outcome));
       return 0;
     }
     if (cmd === "probe") {
-      const ticket = Number(argv[2]);
-      const verdict = argv[3];
+      const ticket = Number(positionals[1]);
+      const verdict = positionals[2];
       if (!Number.isInteger(ticket) || (verdict !== "alive" && verdict !== "dead")) {
         throw new ZError("Usage: loop probe <state.json> <ticket> <alive|dead> [--now <ms>]");
       }
@@ -1020,7 +1008,7 @@ export function main(argv: string[]): number {
       return 0;
     }
     if (cmd === "claim-lost") {
-      const ticket = Number(argv[2]);
+      const ticket = Number(positionals[1]);
       if (!Number.isInteger(ticket)) throw new ZError("Usage: loop claim-lost <state.json> <ticket>");
       const state = readJson(statePath) as LoopState;
       atomicWrite(statePath, JSON.stringify(markClaimLost(state, ticket), null, 2));
@@ -1039,34 +1027,25 @@ export function main(argv: string[]): number {
       return 0;
     }
     if (cmd === "ingest") {
-      if (!argv[2] || !argv[3]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off] [--max-review-bounces N]");
+      if (!positionals[1] || !positionals[2]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off] [--max-review-bounces N]");
       const prev = readPrevState(statePath);
-      const items = readJson(argv[2]) as BoardItemLike[];
-      const bodies = readJson(argv[3]) as Record<string, string>;
-      const maxLanes = flagValue(argv, "--max-lanes");
-      const watchdogMinutes = flagValue(argv, "--watchdog-minutes");
-      const maxQaPasses = flagValue(argv, "--max-qa-passes");
-      const qaInvestigateAfter = flagValue(argv, "--qa-investigate-after");
-      const humanNeededPercent = flagValue(argv, "--human-needed-percent");
-      const minReviewerConfidence = flagValue(argv, "--min-reviewer-confidence");
-      const reviewerBelowThresholdAction = flagValue(argv, "--reviewer-below-threshold-action");
-      const maxReviewBounces = flagValue(argv, "--max-review-bounces");
+      const items = readJson(positionals[1]) as BoardItemLike[];
+      const bodies = readJson(positionals[2]) as Record<string, string>;
+      const reviewerBelowThresholdAction = str(flags, "reviewer-below-threshold-action");
       if (
         reviewerBelowThresholdAction !== undefined &&
         !["block", "retry", "off"].includes(reviewerBelowThresholdAction)
       ) {
         throw new ZError(`--reviewer-below-threshold-action must be "block", "retry", or "off", got ${JSON.stringify(reviewerBelowThresholdAction)}.`);
       }
-      const state = ingestBoardItems(prev, items, bodies, {
-        maxLanes: maxLanes === undefined ? undefined : Number(maxLanes),
-        watchdogMinutes: watchdogMinutes === undefined ? undefined : Number(watchdogMinutes),
-        maxQaPasses: maxQaPasses === undefined ? undefined : Number(maxQaPasses),
-        qaInvestigateAfter: qaInvestigateAfter === undefined ? undefined : Number(qaInvestigateAfter),
-        humanNeededPercent: humanNeededPercent === undefined ? undefined : Number(humanNeededPercent),
-        minReviewerConfidence: minReviewerConfidence === undefined ? undefined : Number(minReviewerConfidence),
-        reviewerBelowThresholdAction: reviewerBelowThresholdAction as "block" | "retry" | "off" | undefined,
-        maxReviewBounces: maxReviewBounces === undefined ? undefined : Number(maxReviewBounces),
-      });
+      const cfg: Record<string, number | string | undefined> = {
+        reviewerBelowThresholdAction,
+      };
+      for (const flag of INGEST_NUMBERS) {
+        const raw = str(flags, flag);
+        if (raw !== undefined) cfg[camel(flag)] = Number(raw);
+      }
+      const state = ingestBoardItems(prev, items, bodies, cfg as Parameters<typeof ingestBoardItems>[3]);
       atomicWrite(statePath, JSON.stringify(state, null, 2));
       console.log(`${state.tickets.length} ticket(s), ${state.lanes.length} lane(s)`);
       return 0;

@@ -15,8 +15,6 @@ import { join } from "node:path";
 import { handleCliError } from "./cli.ts";
 import { ZError } from "./config.ts";
 
-export { ZError } from "./config.ts";
-
 export type SpecSourceKind = "specs" | "ceo-plans" | "test-plan" | "checkpoints";
 
 export interface SpecSource {
