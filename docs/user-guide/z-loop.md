@@ -96,6 +96,19 @@ records the result. It never re-derives a scheduling decision in prose.
   model; the `stageModels` config knob (default `{"merge": "haiku"}`)
   downshifts it for a direct cost cut. See below.
 
+## Skip QA
+
+Add the `skip-qa` label to a GitHub issue and a finished builder advances
+straight to Review (Building → Review), skipping the QA stage entirely. Use it
+when QA adds little over the reviewer's own correctness pass — an error fix,
+answering a question, or resolving a blocker — where a human at triage has
+already decided the change is low-risk. The label rides the board snapshot, so
+the decision is a one-click human classification, not the builder's own call.
+
+The reviewer still runs: `skip-qa` skips QA, never the last correctness gate.
+Every ticket without the label runs the full builder → QA → reviewer → merge
+pipeline, and the QA bounce/investigate machinery is unchanged.
+
 ## End of loop
 
 After the batch drains, the end-of-loop stage runs a regression on merged main
