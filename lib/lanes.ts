@@ -111,14 +111,37 @@ export function selectBatch(tickets: TicketSnapshot[], ticketLimit: number): num
   // session is building, or a dep no run can start (still Backlog, say). An
   // empty allow-list makes drainComplete read
   // true, so the run would exit clean without ever surfacing that. Admit the
-  // first `ticketLimit` workable tickets instead -- all of them are stuck, by
-  // the same condition -- and let nextAction decide exactly as it does with no
-  // cap: wait while a dep is another session's in-flight work, park Blocked
-  // otherwise (step 6's dependency-deadlock break, or step 4 once a cycle
-  // member has parked). Each park drops a ticket out of workable status, so the
-  // stuck set strictly shrinks and the batch terminates. A partial batch
-  // (something WAS flagged, just fewer than the cap) is untouched.
-  if (flagged.size === 0) return workable.slice(0, ticketLimit).map((t) => t.number);
+  // stuck tickets instead -- all of them are stuck, by the same condition --
+  // and let nextAction apply its ordinary rules to them: a dep that can never
+  // complete parks the dependent (step 4), else the whole admitted set waits
+  // while ANY of it holds a dep another session is building, else step 6's
+  // dependency-deadlock break parks the lowest. Each park drops a ticket out of
+  // workable status, so the stuck set strictly shrinks and the batch
+  // terminates. A partial batch (something WAS flagged, just fewer than the
+  // cap) is untouched.
+  //
+  // The admitted set is the lowest `ticketLimit` workable tickets CLOSED OVER
+  // their workable dependencies, which can exceed the cap. #157 review finding
+  // 1: a bare `slice` amputates the ticket that actually holds the blocking
+  // dep, and nextAction's step-6 discriminator only reads the DIRECT deps of
+  // what was admitted -- so #1 -> #2 -> #3(another session's, Building) under
+  // cap 1 admitted only #1, saw no other-session dep, and parked #1 Blocked as
+  // a "dependency cycle" that does not exist, where cap 2 and no cap both
+  // wait. Closing over the deps restores that agreement AND keeps it after the
+  // other session lands #3: #2 is in the allow-list, so it becomes claimable
+  // and the chain drains instead of parking. Over-admitting is bounded by the
+  // workable set and costs nothing -- every ticket in it is stuck by
+  // definition, so none is claimable on the tick the fallback fires.
+  if (flagged.size === 0) {
+    const workableNumbers = new Set(workable.map((t) => t.number));
+    const admitted = new Set(workable.slice(0, ticketLimit).map((t) => t.number));
+    // Set iteration visits values appended during the walk, so this is a full
+    // BFS over dependency edges; the workableNumbers guard bounds it.
+    for (const n of admitted) {
+      for (const d of byNumber.get(n)!.dependsOn) if (workableNumbers.has(d)) admitted.add(d);
+    }
+    return [...admitted].sort((a, b) => a - b);
+  }
   return [...flagged].sort((a, b) => a - b);
 }
 

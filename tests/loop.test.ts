@@ -2027,11 +2027,60 @@ describe("selectBatch (#131 ticket cap)", () => {
   // deadlock break can park it (the no-cap path's behavior).
   test("#157: a cap over a fully cyclic workable set admits the stuck tickets instead of returning an empty batch", () => {
     expect(selectBatch([ticket(1, "Ready", [2]), ticket(2, "Ready", [1])], 2)).toEqual([1, 2]);
-    // Still capped: a 3-cycle under cap 2 admits only the 2 lowest.
+    // A 3-cycle under cap 2 admits all 3: the fallback closes the seed over its
+    // workable deps (see the cap-smaller-than-the-stuck-set test below), and a
+    // cycle's closure is the whole cycle. Over-admitting is free here -- none
+    // of them is claimable -- and it is what keeps the capped decision equal to
+    // the uncapped one.
     const three = [ticket(1, "Ready", [2]), ticket(2, "Ready", [3]), ticket(3, "Ready", [1])];
-    expect(selectBatch(three, 2)).toEqual([1, 2]);
+    expect(selectBatch(three, 2)).toEqual([1, 2, 3]);
     // Nothing workable -> still an empty batch: there is no stuck work to surface.
     expect(selectBatch([ticket(1, "Done")], 2)).toEqual([]);
+  });
+
+  // #157 adversarial-review finding 1, the regression the cap == stuck-set-size
+  // tests above could not see. #1 -> #2 -> #3, #3 held by ANOTHER session:
+  // there is no cycle, and #1's real blocker is work that will finish. A bare
+  // `workable.slice(0, cap)` amputated #2 -- the only ticket holding the
+  // claimedByOther dep -- and nextAction's step-6 discriminator reads only the
+  // DIRECT deps of what was admitted, so cap 1 parked #1 Blocked as a
+  // "dependency cycle" while cap 2 and no cap both waited. Closing the seed
+  // over its workable deps is the fix: on this shape every cap now decides
+  // what no cap decides.
+  test("#157 finding 1: a cap SMALLER than the stuck set closes over the amputated dep, so every cap agrees with no cap", () => {
+    const stuck = () => [
+      ticket(1, "Ready", [2]),
+      ticket(2, "Ready", [3]),
+      ticket(3, "Building", [], { claimedByOther: true }),
+    ];
+    // #3 is another session's, so it is never workable/admitted -- but #2, the
+    // ticket that HOLDS the dep on it, now is, at every cap.
+    for (const cap of [1, 2, 3]) expect(selectBatch(stuck(), cap)).toEqual([1, 2]);
+
+    // ...which is what makes the decision cap-independent, and equal to no cap.
+    for (const cap of [1, 2, 3, 0]) {
+      const s = state(stuck());
+      s.batchTickets = selectBatch(s.tickets, cap);
+      expect(nextAction(s, 0)).toEqual({ kind: "wait" }); // never a park, at any cap
+    }
+
+    // And it stays right after the other session lands #3: the allow-list
+    // persists across re-ingest (#131), so #2 -- now dep-satisfied -- is
+    // claimable rather than sitting outside the batch while #1 gets parked.
+    const landed = state([ticket(1, "Ready", [2]), ticket(2, "Ready", [3]), ticket(3, "Done")]);
+    landed.batchTickets = selectBatch(stuck(), 1); // the batch captured at cap 1
+    expect(nextAction(landed, 0)).toMatchObject({ kind: "claim", ticket: 2 });
+  });
+
+  // The closure walks only WORKABLE deps, so a dep no run can start (Backlog)
+  // is still not dragged in -- the dependent is admitted alone and parked,
+  // which is exactly what an uncapped run does with it.
+  test("#157: the stuck-set closure does not admit a non-workable dep (Backlog stays out)", () => {
+    const tickets = [ticket(1, "Ready", [2]), ticket(2, "Backlog")];
+    expect(selectBatch(tickets, 1)).toEqual([1]);
+    const s = state(tickets);
+    s.batchTickets = [1];
+    expect(nextAction(s, 0)).toMatchObject({ kind: "park", ticket: 1, status: "Blocked" });
   });
 });
 

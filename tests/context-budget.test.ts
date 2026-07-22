@@ -49,9 +49,12 @@ function captureStderr(fn: () => void): string {
   return out;
 }
 
-// #157: every 0 this module returns is an unmeasured window, so every 0 path
-// must say UNKNOWN on stderr -- an operator who cannot tell "could not measure"
-// from "nearly empty" is the whole reason the reporting exists.
+// #157: a 0 from this module means "could not measure", so it must say UNKNOWN
+// on stderr -- an operator who cannot tell that from "nearly empty" is the whole
+// reason the reporting exists. Pinned here for the five unmeasurable paths (no
+// transcript resolved, unreadable file, no usage line, only-unparseable lines,
+// only-synthetic lines); the review that found the fifth verified against real
+// data that no non-synthetic usage line sums to 0, so those five are all of them.
 function expectUnknown(err: string, path?: string): void {
   expect(err).toContain("UNKNOWN");
   expect(err).toContain("cannot gate on it");
@@ -139,6 +142,59 @@ describe("currentContextTokens (AC9)", () => {
     // window: the operator is told the reading is unknown and cannot gate.
     expect(err).toContain("not valid JSON");
     expect(err).toContain("first at line 1");
+    expectUnknown(err, p);
+  });
+
+  // -- #157 adversarial-review finding 2: Claude Code's SYNTHETIC assistant
+  // entries. It writes one inline in the transcript on a rate-limited turn
+  // (isApiErrorMessage + apiErrorStatus 429) and on an interrupted one
+  // ("No response requested."). Both carry model "<synthetic>" and all four
+  // usage keys present and ZERO -- so they parse cleanly, become the last
+  // usage line, and used to be read as an empty window with no UNKNOWN report.
+  // Shapes copied from real transcripts in ~/.claude/projects.
+  const syntheticLine = (kind: "ratelimit" | "interrupt") =>
+    JSON.stringify({
+      type: "assistant",
+      uuid: `u_${kind}`,
+      message: {
+        id: `syn_${kind}`,
+        model: "<synthetic>",
+        role: "assistant",
+        type: "message",
+        usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        content: [{ type: "text", text: kind === "ratelimit" ? "You've hit your weekly limit · resets 3pm" : "No response requested." }],
+      },
+      ...(kind === "ratelimit" ? { isApiErrorMessage: true, apiErrorStatus: 429 } : { isApiErrorMessage: false }),
+    });
+
+  test("#157 finding 2: a synthetic FINAL line does not read as an empty window -- the last real usage line wins", () => {
+    for (const kind of ["ratelimit", "interrupt"] as const) {
+      const p = join(mkTmp(), `synthetic-${kind}.jsonl`);
+      // The real failure mode: the synthetic entry lands exactly when the
+      // window is FULLEST (a rate limit fires at the ceiling), so reading 0
+      // here turns the gate off at the one moment it must fire.
+      writeFileSync(p, `${assistantLine(550000)}\n${syntheticLine(kind)}\n`);
+      let got = -1;
+      const err = captureStderr(() => {
+        got = currentContextTokens(p);
+      });
+      expect(got).toBe(550000); // NOT 0
+      expect(err).toBe(""); // a real reading survived -- nothing to report
+    }
+    // isApiErrorMessage alone would miss the interrupt shape; the model string
+    // is what catches both.
+    expect(syntheticLine("interrupt")).toContain('"isApiErrorMessage":false');
+  });
+
+  test("#157 finding 2: a transcript whose ONLY usage lines are synthetic returns 0 AND reports UNKNOWN", () => {
+    const p = join(mkTmp(), "synthetic-only.jsonl");
+    writeFileSync(p, `${syntheticLine("ratelimit")}\n${syntheticLine("interrupt")}\n`);
+    let got = -1;
+    const err = captureStderr(() => {
+      got = currentContextTokens(p);
+    });
+    expect(got).toBe(0);
+    expect(err).toContain("2 assistant usage line(s) are synthetic");
     expectUnknown(err, p);
   });
 

@@ -191,8 +191,9 @@ dependency-self-contained allow-list of at most that many tickets (except when
 nothing at all is closable -- every workable ticket depends on a board ticket
 that is not Done: a cycle, a dep another session is building, or a dep no run
 can start such as one still in Backlog -- where it admits the lowest workable
-tickets instead, so the run waits on the other session or parks them Blocked
-rather than exiting clean, #157) -- once here
+tickets CLOSED OVER their workable deps, which can exceed the cap, so the run
+waits on the other session or parks them Blocked rather than exiting clean,
+#157) -- once here
 and preserves it across every re-ingest and context clear. At the default `0`
 there is no cap (`batchTickets` stays unset, byte-identical to today). The
 **context ceiling** (`--context-token-limit`, #131) is captured the same way;

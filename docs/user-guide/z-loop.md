@@ -148,13 +148,28 @@ every workable ticket depends on a board ticket that is not Done. That covers
 more than a cycle — the dependency can be one another live session is building,
 or one no run can start at all, such as a ticket still sitting in Backlog. An
 empty allow-list would read as "drained" and exit the run without ever surfacing
-that, so the cap admits the lowest `ticketLimit` workable tickets instead. What
-happens next is unchanged: the fallback only decides *which* tickets are in the
-batch, and the drain loop then treats them exactly as it treats an uncapped
-stuck set — a dependency that can never complete parks the dependent **Blocked**,
-a stuck set waiting on another session's in-flight ticket waits, and an
-otherwise unbreakable set is parked **Blocked** one ticket per tick, with a
-dependency-deadlock note, until the batch is terminal.
+that, so the cap admits the stuck tickets instead: the lowest `ticketLimit`
+workable ones, **closed over their workable dependencies**. That closure can
+exceed the cap, and it has to. The drain loop's park-versus-wait decision reads
+only the *direct* dependencies of what was admitted, so a bare cut at the cap
+can amputate the very ticket holding the dependency that explains the block —
+`#1 → #2 → #3`, with `#3` another session's in-flight work, admitted `#1` alone
+under a cap of 1 and parked it Blocked as a dependency cycle that does not
+exist. Closing over the dependencies keeps the decision the same at every cap,
+and keeps it right after the other session lands `#3`: `#2` is in the
+allow-list, so it becomes claimable and the chain drains instead of parking.
+Over-admitting costs nothing here — every ticket in the admitted set is stuck by
+definition, so none of them is claimable on the tick the fallback fires.
+
+What happens next is the ordinary drain loop, in this order: a dependency that
+can never complete in the batch (one already parked Blocked or Skipped) parks
+the dependent with a `Blocked by dependencies that cannot complete in this
+batch` note; otherwise, if any admitted ticket waits on another session's
+in-flight ticket, the whole set **waits**; otherwise the deadlock break parks
+the lowest-numbered admitted ticket with a `Dependency deadlock … likely a
+dependency cycle` note. Only that *first* park carries the deadlock note — once
+one cycle member is Blocked, the rest fall to the dead-dependency park above and
+carry its wording instead.
 
 The fallback is blunt on purpose, and it has three consequences worth knowing
 before you set a cap:
@@ -168,10 +183,12 @@ before you set a cap:
 - It fires only when *nothing* is closable. A cap that still flags one closable
   ticket leaves the stuck set for a later run, so a Ready queue that keeps
   refilling can defer a cycle indefinitely.
-- If any admitted ticket waits on another session's in-flight ticket and none of
-  them can be parked, the whole stuck set waits — every tick, for as long as that
-  session holds it. An uncapped run does the same; the capped shape used to exit
-  clean instead.
+- The wait wins over the deadlock break for the *whole* admitted set, not per
+  ticket. If one admitted ticket waits on another session's in-flight work, a
+  genuine cycle admitted alongside it waits too — every tick, for as long as
+  that session holds its ticket — and is only parked once that ticket lands and
+  the wait clears. An uncapped run behaves the same way; the capped shape used
+  to exit clean instead.
 
 ### `contextTokenLimit` — a context ceiling with clear-and-resume
 
@@ -189,12 +206,23 @@ clear actually changes. The reading is **fail-open**: an unresolvable or
 unreadable transcript reads `0`, so a measurement hiccup degrades to no gating
 and never wedges a drain. A transcript caught mid-write (its last line
 truncated) falls back to the last complete reading rather than failing — that
-value is a real measurement of an earlier turn. When *no* complete reading
-survives, the tick prints a line on stderr saying the size is unknown, and it
-does so on every such path: no transcript resolved, a transcript that can't be
-read, one with no assistant usage line at all, and one whose only lines were
-unparseable. A `0` here always means "could not measure", never "the window is
-small". Note that only the operator gets that distinction — the ceiling gates on
+value is a real measurement of an earlier turn. So does a transcript whose last
+entry is one of Claude Code's **synthetic** assistant records: it writes one
+inline on a rate-limited, API-errored or interrupted turn, carrying model
+`<synthetic>` and a usage object of four zeros. Those are skipped rather than
+read as an empty window, because they appear exactly when the window is
+fullest — 7 of the 1,185 transcripts on this machine read a silent `0` that way
+before the skip, five of them hiding a real last reading, one at 393,005 tokens.
+
+When *no* usable reading survives, the tick prints a line on stderr saying the
+size is unknown: no transcript resolved, a transcript that can't be read, one
+with no assistant usage line at all, one whose only lines were unparseable, and
+one whose only usage lines were synthetic. A `0` from this measurement means
+"could not measure", not "the window is small" — an empirical claim, not a
+structural one: it holds because no real usage line sums its input, cache-read
+and cache-creation tokens to zero (0 of 78,930 non-synthetic usage lines in this
+machine's corpus; the smallest real reading is 14,239 tokens). Note that only
+the operator gets that distinction — the ceiling gates on
 the integer alone and treats an unknown `0` exactly like a genuine small
 reading, which is what keeps the run draining. A renamed usage key still fails
 loud, as before.

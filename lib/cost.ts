@@ -100,7 +100,10 @@ export interface CostResult {
 // skip BEFORE the rate lookup below so it never trips the fail-loud
 // unknown-model ZError that every genuinely-unrecognized model string
 // should still raise (resolveRate in lib/estimate.ts).
-const SYNTHETIC_MODEL = "<synthetic>";
+// Exported for lib/context-budget.ts, the module's other parseLine caller:
+// parseLine returns these lines like any other, so EVERY caller has to skip
+// them itself or read their all-zero usage as a real measurement (#157).
+export const SYNTHETIC_MODEL = "<synthetic>";
 
 function assertUsageShape(usage: any, where: string): RawUsage {
   const missing = REQUIRED_USAGE_KEYS.filter((k) => typeof usage?.[k] !== "number");
