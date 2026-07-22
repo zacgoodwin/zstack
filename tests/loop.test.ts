@@ -833,6 +833,37 @@ describe("ingest drops a lane whose ticket vanished", () => {
   });
 });
 
+// -- #127: a transient empty snapshot must NOT wipe tickets/lanes -------------
+// Counterpoint to the H14 test above: ONE vanished ticket is a real removal (its
+// lane is dropped); a snapshot of ZERO items over a populated prior state is a
+// GitHub hiccup and must be treated as stale, or nextAction returns a FALSE
+// drain-complete mid-batch and orphans the running stage agents.
+describe("ingest preserves state on a transient empty snapshot (#127)", () => {
+  test("a 0-item snapshot over tickets + in-flight lanes preserves both and does not drain-complete", () => {
+    const prev: LoopState = {
+      tickets: [ticket(119, "Review"), ticket(120, "Review")],
+      lanes: [lane(119, "merge"), lane(120, "reviewer")],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      mergedThisRun: [],
+      initialReadyCount: 2,
+      humanNeededNotified: false,
+    };
+    const s = ingestBoardItems(prev, [], {});
+    expect(s.tickets.map((t) => t.number)).toEqual([119, 120]); // preserved, not wiped
+    expect(s.lanes.map((l) => l.ticket)).toEqual([119, 120]); // in-flight lanes kept
+    expect(drainComplete(s.tickets, s.lanes)).toBe(false);
+    expect(nextAction(s.tickets, s.lanes, OPTS(s)).kind).not.toBe("drain-complete");
+  });
+
+  test("a genuine first ingest (no prev) of 0 items is still allowed to be empty", () => {
+    const s = ingestBoardItems(null, [], {});
+    expect(s.tickets).toEqual([]);
+    expect(s.lanes).toEqual([]);
+    expect(drainComplete(s.tickets, s.lanes)).toBe(true); // nothing to do, correctly
+  });
+});
+
 // -- fresh-stage guarantee (AC4): lane state carries no conversation id -------
 
 describe("fresh-stage lane state", () => {

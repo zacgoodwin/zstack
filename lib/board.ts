@@ -28,6 +28,16 @@ export type Sleep = (ms: number) => Promise<void>;
 
 const defaultSleep: Sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// #127: a transient GitHub read can return 0 items for a board that really has
+// many (observed live: one snapshot() returned 0, the very next returned all
+// 68). snapshot() retries a small, bounded number of times on an EMPTY read
+// before trusting it. ponytail: fixed 3x/500ms backoff, not adaptive -- the one
+// board where this is slow (genuinely empty, i.e. before any ticket exists) is a
+// state a mid-drain loop is never in; upgrade path is exponential backoff if the
+// hiccup window ever proves longer than ~1.5s.
+const SNAPSHOT_EMPTY_RETRIES = 3;
+const SNAPSHOT_RETRY_MS = 500;
+
 // -- GraphQL operations. Each is named so the fixture router can key off it.
 // Every value shape is scalar-only; the JSON-body executor (see ghExecutor)
 // preserves each variable's type, so no CLI-level type coercion is involved. ---
@@ -309,7 +319,16 @@ export class Board {
   // The bodies map is keyed by issue number (as a string), the exact shape
   // loop.ts `ingest` consumes for dependency parsing.
   async snapshot(): Promise<{ items: BoardItem[]; bodies: Record<string, string> }> {
-    const nodes = await this.listNodes();
+    // #127: an empty read here is almost always a transient hiccup, not a truly
+    // empty board -- and the drain loop trusts this snapshot to decide
+    // drain-complete, so believing a bogus empty read falsely ends the batch and
+    // orphans in-flight lanes. Retry a bounded number of times before trusting a
+    // 0-item read; a genuinely empty board still returns [] once retries exhaust.
+    let nodes = await this.listNodes();
+    for (let attempt = 0; nodes.length === 0 && attempt < SNAPSHOT_EMPTY_RETRIES; attempt++) {
+      await this.sleep(SNAPSHOT_RETRY_MS);
+      nodes = await this.listNodes();
+    }
     const items: BoardItem[] = [];
     const bodies: Record<string, string> = {};
     for (const n of nodes) {
