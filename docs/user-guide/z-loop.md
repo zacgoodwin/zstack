@@ -127,19 +127,82 @@ and both default to today's behavior.
 
 `ticketLimit` (default `0` = no cap) caps how many tickets one run works. At the
 default, every gated Ready ticket is workable, exactly as before. Set it to `3`
-and the run flags **the batch**: a dependency-self-contained allow-list of at
-most three tickets, captured once at Step 3's ingest and held on
+and the run flags **the batch**: an allow-list of at most three tickets —
+dependency-self-contained, with the one exception below — captured once at
+Step 3's ingest and held on
 `state.batchTickets`. The remaining Ready tickets stay Ready and are simply
 picked up by a future run — they are never claimed, never counted against this
 run's drain, and never mis-parked as blocked.
 
 The batch is chosen by a Kahn walk in ascending issue number: a ticket is
 flagged only when every dependency is already Done or already flagged, so a
-flagged ticket never depends on an un-flagged one. A dependent whose dependency
-doesn't fit under the cap just waits — it stays Ready (a Ready dependency is not
-terminal), so the dead-dependency park never touches it. The allow-list
-persists verbatim across every re-ingest and across a context clear, so the run
-always finishes the exact batch it started.
+flagged ticket never depends on an un-flagged one. **Whenever the walk flags at
+least one ticket**, a dependent whose dependency doesn't fit under the cap just
+waits — it stays Ready, outside the allow-list, and the loop's park steps only
+ever consider in-batch tickets, so the dead-dependency park never touches it.
+The allow-list persists verbatim across every re-ingest and across a context
+clear, so the run always finishes the exact batch it started.
+
+One case cannot be self-contained: when the walk can flag **nothing**, because
+every workable ticket depends on a board ticket that is not Done. That covers
+more than a cycle — the dependency can be one another live session is building,
+or one no run can start at all, such as a ticket still sitting in Backlog. An
+empty allow-list would read as "drained" and exit the run without ever surfacing
+that, so the cap admits the stuck tickets instead: the lowest `ticketLimit`
+workable ones, **closed over their workable dependencies**. That closure can
+exceed the cap, and it has to. The drain loop's park-versus-wait decision reads
+only the *direct* dependencies of what was admitted, so a bare cut at the cap
+can amputate the very ticket holding the dependency that explains the block —
+`#1 → #2 → #3`, with `#3` another session's in-flight work, admitted `#1` alone
+under a cap of 1 and parked it Blocked as a dependency cycle that does not
+exist. Closing over the dependencies makes every cap decide that shape the way
+no cap decides it (verified at caps 1–4 and uncapped), and keeps it right after
+the other session lands `#3`: `#2` is in the allow-list, so it becomes claimable
+and the chain drains instead of parking. That is a fix for the false park, not a
+general guarantee that a cap never changes the outcome — with two disjoint stuck
+components, a capped run can still park a genuine cycle on a tick where an
+uncapped run is still waiting on the unrelated component.
+
+On the tick the fallback fires, over-admitting changes nothing: every ticket in
+the admitted set is stuck by definition, so none of them is claimable. It is not
+free across the run, though — the allow-list is captured once and persisted, so
+whatever the closure admitted is what this run works. That is the first
+consequence below.
+
+What happens next is the ordinary drain loop, in this order: a dependency that
+can never complete in the batch (one already parked Blocked or Skipped) parks
+the dependent with a `Blocked by dependencies that cannot complete in this
+batch` note; otherwise, if any admitted ticket waits on another session's
+in-flight ticket, the whole set **waits**; otherwise the deadlock break parks
+the lowest-numbered admitted ticket with a `Dependency deadlock … likely a
+dependency cycle` note. Only that *first* park carries the deadlock note — once
+one cycle member is Blocked, the rest fall to the dead-dependency park above and
+carry its wording instead.
+
+The fallback is blunt on purpose, and it has four consequences worth knowing
+before you set a cap:
+
+- **The cap can be exceeded by a lot.** The closure is persisted as the batch,
+  so once the block clears the run works all of it — not `ticketLimit` of it. A
+  50-long chain `#1 → … → #50` whose tail `#50` is another session's in-flight
+  ticket admits 49 tickets under `ticketLimit: 1`, and drains all 49 once `#50`
+  lands. That set is exactly what an uncapped run would work, which is the
+  point, but a cap of 1 is not a promise of one ticket on this path.
+- It parks tickets that a capped run used to leave alone. Before it existed, a
+  cap over a stuck set produced an empty allow-list and the run exited clean with
+  those tickets still Ready. Now a ticket whose only problem is a dependency
+  still sitting in **Backlog** is parked Blocked and a human has to move it back.
+  (An uncapped run has always parked that ticket — this makes the capped run
+  agree with it.)
+- It fires only when *nothing* is closable. A cap that still flags one closable
+  ticket leaves the stuck set for a later run, so a Ready queue that keeps
+  refilling can defer a cycle indefinitely.
+- The wait wins over the deadlock break for the *whole* admitted set, not per
+  ticket. If one admitted ticket waits on another session's in-flight work, a
+  genuine cycle admitted alongside it waits too — every tick, for as long as
+  that session holds its ticket — and is only parked once that ticket lands and
+  the wait clears. An uncapped run behaves the same way; the capped shape used
+  to exit clean instead.
 
 ### `contextTokenLimit` — a context ceiling with clear-and-resume
 
@@ -155,7 +218,28 @@ cache-creation tokens) of its session transcript's most recent request, via
 `z-cost`); it is how full the window is right now, the only thing a context
 clear actually changes. The reading is **fail-open**: an unresolvable or
 unreadable transcript reads `0`, so a measurement hiccup degrades to no gating
-and never wedges a drain.
+and never wedges a drain. A transcript caught mid-write (its last line
+truncated) falls back to the last complete reading rather than failing — that
+value is a real measurement of an earlier turn. So does a transcript whose last
+entry is one of Claude Code's **synthetic** assistant records: it writes one
+inline on a rate-limited, API-errored or interrupted turn, carrying model
+`<synthetic>` and a usage object of four zeros. Those are skipped rather than
+read as an empty window, because they appear exactly when the window is
+fullest — 7 of the 1,185 transcripts on this machine read a silent `0` that way
+before the skip, five of them hiding a real last reading, one at 393,005 tokens.
+
+When *no* usable reading survives, the tick prints a line on stderr saying the
+size is unknown: no transcript resolved, a transcript that can't be read, one
+with no assistant usage line at all, one whose only lines were unparseable, and
+one whose only usage lines were synthetic. A `0` from this measurement means
+"could not measure", not "the window is small" — an empirical claim, not a
+structural one: it holds because no real usage line sums its input, cache-read
+and cache-creation tokens to zero (0 of 78,930 non-synthetic usage lines in this
+machine's corpus; the smallest real reading is 14,239 tokens). Note that only
+the operator gets that distinction — the ceiling gates on
+the integer alone and treats an unknown `0` exactly like a genuine small
+reading, which is what keeps the run draining. A renamed usage key still fails
+loud, as before.
 
 When the reading reaches the limit, the scheduler stops **claiming** new
 tickets — no new ticket enters Building — while in-flight lanes keep draining

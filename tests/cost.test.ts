@@ -128,10 +128,12 @@ describe("format-drift canary (AC4)", () => {
 // -- synthetic transcript entries (ticket #30) --------------------------------
 //
 // Hit live during a /z-loop drain: Claude Code itself writes an inline
-// synthetic assistant entry with `"model": "<synthetic>"` whenever an API
-// call fails transiently mid-session (isApiErrorMessage:true, apiErrorStatus
-// 429/500/529 -- rate limit or server error). Confirmed against 11/11 real
-// "<synthetic>" occurrences in ~/.claude/projects/ transcripts. It has a
+// synthetic assistant entry with `"model": "<synthetic>"` on a turn that
+// produced no real API response -- a transient API failure
+// (isApiErrorMessage:true with apiErrorStatus 429/500/529) or an interrupted
+// turn ("No response requested.", isApiErrorMessage:false and no
+// apiErrorStatus). Measured over ~/.claude/projects: 27 occurrences, 23 of the
+// first shape and 4 of the second (see SYNTHETIC_MODEL in lib/cost.ts). It has a
 // full, validly-shaped usage object (that's why it reached resolveRate at
 // all instead of being filtered out by parseLine's assistant+usage check)
 // but carries nothing billable -- z-cost must skip it before the rate lookup

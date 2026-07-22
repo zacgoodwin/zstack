@@ -75,11 +75,13 @@ export function deadDeps(t: TicketSnapshot, byNumber: Map<number, TicketSnapshot
 // (byte-identical to pre-#131). Otherwise a Kahn walk modeled on mergeOrder:
 // each round flags the LOWEST-numbered workable ticket whose every dependency
 // is already Done or already flagged, until the cap is hit or no further
-// ticket can be closed. This keeps the batch dependency-self-contained -- a
-// flagged ticket never depends on an un-flagged workable ticket -- so no
-// dependent can wedge waiting on work left out of the run; a dependent whose
-// dependency doesn't make the cap simply stays Ready (a Ready non-batch dep is
-// not terminal, so deadDeps never mis-parks it). Captured ONCE per batch in
+// ticket can be closed. Whenever that walk flags anything, the batch is
+// dependency-self-contained -- a flagged ticket never depends on an un-flagged
+// workable ticket -- so no dependent can wedge waiting on work left out of the
+// run; a dependent whose dependency doesn't make the cap simply stays Ready (a
+// Ready non-batch dep is not terminal, so deadDeps never mis-parks it). The one
+// exception is the stuck fallback below (#157), where the walk can flag nothing
+// and self-containment is impossible by definition. Captured ONCE per batch in
 // ingestBoardItems (persisted on LoopState.batchTickets), not recomputed per
 // tick.
 export function selectBatch(tickets: TicketSnapshot[], ticketLimit: number): number[] | undefined {
@@ -102,6 +104,43 @@ export function selectBatch(tickets: TicketSnapshot[], ticketLimit: number): num
       .map((t) => t.number);
     if (ready.length === 0) break; // nothing further can be closed within the cap
     flagged.add(Math.min(...ready)); // lowest ready first, exactly like mergeOrder
+  }
+  // Nothing closable at all (#157): the walk flagged NOTHING while workable
+  // tickets exist, which by the loop condition above means every one of them
+  // waits on a board ticket that is not Done: a dependency cycle, a dep another
+  // session is building, or a dep no run can start (still Backlog, say). An
+  // empty allow-list makes drainComplete read
+  // true, so the run would exit clean without ever surfacing that. Admit the
+  // stuck tickets instead -- all of them are stuck, by the same condition --
+  // and let nextAction apply its ordinary rules to them: a dep that can never
+  // complete parks the dependent (step 4), else the whole admitted set waits
+  // while ANY of it holds a dep another session is building, else step 6's
+  // dependency-deadlock break parks the lowest. Each park drops a ticket out of
+  // workable status, so the stuck set strictly shrinks and the batch
+  // terminates. A partial batch (something WAS flagged, just fewer than the
+  // cap) is untouched.
+  //
+  // The admitted set is the lowest `ticketLimit` workable tickets CLOSED OVER
+  // their workable dependencies, which can exceed the cap. #157 review finding
+  // 1: a bare `slice` amputates the ticket that actually holds the blocking
+  // dep, and nextAction's step-6 discriminator only reads the DIRECT deps of
+  // what was admitted -- so #1 -> #2 -> #3(another session's, Building) under
+  // cap 1 admitted only #1, saw no other-session dep, and parked #1 Blocked as
+  // a "dependency cycle" that does not exist, where cap 2 and no cap both
+  // wait. Closing over the deps restores that agreement AND keeps it after the
+  // other session lands #3: #2 is in the allow-list, so it becomes claimable
+  // and the chain drains instead of parking. Over-admitting is bounded by the
+  // workable set and costs nothing -- every ticket in it is stuck by
+  // definition, so none is claimable on the tick the fallback fires.
+  if (flagged.size === 0) {
+    const workableNumbers = new Set(workable.map((t) => t.number));
+    const admitted = new Set(workable.slice(0, ticketLimit).map((t) => t.number));
+    // Set iteration visits values appended during the walk, so this is a full
+    // BFS over dependency edges; the workableNumbers guard bounds it.
+    for (const n of admitted) {
+      for (const d of byNumber.get(n)!.dependsOn) if (workableNumbers.has(d)) admitted.add(d);
+    }
+    return [...admitted].sort((a, b) => a - b);
   }
   return [...flagged].sort((a, b) => a - b);
 }
