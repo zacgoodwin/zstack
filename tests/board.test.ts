@@ -260,7 +260,7 @@ describe("list", () => {
         },
       })
     );
-    await expect(board.list("Todo")).rejects.toThrow(/same endCursor/);
+    await expect(board.list("Todo")).rejects.toThrow(/endCursor "CUR_STUCK" twice in a row/);
     expect(fetches).toBe(2); // page 1 issued CUR_STUCK, page 2 repeated it
   });
 

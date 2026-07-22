@@ -26,6 +26,60 @@ export type Sleep = (ms: number) => Promise<void>;
 
 const defaultSleep: Sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// One cursor-pagination loop for every connection the pack walks: Board's
+// ProjectItems (below) and SetupBoard's Projects / ProjectFields / FieldUsage
+// (lib/setup-board.ts). Truncation is never cosmetic on any of them -- a
+// dropped ProjectItems page silently loses tickets, an undercounted FieldUsage
+// waves a destructive adopt through, a missed Projects page creates a
+// duplicate -- so every malformed shape throws, naming `what`, instead of
+// being read as "that was the last page":
+//
+//   * nodes but no pageInfo  -- a malformed response, NOT a drained connection.
+//   * hasNextPage, no cursor -- an advertised page that cannot be followed.
+//   * the same cursor twice  -- would refetch one page forever.
+//
+// The page callback receives undefined on page one so callers can omit the
+// cursor variable entirely (ghExecutor encodes every variable it is given).
+export interface Connection<T> {
+  pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+  nodes?: (T | null)[];
+}
+
+export async function paginate<T>(
+  what: string,
+  page: (after: string | undefined) => Promise<Connection<T> | null | undefined>
+): Promise<T[]> {
+  const out: T[] = [];
+  let after: string | undefined;
+  for (;;) {
+    const conn = await page(after);
+    const nodes = conn?.nodes ?? [];
+    for (const n of nodes) if (n != null) out.push(n);
+    const info = conn?.pageInfo;
+    if (!info) {
+      if (nodes.length > 0) {
+        throw new ZError(
+          `${what} returned ${nodes.length} node(s) but no pageInfo -- malformed response, refusing to treat the connection as fully listed.`
+        );
+      }
+      return out;
+    }
+    if (!info.hasNextPage) return out;
+    const next = info.endCursor;
+    if (typeof next !== "string" || next === "") {
+      throw new ZError(
+        `${what} advertises another page but returned no endCursor -- refusing to silently truncate.`
+      );
+    }
+    if (next === after) {
+      throw new ZError(
+        `${what} pagination returned endCursor "${next}" twice in a row -- aborting instead of looping forever.`
+      );
+    }
+    after = next;
+  }
+}
+
 // -- GraphQL operations. Each is named so the fixture router can key off it.
 // Every value shape is scalar-only; the JSON-body executor (see ghExecutor)
 // preserves each variable's type, so no CLI-level type coercion is involved. ---
@@ -86,12 +140,6 @@ const Q_FIELD_VALUE = `query FieldValue($owner: String!, $repo: String!, $number
         }
       }
     }
-  }
-}`;
-
-const Q_ISSUE_ASSIGNEES = `query IssueAssignees($owner: String!, $repo: String!, $number: Int!) {
-  repository(owner: $owner, name: $repo) {
-    issue(number: $number) { assignees(first: 10) { nodes { login } } }
   }
 }`;
 
@@ -246,43 +294,13 @@ export class Board {
   private async listNodes(): Promise<any[]> {
     // Cursor pagination (issue #14 item 1): the board WILL exceed 100 items
     // (auto-archive is forced off and Done issues stay open), so truncation
-    // here silently drops tickets.
-    const nodes: any[] = [];
-    let cursor: string | undefined;
-    do {
+    // here silently drops tickets. paginate() above owns the F3a/F3b/F3c
+    // malformed-response guards, shared with setup-board's connections.
+    return paginate<any>("ProjectItems", async (cursor) => {
       const vars: Record<string, unknown> = { project: this.cfg.projectId };
       if (cursor !== undefined) vars.cursor = cursor;
-      const data = await this.gql(Q_PROJECT_ITEMS, vars);
-      const items = data.node?.items;
-      nodes.push(...(items?.nodes ?? []));
-      const page = items?.pageInfo;
-      // F3c: items with no pageInfo is a malformed response, NOT "board
-      // drained" -- callers treat completion as authoritative, so guessing
-      // termination here would silently drop tickets.
-      if (!page && (items?.nodes?.length ?? 0) > 0) {
-        throw new ZError(
-          `ProjectItems returned ${items.nodes.length} item(s) but no pageInfo -- malformed response, refusing to treat the board as fully listed.`
-        );
-      }
-      if (page?.hasNextPage) {
-        // F3a: an absent OR empty endCursor cannot be followed.
-        if (typeof page.endCursor !== "string" || page.endCursor === "") {
-          throw new ZError(
-            `ProjectItems advertises another page but returned no endCursor -- refusing to silently drop board items.`
-          );
-        }
-        // F3b: a cursor that does not advance would refetch this page forever.
-        if (page.endCursor === cursor) {
-          throw new ZError(
-            `ProjectItems returned the same endCursor twice (${JSON.stringify(cursor)}) -- refusing to loop forever on one page.`
-          );
-        }
-        cursor = page.endCursor;
-      } else {
-        cursor = undefined;
-      }
-    } while (cursor !== undefined);
-    return nodes;
+      return (await this.gql(Q_PROJECT_ITEMS, vars)).node?.items;
+    });
   }
 
   // status omitted = every item on the board (F0): the one-call atomic
@@ -532,7 +550,9 @@ export class Board {
     const user = await this.userId(assignee);
     await this.gql(M_ADD_ASSIGNEES, { assignable: issue.id, user });
 
-    const after = await this.assignees(n);
+    // Re-read to settle a concurrent claim: lookup() already returns the
+    // assignee list, so this is the same round trip, not a second query shape.
+    const after = (await this.lookup(n)).assignees.nodes.map((a) => a.login);
     if (after[0] === assignee) return;
 
     await this.gql(M_REMOVE_ASSIGNEES, { assignable: issue.id, user });
@@ -592,15 +612,6 @@ export class Board {
       );
     }
     return item.id;
-  }
-
-  private async assignees(n: number): Promise<string[]> {
-    const data = await this.gql(Q_ISSUE_ASSIGNEES, {
-      owner: this.cfg.owner,
-      repo: this.cfg.repo,
-      number: n,
-    });
-    return (data.repository?.issue?.assignees?.nodes ?? []).map((a: any) => a.login);
   }
 
   private async userId(login: string): Promise<string> {
@@ -665,11 +676,11 @@ function fieldValue(fv: any): string | number | null {
       return fv.text ?? null;
     case "ProjectV2ItemFieldNumberValue":
       return fv.number ?? null;
-    default:
-      // No __typename in a targeted fieldValueByName fixture: fall back to the
-      // first scalar present.
-      return fv.name ?? fv.text ?? fv.number ?? null;
   }
+  // Both queries that reach here (Q_PROJECT_ITEMS, Q_FIELD_VALUE) request
+  // __typename explicitly, so an unrecognized member is a field type the board
+  // does not use -- not a shape to guess a scalar out of.
+  return null;
 }
 
 function readBody(bodyFile: string): string {
@@ -759,7 +770,7 @@ const USAGE = `z-board <command> [args]
   snapshot --out-items <F> --out-bodies <F>   all-status items + each ticket's body, one pass (z-loop drain)
   move <N> <S>                      set an issue's Status
   comment <N> --body-file <F>       add a comment
-  field-get <N> <Field>             read a custom field (${FIELD_HINT()})
+  field-get <N> <Field>             read a custom field (Model | Model Effort | Estimate | Actual)
   field-set <N> <Field> <V>         write a custom field
   create --title T --body-file F --milestone M [--label L]
   link <N> <M>                      record N depends on M (both directions)
@@ -768,10 +779,6 @@ const USAGE = `z-board <command> [args]
   quota                            remaining GraphQL points
 
   --slug <name>                     which ~/.zstack/projects/<slug> to use`;
-
-function FIELD_HINT(): string {
-  return "Model | Model Effort | Estimate | Actual";
-}
 
 const COMMANDS = new Set([
   "list",
@@ -916,10 +923,10 @@ export async function main(argv: string[]): Promise<number> {
         console.log(`remaining=${q.remaining} resetAt=${q.resetAt}`);
         return 0;
       }
-      default:
-        console.error(`Unknown command "${cmd}".\n\n${USAGE}`);
-        return 1;
     }
+    // Unreachable: COMMANDS.has(cmd) above already rejected anything the cases
+    // below do not cover.
+    return 1;
   } catch (e) {
     return handleCliError(e);
   }

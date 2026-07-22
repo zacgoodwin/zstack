@@ -23,7 +23,6 @@ import {
   DEFAULT_MAX_LANES,
   DEFAULT_QUOTA,
   DEFAULT_WATCHDOG_MINUTES,
-  EpicStyle,
   FieldConfig,
   FieldDataType,
   configPath,
@@ -37,7 +36,7 @@ import {
   validateQuota,
   validateStageModels,
 } from "./config-schema.ts";
-import { ghExecutor, type GraphQLData, type GraphQLExecutor } from "./board.ts";
+import { ghExecutor, paginate, type GraphQLData, type GraphQLExecutor } from "./board.ts";
 import {
   type BoardShape,
   type BoardTemplate,
@@ -49,8 +48,6 @@ import {
   deriveShape,
   loadBoardTemplate,
 } from "./board-template.ts";
-
-export type { DesiredField } from "./board-template.ts";
 
 // -- desired board shape (docs/user-guide/spec/PROCESS.md + issue #1) ---------
 export const STATUS_FIELD_NAME = "Status";
@@ -320,9 +317,6 @@ export interface ApplyOptions {
   slug: string;
   title: string;
   projectNumber?: number; // adopt this exact project instead of searching by title
-  // Only "milestones" is supported (issue #14 item 6): the literal type pins TS
-  // callers, and apply() re-checks at runtime for plain-JS callers (F9).
-  epicStyle?: "milestones";
   maxLanes?: number;
   watchdogMinutes?: number;
   force?: boolean; // adopt even when non-canonical single-select options still hold items
@@ -375,41 +369,6 @@ export class SetupBoard {
     return id;
   }
 
-  // Cursor-follows a GraphQL connection to exhaustion, with lib/board.ts's
-  // loud-throw contract (F6): hasNextPage with a missing/empty endCursor, or a
-  // cursor that repeats, throws instead of silently truncating or spinning.
-  // Truncation here is never cosmetic: an undercounted FieldUsage waves a
-  // destructive adopt through, and a missed Projects page creates a duplicate.
-  // The page callback receives undefined on page one so callers can omit the
-  // $after variable entirely (ghExecutor encodes every variable it is given).
-  private async paginate<T>(
-    what: string,
-    page: (
-      after: string | undefined
-    ) => Promise<{ pageInfo?: { hasNextPage?: boolean; endCursor?: string | null }; nodes?: (T | null)[] } | null | undefined>
-  ): Promise<T[]> {
-    const out: T[] = [];
-    let after: string | undefined;
-    for (;;) {
-      const conn = await page(after);
-      for (const n of conn?.nodes ?? []) if (n != null) out.push(n);
-      const info = conn?.pageInfo;
-      if (!info?.hasNextPage) return out;
-      const next = info.endCursor;
-      if (typeof next !== "string" || next === "") {
-        throw new ZError(
-          `${what} advertises another page but returned no endCursor -- refusing to silently truncate.`
-        );
-      }
-      if (next === after) {
-        throw new ZError(
-          `${what} pagination returned endCursor "${next}" twice in a row -- aborting instead of looping forever.`
-        );
-      }
-      after = next;
-    }
-  }
-
   // Which project to work on. By explicit number (adopt), else by title match
   // among the repo's linked projects. null means "does not exist yet".
   async resolveHeader(
@@ -422,7 +381,7 @@ export class SetupBoard {
       const p = data.repository?.projectV2;
       return p ? { id: p.id, number: p.number, title: p.title } : null;
     }
-    const nodes = await this.paginate<any>("Projects", async (after) => {
+    const nodes = await paginate<any>("Projects", async (after) => {
       const data = await this.exec(Q_PROJECTS, after ? { owner, repo, after } : { owner, repo });
       return data.repository?.projectsV2;
     });
@@ -434,7 +393,7 @@ export class SetupBoard {
     // The header (id/number/title) rides along on page one; only the fields
     // connection is followed across pages.
     let header: any;
-    const fieldNodes = await this.paginate<any>("ProjectFields", async (after) => {
+    const fieldNodes = await paginate<any>("ProjectFields", async (after) => {
       const data = await this.exec(Q_PROJECT_FIELDS, after ? { project: projectId, after } : { project: projectId });
       if (header === undefined) header = data.node;
       return data.node?.fields;
@@ -444,7 +403,7 @@ export class SetupBoard {
 
   // Item count per option name of one single-select field, across every page.
   private async fieldUsage(projectId: string, field: string): Promise<Record<string, number>> {
-    const nodes = await this.paginate<any>(`FieldUsage("${field}")`, async (after) => {
+    const nodes = await paginate<any>(`FieldUsage("${field}")`, async (after) => {
       const data = await this.exec(
         Q_FIELD_USAGE,
         after ? { project: projectId, field, after } : { project: projectId, field }
@@ -635,7 +594,6 @@ function validateApplyOptions(opts: ApplyOptions): void {
   if (typeof opts.slug !== "string" || !opts.slug) {
     throw new ZError(`Config "slug" must be a non-empty string.`);
   }
-  toEpicStyle(opts.epicStyle); // rejects "issue-type" and any other non-"milestones" value
   requirePositiveNumber("maxLanes", opts.maxLanes);
   requirePositiveNumber("watchdogMinutes", opts.watchdogMinutes);
   if (opts.projectNumber !== undefined && !Number.isInteger(opts.projectNumber)) {
@@ -743,7 +701,8 @@ function buildConfig(
     repositoryId: ctx.repositoryId,
     statusField: { id: status.id, dataType: "SINGLE_SELECT", options: optionMap(status.options) },
     fields,
-    epicStyle: ctx.epicStyle ?? DEFAULT_EPIC_STYLE,
+    // "milestones" is the only style; config-schema.ts rejects any other on read.
+    epicStyle: DEFAULT_EPIC_STYLE,
     maxLanes: ctx.maxLanes ?? DEFAULT_MAX_LANES,
     watchdogMinutes: ctx.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES,
     quota: { ...DEFAULT_QUOTA },
@@ -768,7 +727,7 @@ const USAGE = `z-setup-board <command> [flags]
   plan   --owner O --repo R --title T [--project-number N] [--template FILE]
          print the mutations needed to reach the board shape (zero writes)
   apply  --owner O --repo R --slug S --title T [--project-number N] [--force]
-         [--epic-style milestones] [--max-lanes 3] [--watchdog-minutes 10] [--template FILE]
+         [--max-lanes 3] [--watchdog-minutes 10] [--template FILE]
          create/adopt the project, run the mutations, write config.json
          (adopting a board whose non-canonical Status options still hold items
          refuses and lists them unless --force is given)
@@ -807,22 +766,6 @@ export function renderViewsBlock(views: TemplateView[]): string {
     lines.push(`  - "${v.name}" (${bits.join(", ")})${v.description ? ` -- ${v.description}` : ""}`);
   }
   return lines.join("\n");
-}
-
-// Exported for the gate test: rejecting "issue-type" here keeps the CLI from
-// ever calling GraphQL with a config the loop cannot act on (issue #14 item 6).
-// Returns the supported literal, matching ApplyOptions.epicStyle (F9).
-export function toEpicStyle(v: string | undefined): "milestones" | undefined {
-  if (v === undefined) return undefined;
-  if (v === "issue-type") {
-    throw new ZError(
-      `--epic-style "issue-type" is not yet supported (no sub-issue create path exists yet; issue #14). Use "milestones".`
-    );
-  }
-  if (v !== "milestones") {
-    throw new ZError(`--epic-style must be "milestones", got "${v}".`);
-  }
-  return v;
 }
 
 export async function main(argv: string[]): Promise<number> {
@@ -876,7 +819,6 @@ export async function main(argv: string[]): Promise<number> {
           slug,
           title,
           projectNumber: number,
-          epicStyle: toEpicStyle(str(flags, "epic-style")),
           maxLanes: maxLanes ? Number(maxLanes) : undefined,
           watchdogMinutes: watchdogMinutes ? Number(watchdogMinutes) : undefined,
           force: flags["force"] === true,
@@ -907,10 +849,10 @@ export async function main(argv: string[]): Promise<number> {
         console.log(report.ok ? "\nVERIFIED: board matches the contract." : "\nDRIFT: board does not match the contract.");
         return report.ok ? 0 : 1;
       }
-      default:
-        console.error(`Unknown command "${cmd}".\n\n${USAGE}`);
-        return 1;
     }
+    // Unreachable: the command-set check above already rejected anything the
+    // cases below do not cover.
+    return 1;
   } catch (e) {
     return handleCliError(e);
   }

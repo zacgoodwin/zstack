@@ -182,14 +182,9 @@ function validateView(path: string, v: unknown): TemplateView {
   };
 }
 
-function firstDuplicate(names: string[]): string | undefined {
-  const seen = new Set<string>();
-  for (const n of names) {
-    if (seen.has(n)) return n;
-    seen.add(n);
-  }
-  return undefined;
-}
+// n <= 9 here (the status set, or one field's options), so indexOf beats a Set.
+const firstDuplicate = (names: string[]): string | undefined =>
+  names.find((n, i) => names.indexOf(n) !== i);
 
 // Throws a ZError naming the first bad path; returns the normalized template on
 // success. The status set must EQUAL lib/config.ts BOARD_STATUSES (no missing,
