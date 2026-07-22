@@ -11,6 +11,8 @@ import { join } from "node:path";
 import { runAllAssertions, type AssertionResult } from "../evals/e2e/assertions.ts";
 import { main, SAMPLE_RUN } from "../evals/e2e/check.ts";
 
+const CHECK_CLI = join(import.meta.dir, "..", "evals", "e2e", "check.ts");
+
 const REPO_ROOT = join(import.meta.dir, "..");
 
 const tmps: string[] = [];
@@ -184,7 +186,7 @@ describe("mutated runs: the checker catches the specific break", () => {
     expect(r.detail).toContain("!= sum of board Actuals");
   });
 
-  test("check.ts main() exits 1 on a broken run", () => {
+  test("check.ts main() exits 1 on a broken run, and prints no FAIL line to the real console", () => {
     const dir = mkdtempSync(join(tmpdir(), "zstack-e2e-check-"));
     tmps.push(dir);
     cpSync(SAMPLE_RUN, dir, { recursive: true });
@@ -192,7 +194,25 @@ describe("mutated runs: the checker catches the specific break", () => {
     const s = readJson(p);
     s.mergedThisRun = [3, 2, 1];
     writeJson(p, s);
-    expect(main([dir])).toBe(1);
+
+    // main() on a deliberately-broken run legitimately prints "FAIL  merge-order ...".
+    // That's indistinguishable from a real test failure in the suite console (#128).
+    // A console.log/mock.calls spy can't prove suppression: bun:test spies record
+    // every call whether or not .mockImplementation overrides the real behavior, so
+    // a dropped override would still leave `mock.calls` (and the assertion) green
+    // while the real console.log printed anyway -- that's the bug this test used to
+    // have (review bounce). Run the checker as a real subprocess instead, with
+    // stdout/stderr piped rather than inherited: the OS pipe is ground truth, not a
+    // mock, so the FAIL line can never reach the real bun test console regardless of
+    // how check.ts prints internally. Proven: switching `stdout: "pipe"` to
+    // "inherit" here leaks the line to the terminal AND fails this assertion, since
+    // `result.stdout` is only populated when the pipe is in effect.
+    const result = Bun.spawnSync([process.execPath, CHECK_CLI, dir], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout.toString()).toContain("FAIL");
   });
 });
 

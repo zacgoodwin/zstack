@@ -867,22 +867,22 @@ describe("ingest preserves state on a transient empty snapshot (#127)", () => {
 // -- fresh-stage guarantee (AC4): lane state carries no conversation id -------
 
 describe("fresh-stage lane state", () => {
-  test("LaneState carries exactly its seven scheduling fields and no session/conversation id", () => {
+  test("LaneState carries exactly its eight scheduling fields and no session/conversation id", () => {
     // Compile-time half: this constant stops typechecking if LaneState's key
-    // set ever drifts from the seven named here (issue #76 added reviewBounces,
-    // mirroring qaBounces).
+    // set ever drifts from the eight named here (issue #76 added reviewBounces,
+    // mirroring qaBounces; #125 added lastWroteStatus, the resync origin marker).
     type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
     const _laneKeysExact: Exact<
       keyof LaneState,
-      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "workerDead" | "outcome"
+      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "workerDead" | "outcome" | "lastWroteStatus"
     > = true;
     void _laneKeysExact;
     // Runtime half: a fully-populated lane exposes exactly those keys, and none
     // of them smells like a carried conversation.
     const full: Required<LaneState> = {
-      ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, workerDead: false, outcome: { kind: "built" },
+      ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, workerDead: false, outcome: { kind: "built" }, lastWroteStatus: "Building",
     };
-    expect(Object.keys(full).sort()).toEqual(["lastActivityMs", "outcome", "qaBounces", "reviewBounces", "stage", "ticket", "workerDead"]);
+    expect(Object.keys(full).sort()).toEqual(["lastActivityMs", "lastWroteStatus", "outcome", "qaBounces", "reviewBounces", "stage", "ticket", "workerDead"]);
     for (const k of Object.keys(full)) {
       expect(k).not.toMatch(/conversation|session|context|transcript|agent/i);
     }
@@ -978,7 +978,7 @@ describe("stage/status desync fails soft (#110)", () => {
     let s = state(
       [ticket(1, "Building"), ticket(2, "QA")],
       [
-        lane(1, "qa", { outcome: { kind: "qa-pass" } }), // board write to QA lagged
+        lane(1, "qa", { outcome: { kind: "qa-pass" }, lastWroteStatus: "QA" }), // loop's QA write still in flight (board lags at Building)
         lane(2, "qa"), // healthy, mid-stage (no outcome yet)
       ]
     );
@@ -999,7 +999,10 @@ describe("stage/status desync fails soft (#110)", () => {
     // #130 made Building -> Review legal (the label-gated skip-QA advance), so
     // the raw advance no longer throws -- it lands the ticket in Review directly.
     expect(canTransition("Building", "Review")).toBe(true);
-    const skip = state([ticket(1, "Building")], [lane(1, "qa", { outcome: { kind: "qa-pass" } })]);
+    // #125: lastWroteStatus is the origin marker that lets nextAction's guard
+    // resync -- the loop's own QA write is in flight (not a human move-back), so
+    // the lagged-at-Building qa-pass lane is corrected to QA before it advances.
+    const skip = state([ticket(1, "Building")], [lane(1, "qa", { outcome: { kind: "qa-pass" }, lastWroteStatus: "QA" })]);
     expect(() => applyAction(skip, { kind: "advance", ticket: 1, to: "reviewer" }, 0)).not.toThrow();
     // The #116 resync-on-lag path is UNCHANGED for a real qa-pass lane: through
     // nextAction the lagged lane is still corrected to QA before it advances, so
@@ -1032,17 +1035,19 @@ describe("stage/status desync fails soft (#110)", () => {
 // -- #116: resync-on-lag instead of stop-lane rebuild, when the board status --
 // merely lags the loop's own write -----------------------------------------
 // A lagged board write (GitHub eventual consistency) and a genuine human
-// move-back produce the IDENTICAL snapshot for a mid-pipeline stage -- the
-// discriminator #116 uses is distance: the board only ever moves one column
-// per advance, so a gap of exactly one hop behind the lane's own stage is
-// treated as our own write still propagating (resync + advance, no rebuild,
-// no wasted QA re-run); a gap of more than one hop cannot be explained by a
-// single write in flight and stays #110's safe stop-lane.
+// move-back produce the IDENTICAL snapshot for a mid-pipeline stage. #116's
+// first cut used distance alone: a gap of exactly one hop behind the lane's own
+// stage was treated as our own write still propagating (resync + advance, no
+// rebuild); a gap of more than one hop cannot be a single write in flight and
+// stays #110's safe stop-lane. #125 closed the one-hop blind spot -- distance
+// alone can't tell a lagged one-hop write from a genuine one-hop human move --
+// so the one-hop resync now ALSO requires the origin marker (lastWroteStatus);
+// see the "(#125)" block below. The two-hop case here is unchanged.
 describe("resync-on-lag vs genuine move-back (#116)", () => {
   test("AC1: one hop behind (qa lane lagging at Building) resyncs to QA and advances to reviewer -- no stop-lane, no rebuild", () => {
     const s = state(
       [ticket(1, "Building")],
-      [lane(1, "qa", { outcome: { kind: "qa-pass" } })] // the loop's own QA-move write has not landed yet
+      [lane(1, "qa", { outcome: { kind: "qa-pass" }, lastWroteStatus: "QA" })] // the loop's own QA-move write has not landed yet
     );
     const a = nextAction(s.tickets, s.lanes, OPTS(s));
     expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "reviewer", resyncStatus: "QA" });
@@ -1067,6 +1072,64 @@ describe("resync-on-lag vs genuine move-back (#116)", () => {
   });
 });
 
+// -- #125: one-hop resync tells a lagged write from a genuine move by ORIGIN --
+// #116's distance-only discriminator resynced EVERY one-hop-behind read, so a
+// reviewer lane reading QA was silently pushed to merge whether the loop's own
+// Review write merely lagged OR a human genuinely dragged Review->QA (wanting
+// another QA pass). Both snapshots are byte-identical; distance cannot tell
+// them apart at one hop. The fix records the status the loop wrote
+// (lane.lastWroteStatus, cleared by ingest the moment the board shows it land):
+// a one-hop gap resyncs ONLY while that marker still points at the lane's own
+// stage status. A human move the loop never wrote leaves it cleared -> safe
+// stop-lane, even at one hop.
+describe("one-hop resync: lagged write vs genuine move-back by origin (#125)", () => {
+  const reviewerLane = (over: Partial<LaneState> = {}) =>
+    lane(1, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, ...over });
+
+  test("AC1: a reviewer lane one hop behind (board QA) with the loop's Review write still in flight resyncs to Review and advances to merge", () => {
+    const s = state([ticket(1, "QA")], [reviewerLane({ lastWroteStatus: "Review" })]);
+    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "merge", resyncStatus: "Review" });
+    const after = applyAction(s, a, 0);
+    expect(after.tickets[0].status).toBe("Review"); // resynced past the lag, merge runs under Review
+    expect(after.lanes[0]).toMatchObject({ ticket: 1, stage: "merge" });
+  });
+
+  test("AC2: a reviewer lane a human dragged Review -> QA (loop observed its Review write land, marker cleared) stop-lanes -- the one-hop human move is honored, NOT silently overridden", () => {
+    let s = state([ticket(1, "QA")], [reviewerLane()]); // no lastWroteStatus: the Review write already landed and was observed
+    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(a).toMatchObject({ kind: "stop-lane", ticket: 1 });
+    expect((a as { note: string }).note).toContain("reviewer");
+    s = applyAction(s, a, 0);
+    expect(s.lanes).toEqual([]); // lane dropped
+    expect(s.tickets[0].status).toBe("QA"); // human's move honored, never overwritten back to Review
+  });
+
+  test("AC1 vs AC2: the IDENTICAL one-hop snapshot yields opposite outcomes -- marker present resyncs, marker absent stop-lanes (origin, not distance)", () => {
+    const opts = OPTS(state([]));
+    const lagged = nextAction([ticket(1, "QA")], [reviewerLane({ lastWroteStatus: "Review" })], opts);
+    const human = nextAction([ticket(1, "QA")], [reviewerLane()], opts);
+    expect(lagged.kind).toBe("advance");
+    expect(human.kind).toBe("stop-lane");
+  });
+
+  test("origin marker mechanics: advance sets lastWroteStatus; ingest clears it on observed-land and preserves it while the write lags", () => {
+    // advance-to-reviewer records the Review write as the lane's origin marker.
+    let s = state([ticket(1, "QA")], [lane(1, "qa", { outcome: { kind: "qa-pass" } })]);
+    s = applyAction(s, { kind: "advance", ticket: 1, to: "reviewer" }, 0);
+    expect(s.lanes[0].lastWroteStatus).toBe("Review");
+
+    // Ingest sees the board LAND on Review -> marker cleared (write observed).
+    const landed = ingestBoardItems(s, [{ number: 1, title: "t", fields: { Status: "Review" } }], { "1": "" });
+    expect(landed.lanes[0].lastWroteStatus).toBeUndefined();
+
+    // Ingest sees the board still LAG at QA -> marker preserved (write in flight,
+    // so the desync guard will still resync on the next tick).
+    const lagging = ingestBoardItems(s, [{ number: 1, title: "t", fields: { Status: "QA" } }], { "1": "" });
+    expect(lagging.lanes[0].lastWroteStatus).toBe("Review");
+  });
+});
+
 // -- #124: resync-on-lag also covers advance->builder bounce-backs ------------
 // #116 mapped only the two FORWARD advances (qa lagging at Building, reviewer
 // at QA) and omitted builder on the false premise that no advance reaches it.
@@ -1080,7 +1143,7 @@ describe("resync-on-lag covers advance->builder bounce-backs (#124)", () => {
   test("AC1: a qa-bugs bounce lane at builder lagging at QA resyncs to Building and proceeds -- no stop-lane, no second rebuild", () => {
     const s = state(
       [ticket(1, "QA")], // the loop's own bounce-to-Building write has not landed yet
-      [lane(1, "builder", { qaBounces: 1, outcome: { kind: "built" } })] // the rebuild finished, passing
+      [lane(1, "builder", { qaBounces: 1, outcome: { kind: "built" }, lastWroteStatus: "Building" })] // rebuild passing; #125 origin marker: the bounce write is in flight
     );
     const a = nextAction(s.tickets, s.lanes, OPTS(s));
     expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "qa", resyncStatus: "Building" });
@@ -1093,7 +1156,7 @@ describe("resync-on-lag covers advance->builder bounce-backs (#124)", () => {
   test("AC2: a review-findings bounce lane at builder lagging at Review resyncs to Building and proceeds -- same resync", () => {
     const s = state(
       [ticket(1, "Review")], // the bounce-to-Building write from Review has not landed yet
-      [lane(1, "builder", { reviewBounces: 1, outcome: { kind: "built" } })]
+      [lane(1, "builder", { reviewBounces: 1, outcome: { kind: "built" }, lastWroteStatus: "Building" })] // #125 origin marker: the bounce write is in flight
     );
     const a = nextAction(s.tickets, s.lanes, OPTS(s));
     expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "qa", resyncStatus: "Building" });

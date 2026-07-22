@@ -82,8 +82,10 @@ export function happyOutcome(stage: Stage, ticket: number): string {
 // session / context id -- would mean latent state travels between stages, which
 // the "one fresh agent per stage" rule forbids (PROCESS.md, issue #3 AC).
 // `reviewBounces` (issue #76) mirrors `qaBounces`: a scheduling counter, not a
-// carried conversation.
-const ALLOWED_LANE_KEYS = new Set(["ticket", "stage", "lastActivityMs", "qaBounces", "reviewBounces", "workerDead", "outcome"]);
+// carried conversation. `lastWroteStatus` (issue #125) is the resync origin
+// marker (the board status the loop last wrote for this lane) -- a scheduling
+// field the loop itself sets/clears, never anything the stage agent carried.
+const ALLOWED_LANE_KEYS = new Set(["ticket", "stage", "lastActivityMs", "qaBounces", "reviewBounces", "workerDead", "outcome", "lastWroteStatus"]);
 const FORBIDDEN_LANE_KEY = /conversation|session|context|thread|agent.?id|history|transcript/i;
 
 export interface SimTrace {
