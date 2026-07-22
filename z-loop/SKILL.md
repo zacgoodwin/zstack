@@ -230,6 +230,7 @@ Perform exactly that action, then record it. Action → side effects:
 | `park N Blocked` | Comment the note (what was wrong + recommended next steps), `move <N> Blocked`, apply, remove the lane lock. **Notify** `token-burn` (`{ticket,detail:note}`) when the note begins `Dependency deadlock:` (the step-6 deadlock break); otherwise `ticket-parked` (`{ticket,title,status:"Blocked",note}`). |
 | `skip N` | Comment the note (the confusion or the dead-worker evidence), `move <N> Skipped`, apply, remove the lane lock. (PROCESS.md global rule.) **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:note}`) when the note begins `Worker died mid-` (a watchdog dead-worker skip); otherwise `ticket-parked` (`{ticket,title,status:"Skipped",note}`). |
 | `stop-lane N` | A human moved #N to a stop status (Blocked/Questions/Skipped/Done) mid-run; the board already reflects it — do NOT move or comment it. Tear down the lane's background agent, remove the lane lock (`lane-remove`), keep the worktree for inspection, and apply (drops the lane, leaves the human's status). Other lanes are unaffected. |
+| `return-ready N` | A graceful stop (`z-stop`, #132) is draining: an unclaimed ticket goes back to the Ready queue for the next run. `"$Z_BOARD" move <N> Ready --slug "$SLUG"`, then apply — **no lane lock to remove** (the ticket was never claimed) and no comment. In-flight lanes keep draining to Done; only new claims are blocked. |
 | `check-worker N` | Is the lane's background agent still running (harness task list)? Alive → `bun "$PACK/lib/loop.ts" probe "$STATE" <N> alive`. Dead with no final message: **if the lane's stage is `merge`, do NOT probe-dead/skip** — verify PR state first (H9): `gh pr view <branch> --json state,url -q '.state'`. If `MERGED`, the PR landed before the worker died, so record it as merged (`printf 'MERGED: %s\n' "$prUrl" > msg.txt; bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`) → the reducer completes it and counts it in `mergedThisRun` (so a stacked child still retargets and the batch-end branch delete can't close its PR). If NOT merged, record `printf 'BLOCKED: merge worker died with the PR unmerged (%s)\n' "$state" > msg.txt; outcome ...` → parks it Blocked for a human, and **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:"merge worker died with the PR unmerged"}`). For any OTHER stage, dead with no final message → `probe "$STATE" <N> dead` (the next `next` returns the skip). |
 | `complete N` | The completion flow — Step 6 — then apply, then **remove the lane lock**. |
 | `wait` | Block until a background stage agent finishes (the harness notifies you) or one minute passes, then re-run `next` — the watchdog only fires if `next` is called with a fresh clock. When an agent finishes: save its final message to a file and `bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`, then update Actual (below), then re-run `next`. |
@@ -383,7 +384,10 @@ bun "$PACK/lib/stage-prompts.ts" note "$TMP/note-<N>.json" > "$TMP/note-<N>.md"
 
 1. **Batch cleanup:** every dependent PR has landed, so delete the merged
    `z/ticket-*` branches now (PROCESS.md step 18: delete last), and remove any
-   leftover throwaway review worktrees.
+   leftover throwaway review worktrees. Also `rm -f "$STATE_DIR/stop-requested"`
+   so a consumed `z-stop` sentinel (#132) never wedges the next run into stop
+   mode (belt-and-suspenders with the fresh-batch `stopRequested` reset in
+   `ingest`).
 2. **End-of-loop (PROCESS.md steps 22–23, C8):** run Step 7a below in full.
    It decides red/green from a real regression on the merged base, never
    deploys on red, walks the deploy chain in order on green, runs the Nth-loop
@@ -608,6 +612,24 @@ Blocked or Questions mid-run is respected: `loop.ts next` returns `stop-lane`
 for that ticket at its next stage boundary. The lane stops cleanly (agent torn
 down, lock removed, worktree kept, the human's status honored) and every other
 lane keeps running. This replaces super-board's 120-second tick.
+
+**Stopping a running loop (`z-stop`, #132).** To stop a drain gracefully, run
+`bin/z-stop [--slug <slug>]` from a SECOND terminal on the SAME machine. It finds
+the running loop via `loop.lock` and, only when that lock is **live**, drops one
+sentinel file at `$STATE_DIR/stop-requested` (next to `state.json`); it writes
+nothing to the board or `state.json`, so it never races the loop's single writer.
+On the loop's next `z-loop-tick`, the sentinel makes `ingest` set
+`stopRequested`, and `nextAction` then **pulls no new work**: in-flight lanes
+finish to Done exactly as normal (a builder still advances to qa, an approved
+lane still merges, a completed merge still completes), unclaimed
+Building/QA/Review tickets return to Ready one per tick (`return-ready`), and once
+every lane is gone the loop reaches `drain-complete` and exits through the normal
+Step 7 path (which also `rm -f`s the sentinel). `z-stop` on a **free** lock prints
+"nothing to stop"; on a **stale** (crashed) lock it points at `/z-loop
+--reconcile` and writes no sentinel. Per-machine only, the same limitation as
+`loop.lock` — a loop running under the same login on another machine is not
+reachable. This is graceful by definition: it never kills a mid-stage worker
+(that is what killing the session + `--reconcile` is for).
 
 ---
 

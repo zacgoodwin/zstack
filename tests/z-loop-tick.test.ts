@@ -45,6 +45,13 @@ const TRIPPED_ITEMS = JSON.stringify([
 ]);
 const TRIPPED_BODIES = JSON.stringify({ "1": "no deps", "2": "no deps", "3": "no deps", "4": "no deps" });
 
+// A board with one unclaimed Building ticket -- the #132 stop-sentinel case:
+// normally claimed, but returned to Ready once the sentinel exists.
+const BUILDING_ITEMS = JSON.stringify([
+  { number: 1, title: "T1", url: "http://x/1", fields: { Status: "Building" } },
+]);
+const BUILDING_BODIES = JSON.stringify({ "1": "no deps" });
+
 const dirs: string[] = [];
 function mkTmp(): string {
   const d = mkdtempSync(join(tmpdir(), "z-loop-tick-"));
@@ -293,6 +300,43 @@ describe("z-loop-tick", () => {
     } finally {
       server.stop(true);
     }
+  });
+
+  // #132 AC6: the wrapper passes --stop-requested to ingest IFF the stop
+  // sentinel exists next to state.json. First tick (no sentinel) claims normally
+  // and writes no stopRequested:true; after dropping the sentinel (what z-stop
+  // does) the next tick latches stopRequested:true and returns the unclaimed
+  // Building ticket to Ready -- never a claim.
+  test("passes --stop-requested to ingest iff the stop sentinel exists (AC6)", () => {
+    const dir = mkTmp();
+    const stub = writeStubZBoard(dir, BUILDING_ITEMS, BUILDING_BODIES);
+    const home = makeConfigHome();
+    const tickTmp = join(dir, "tick-tmp");
+    const tickState = join(dir, "tick-state.json");
+    const env = { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home };
+
+    // First tick, no sentinel: a normal claim, state carries no stopRequested:true.
+    const first = Bun.spawnSync(
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp],
+      { env, stdout: "pipe", stderr: "pipe" }
+    );
+    expect(first.exitCode).toBe(0);
+    expect(JSON.parse(first.stdout.toString().trim())).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+    expect(JSON.parse(readFileSync(tickState, "utf8")).stopRequested).not.toBe(true);
+
+    // Drop the sentinel next to state.json (STATE_DIR/stop-requested) and tick
+    // again: ingest gets --stop-requested, the stop branch returns the unclaimed
+    // ticket to Ready, and state.json now carries stopRequested:true.
+    writeFileSync(join(dir, "stop-requested"), "stop-requested\n");
+    const second = Bun.spawnSync(
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp],
+      { env, stdout: "pipe", stderr: "pipe" }
+    );
+    expect(second.exitCode).toBe(0);
+    const action = JSON.parse(second.stdout.toString().trim());
+    expect(action.kind).not.toBe("claim");
+    expect(["return-ready", "drain-complete"]).toContain(action.kind);
+    expect(JSON.parse(readFileSync(tickState, "utf8")).stopRequested).toBe(true);
   });
 
   // Ordering canary (issue #58): the throttle step must run BEFORE the

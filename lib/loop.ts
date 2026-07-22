@@ -203,6 +203,14 @@ export interface LoopState {
   initialReadyCount?: number;
   humanNeededPercent?: number;
   humanNeededNotified?: boolean;
+  // Graceful-stop request (#132): a z-stop sentinel was observed for this batch.
+  // Threaded in through ingest (cfg.stopRequested) exactly like the per-batch
+  // facts above, and latched/reset on the SAME startingFreshBatch boundary as
+  // initialReadyCount/humanNeededNotified/mergedThisRun, so a persisted stopped
+  // run never leaks stop mode into the next /z-loop. Read by nextAction's stop
+  // branch: pull no new work, drain in-flight lanes, return unclaimed tickets to
+  // Ready, then drain-complete.
+  stopRequested?: boolean;
 }
 
 // -- stage outcomes -----------------------------------------------------------
@@ -299,6 +307,7 @@ export type Action =
   | { kind: "park"; ticket: number; status: "Questions" | "Blocked"; note: string }
   | { kind: "skip"; ticket: number; note: string }
   | { kind: "stop-lane"; ticket: number; note: string }
+  | { kind: "return-ready"; ticket: number; note: string } // #132: an unclaimed ticket goes back to Ready on a graceful stop
   | { kind: "check-worker"; ticket: number }
   | { kind: "complete"; ticket: number; note: string }
   | { kind: "wait" }
@@ -416,6 +425,7 @@ export interface LoopOpts {
   reviewerBelowThresholdAction?: "block" | "retry" | "off";
   maxReviewBounces?: number;
   mergedThisRun?: number[];
+  stopRequested?: boolean; // #132: graceful stop -- pull no new work, drain in-flight lanes, return unclaimed tickets to Ready
 }
 
 // The scheduler. Deterministic priority order:
@@ -550,6 +560,35 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
       return { kind: "skip", ticket: lane.ticket, note: `Worker died mid-${lane.stage}: silent past the ${wd}-minute watchdog and not alive on probe. Skipped per the PROCESS.md no-token-burn rule; worktree left for inspection.` };
     }
     return { kind: "check-worker", ticket: lane.ticket };
+  }
+
+  // 3b. Graceful stop (#132). A z-stop sentinel was observed for this batch and
+  //     threaded in via ingest -> LoopState.stopRequested -> opts. Steps 1-3 above
+  //     run UNCHANGED so in-flight lanes still drain to Done: a finished builder
+  //     advances to qa, an approved lane merges through the gate, a completed
+  //     merge completes, a silent worker is still probed/skipped. Only NEW work is
+  //     blocked -- this branch sits before steps 4-6 (dead-dep park, claim,
+  //     deadlock-break) so NO unclaimed ticket ever enters Building. Unworked,
+  //     unclaimed non-Ready tickets (Building/QA/Review with no lane, i.e.
+  //     committed-but-never-claimed) go back to Ready one per tick, lowest first;
+  //     already-Ready tickets are left as-is (excluded so they don't re-qualify
+  //     forever); an in-lane ticket is never yanked from its worker. drain-complete
+  //     fires once nothing is left to return and no lane remains; while a lane is
+  //     still mid-stage it waits.
+  if (opts.stopRequested) {
+    const inLaneStop = new Set(lanes.map((l) => l.ticket));
+    const toReturn = tickets
+      .filter((t) => isWorkableStatus(t.status) && t.status !== "Ready" && !inLaneStop.has(t.number) && !t.claimedByOther)
+      .sort((a, b) => a.number - b.number);
+    if (toReturn.length > 0) {
+      return {
+        kind: "return-ready",
+        ticket: toReturn[0].number,
+        note: "Loop stopped (z-stop) before this ticket was claimed; returned to Ready for the next run.",
+      };
+    }
+    if (lanes.length === 0) return { kind: "drain-complete" };
+    return { kind: "wait" }; // lanes still finishing
   }
 
   // 4. A dependent whose dependency parked can never proceed in this batch.
@@ -745,6 +784,16 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
       (next.mergedThisRun ??= []).push(action.ticket);
       return next;
     }
+    case "return-ready": {
+      // #132: an unworked, unclaimed ticket returns to the Ready queue on a
+      // graceful stop. It holds no lane (nextAction's stop branch excludes
+      // in-lane tickets), and Building/QA/Review -> Ready is not a normal
+      // pipeline hop (LEGAL_TRANSITIONS), so set it directly -- this returns a
+      // card to the queue, not a semantic pipeline move. Mirrors reconcile's
+      // park-ready and the resyncStatus/stop-lane direct writes.
+      findTicket(next, action.ticket).status = "Ready";
+      return next;
+    }
     case "check-worker":
     case "wait":
     case "drain-complete":
@@ -820,6 +869,7 @@ export function ingestBoardItems(
     reviewerBelowThresholdAction?: "block" | "retry" | "off";
     maxReviewBounces?: number;
     humanNeededPercent?: number;
+    stopRequested?: boolean; // #132: this tick's z-stop sentinel state (bin/z-loop-tick tests the file, passes --stop-requested)
   }
 ): LoopState {
   // #127 backstop: a transient GitHub hiccup can make `z-board snapshot` return
@@ -930,6 +980,12 @@ export function ingestBoardItems(
     mergedThisRun: startingFreshBatch ? [] : [...(prev?.mergedThisRun ?? [])],
     initialReadyCount: startingFreshBatch ? buildingCount : (prev!.initialReadyCount ?? 0),
     humanNeededNotified: startingFreshBatch ? false : (prev!.humanNeededNotified ?? false),
+    // #132: this tick's flag always wins true (a stop requested on a fresh
+    // batch's first tick is honored); otherwise it LATCHES across the batch; and
+    // it resets to false on the SAME startingFreshBatch boundary as the three
+    // above, so a persisted state.json from a prior stopped run never leaks stop
+    // mode into the next /z-loop.
+    stopRequested: !!cfg?.stopRequested || (!startingFreshBatch && prev?.stopRequested === true),
   };
 }
 
@@ -950,7 +1006,7 @@ const USAGE = `loop <command> [args]
   ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M]
                       [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N]
                       [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off]
-                      [--max-review-bounces N]
+                      [--max-review-bounces N] [--stop-requested]
                                                      build/refresh the snapshot (creates state.json)
 
   --now defaults to the wall clock; tests pass it explicitly.`;
@@ -1038,6 +1094,7 @@ export function main(argv: string[]): number {
         reviewerBelowThresholdAction: state.reviewerBelowThresholdAction,
         maxReviewBounces: state.maxReviewBounces,
         mergedThisRun: state.mergedThisRun,
+        stopRequested: state.stopRequested,
       });
       console.log(JSON.stringify(action));
       return 0;
@@ -1091,7 +1148,7 @@ export function main(argv: string[]): number {
       return 0;
     }
     if (cmd === "ingest") {
-      if (!argv[2] || !argv[3]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off] [--max-review-bounces N]");
+      if (!argv[2] || !argv[3]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off] [--max-review-bounces N] [--stop-requested]");
       const prev = readPrevState(statePath);
       const items = readJson(argv[2]) as BoardItemLike[];
       const bodies = readJson(argv[3]) as Record<string, string>;
@@ -1118,6 +1175,9 @@ export function main(argv: string[]): number {
         minReviewerConfidence: minReviewerConfidence === undefined ? undefined : Number(minReviewerConfidence),
         reviewerBelowThresholdAction: reviewerBelowThresholdAction as "block" | "retry" | "off" | undefined,
         maxReviewBounces: maxReviewBounces === undefined ? undefined : Number(maxReviewBounces),
+        // #132: a boolean flag, not a value flag -- bin/z-loop-tick appends it
+        // when the stop sentinel exists next to state.json.
+        stopRequested: argv.includes("--stop-requested"),
       });
       atomicWrite(statePath, JSON.stringify(state, null, 2));
       console.log(`${state.tickets.length} ticket(s), ${state.lanes.length} lane(s)`);

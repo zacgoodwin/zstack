@@ -308,6 +308,43 @@ event; see
 [z-setup.md → Config knobs](z-setup.md#config-knobs-hand-edit-configjson-after-setup)
 for the `humanNeededPercent` knob itself.
 
+## Stopping a running loop (z-stop)
+
+`/z-loop` drains the whole batch before it exits — there is no early "stop after
+this" flag inside the run. To stop a drain **gracefully**, open a second terminal
+on the same machine and run:
+
+```bash
+bin/z-stop            # or: bin/z-stop --slug <slug>
+```
+
+`z-stop` finds the running loop through its `loop.lock` and, when that lock is
+live, drops a single sentinel file (`~/.zstack/projects/<slug>/loop/stop-requested`,
+next to `state.json`). It writes nothing to the board and nothing to the loop's
+state file, so it can never race the loop's single writer — it just leaves the
+sentinel for the loop to notice.
+
+On its **next tick** the loop sees the sentinel and switches to stop mode:
+
+- **pulls no new tickets** — nothing new enters Building;
+- **lets in-flight lanes finish** — a lane already building/QA-ing/reviewing/merging
+  runs through to Done exactly as it would have; workers are never killed;
+- **returns unworked tickets to Ready** — anything committed to the batch but not
+  yet claimed goes back to the Ready queue for the next run;
+- **exits through the normal end-of-loop** — once every lane is done it reaches
+  `drain-complete` and runs Step 7a (regression → deploy-on-green → report) like
+  any other drain, then clears the sentinel.
+
+If no loop is running, `z-stop` says so and does nothing. If the loop **crashed**
+(a stale lock), there is no live process to observe the signal, so `z-stop` tells
+you to run `/z-loop --reconcile` instead and writes no sentinel.
+
+**Per machine, like the loop lock.** `z-stop` targets a loop running on *this*
+machine. A loop running under the same login on another machine is not reachable —
+the same limitation the `loop.lock` second-invocation guard has. To stop a
+mid-stage worker *now* (not gracefully), kill the loop session and run
+`/z-loop --reconcile` to clean up.
+
 ## --reconcile (crash recovery)
 
 A crashed loop leaves lane locks, stray worktrees, or Building tickets with no
