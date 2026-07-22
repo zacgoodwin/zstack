@@ -412,6 +412,40 @@ describe("snapshot", () => {
     expect(Object.keys(snap.bodies).length).toBe(101);
     expect(snap.bodies["101"]).toBe("b101");
   });
+
+  // #127: a transient GitHub read can return 0 items for a board that really has
+  // many (observed live: one snapshot returned 0, the next returned all 68).
+  test("retries an empty read and returns the real items when a retry succeeds", async () => {
+    let reads = 0;
+    // First underlying ProjectItems read is a well-formed but EMPTY page (the
+    // hiccup); the retry returns the real board. sleep injected as a no-op so the
+    // gate test never touches the wall clock.
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        overrides: {
+          ProjectItems: () => (++reads === 1 ? boardPage([]) : boardPage([nodeWithBody(4, "Done", "b4")])),
+        },
+      }),
+      () => Promise.resolve()
+    );
+    const snap = await board.snapshot();
+    expect(snap.items.map((i) => i.number)).toEqual([4]); // the retry's items, not the empty first read
+    expect(snap.bodies).toEqual({ "4": "b4" });
+    expect(reads).toBe(2); // retried exactly once past the empty read
+  });
+
+  test("a genuinely empty board still returns [] once the bounded retries exhaust", async () => {
+    let reads = 0;
+    const board = new Board(
+      CFG,
+      makeExecutor({ overrides: { ProjectItems: () => (reads++, boardPage([])) } }),
+      () => Promise.resolve()
+    );
+    const snap = await board.snapshot();
+    expect(snap.items).toEqual([]);
+    expect(reads).toBe(4); // initial read + 3 bounded retries, then trusts the empty
+  });
 });
 
 describe("move", () => {

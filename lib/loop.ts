@@ -800,6 +800,20 @@ export function ingestBoardItems(
     humanNeededPercent?: number;
   }
 ): LoopState {
+  // #127 backstop: a transient GitHub hiccup can make `z-board snapshot` return
+  // 0 items for a board that actually has many (observed live: one read returned
+  // 0, the next returned all 68). Faithfully ingesting that empty read would
+  // overwrite tickets with [] and drop every in-flight lane (H14 below), and
+  // nextAction would then return a FALSE drain-complete mid-batch -- ending the
+  // loop early and orphaning running stage agents. A genuinely empty board only
+  // exists before any ticket is created, a state a mid-drain loop is never in, so
+  // when the snapshot is empty but `prev` still tracked tickets or lanes, treat
+  // the read as stale and keep the prior state unchanged. The caller re-snapshots
+  // next tick (snapshot() also retries at the source); nothing here reports drain-
+  // complete off the stale read. First ingest (prev null / empty) is untouched.
+  if (items.length === 0 && prev && (prev.tickets.length > 0 || prev.lanes.length > 0)) {
+    return prev;
+  }
   const prevByNumber = new Map((prev?.tickets ?? []).map((t) => [t.number, t]));
   const tickets = items.map((it) => {
     const status = String(it.fields["Status"] ?? "") as BoardStatus;
