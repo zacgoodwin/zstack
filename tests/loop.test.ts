@@ -935,7 +935,8 @@ describe("transitions and reducers", () => {
     expect(canTransition("Ready", "Building")).toBe(true);
     expect(canTransition("Review", "Done")).toBe(true);
     expect(canTransition("QA", "Building")).toBe(true);
-    expect(canTransition("Building", "Done")).toBe(false); // no skipping QA/Review
+    expect(canTransition("Building", "Review")).toBe(true); // #130: skip-QA label walks builder straight to Review
+    expect(canTransition("Building", "Done")).toBe(false); // but never straight to Done -- Review is never skipped
     expect(canTransition("Backlog", "Building")).toBe(false);
     expect(canTransition("Done", "Ready")).toBe(true); // human bounce
     expect(canTransition("QA", "QA")).toBe(true); // same status is a no-op
@@ -994,19 +995,18 @@ describe("stage/status desync fails soft (#110)", () => {
     expect(s.lanes.find((l) => l.ticket === 2)).toEqual(lane(2, "qa")); // #2 untouched (still mid-stage, no outcome)
   });
 
-  test("AC2: the QA-skip walk invariant holds -- an un-resynced advance never lands the ticket in Review directly from Building", () => {
-    // The guard exists precisely because this transition is (and stays) illegal.
-    expect(canTransition("Building", "Review")).toBe(false);
-    // The raw advance without nextAction's resync correction still throws --
-    // proving the resyncStatus write, not a loosened transition, is what makes
-    // the corrected advance below legal.
-    const desynced = state([ticket(1, "Building")], [lane(1, "qa", { outcome: { kind: "qa-pass" } })]);
-    expect(() => applyAction(desynced, { kind: "advance", ticket: 1, to: "reviewer" }, 0)).toThrow(ZError);
-    // Through nextAction, the same lane now resolves to a resync-on-lag advance
-    // (#116) and actually reaches Review, instead of the old soft stop.
-    const a = nextAction(desynced.tickets, desynced.lanes, OPTS(desynced));
+  test("AC2: Building -> Review is a legal skip-QA walk now (#130); a qa-pass lane lagging at Building still resyncs through QA", () => {
+    // #130 made Building -> Review legal (the label-gated skip-QA advance), so
+    // the raw advance no longer throws -- it lands the ticket in Review directly.
+    expect(canTransition("Building", "Review")).toBe(true);
+    const skip = state([ticket(1, "Building")], [lane(1, "qa", { outcome: { kind: "qa-pass" } })]);
+    expect(() => applyAction(skip, { kind: "advance", ticket: 1, to: "reviewer" }, 0)).not.toThrow();
+    // The #116 resync-on-lag path is UNCHANGED for a real qa-pass lane: through
+    // nextAction the lagged lane is still corrected to QA before it advances, so
+    // the board reflects the QA the ticket actually passed (not a skip walk).
+    const a = nextAction(skip.tickets, skip.lanes, OPTS(skip));
     expect(a).toMatchObject({ kind: "advance", to: "reviewer", resyncStatus: "QA" });
-    const after = applyAction(desynced, a, 0);
+    const after = applyAction(skip, a, 0);
     expect(after.tickets[0].status).toBe("Review");
     expect(after.lanes[0]).toMatchObject({ ticket: 1, stage: "reviewer" });
   });
@@ -1121,6 +1121,48 @@ describe("resync-on-lag covers advance->builder bounce-backs (#124)", () => {
   });
 });
 
+// -- #130: a `skip-qa` label sends a finished builder straight to Review -------
+// A human sets the label at triage (error fix, answering a question, resolving
+// a blocker); it rides the board snapshot onto TicketSnapshot.skipQa, and a
+// finished builder then advances to reviewer, skipping QA. Every non-skip
+// ticket is byte-for-byte unchanged (the QA-bounce ladder test above still
+// passes untouched).
+describe("skip-qa label short-circuits QA (#130)", () => {
+  // Build the exact AC fixture: ingest a Building issue #1 (skip-qa label or
+  // not) so skipQa comes off the snapshot the real reducer reads, then attach
+  // the finished builder lane.
+  const builtLane = (skipQaLabel: boolean): LoopState => {
+    const ingested = ingestBoardItems(
+      null,
+      [{ number: 1, title: "t", fields: { Status: "Building" }, labels: skipQaLabel ? ["skip-qa"] : [] }],
+      { "1": "" }
+    );
+    return { ...ingested, lanes: [lane(1, "builder", { outcome: { kind: "built" } })] };
+  };
+
+  test("AC1: a skip-qa builder advances straight to reviewer and lands in Review, no throw", () => {
+    let s = builtLane(true);
+    expect(s.tickets[0].skipQa).toBe(true);
+    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(a).toEqual({ kind: "advance", ticket: 1, to: "reviewer" });
+    expect(() => applyAction(s, a, 0)).not.toThrow();
+    s = applyAction(s, a, 0);
+    expect(s.tickets[0].status).toBe("Review");
+    expect(s.lanes[0]).toMatchObject({ ticket: 1, stage: "reviewer" });
+    expect(s.lanes[0].outcome).toBeUndefined();
+  });
+
+  test("AC2: the same fixture without the label takes the normal builder -> qa path", () => {
+    let s = builtLane(false);
+    expect(s.tickets[0].skipQa).toBeFalsy();
+    const a = nextAction(s.tickets, s.lanes, OPTS(s));
+    expect(a).toEqual({ kind: "advance", ticket: 1, to: "qa" });
+    s = applyAction(s, a, 0);
+    expect(s.tickets[0].status).toBe("QA");
+    expect(s.lanes[0]).toMatchObject({ ticket: 1, stage: "qa" });
+  });
+});
+
 // -- board-snapshot ingest ----------------------------------------------------
 
 describe("ingestBoardItems", () => {
@@ -1149,6 +1191,19 @@ describe("ingestBoardItems", () => {
 
   test("an unknown board status fails loudly", () => {
     expect(() => ingestBoardItems(null, [{ number: 1, title: "x", fields: { Status: "Doing" } }], {})).toThrow(ZError);
+  });
+
+  test("reads the skip-qa label into skipQa; an item without it leaves skipQa falsy (#130)", () => {
+    const s = ingestBoardItems(
+      null,
+      [
+        { number: 1, title: "a", fields: { Status: "Building" }, labels: ["skip-qa"] },
+        { number: 2, title: "b", fields: { Status: "Building" }, labels: [] },
+      ],
+      { "1": "", "2": "" }
+    );
+    expect(s.tickets.find((t) => t.number === 1)!.skipQa).toBe(true);
+    expect(s.tickets.find((t) => t.number === 2)!.skipQa).toBeFalsy();
   });
 
   // -- issue #41: maxQaPasses / qaInvestigateAfter thread through ingest, same

@@ -208,6 +208,12 @@ sole sanctioned gh caller), and its `ingest` preserves lanes + lost-claim flags
 `next` — especially before any advance/park/complete, so no stage transition acts
 on a board the human has since changed.
 
+**Skip QA (#130).** The board snapshot now carries each issue's labels. When a
+ticket has the `skip-qa` label, a finished builder advances straight to Review
+(Building → Review), skipping the QA stage — a human sets that label at triage
+for an error fix, a question answer, or a blocker resolution. The QA
+bounce/investigate machinery is unchanged for every ticket without the label.
+
 **Human-needed safety control (issue #63).** `z-loop-tick` also recomputes the
 parked-tickets breakdown every iteration and fires a ONE-TIME mid-run Discord
 notification (`human-needed` event) the moment `(Blocked + Skipped +
