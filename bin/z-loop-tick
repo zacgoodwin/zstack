@@ -61,17 +61,10 @@ bun "$PACK/lib/throttle.ts" wait --slug "$SLUG" >/dev/null
 #     transcript dir.
 CTX=$(bun "$PACK/lib/context-budget.ts" current --project-dir "$PWD" 2>/dev/null || echo 0)
 [ -z "$CTX" ] && CTX=0
-# 2a. Graceful stop sentinel (#132): z-stop drops a "stop-requested" file next to
-#     state.json (lib/stop.ts stopSentinelPath == STATE_DIR/stop-requested). A
-#     plain file test -- no per-tick bun spawn on a 100+ iteration drain -- passes
-#     --stop-requested to ingest so the loop pulls no new work and drains to exit.
-#     The "stop-requested" literal is shared with lib/stop.ts; keep the two in sync.
-STOP_FLAG=""
-if [ -f "$(dirname "$STATE")/stop-requested" ]; then STOP_FLAG="--stop-requested"; fi
 # 2. Ingest: refresh ticket statuses; preserves lanes + lost-claim flags (no
 #    config flags here -- Step 3's first ingest already set maxLanes/watchdog);
 #    threads the fresh context reading (contextTokenLimit was captured at Step 3).
-bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" --context-tokens "$CTX" $STOP_FLAG >/dev/null
+bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" --context-tokens "$CTX" >/dev/null
 # 2b. Human-needed safety control (issue #63): recompute the parked-tickets
 # breakdown every tick (read-only) and fire the ONE-TIME mid-run breakdown
 # notification the instant it first crosses BoardConfig.humanNeededPercent.
