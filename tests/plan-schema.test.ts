@@ -1076,4 +1076,18 @@ describe("z-plan/SKILL.md: --reestimate re-estimates Backlog + Ready (issue #134
     expect(done).toMatch(/`\/z-plan --reestimate`/);
     expect(done).toMatch(/re-runs Step 6's tier chain over every\s*\n?\s*Backlog and Ready ticket/);
   });
+
+  test("docs/user-guide/z-plan.md documents --reestimate and its dry-run compose", () => {
+    const docs = readFileSync(
+      join(import.meta.dir, "..", "docs", "user-guide", "z-plan.md"),
+      "utf8"
+    );
+    expect(docs).toContain("/z-plan --reestimate");
+    expect(docs).toContain("/z-plan --dry-run --reestimate");
+    // The user-facing contract lines: unconditional re-run, the old -> new
+    // comment, and the never-promote/never-edit guarantee.
+    expect(docs).toMatch(/even one\s*\n?\s*that already has an Estimate/);
+    expect(docs).toContain("Estimate $OLD → $NEW");
+    expect(docs).toMatch(/never\s*\n?\s*promotes a ticket to Ready and never edits a body/);
+  });
 });
