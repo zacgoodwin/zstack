@@ -892,3 +892,202 @@ describe("z-plan/SKILL.md: Step 4 `## Files` section + --check-paths (issue #84 
     expect(zPlan()).toContain('REPO_ROOT="$(pwd -P)"');
   });
 });
+
+// -- Step 12 --reestimate scan (issue #134) ----------------------------------
+// The SKILL is executed by an agent, not this test suite, so these are doc
+// canaries: they pin the exact contract strings in z-plan/SKILL.md that make
+// --reestimate's ACs true, and fail loudly if a future edit silently drops
+// the flag, waters down "re-runs unconditionally even when an Estimate
+// already exists" back to Step 10 item 4's empty-field-only behavior, or
+// drops the old -> new comment contract (CLAUDE.md: weakening a planned AC
+// is never a silent edit).
+describe("z-plan/SKILL.md: --reestimate re-estimates Backlog + Ready (issue #134)", () => {
+  const zPlan = () => readFileSync(join(import.meta.dir, "..", "z-plan", "SKILL.md"), "utf8");
+
+  function section(md: string, heading: string): string {
+    const start = md.indexOf(heading);
+    if (start < 0) return "";
+    const rest = md.slice(start + heading.length);
+    const next = rest.indexOf("\n## ");
+    return next < 0 ? rest : rest.slice(0, next);
+  }
+
+  test("--reestimate is parsed as its own flag alongside --backlog/--ticket/--dry-run", () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toContain("--reestimate) REESTIMATE_ONLY=1");
+    expect(step1).toContain("REESTIMATE_ONLY=\"\"");
+    // The pre-existing flags must survive unweakened alongside the new one.
+    expect(step1).toContain("BACKLOG_ONLY=1");
+    expect(step1).toContain("TICKET_ONLY");
+    expect(step1).toContain("SPECS=()");
+  });
+
+  test('--reestimate bypasses spec resolution with no "No spec file found", and skips Steps 2-9 + Step 10 (AC1)', () => {
+    const step1 = section(zPlan(), "## Step 1 —");
+    expect(step1).toMatch(/When `--reestimate` is set/);
+    expect(step1).toMatch(/skip straight to the reestimate scan \(Step\s*\n?\s*12\)/);
+    expect(step1).toMatch(/no "No spec file found" failure/);
+    expect(step1).toMatch(/does \*\*not\*\* run Steps\s*\n?\s*2–9/);
+    expect(step1).toMatch(/does \*\*not\*\* run Step 10's Backlog gate/);
+  });
+
+  test("Step 12 exists, after Step 11, before Dry-run/eval mode", () => {
+    const md = zPlan();
+    const step11 = md.indexOf("## Step 11 — Cost-saving");
+    const step12 = md.indexOf("## Step 12 — Reestimate scan");
+    const dryRun = md.indexOf("## Dry-run / eval mode");
+    expect(step11).toBeGreaterThan(-1);
+    expect(step12).toBeGreaterThan(step11);
+    expect(dryRun).toBeGreaterThan(step12);
+  });
+
+  test("Step 12 scans BOTH Backlog and Ready, and the exclusion sentence NAMES every excluded status (AC2, review finding 3)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).not.toBe("");
+    expect(step12).toContain('"$Z_BOARD" list --status Backlog --json --slug "$SLUG"');
+    expect(step12).toContain('"$Z_BOARD" list --status Ready --json --slug "$SLUG"');
+    // Tightened: a decoy "left ... untouched" sentence with no status names
+    // must NOT satisfy this -- the excluded statuses have to be named right
+    // next to "left ... untouched" (review finding 3: the old
+    // /left\s*\n?\s*untouched/ regex alone was too generic).
+    expect(step12).toMatch(
+      /\(Building\/QA\/Review\/Blocked\/Skipped\/Done\)\s+is\s+left\s*\n?\s*untouched/
+    );
+  });
+
+  test("Step 12 skips split parents via the durable `## Subtasks (in order)` heading, same signal as Step 10 item 4 (AC8)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toContain("## Subtasks (in order)");
+    expect(step12).toMatch(/Step 10 item 4's durable signal/);
+    expect(step12).toMatch(/skip it: no estimate, no field-set, no\s*\n?\s*comment/);
+  });
+
+  test("Step 12 re-runs the tier chain unconditionally, even when an Estimate is already present (AC3)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toMatch(/This runs even when the ticket already has an Estimate/);
+    expect(step12).toMatch(
+      /unlike Step 10 item 4, which only re-fields a ticket when a field is\s*\n?\s*empty/
+    );
+  });
+
+  test("equal estimate: zero writes -- idempotent, reproducible re-run (AC6)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toMatch(/\*\*Equal:\*\* write nothing — no field-set, no comment/);
+    expect(step12).toMatch(/is a no-op \(idempotent, reproducible\)/);
+  });
+
+  test("changed estimate with a prior value present: the FIELD-WRITE is instructed, not just the comment (AC4/AC5, review finding 1)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toMatch(/\*\*Different, and a prior Estimate was present:\*\*/);
+    // Pin the actual field-set CLI calls. The prior canary here only checked
+    // the comment-template wording, so deleting the field-write instruction
+    // sentence at SKILL.md:676-684 and leaving only the comment template
+    // left this test green (review finding 1) -- these three exact CLI
+    // lines must survive.
+    expect(step12).toContain(
+      '"$Z_BOARD" field-set <N> Estimate <new> --slug "$SLUG"'
+    );
+    expect(step12).toContain(
+      '"$Z_BOARD" field-set <N> Model <newmodel> --slug "$SLUG"'
+    );
+    expect(step12).toContain(
+      '"$Z_BOARD" field-set <N> "Model Effort" <neweffort> --slug "$SLUG"'
+    );
+    expect(step12).toMatch(/field-set` those two as well/);
+    expect(step12).toContain("recommended tier changed");
+    expect(step12).toMatch(/scope grew per the current body\)/);
+    expect(step12).toMatch(/scope shrank per the current body\)/);
+    expect(step12).toMatch(/recalibration \(same <tier>\s*\n?\s*tier;/);
+    expect(step12).toContain(
+      "z-plan/tiers.json buckets or references/rates.json updated"
+    );
+  });
+
+  test("changed estimate with NO prior value: the FIELD-WRITE covers all three fields, posts no comment (AC7, review finding 2)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toMatch(/\*\*Different, but no prior Estimate\*\* \(the field was empty\)/);
+    // Pin the actual "field-set all three fields" instruction and its CLI
+    // template, not just the header phrase + "no comment" (review finding
+    // 2: deleting SKILL.md:706-711's write instruction left this green).
+    expect(step12).toMatch(/`field-set`\s*\n?\s*all three fields — Estimate, Model, and Model Effort/);
+    expect(step12).toContain(
+      '"$Z_BOARD" field-set <N> <Field> <value> --slug "$SLUG"'
+    );
+    expect(step12).toMatch(/post \*\*no\*\*\s*\n?\s*"changed" comment/);
+  });
+
+  test('tier-changed direction is decided by TIER RANK, never by the dollar delta (review finding 4, real logic bug)', () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    // Pins the fixed escalation order used to decide grew/shrank.
+    expect(step12).toContain(
+      "haiku-low < sonnet-medium < opus-high < opus-xhigh < fable-xhigh"
+    );
+    expect(step12).toContain("never** by comparing $OLD to $NEW");
+    // Old, buggy contract this replaces must not be present: deciding the
+    // word from whether the new total is numerically higher/lower than the
+    // old one (tiers.json dollars are not monotonic by rank, so that logic
+    // prints the wrong direction on a real tier escalation).
+    expect(step12).not.toMatch(/when the new\s*\n?\s*total is higher than the old/);
+    // Worked example where the dollar direction disagrees with the tier
+    // direction: sonnet-medium ($10.27) -> opus-high ($9.44) is a tier
+    // ESCALATION even though the dollar total drops. The comment must read
+    // "grew", never "shrank", right next to this worked example -- proves
+    // the fix is rank-based, not dollar-based.
+    const idx = step12.indexOf(
+      "`sonnet-medium` → `opus-high` is an ESCALATION"
+    );
+    expect(idx).toBeGreaterThan(-1);
+    const window = step12.slice(idx, idx + 400);
+    expect(window).toMatch(
+      /recommended tier changed sonnet-medium → opus-high \(scope grew per the current body\)\.`,\s*\n?\s*never\s*\n?\s*`\(scope shrank per the current body\)\.`/
+    );
+  });
+
+  test("board comment is always prefixed literally `Estimate $OLD -> $NEW:` (review finding 5)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toContain("prefixed literally `Estimate $OLD → $NEW:`");
+  });
+
+  test("Terminal summary states it does not invoke z-cost-suggest (SKILL.md:717-721, review finding 5)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toMatch(/\*\*Terminal summary\.\*\*/);
+    expect(step12).toMatch(
+      /does \*\*not\*\* invoke Step 11's\s*\n?\s*`z-cost-suggest` helper/
+    );
+    expect(step12).toMatch(/per-ticket file lists Step 5 builds/);
+  });
+
+  test("Step 12 never promotes to Ready and never edits a body (AC9)", () => {
+    const step12 = section(zPlan(), "## Step 12 — Reestimate scan");
+    expect(step12).toMatch(
+      /never\s*\n?\s*moves a ticket to Ready and never edits a body/
+    );
+  });
+
+  test("--dry-run --reestimate emits changes to stdout with no board writes (AC10)", () => {
+    const dryRun = section(zPlan(), "## Dry-run / eval mode");
+    expect(dryRun).toContain("--dry-run --reestimate");
+    expect(dryRun).toMatch(/composes like `--dry-run --backlog`/);
+    expect(dryRun).toMatch(/No board writes, no\s*\n?\s*GitHub writes/);
+  });
+
+  test("Done criteria names --reestimate", () => {
+    const done = section(zPlan(), "## Done criteria");
+    expect(done).toMatch(/`\/z-plan --reestimate`/);
+    expect(done).toMatch(/re-runs Step 6's tier chain over every\s*\n?\s*Backlog and Ready ticket/);
+  });
+
+  test("docs/user-guide/z-plan.md documents --reestimate and its dry-run compose", () => {
+    const docs = readFileSync(
+      join(import.meta.dir, "..", "docs", "user-guide", "z-plan.md"),
+      "utf8"
+    );
+    expect(docs).toContain("/z-plan --reestimate");
+    expect(docs).toContain("/z-plan --dry-run --reestimate");
+    // The user-facing contract lines: unconditional re-run, the old -> new
+    // comment, and the never-promote/never-edit guarantee.
+    expect(docs).toMatch(/even one\s*\n?\s*that already has an Estimate/);
+    expect(docs).toContain("Estimate $OLD → $NEW");
+    expect(docs).toMatch(/never\s*\n?\s*promotes a ticket to Ready and never edits a body/);
+  });
+});

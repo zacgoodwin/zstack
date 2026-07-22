@@ -62,17 +62,18 @@ REPO_ROOT="$(pwd -P)"        # the TARGET project repo (this skill always runs
 
 ---
 
-## Step 1 — Resolve the input spec(s), and the `--backlog` / `--ticket` / `--dry-run` flags
+## Step 1 — Resolve the input spec(s), and the `--backlog` / `--ticket` / `--dry-run` / `--reestimate` flags
 
-Three flags are recognized ahead of any spec path arguments; parse them first
+Four flags are recognized ahead of any spec path arguments; parse them first
 and collect every remaining non-flag argument into an ordered list,
 first-is-primary (below). `--ticket` takes a value (the issue number), so it
-consumes the next argument rather than standing alone like the other two:
+consumes the next argument rather than standing alone like the others:
 
 ```bash
 BACKLOG_ONLY=""
 TICKET_ONLY=""
 DRY_RUN=""
+REESTIMATE_ONLY=""
 SPECS=()
 WANT_TICKET=""
 for arg in "$@"; do
@@ -85,6 +86,7 @@ for arg in "$@"; do
     --backlog) BACKLOG_ONLY=1 ;;
     --ticket) WANT_TICKET=1 ;;
     --dry-run) DRY_RUN=1 ;;
+    --reestimate) REESTIMATE_ONLY=1 ;;
     *) SPECS+=("$arg") ;;
   esac
 done
@@ -94,6 +96,13 @@ done
 **When `--backlog` or `--ticket <N>` is set:** skip straight to Step 10 — no
 spec resolution, and no "No spec file found" failure (AC4). Steps 2–9 do not
 run; `--dry-run` still applies (Dry-run / eval mode below).
+
+**When `--reestimate` is set:** skip straight to the reestimate scan (Step
+12) — no spec resolution, and no "No spec file found" failure, the same
+bypass `--backlog` gets. It is a mode of its own: it does **not** run Steps
+2–9, and it does **not** run Step 10's Backlog gate (that lint/draft/split
+pass is `--backlog`'s job, not this one); `--dry-run` still applies (Dry-run
+/ eval mode below).
 
 **`--ticket <N>` (issue #78)** is the single-ticket form of `--backlog`'s
 scoping: it implies the same bypass above, but scopes Step 10's loop to
@@ -616,6 +625,103 @@ to this batch's actual numbers). Example shape (not literal wording):
 
 ---
 
+## Step 12 — Reestimate scan (`--reestimate`)
+
+`/z-plan --reestimate` (Step 1's flag parsing) re-runs Step 6's tier chain
+over EVERY Backlog and EVERY Ready ticket from what is currently in its
+body — even one that already carries an Estimate. Where Step 10 item 4 only
+re-fields a ticket when Model, Model Effort, or Estimate is EMPTY, this step
+never skips on that ground: a number already on the board can be stale (the
+body's scope changed under a human's edit, or `z-plan/tiers.json` was
+recalibrated, issue #81), and this is the deliberate pass that catches it.
+It never runs as part of a normal spec run, `--backlog`, or `--ticket <N>` —
+only `/z-plan --reestimate` triggers it (Step 1's bypass), and it does not
+run Step 10's lint/draft/split gate.
+
+```bash
+TMP="$HOME/.zstack/projects/$SLUG/z-plan/tmp"; mkdir -p "$TMP"
+"$Z_BOARD" list --status Backlog --json --slug "$SLUG" > "$TMP/reest-backlog.json"
+"$Z_BOARD" list --status Ready --json --slug "$SLUG" > "$TMP/reest-ready.json"
+```
+
+Every other status (Building/QA/Review/Blocked/Skipped/Done) is left
+untouched — this step reads and writes nothing outside Backlog + Ready.
+
+For each ticket number `<N>` in the combined Backlog + Ready list:
+
+1. **Fetch the current body:** `gh issue view <N> --json body -q .body > "$TMP/body-<N>.md"`
+   (the same read Step 10 item 1 uses).
+2. **Skip split parents.** If that body carries a `## Subtasks (in order)`
+   heading, this ticket is a split parent and carries no Estimate of its own
+   (Step 10 item 4's durable signal) — skip it: no estimate, no field-set, no
+   comment.
+3. **Re-estimate unconditionally.** Ground in the body and the code it names
+   (Step 2 applies — no file ref not opened) and pick Model + Model Effort
+   from what the body says NOW, per Step 6's rules of thumb — that choice is
+   the tier. Run Step 6's chain unchanged (copy `z-plan/tiers.json`'s entry
+   for that tier into a `buckets.json`, shell `"$Z_ESTIMATE"`) to get the new
+   dollar total. **This runs even when the ticket already has an Estimate** —
+   unlike Step 10 item 4, which only re-fields a ticket when a field is
+   empty, this step never skips on that ground.
+4. **Compare and write.** Read the current fields once each:
+   `"$Z_BOARD" field-get <N> Estimate --slug "$SLUG"`,
+   `"$Z_BOARD" field-get <N> Model --slug "$SLUG"`,
+   `"$Z_BOARD" field-get <N> "Model Effort" --slug "$SLUG"`. Compare the new
+   total against the stored Estimate as a to-the-cent numeric comparison —
+   the new number comes straight off `z-estimate`'s `$X (subtotal …, model
+   …)` output line, no arithmetic in prose:
+   - **Equal:** write nothing — no field-set, no comment. Same body + same
+     tier → same dollars, so a second `--reestimate` over an unchanged board
+     is a no-op (idempotent, reproducible).
+   - **Different, and a prior Estimate was present:** write the fields
+     FIRST, then comment:
+     - `field-set` Estimate to the new number:
+       `"$Z_BOARD" field-set <N> Estimate <new> --slug "$SLUG"`.
+     - If the newly picked tier differs from the stored Model + Model
+       Effort, `field-set` those two as well, so the fields keep selecting
+       the number they price (Step 6 writes all three together):
+       `"$Z_BOARD" field-set <N> Model <newmodel> --slug "$SLUG"` and
+       `"$Z_BOARD" field-set <N> "Model Effort" <neweffort> --slug "$SLUG"`.
+     - Then post exactly one board comment naming the change and its cause
+       (`"$Z_BOARD" comment <N> --body-file ... --slug "$SLUG"`), always
+       prefixed literally `Estimate $OLD → $NEW:`:
+       - tier changed → grew/shrank is decided by the tier's RANK in the
+         fixed escalation order `haiku-low < sonnet-medium < opus-high < opus-xhigh < fable-xhigh`
+         (Step 6's table row order, `z-plan/tiers.json`'s key order) —
+         **never** by comparing $OLD to $NEW. Tier dollars are NOT
+         monotonic by rank (`sonnet-medium` prices at $10.27, MORE than
+         `opus-high` at $9.44), so a genuine tier escalation can lower the
+         total; deciding the word from the dollar delta would post the
+         wrong direction on a live comment. Worked example where the
+         dollar direction disagrees with the tier direction: `sonnet-medium` → `opus-high` is an ESCALATION (rank 2 → rank 3) even
+         though the total drops $10.27 → $9.44 — the comment reads
+         `Estimate $10.27 → $9.44: recommended tier changed sonnet-medium → opus-high (scope grew per the current body).`, never `(scope shrank per the current body).`.
+         General rule: `Estimate $OLD → $NEW: recommended tier changed
+         <oldtier> → <newtier> (scope grew per the current body).` when the
+         new tier's rank is HIGHER than the old tier's rank, or `(scope
+         shrank per the current body).` when it is LOWER.
+       - tier unchanged → `Estimate $OLD → $NEW: recalibration (same <tier>
+         tier; z-plan/tiers.json buckets or references/rates.json updated
+         since the last estimate).`
+   - **Different, but no prior Estimate** (the field was empty): `field-set`
+     all three fields — Estimate, Model, and Model Effort, the same
+     `"$Z_BOARD" field-set <N> <Field> <value> --slug "$SLUG"` calls as
+     above — exactly like Step 10 item 4's empty-field path, but post **no**
+     "changed" comment — the comment fires only when an estimate was
+     already present and the number differs.
+5. **Never promote, never re-draft.** Like Step 10 item 6, this step never
+   moves a ticket to Ready and never edits a body — Status is unchanged and
+   the body is unchanged; it only writes the three number/tier fields and,
+   at most, one comment.
+
+**Terminal summary.** End the run with a short line naming how many tickets
+were re-estimated and how many changed — the old → new figures are already
+in hand, so nothing new is computed. This step does **not** invoke Step 11's
+`z-cost-suggest` helper: that needs the per-ticket file lists Step 5 builds,
+which a pure re-estimate pass never assembles.
+
+---
+
 ## Dry-run / eval mode
 
 For the planner eval (`evals/planner/`, wired by C10) and any offline check,
@@ -640,6 +746,12 @@ no GitHub writes. This is what `evals/planner/`'s backlog-scan pass
 Step 1/Step 10 contract — the same lookup-and-validate (exists, not Done)
 runs before anything is emitted; a missing or Done `N` still fails loud with
 no output, dry run or not.
+
+**`--dry-run --reestimate`** (issue #134) composes like `--dry-run --backlog`:
+decide per ticket exactly as Step 12 describes, but instead of `field-set` or
+`comment`, emit each ticket whose estimate would change to stdout as one
+block — its number, `$OLD → $NEW`, and the why line. No board writes, no
+GitHub writes.
 
 ---
 
@@ -668,6 +780,11 @@ Report DONE only when all hold:
   to its filed children; the parent stays OPEN and un-promoted — never
   auto-closed, never moved to Ready — with a comment that a human should
   close it once every child lands.
+- `/z-plan --reestimate` (issue #134) re-runs Step 6's tier chain over every
+  Backlog and Ready ticket, even one that already carries an Estimate; a
+  changed number is written and commented (old → new, and why), an unchanged
+  one writes nothing, a split parent is skipped, and it never promotes a
+  ticket or edits its body (Step 12).
 
 **Notify.** Once DONE, `send plan-complete` through the shared notification edge
 (`lib/notify.ts`) so a `/z-plan` run pings the same Discord channel as the loop —
