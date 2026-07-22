@@ -78,18 +78,37 @@ export const STATUS_FOR_STAGE: Record<Stage, BoardStatus> = {
 
 // The board status one hop EARLIER in the fixed pipeline (builder -> qa ->
 // reviewer -> merge) than a stage's own STATUS_FOR_STAGE (issue #116, the
-// nextAction desync guard below). builder has no entry: a builder-stage lane
-// only ever reaches that guard after a CLAIM (Ready/Building -> Building,
-// never an async write in flight by the time a builder agent finishes), never
-// an ADVANCE, so there is no lagged-write story to resync from -- any mismatch
-// there stays #110's safe stop-lane. merge is omitted too: its own status is
-// ALSO "Review" (same as reviewer's), so a merge lane can never be one hop
-// behind its own expected status -- the guard's mismatch check already
-// excludes it.
+// nextAction desync guard below). Only the two FORWARD advances live in this
+// single-status map: each has ONE preceding status that is always present
+// (every qa lane came from Building, every reviewer lane from QA). builder is
+// deliberately absent here -- not because it is unreachable by an advance (the
+// #116 claim, wrong: reviewerBounceAction and the qa-bugs case both advance TO
+// builder), but because it is reached by a BOUNCE-back whose lagged status is
+// NOT unique: a qa-bugs bounce lags at QA, a review-findings bounce lags at
+// Review (issue #124). isOneHopLag handles builder directly, gating each source
+// on the matching bounce counter. merge is omitted too: its own status is ALSO
+// "Review" (same as reviewer's), so a merge lane can never be one hop behind
+// its own expected status -- the guard's mismatch check already excludes it.
 const PRECEDING_BOARD_STATUS: Partial<Record<Stage, BoardStatus>> = {
   qa: "Building",
   reviewer: "QA",
 };
+
+// True when a lane's lagging board status is exactly one advance-write behind
+// its own stage -- the loop's own not-yet-landed write, safe to resync (#116),
+// versus a genuine human move that must stop-lane. Forward advances (qa,
+// reviewer) have a single preceding status in PRECEDING_BOARD_STATUS. builder
+// is reached only by a bounce-back (#124): a qa-bugs bounce lags at QA, a
+// review-findings bounce lags at Review -- each a legal one-hop lag, but only
+// when that bounce actually happened (its counter > 0), so a human drag onto a
+// never-bounced builder lane (counters at 0, or a status that is neither) still
+// stop-lanes.
+function isOneHopLag(lane: LaneState, boardStatus: BoardStatus): boolean {
+  if (lane.stage === "builder") {
+    return (boardStatus === "QA" && lane.qaBounces > 0) || (boardStatus === "Review" && lane.reviewBounces > 0);
+  }
+  return boardStatus === PRECEDING_BOARD_STATUS[lane.stage];
+}
 
 // Per-stage model routing (issue #82). The merge stage is mechanical (`gh pr
 // create`, a conflict check, `gh pr merge`) and never needs the ticket's
@@ -461,9 +480,10 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
     // Review write is still in flight or a human genuinely dragged Review->QA.
     // ORIGIN settles it: the loop records the status it wrote (lane.lastWroteStatus,
     // cleared by ingest the moment the board shows it land), so a one-hop-behind
-    // read resyncs ONLY when that marker still points at this lane's own stage
-    // status -- proof the gap is the loop's own still-propagating write, not a
-    // human move the loop never made. Resync corrects the ticket to the lane's
+    // read (isOneHopLag, incl. #124's advance->builder bounce lag) resyncs ONLY
+    // when that marker still points at this lane's own stage status -- proof the
+    // gap is the loop's own still-propagating write, not a human move the loop
+    // never made. Resync corrects the ticket to the lane's
     // expected status and proceeds with the normal advance (no rebuild, no
     // re-run of QA that already passed). Everything else -- a further-back gap,
     // OR a one-hop gap with no in-flight write of ours (lastWroteStatus cleared/
@@ -477,7 +497,7 @@ export function nextAction(tickets: TicketSnapshot[], lanes: LaneState[], opts: 
     const t = byNumber.get(lane.ticket);
     if (t && t.status !== STATUS_FOR_STAGE[lane.stage]) {
       if (
-        t.status === PRECEDING_BOARD_STATUS[lane.stage] &&
+        isOneHopLag(lane, t.status) &&
         lane.lastWroteStatus === STATUS_FOR_STAGE[lane.stage]
       ) {
         resyncStatus.set(lane.ticket, STATUS_FOR_STAGE[lane.stage]);
@@ -802,6 +822,20 @@ export function ingestBoardItems(
     humanNeededPercent?: number;
   }
 ): LoopState {
+  // #127 backstop: a transient GitHub hiccup can make `z-board snapshot` return
+  // 0 items for a board that actually has many (observed live: one read returned
+  // 0, the next returned all 68). Faithfully ingesting that empty read would
+  // overwrite tickets with [] and drop every in-flight lane (H14 below), and
+  // nextAction would then return a FALSE drain-complete mid-batch -- ending the
+  // loop early and orphaning running stage agents. A genuinely empty board only
+  // exists before any ticket is created, a state a mid-drain loop is never in, so
+  // when the snapshot is empty but `prev` still tracked tickets or lanes, treat
+  // the read as stale and keep the prior state unchanged. The caller re-snapshots
+  // next tick (snapshot() also retries at the source); nothing here reports drain-
+  // complete off the stale read. First ingest (prev null / empty) is untouched.
+  if (items.length === 0 && prev && (prev.tickets.length > 0 || prev.lanes.length > 0)) {
+    return prev;
+  }
   const prevByNumber = new Map((prev?.tickets ?? []).map((t) => [t.number, t]));
   const tickets = items.map((it) => {
     const status = String(it.fields["Status"] ?? "") as BoardStatus;
