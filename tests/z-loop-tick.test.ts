@@ -132,18 +132,28 @@ describe("z-loop-tick", () => {
 
     // The state file z-loop-tick wrote equals what the manual sequence produces:
     // the only step that writes state is `ingest`, so run it directly on the same
-    // fixture and compare byte-for-byte.
+    // fixture and compare byte-for-byte. #131: the wrapper now threads a live
+    // context reading as `--context-tokens N`; under the temp $HOME there is no
+    // ~/.claude/projects, so context-budget resolves nothing and reads 0
+    // (fail-open) -- the manual ingest passes the same `--context-tokens 0` so
+    // both states carry contextTokens:0 and the default contextTokenLimit.
     const items = join(dir, "items.json");
     const bodies = join(dir, "bodies.json");
     const expectedState = join(dir, "expected-state.json");
     writeFileSync(items, ITEMS);
     writeFileSync(bodies, BODIES);
     const ing = Bun.spawnSync(
-      ["bun", join(REPO_ROOT, "lib", "loop.ts"), "ingest", expectedState, items, bodies],
+      ["bun", join(REPO_ROOT, "lib", "loop.ts"), "ingest", expectedState, items, bodies, "--context-tokens", "0"],
       { stdout: "pipe", stderr: "pipe" }
     );
     expect(ing.exitCode).toBe(0);
     expect(readFileSync(tickState, "utf8")).toBe(readFileSync(expectedState, "utf8"));
+
+    // #131: the threaded reading landed as a live contextTokens (0 here) and the
+    // default context ceiling was captured on this first ingest.
+    const tickWritten = JSON.parse(readFileSync(tickState, "utf8"));
+    expect(tickWritten.contextTokens).toBe(0);
+    expect(tickWritten.contextTokenLimit).toBe(550000);
 
     // Human-needed safety control (issue #63): the first tick's ITEMS is one
     // Ready ticket, so #133's Ready-count capture makes initialReadyCount = 1
@@ -306,6 +316,18 @@ describe("z-loop-tick", () => {
     const tick = readFileSync(Z_LOOP_TICK, "utf8");
     expect(tick).toContain('lib/throttle.ts" wait --slug "$SLUG"');
     expect(tick.indexOf('lib/throttle.ts" wait')).toBeLessThan(tick.indexOf("snapshot --slug"));
+  });
+
+  // #131: the wrapper computes the live context reading and threads it into the
+  // per-tick ingest as --context-tokens. Wiring canary: the context-budget call
+  // is best-effort (`|| echo 0`, fail-open) and precedes the ingest that
+  // consumes $CTX.
+  test("the context reading is computed fail-open and threaded into the per-tick ingest", () => {
+    const tick = readFileSync(Z_LOOP_TICK, "utf8");
+    expect(tick).toContain('lib/context-budget.ts" current');
+    expect(tick).toContain("|| echo 0"); // hard-error backstop -> never wedges the drain
+    expect(tick).toContain('--context-tokens "$CTX"');
+    expect(tick.indexOf("context-budget.ts")).toBeLessThan(tick.indexOf("loop.ts\" ingest"));
   });
 });
 

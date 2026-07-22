@@ -31,11 +31,14 @@ import {
   type TicketSnapshot,
 } from "../lib/loop.ts";
 import { ZError } from "../lib/config.ts";
+import { validateConfig } from "../lib/config-schema.ts";
 import {
   claimableTickets,
   claimStage,
+  deadDeps,
   mergeOrder,
   parseDependsOn,
+  selectBatch,
   watchdogExpired,
 } from "../lib/lanes.ts";
 import type { BoardStatus } from "../lib/loop.ts";
@@ -1752,5 +1755,222 @@ describe("loop CLI", () => {
       expect(proc.exitCode).toBe(1);
       expect(proc.stderr.toString()).toMatch(/Usage: loop stage-model/);
     });
+  });
+});
+
+// ============================================================================
+// issue #131: per-loop ticket cap (ticketLimit / selectBatch / batch-scoped
+// claim+drain) and context ceiling (contextTokenLimit gate + context-clear).
+// ============================================================================
+
+describe("selectBatch (#131 ticket cap)", () => {
+  test("AC1: ticketLimit 3 over 10 no-dep tickets flags the 3 lowest; the rest stay Ready but are not claimable", () => {
+    const tickets = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => ticket(n, "Ready"));
+    const batch = selectBatch(tickets, 3);
+    expect(batch).toEqual([1, 2, 3]);
+    // The other 7 remain in tickets (Ready) but are excluded from the claim set.
+    const claimable = claimableTickets(tickets, [], batch);
+    expect(claimable.map((t) => t.number)).toEqual([1, 2, 3]);
+    // Sanity: without the allow-list all 10 are claimable (byte-identical today).
+    expect(claimableTickets(tickets, []).length).toBe(10);
+  });
+
+  test("AC3: cap 2, #2 depends on #3 -- the greedy walk closes #1 + #3, never flags #2 before #3, and the batch is dependency-self-contained", () => {
+    const tickets = [ticket(1, "Ready"), ticket(2, "Ready", [3]), ticket(3, "Ready")];
+    const batch = selectBatch(tickets, 2);
+    expect(batch).toEqual([1, 3]); // #1 (no deps) + #3 (no deps); #2 can't close within the cap
+    expect(batch).not.toContain(2);
+    // Dependency-self-contained: every flagged ticket's deps are Done or flagged.
+    const byNum = new Map(tickets.map((t) => [t.number, t]));
+    for (const n of batch!) {
+      const t = byNum.get(n)!;
+      expect(t.dependsOn.every((d) => batch!.includes(d) || byNum.get(d)?.status === "Done")).toBe(true);
+    }
+    // #2 left in Ready is NOT deadDeps-parked: its dep #3 is Ready (not terminal).
+    expect(deadDeps(tickets[1], byNum)).toEqual([]);
+  });
+
+  test("ticketLimit 0 returns undefined (no allow-list, no gating)", () => {
+    expect(selectBatch([ticket(1, "Ready"), ticket(2, "Ready")], 0)).toBeUndefined();
+  });
+
+  test("a dependency chain longer than the cap flags a closable prefix, never a ticket whose dep is left out", () => {
+    // #1 <- #2 <- #3 (each depends on the previous), cap 2.
+    const tickets = [ticket(1, "Ready"), ticket(2, "Ready", [1]), ticket(3, "Ready", [2])];
+    expect(selectBatch(tickets, 2)).toEqual([1, 2]); // #3 excluded (its dep #2's chain root closes, but cap hit at 2)
+  });
+});
+
+describe("batch-scoped claiming + drain (#131)", () => {
+  test("AC2: with no cap (batchTickets undefined), the action stream equals a full-allow-list drain byte-for-byte", () => {
+    const mk = () => state([1, 2, 3, 4, 5].map((n) => ticket(n, "Ready")));
+    const noCap = drainHappy(mk());
+    const fullAllow = mk();
+    fullAllow.batchTickets = [1, 2, 3, 4, 5]; // an allow-list containing everything gates nothing
+    const withAllow = drainHappy(fullAllow);
+    expect(withAllow.log).toEqual(noCap.log); // identical schedule
+    expect(noCap.state.tickets.every((t) => t.status === "Done")).toBe(true);
+  });
+
+  test("AC1 (nextAction): a claim only ever targets an in-batch ticket", () => {
+    const s = state([1, 2, 3, 4, 5, 6].map((n) => ticket(n, "Ready")));
+    s.batchTickets = [1, 2];
+    expect(nextAction(s, 0)).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+  });
+
+  test("AC4: cap 2, #1/#2 Done, #3..#10 Ready but un-flagged, no lanes -> drain-complete (leftovers don't keep the run alive)", () => {
+    const s = state([
+      ticket(1, "Done"),
+      ticket(2, "Done"),
+      ...[3, 4, 5, 6, 7, 8, 9, 10].map((n) => ticket(n, "Ready")),
+    ]);
+    s.batchTickets = [1, 2];
+    expect(nextAction(s, 0)).toEqual({ kind: "drain-complete" });
+    expect(drainComplete(s.tickets, s.lanes, s.batchTickets)).toBe(true);
+    // Without the batch scope those 8 Ready tickets WOULD keep it alive.
+    expect(drainComplete(s.tickets, s.lanes)).toBe(false);
+  });
+});
+
+describe("context ceiling gate (#131)", () => {
+  const overLimit = (over: Partial<LoopState> = {}): LoopState => ({
+    ...state([ticket(1, "Ready")]),
+    contextTokenLimit: 550000,
+    contextTokens: 600000,
+    ...over,
+  });
+
+  test("AC5: over-limit, one claimable batch ticket, all lanes idle -> context-clear (claim suppressed, no wait)", () => {
+    expect(nextAction(overLimit(), 0)).toEqual({ kind: "context-clear" });
+  });
+
+  test("AC6: over-limit but a lane is still running (unresolved) -> the lane's watchdog action, never context-clear", () => {
+    const s = overLimit({
+      tickets: [ticket(1, "QA")],
+      lanes: [lane(1, "qa", { lastActivityMs: 0 })], // silent, no outcome
+    });
+    // nowMs past the 10-minute watchdog: an in-flight lane drains via check-worker.
+    const a = nextAction(s, 11 * 60_000);
+    expect(a).toEqual({ kind: "check-worker", ticket: 1 });
+    expect(a.kind).not.toBe("context-clear");
+  });
+
+  test("AC6b: over-limit but a lane has a finished stage -> its advance still fires (draining continues)", () => {
+    const s = overLimit({
+      tickets: [ticket(1, "QA")],
+      lanes: [lane(1, "qa", { outcome: { kind: "qa-pass" } })],
+    });
+    expect(nextAction(s, 0)).toMatchObject({ kind: "advance", ticket: 1, to: "reviewer" });
+  });
+
+  test("AC7: contextTokenLimit 0 disables the gate -> a normal claim even far over any reading", () => {
+    const s = overLimit({ contextTokenLimit: 0 });
+    expect(nextAction(s, 0)).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+  });
+
+  test("over-limit with the batch fully drained (no work remaining) -> drain-complete still wins over context-clear", () => {
+    const s = overLimit({ tickets: [ticket(1, "Done")] });
+    expect(nextAction(s, 0)).toEqual({ kind: "drain-complete" });
+  });
+
+  test("AC8: applyAction(context-clear) is a pure no-op -- lanes, tickets, and batchTickets all unchanged", () => {
+    const s: LoopState = { ...overLimit(), batchTickets: [1] };
+    const before = structuredClone(s);
+    const after = applyAction(s, { kind: "context-clear" }, 12345);
+    expect(after).toEqual(before); // state is identical; a pause, not a transition
+    expect(s).toEqual(before); // input untouched (pure)
+  });
+});
+
+describe("ingestBoardItems: batch + context knobs (#131)", () => {
+  test("AC1 (capture): a fresh batch with --ticket-limit captures batchTickets as the flagged allow-list", () => {
+    const items = [1, 2, 3, 4, 5].map((n) => ({ number: n, title: `t${n}`, fields: { Status: "Ready" } }));
+    const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
+    const s = ingestBoardItems(null, items, bodies, { ticketLimit: 3 });
+    expect(s.batchTickets).toEqual([1, 2, 3]);
+    // The other 2 are present + Ready but not claimable within the batch.
+    expect(s.tickets.filter((t) => t.status === "Ready").map((t) => t.number)).toEqual([1, 2, 3, 4, 5]);
+    expect(claimableTickets(s.tickets, s.lanes, s.batchTickets).map((t) => t.number)).toEqual([1, 2, 3]);
+  });
+
+  test("ticketLimit 0 (default) leaves batchTickets undefined -- byte-identical to today", () => {
+    const items = [1, 2].map((n) => ({ number: n, title: `t${n}`, fields: { Status: "Ready" } }));
+    const s = ingestBoardItems(null, items, { "1": "", "2": "" });
+    expect(s.batchTickets).toBeUndefined();
+  });
+
+  test("contextTokens is stored fresh from cfg (never preserved from prev); contextTokenLimit defaults + persists", () => {
+    const items = [{ number: 1, title: "t1", fields: { Status: "Ready" } }];
+    const first = ingestBoardItems(null, items, { "1": "" });
+    expect(first.contextTokens).toBe(0); // absent reading -> 0 (never gates)
+    expect(first.contextTokenLimit).toBe(550000); // DEFAULT_CONTEXT_TOKEN_LIMIT
+
+    const withReading = ingestBoardItems(first, items, { "1": "" }, { contextTokens: 400000, contextTokenLimit: 500000 });
+    expect(withReading.contextTokens).toBe(400000);
+    expect(withReading.contextTokenLimit).toBe(500000);
+
+    // A later tick with a fresh (smaller) reading and no --context-token-limit:
+    // contextTokens updates to the new reading, the limit persists from prev.
+    const nextTick = ingestBoardItems(withReading, items, { "1": "" }, { contextTokens: 5000 });
+    expect(nextTick.contextTokens).toBe(5000); // NOT preserved at 400000
+    expect(nextTick.contextTokenLimit).toBe(500000); // preserved
+  });
+
+  test("AC11: over-limit context-clear then re-ingest the un-drained state -> batchTickets preserved, small fresh reading resumes claiming the next flagged ticket", () => {
+    // Prev: #1 built (Done, left Ready), #2/#3 flagged-but-unbuilt (Ready), no
+    // lanes, over the ceiling -- the state a context-clear pause leaves behind.
+    const prev: LoopState = {
+      ...state([ticket(1, "Done"), ticket(2, "Ready"), ticket(3, "Ready")]),
+      batchTickets: [1, 2, 3],
+      contextTokens: 600000,
+      contextTokenLimit: 550000,
+      initialReadyCount: 3,
+    };
+    // Sanity: prev is NOT drained (unbuilt flagged Ready tickets remain in-batch).
+    expect(drainComplete(prev.tickets, prev.lanes, prev.batchTickets)).toBe(false);
+
+    const items = [
+      { number: 1, title: "t1", fields: { Status: "Done" } },
+      { number: 2, title: "t2", fields: { Status: "Ready" } },
+      { number: 3, title: "t3", fields: { Status: "Ready" } },
+    ];
+    const bodies = { "1": "", "2": "", "3": "" };
+    // Resume ingest: no --ticket-limit (batch already flagged), a fresh SMALL
+    // reading (the context-cleared orchestrator's first tick).
+    const resumed = ingestBoardItems(prev, items, bodies, { contextTokens: 5000 });
+    expect(resumed.batchTickets).toEqual([1, 2, 3]); // preserved verbatim (startingFreshBatch false)
+    expect(resumed.contextTokens).toBe(5000);
+    expect(resumed.contextTokenLimit).toBe(550000); // preserved
+    // The gate is now open -> claiming resumes on the next flagged-but-unbuilt ticket.
+    expect(nextAction(resumed, 0)).toEqual({ kind: "claim", ticket: 2, stage: "builder" });
+  });
+});
+
+describe("validateConfig: ticketLimit / contextTokenLimit (#131 AC10)", () => {
+  const baseConfig = () => ({
+    slug: "s",
+    owner: "o",
+    repo: "r",
+    projectNumber: 1,
+    projectId: "P",
+    repositoryId: "R",
+    statusField: { id: "F", dataType: "SINGLE_SELECT", options: { Ready: "o1" } },
+    fields: {},
+  });
+
+  test("ticketLimit -1 throws naming the field with the non-negative-integer rule", () => {
+    expect(() => validateConfig({ ...baseConfig(), ticketLimit: -1 })).toThrow(
+      /"ticketLimit" must be a non-negative integer \(0 = no cap\)/
+    );
+  });
+
+  test("contextTokenLimit 2.5 throws naming the field with the non-negative-integer rule", () => {
+    expect(() => validateConfig({ ...baseConfig(), contextTokenLimit: 2.5 })).toThrow(
+      /"contextTokenLimit" must be a non-negative integer \(0 = disabled\)/
+    );
+  });
+
+  test("ticketLimit 0 and contextTokenLimit 0 both pass (disabled is legal)", () => {
+    expect(() => validateConfig({ ...baseConfig(), ticketLimit: 0, contextTokenLimit: 0 })).not.toThrow();
   });
 });

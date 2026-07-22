@@ -180,6 +180,14 @@ export function validateConfig(cfg: unknown): BoardConfig {
   // this is a non-negative-finite guard, not requirePositiveNumber.
   requireNumber("humanNeededPercent", c.humanNeededPercent, { min: 0, desc: "a non-negative number (0 disables)" });
 
+  // ticketLimit / contextTokenLimit (issue #131): per-loop ticket cap and
+  // context-window ceiling. Both are integer counts where `0` is a legitimate
+  // "disabled" value, so -- like tickThrottleSeconds above -- they are
+  // non-negative-integer guards, not requirePositiveNumber (which rejects 0
+  // and accepts fractions).
+  requireNumber("ticketLimit", c.ticketLimit, { min: 0, integer: true, desc: "a non-negative integer (0 = no cap)" });
+  requireNumber("contextTokenLimit", c.contextTokenLimit, { min: 0, integer: true, desc: "a non-negative integer (0 = disabled)" });
+
   // notifications (#60): validated only when present (absent = off). The
   // discordWebhookUrl is a SECRET, so its error text names the field ONLY and
   // never echoes the value -- a pasted bare token or a leaked URL must not land

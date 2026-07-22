@@ -76,11 +76,12 @@ mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports" 
 4. Read the loop knobs from config (defaults 3 lanes / 10 minutes / audits
    every 5th loop / 3 QA passes before Blocked / investigate from QA bounce 2 /
    human-needed at 30% parked / reviewer-confidence floor 70, block a
-   sub-floor approve / 2 reviewer->builder bounces before Blocked):
+   sub-floor approve / 2 reviewer->builder bounces before Blocked / no per-loop
+   ticket cap / context ceiling 550000 tokens):
 
 ```bash
-read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMAN_NEEDED_PERCENT MIN_REVIEWER_CONFIDENCE REVIEWER_BELOW_ACTION MAX_REVIEW_BOUNCES <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
-  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.humanNeededPercent, c.minReviewerConfidence, c.reviewerBelowThresholdAction, c.maxReviewBounces)")"
+read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMAN_NEEDED_PERCENT MIN_REVIEWER_CONFIDENCE REVIEWER_BELOW_ACTION MAX_REVIEW_BOUNCES TICKET_LIMIT CONTEXT_TOKEN_LIMIT <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
+  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.humanNeededPercent, c.minReviewerConfidence, c.reviewerBelowThresholdAction, c.maxReviewBounces, c.ticketLimit, c.contextTokenLimit)")"
 ```
 
 5. **Startup orphan scan (C7).** A crashed prior loop leaves lane locks in
@@ -176,13 +177,21 @@ bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" \
   --max-qa-passes "$MAX_QA_PASSES" --qa-investigate-after "$QA_INVESTIGATE_AFTER" \
   --human-needed-percent "$HUMAN_NEEDED_PERCENT" \
   --min-reviewer-confidence "$MIN_REVIEWER_CONFIDENCE" --reviewer-below-threshold-action "$REVIEWER_BELOW_ACTION" \
-  --max-review-bounces "$MAX_REVIEW_BOUNCES"
+  --max-review-bounces "$MAX_REVIEW_BOUNCES" \
+  --ticket-limit "$TICKET_LIMIT" --context-token-limit "$CONTEXT_TOKEN_LIMIT"
 ```
 
 This is the ONE ingest call that captures `initialReadyCount` for the batch --
 the committed queue is the gated Ready tickets from Step 2, still in Ready
 (nothing has been claimed yet, #133), so `initialReadyCount` is captured from
-that Ready count and this is ingest-time-zero for the safety control below.
+that Ready count and this is ingest-time-zero for the safety control below. It
+is also where the **per-loop ticket cap** (`--ticket-limit`, #131) flags this
+run's batch: with a non-zero limit, `ingest` captures `batchTickets` -- the
+dependency-self-contained allow-list of at most that many tickets -- once here
+and preserves it across every re-ingest and context clear. At the default `0`
+there is no cap (`batchTickets` stays unset, byte-identical to today). The
+**context ceiling** (`--context-token-limit`, #131) is captured the same way;
+the live per-tick reading that trips it is threaded by `z-loop-tick` in Step 4.
 
 `ingest` preserves lanes and lost-claim flags across re-ingests, so re-running
 it after board writes is always safe.
@@ -241,6 +250,7 @@ Perform exactly that action, then record it. Action → side effects:
 | `check-worker N` | Is the lane's background agent still running (harness task list)? Alive → `bun "$PACK/lib/loop.ts" probe "$STATE" <N> alive`. Dead with no final message: **if the lane's stage is `merge`, do NOT probe-dead/skip** — verify PR state first (H9): `gh pr view <branch> --json state,url -q '.state'`. If `MERGED`, the PR landed before the worker died, so record it as merged (`printf 'MERGED: %s\n' "$prUrl" > msg.txt; bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`) → the reducer completes it and counts it in `mergedThisRun` (so a stacked child still retargets and the batch-end branch delete can't close its PR). If NOT merged, record `printf 'BLOCKED: merge worker died with the PR unmerged (%s)\n' "$state" > msg.txt; outcome ...` → parks it Blocked for a human, and **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:"merge worker died with the PR unmerged"}`). For any OTHER stage, dead with no final message → `probe "$STATE" <N> dead` (the next `next` returns the skip). |
 | `complete N` | The completion flow — Step 6 — then apply, then **remove the lane lock**. |
 | `wait` | Block until a background stage agent finishes (the harness notifies you) or one minute passes, then re-run `next` — the watchdog only fires if `next` is called with a fresh clock. When an agent finishes: save its final message to a file and `bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`, then update Actual (below), then re-run `next`. |
+| `context-clear` | The context ceiling (`contextTokenLimit`, #131) is reached, every lane is idle, and the batch still has unbuilt tickets — a mid-batch PAUSE, distinct from `drain-complete`. Apply it (a pure no-op on state). Then: release the loop lock (`bun "$PACK/lib/locks.ts" release --slug "$SLUG"`), **keep** every worktree/branch and `state.json` (the batch is un-drained — `batchTickets` still holds the unbuilt tickets), and **exit WITHOUT running Step 7 end-of-loop** (no regression, no deploy — the batch isn't done). Print the resume instruction: the operator (or harness) clears this session's context and re-invokes `/z-loop`; the fresh orchestrator reads a small context on its first tick, so the gate is open and Step 3's ingest (seeing the un-drained `state.json`, `startingFreshBatch` false) preserves `batchTickets` and resumes claiming the next flagged-but-unbuilt ticket. In-flight lanes are never cut short — `context-clear` only fires with all lanes idle. |
 | `drain-complete` | Step 7. |
 
 **Notify (best-effort, one event per moment).** The park/skip/safety rows above

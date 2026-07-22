@@ -133,6 +133,21 @@ export interface BoardConfig {
   // tickets (Blocked + Skipped + Questions) exceed this percent of the
   // batch's initial committed-to-Building count. 0 disables the control.
   humanNeededPercent?: number;
+  // Per-loop ticket cap (issue #131): the maximum number of tickets a single
+  // /z-loop run flags into its batch. 0 (the default) = no cap -- every gated
+  // Ready ticket is workable, byte-identical to pre-#131. The batch is a
+  // dependency-self-contained allow-list captured once per run
+  // (lib/lanes.ts selectBatch); the leftover Ready tickets simply wait for a
+  // future run. Read at Step 3 ingest only.
+  ticketLimit?: number;
+  // Context ceiling (issue #131): the live orchestrator context-window token
+  // occupancy (input + cache-read + cache-creation of its most recent request,
+  // measured by lib/context-budget.ts) at/above which the loop stops claiming
+  // NEW tickets and, once every lane is idle with batch work still remaining,
+  // returns a `context-clear` pause so the operator/harness can clear context
+  // and re-invoke to resume the same batch. 0 disables the gate. Default
+  // 550000 -- below the harness auto-compaction point, with headroom.
+  contextTokenLimit?: number;
   // Discord notifications for the loop/plan events (#60, #63, #68). Absent block = off (a
   // no-op), which is the correct default -- so there is deliberately no
   // DEFAULT_NOTIFICATIONS const and no loadConfig mutation. The URL is a SECRET:
@@ -164,6 +179,8 @@ export const DEFAULT_MIN_REVIEWER_CONFIDENCE = 70;
 export const DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION = "block" as const;
 export const DEFAULT_MAX_REVIEW_BOUNCES = 2;
 export const DEFAULT_HUMAN_NEEDED_PERCENT = 30;
+export const DEFAULT_TICKET_LIMIT = 0;
+export const DEFAULT_CONTEXT_TOKEN_LIMIT = 550000;
 
 // Every actionable failure in the pack is a ZError; main() prints .message to
 // stderr and exits non-zero. Anything else is a bug and bubbles up with a stack.
@@ -269,5 +286,7 @@ export function loadConfig(slug?: string, home = homedir()): BoardConfig {
   cfg.reviewerBelowThresholdAction = cfg.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION;
   cfg.maxReviewBounces = cfg.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES;
   cfg.humanNeededPercent = cfg.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT;
+  cfg.ticketLimit = cfg.ticketLimit ?? DEFAULT_TICKET_LIMIT;
+  cfg.contextTokenLimit = cfg.contextTokenLimit ?? DEFAULT_CONTEXT_TOKEN_LIMIT;
   return cfg;
 }
