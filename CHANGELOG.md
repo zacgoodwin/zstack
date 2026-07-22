@@ -4,6 +4,10 @@ All notable changes to zstack are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [1.0.1.0] - 2026-07-22
+
+A correctness-and-hygiene point release on top of `1.0.0.0`, all loop-safety and dead-code work — no new user-facing features. The bulk is the loop's eventual-consistency handling when a board status lags its stage: a lagging lane now fails soft with a per-lane `stop-lane` instead of aborting the whole tick (#110), and a merely one-hop-lagged write resyncs-and-advances rather than throwing away already-passed build/QA (#116). Also hardens the reviewer's throwaway worktree so its `bun test` run can never resolve a destructive path onto the loop's own live state (#118), resets `mergedThisRun` at each fresh-batch boundary so the merge gate never points at a dead parent (#119), removes the dead `lib/lanes.ts` CLI entrypoint (#120), defers each ticket's move to **Building** to claim time instead of a batch commit (#133), and folds the ponytail-audit numeric-guard/dead-export follow-up (#109). 971 gate tests green; typecheck clean.
+
 ### Fixed
 
 - The reviewer stage's throwaway worktree (`z-loop/SKILL.md`, `git worktree add`) is now rooted at the repo's own `.worktrees/review-<N>` instead of `$TMP` (`~/.zstack/projects/<slug>/loop/tmp`), so the full `bun test` suite the reviewer runs inside it can never resolve a destructive path onto the loop's own live `state.json`/locks/transcripts (#118; observed empirically during #110's adversarial review, where the throwaway worktree under `~/.zstack` was wiped mid-review by the suite's own cleanup). Root-caused, not just relocated: audited every test touching `.zstack` and fixed the one real offender (`tests/notify.test.ts`'s CLI `send` test wrote a `~/.zstack/projects/<slug>` directory via the real `homedir()` and `rmSync`'d it afterward) to sandbox `HOME`/`USERPROFILE` like every other subprocess test already does. A new gate test (`tests/zstack-home-safety.test.ts`) greps every test file for the dangerous `homedir()` + `.zstack` combination outside a read-only `existsSync` check, so a regression fails the suite instead of silently landing again.
