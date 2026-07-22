@@ -1758,6 +1758,176 @@ describe("loop CLI", () => {
   });
 });
 
+// -- graceful stop (#132) -----------------------------------------------------
+
+describe("graceful stop (#132)", () => {
+  // The stage outcomes A is fed as it drains; reviewer at confidence=90 clears
+  // the default 70 floor so the approve passes to the merge gate (not a bounce).
+  const FEED: Record<Stage, string> = {
+    builder: "BUILT: ok",
+    qa: "QA-PASS: ok",
+    reviewer: "REVIEW-APPROVE: confidence=90 satisfies every criterion",
+    merge: "MERGED: https://github.com/x/y/pull/1",
+  };
+
+  // AC1: a lane mid-builder (A=1), an unclaimed Building ticket (B=2), a Ready
+  // ticket (C=3), stopRequested. A drains builder->qa->reviewer->merge->Done; B
+  // returns to Ready (never claimed to Building); C stays Ready; drain-complete
+  // once A's lane is gone; and no `claim` is EVER emitted while stopRequested.
+  test("drains in-flight lanes, returns unworked to Ready, never claims, then drain-completes (AC1)", () => {
+    let s: LoopState = {
+      ...state([ticket(1, "Building"), ticket(2, "Building"), ticket(3, "Ready")], [lane(1, "builder")]),
+      stopRequested: true,
+    };
+    const returnedReady: number[] = [];
+    let drained = false;
+    for (let i = 0; i < 100; i++) {
+      const a = nextAction(s, 0);
+      expect(a.kind).not.toBe("claim");
+      if (a.kind === "drain-complete") {
+        drained = true;
+        break;
+      }
+      if (a.kind === "wait") {
+        const l = s.lanes.find((x) => !x.outcome);
+        if (!l) throw new Error("wait with no lane to progress -- scheduler stuck");
+        s = recordOutcome(s, l.ticket, FEED[l.stage], 0);
+        continue;
+      }
+      if (a.kind === "return-ready") returnedReady.push(a.ticket);
+      s = applyAction(s, a, 0);
+    }
+    expect(drained).toBe(true);
+    expect(returnedReady).toEqual([2]); // B returned exactly once, never re-qualifies
+    expect(s.lanes.length).toBe(0);
+    expect(s.tickets.find((t) => t.number === 1)!.status).toBe("Done"); // A merged
+    expect(s.tickets.find((t) => t.number === 2)!.status).toBe("Ready"); // B back in Ready
+    expect(s.tickets.find((t) => t.number === 3)!.status).toBe("Ready"); // C untouched
+  });
+
+  test("returns unclaimed non-Ready tickets to Ready, lowest first", () => {
+    const s: LoopState = {
+      ...state([ticket(5, "Review"), ticket(3, "Building"), ticket(4, "QA")], []),
+      stopRequested: true,
+    };
+    expect(nextAction(s, 0)).toEqual({
+      kind: "return-ready",
+      ticket: 3,
+      note: "Loop stopped (z-stop) before this ticket was claimed; returned to Ready for the next run.",
+    });
+  });
+
+  test("leaves already-Ready tickets alone, and never claims a claimable Ready ticket", () => {
+    // A Ready + a Building ticket: the Building one returns; the Ready one is
+    // skipped by the status!==Ready guard (so it can't re-qualify forever).
+    const mixed: LoopState = {
+      ...state([ticket(7, "Ready"), ticket(8, "Building")], []),
+      stopRequested: true,
+    };
+    expect(nextAction(mixed, 0).kind).toBe("return-ready");
+    expect((nextAction(mixed, 0) as any).ticket).toBe(8);
+
+    // Only Ready left -> nothing to return, no lanes -> drain-complete, NOT claim.
+    const onlyReady: LoopState = { ...state([ticket(7, "Ready")], []), stopRequested: true };
+    expect(nextAction(onlyReady, 0)).toEqual({ kind: "drain-complete" });
+  });
+
+  test("waits while a lane is still mid-stage (in-lane ticket never yanked)", () => {
+    const s: LoopState = {
+      ...state([ticket(9, "Building")], [lane(9, "builder")]), // no outcome yet
+      stopRequested: true,
+    };
+    expect(nextAction(s, 0)).toEqual({ kind: "wait" });
+  });
+
+  test("drain-complete when nothing is left to return and no lane remains", () => {
+    const s: LoopState = { ...state([ticket(1, "Done")], []), stopRequested: true };
+    expect(nextAction(s, 0)).toEqual({ kind: "drain-complete" });
+  });
+
+  test("applyAction return-ready sets Ready from Building/QA/Review without throwing", () => {
+    for (const from of ["Building", "QA", "Review"] as const) {
+      const s = state([ticket(2, from)], []);
+      const next = applyAction(s, { kind: "return-ready", ticket: 2, note: "x" }, 0);
+      expect(next.tickets.find((t) => t.number === 2)!.status).toBe("Ready");
+    }
+  });
+
+  // AC5: ingest latches stopRequested across a batch, and resets it on the SAME
+  // fresh-batch boundary as initialReadyCount.
+  test("ingest latches stopRequested across a batch and resets it on a fresh batch (AC5)", () => {
+    const item = (n: number, status: BoardStatus) => ({ number: n, title: `T${n}`, fields: { Status: status } });
+    const bodies = {};
+
+    // fresh ingest WITH the flag -> true
+    const s1 = ingestBoardItems(null, [item(1, "Building")], bodies, { stopRequested: true });
+    expect(s1.stopRequested).toBe(true);
+    expect(s1.initialReadyCount).toBe(1);
+
+    // re-ingest the SAME batch WITHOUT the flag -> latched true
+    const s2 = ingestBoardItems(s1, [item(1, "Building")], bodies, {});
+    expect(s2.stopRequested).toBe(true);
+
+    // drain that batch (ticket 1 Done): still the same batch, so stopRequested
+    // stays latched and the state is drainComplete.
+    const drainedPrev = ingestBoardItems(s2, [item(1, "Done")], bodies, {});
+    expect(drainedPrev.stopRequested).toBe(true);
+    expect(drainComplete(drainedPrev.tickets, drainedPrev.lanes)).toBe(true);
+
+    // a FRESH batch commits a new unclaimed Building ticket -> stopRequested
+    // resets to false alongside initialReadyCount.
+    const fresh = ingestBoardItems(drainedPrev, [item(1, "Done"), item(2, "Building")], bodies, {});
+    expect(fresh.stopRequested).toBe(false);
+    expect(fresh.initialReadyCount).toBe(1);
+  });
+
+  // AC5 regression (review bounce): the shipped AC5 test above used an
+  // all-terminal drainedPrev (1:Done), a shape a real graceful stop never
+  // produces. A stop RETURNS unworked tickets to Ready (a workable status), so
+  // the persisted post-stop state is Done + Ready stragglers, on which plain
+  // drainComplete(prev) reads false -- and pre-fix that permanently wedged
+  // stopRequested (and the sibling per-batch counters) into the NEXT /z-loop.
+  // This test's prev is that REAL post-stop shape; it FAILS against the pre-fix
+  // startingFreshBatch (drainComplete-gated) code.
+  test("a REAL post-stop prev (Done + Ready stragglers) resets stopRequested and the per-batch counters on the next run (AC5 regression)", () => {
+    const item = (n: number, status: BoardStatus) => ({ number: n, title: `T${n}`, fields: { Status: status } });
+    const bodies = {};
+
+    // Stop a running batch: latch stopRequested, then observe the drained board
+    // the stop leaves -- #1 finished to Done, #2/#3 returned to Ready.
+    const stopped = ingestBoardItems(
+      null,
+      [item(1, "Building"), item(2, "Building"), item(3, "Building")],
+      bodies,
+      { stopRequested: true }
+    );
+    const postStop = ingestBoardItems(stopped, [item(1, "Done"), item(2, "Ready"), item(3, "Ready")], bodies, {});
+    // In-run behavior preserved: the latch holds across the stopped batch, and
+    // this Done+Ready shape is (correctly) NOT drainComplete.
+    expect(postStop.stopRequested).toBe(true);
+    expect(drainComplete(postStop.tickets, postStop.lanes)).toBe(false);
+
+    // The exact wedge the reviewer reproduced: a persisted post-stop state with
+    // stale per-batch counters (initialReadyCount 0, a prior human-needed
+    // crossing, a merged entry from the stopped batch).
+    const stalePostStop: LoopState = { ...postStop, initialReadyCount: 0, humanNeededNotified: true, mergedThisRun: [99] };
+
+    // NEXT /z-loop: planning commits the returned Ready stragglers to Building.
+    // The next ingest carries NO --stop-requested flag, so stopRequested and ALL
+    // the sibling per-batch counters must reset for the fresh batch.
+    const nextRun = ingestBoardItems(
+      stalePostStop,
+      [item(1, "Done"), item(2, "Building"), item(3, "Building")],
+      bodies,
+      {}
+    );
+    expect(nextRun.stopRequested).toBe(false); // no longer wedged
+    expect(nextRun.initialReadyCount).toBe(2); // fresh count from the new Building batch, not stale 0
+    expect(nextRun.humanNeededNotified).toBe(false); // reset alongside (#63)
+    expect(nextRun.mergedThisRun).toEqual([]); // reset alongside (#119)
+  });
+});
+
 // ============================================================================
 // issue #131: per-loop ticket cap (ticketLimit / selectBatch / batch-scoped
 // claim+drain) and context ceiling (contextTokenLimit gate + context-clear).

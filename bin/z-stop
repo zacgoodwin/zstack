@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Thin entry for z-stop (#132): request a graceful stop of the /z-loop running on
+# this machine. Everything lives in lib/stop.ts under bun; this wrapper only
+# resolves its own location and hands off (mirrors bin/z-board). Run it from a
+# SECOND terminal while a loop is draining.
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+exec bun "$HERE/../lib/stop.ts" "$@"
