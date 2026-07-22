@@ -597,7 +597,7 @@ export function nextAction(state: LoopState, nowMs: number): Action {
   }
 
   // 3b. Graceful stop (#132). A z-stop sentinel was observed for this batch and
-  //     threaded in via ingest -> LoopState.stopRequested -> opts. Steps 1-3 above
+  //     threaded in via ingest -> LoopState.stopRequested -> state. Steps 1-3 above
   //     run UNCHANGED so in-flight lanes still drain to Done: a finished builder
   //     advances to qa, an approved lane merges through the gate, a completed
   //     merge completes, a silent worker is still probed/skipped. Only NEW work is
@@ -609,7 +609,7 @@ export function nextAction(state: LoopState, nowMs: number): Action {
   //     forever); an in-lane ticket is never yanked from its worker. drain-complete
   //     fires once nothing is left to return and no lane remains; while a lane is
   //     still mid-stage it waits.
-  if (opts.stopRequested) {
+  if (state.stopRequested) {
     const inLaneStop = new Set(lanes.map((l) => l.ticket));
     const toReturn = tickets
       .filter((t) => isWorkableStatus(t.status) && t.status !== "Ready" && !inLaneStop.has(t.number) && !t.claimedByOther)
@@ -1113,7 +1113,7 @@ export function ingestBoardItems(
     maxReviewBounces: cfg?.maxReviewBounces ?? prev?.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES,
     humanNeededPercent: cfg?.humanNeededPercent ?? prev?.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT,
     mergedThisRun: startingFreshBatch ? [] : [...(prev?.mergedThisRun ?? [])],
-    initialReadyCount: startingFreshBatch ? readyCount : (prev!.initialReadyCount ?? 0),
+    initialReadyCount: startingFreshBatch ? (!prev || (prevBatchSpent && buildingCount > 0) ? buildingCount : readyCount) : (prev!.initialReadyCount ?? 0),
     humanNeededNotified: startingFreshBatch ? false : (prev!.humanNeededNotified ?? false),
     // #132: this tick's flag always wins true (a stop requested on a fresh
     // batch's first tick is honored); otherwise it LATCHES across the batch; and

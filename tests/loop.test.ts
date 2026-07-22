@@ -1925,6 +1925,7 @@ describe("graceful stop (#132)", () => {
     expect(nextRun.initialReadyCount).toBe(2); // fresh count from the new Building batch, not stale 0
     expect(nextRun.humanNeededNotified).toBe(false); // reset alongside (#63)
     expect(nextRun.mergedThisRun).toEqual([]); // reset alongside (#119)
+  });
 });
 
 // ============================================================================
