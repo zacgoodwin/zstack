@@ -11,11 +11,14 @@
 // size of the window sent on the most recent turn -- which is what "how full
 // am I right now" means and the only thing a context clear affects.
 //
-// Fail-open by construction (bin/z-loop-tick:66-70 discipline): an unresolvable
-// or unreadable transcript returns 0, which never gates -- the run degrades to
-// pre-#131 behavior (drains to real drain-complete) rather than wedging. Only a
-// transcript that IS readable but whose usage keys were renamed still fails
-// loud, via parseLine's format-drift assertion (reused from lib/cost.ts).
+// Fail-open by construction: an unresolvable or unreadable transcript -- and a
+// transcript line that is not even valid JSON, i.e. a live file caught
+// mid-write (#157) -- returns 0 or the last well-formed reading, which never
+// gates, so the run degrades to pre-#131 behavior (drains to real
+// drain-complete) rather than wedging. Only a transcript whose lines ARE valid
+// JSON but whose usage keys were renamed still fails loud, via parseLine's
+// format-drift assertion (reused from lib/cost.ts): the tolerance below is
+// scoped to unparseable text and never swallows format drift.
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -61,12 +64,34 @@ export function resolveSessionTranscript(cwd: string, home = homedir()): string 
   return newest?.path;
 }
 
+function parsesAsJson(line: string): boolean {
+  try {
+    JSON.parse(line);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Current context occupancy from a transcript: the input side (input +
 // cache-read + cache-creation tokens; output excluded) of the LAST assistant
 // line carrying usage -- the size of the window sent on that turn. A missing/
 // unreadable file, or one with no assistant-usage line, returns 0 (fail-open).
-// parseLine keeps its hardened parse + fail-loud key assertion, so a renamed
-// usage key still throws rather than silently under-reading occupancy.
+//
+// #157: a line that is not valid JSON is SKIPPED, not thrown on. The transcript
+// this reads is the orchestrator's own live session file, so the tick can catch
+// it mid-write with a truncated final line -- which used to throw here and left
+// bin/z-loop-tick's `|| echo 0` as the only fail-open, discarding a reading that
+// the earlier, complete lines still carry. Skipping is bounded: a surviving
+// well-formed usage line is a real measurement of an earlier turn, at most one
+// turn stale, which is the same lag resolveSessionTranscript already documents.
+// When NOTHING well-formed survives, the 0 returned means UNKNOWN, not
+// known-small, so that case (and only that case) says so on stderr rather than
+// passing silently for a healthy small window.
+//
+// parseLine keeps its hardened parse + fail-loud key assertion for every line
+// that IS valid JSON, so a renamed usage key still throws rather than silently
+// under-reading occupancy.
 export function currentContextTokens(path: string): number {
   let text: string;
   try {
@@ -75,12 +100,30 @@ export function currentContextTokens(path: string): number {
     return 0; // unreadable -> fail-open
   }
   let last: ReturnType<typeof parseLine> = null;
+  let skipped = 0;
+  let firstSkippedLine = 0;
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
-    const parsed = parseLine(lines[i], `${path}:${i + 1}`);
+    let parsed: ReturnType<typeof parseLine>;
+    try {
+      parsed = parseLine(lines[i], `${path}:${i + 1}`);
+    } catch (e) {
+      if (parsesAsJson(lines[i])) throw e; // valid JSON, wrong shape -> format drift, stays loud
+      if (skipped++ === 0) firstSkippedLine = i + 1;
+      continue;
+    }
     if (parsed) last = parsed;
   }
-  if (!last) return 0;
+  if (!last) {
+    if (skipped > 0) {
+      console.error(
+        `context-budget: ${path}: skipped ${skipped} line(s) that are not valid JSON (first at line ${firstSkippedLine}) ` +
+          `and no well-formed assistant usage line remains, so this reading is 0. That 0 means the context size is UNKNOWN here, ` +
+          `not known-small: the context ceiling cannot gate on it and the run drains as if the ceiling were off.`
+      );
+    }
+    return 0;
+  }
   const u = last.usage;
   return u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
 }

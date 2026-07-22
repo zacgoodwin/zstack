@@ -141,6 +141,15 @@ terminal), so the dead-dependency park never touches it. The allow-list
 persists verbatim across every re-ingest and across a context clear, so the run
 always finishes the exact batch it started.
 
+One case cannot be self-contained: when the walk can flag **nothing** because
+every workable ticket waits on another workable ticket — a dependency cycle, or
+a dependency another live session holds. An empty allow-list would read as
+"drained" and exit the run without ever surfacing that, so the cap admits the
+lowest `ticketLimit` stuck tickets instead and the run handles them exactly as
+an uncapped run does: it waits while another session's dependency is still
+in flight, and otherwise parks the cycle **Blocked** with a dependency-deadlock
+note, one ticket per tick until the batch is terminal.
+
 ### `contextTokenLimit` — a context ceiling with clear-and-resume
 
 The orchestrator is one long-lived session that holds no ticket context by
@@ -155,7 +164,12 @@ cache-creation tokens) of its session transcript's most recent request, via
 `z-cost`); it is how full the window is right now, the only thing a context
 clear actually changes. The reading is **fail-open**: an unresolvable or
 unreadable transcript reads `0`, so a measurement hiccup degrades to no gating
-and never wedges a drain.
+and never wedges a drain. A transcript caught mid-write (its last line
+truncated) falls back to the last complete reading rather than failing — that
+value is a real measurement of an earlier turn. When *no* complete reading
+survives, the tick prints a line saying the size is unknown: the `0` it reports
+means "could not measure", not "the window is small", and the ceiling cannot
+gate on it. A renamed usage key still fails loud, as before.
 
 When the reading reaches the limit, the scheduler stops **claiming** new
 tickets — no new ticket enters Building — while in-flight lanes keep draining

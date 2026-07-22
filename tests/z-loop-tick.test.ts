@@ -449,6 +449,28 @@ describe("z-loop-tick", () => {
     expect(tick).toContain('--context-tokens "$CTX"');
     expect(tick.indexOf("context-budget.ts")).toBeLessThan(tick.indexOf("loop.ts\" ingest"));
   });
+
+  // #157 (#131 review finding 1): #131's cap-evaporation fix rests on THIS
+  // wrapper's per-tick ingest carrying --context-tokens and never
+  // --ticket-limit. A --ticket-limit here sets ticketLimitProvided, which makes
+  // ingestBoardItems start a FRESH batch at the drain boundary and re-selects
+  // (i.e. evaporates) the allow-list mid-run -- the exact bug #131's review
+  // bounce caught. tests/loop.test.ts pins the reducer's behavior GIVEN a
+  // flagless ingest; nothing pinned the wrapper that produces it, so re-adding
+  // the flag used to leave every test green. This reads the command itself.
+  test("#157: the per-tick ingest passes --context-tokens and NEVER --ticket-limit", () => {
+    const tick = readFileSync(Z_LOOP_TICK, "utf8");
+    const ingestCommands = tick
+      .replace(/\\\r?\n\s*/g, " ") // fold backslash continuations, so a multi-line ingest can't slip past
+      .split(/\r?\n/)
+      .filter((l) => !l.trimStart().startsWith("#"))
+      .filter((l) => /loop\.ts"?\s+ingest\b/.test(l));
+    // Exactly one ingest invocation: a second one (or a rename that hides it
+    // from this filter) fails here rather than silently escaping the assertion.
+    expect(ingestCommands.length).toBe(1);
+    expect(ingestCommands[0]).toContain('--context-tokens "$CTX"');
+    expect(ingestCommands[0]).not.toContain("--ticket-limit");
+  });
 });
 
 // ============================================================================

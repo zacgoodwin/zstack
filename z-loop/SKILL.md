@@ -187,7 +187,10 @@ the committed queue is the gated Ready tickets from Step 2, still in Ready
 that Ready count and this is ingest-time-zero for the safety control below. It
 is also where the **per-loop ticket cap** (`--ticket-limit`, #131) flags this
 run's batch: with a non-zero limit, `ingest` captures `batchTickets` -- the
-dependency-self-contained allow-list of at most that many tickets -- once here
+dependency-self-contained allow-list of at most that many tickets (except when
+nothing at all is closable -- a cycle, or a dep another session holds -- where
+it admits the lowest stuck tickets so the deadlock break can park them rather
+than exiting clean, #157) -- once here
 and preserves it across every re-ingest and context clear. At the default `0`
 there is no cap (`batchTickets` stays unset, byte-identical to today). The
 **context ceiling** (`--context-token-limit`, #131) is captured the same way;

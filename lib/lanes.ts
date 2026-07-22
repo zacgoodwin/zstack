@@ -75,11 +75,13 @@ export function deadDeps(t: TicketSnapshot, byNumber: Map<number, TicketSnapshot
 // (byte-identical to pre-#131). Otherwise a Kahn walk modeled on mergeOrder:
 // each round flags the LOWEST-numbered workable ticket whose every dependency
 // is already Done or already flagged, until the cap is hit or no further
-// ticket can be closed. This keeps the batch dependency-self-contained -- a
-// flagged ticket never depends on an un-flagged workable ticket -- so no
-// dependent can wedge waiting on work left out of the run; a dependent whose
-// dependency doesn't make the cap simply stays Ready (a Ready non-batch dep is
-// not terminal, so deadDeps never mis-parks it). Captured ONCE per batch in
+// ticket can be closed. Whenever that walk flags anything, the batch is
+// dependency-self-contained -- a flagged ticket never depends on an un-flagged
+// workable ticket -- so no dependent can wedge waiting on work left out of the
+// run; a dependent whose dependency doesn't make the cap simply stays Ready (a
+// Ready non-batch dep is not terminal, so deadDeps never mis-parks it). The one
+// exception is the stuck fallback below (#157), where the walk can flag nothing
+// and self-containment is impossible by definition. Captured ONCE per batch in
 // ingestBoardItems (persisted on LoopState.batchTickets), not recomputed per
 // tick.
 export function selectBatch(tickets: TicketSnapshot[], ticketLimit: number): number[] | undefined {
@@ -103,6 +105,20 @@ export function selectBatch(tickets: TicketSnapshot[], ticketLimit: number): num
     if (ready.length === 0) break; // nothing further can be closed within the cap
     flagged.add(Math.min(...ready)); // lowest ready first, exactly like mergeOrder
   }
+  // Nothing closable at all (#157): the walk flagged NOTHING while workable
+  // tickets exist, which by the loop condition above means every one of them
+  // waits on a board ticket that is not Done: a dependency cycle, a dep another
+  // session is building, or a dep no run can start (still Backlog, say). An
+  // empty allow-list makes drainComplete read
+  // true, so the run would exit clean without ever surfacing that. Admit the
+  // first `ticketLimit` workable tickets instead -- all of them are stuck, by
+  // the same condition -- and let nextAction decide exactly as it does with no
+  // cap: wait while a dep is another session's in-flight work, park Blocked
+  // otherwise (step 6's dependency-deadlock break, or step 4 once a cycle
+  // member has parked). Each park drops a ticket out of workable status, so the
+  // stuck set strictly shrinks and the batch terminates. A partial batch
+  // (something WAS flagged, just fewer than the cap) is untouched.
+  if (flagged.size === 0) return workable.slice(0, ticketLimit).map((t) => t.number);
   return [...flagged].sort((a, b) => a - b);
 }
 

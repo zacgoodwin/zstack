@@ -62,6 +62,72 @@ describe("currentContextTokens (AC9)", () => {
   test("a missing file returns 0 (fail-open, never throws)", () => {
     expect(currentContextTokens(join(mkTmp(), "does-not-exist.jsonl"))).toBe(0);
   });
+
+  // -- #157: partial-line tolerance (fail-open in the FUNCTION, not just the
+  // wrapper). The transcript read here is the orchestrator's own live session
+  // file, so a tick can catch it mid-write.
+  const assistantLine = (input: number) =>
+    JSON.stringify({
+      type: "assistant",
+      requestId: `req_${input}`,
+      message: { model: "claude-opus-4", id: `msg_${input}`, usage: { input_tokens: input, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
+    });
+
+  function captureStderr(fn: () => void): string {
+    const orig = console.error;
+    let out = "";
+    console.error = (...args: unknown[]) => {
+      out += args.join(" ") + "\n";
+    };
+    try {
+      fn();
+    } finally {
+      console.error = orig;
+    }
+    return out;
+  }
+
+  test("#157 AC3: a truncated FINAL line does not throw -- the last well-formed usage line is returned", () => {
+    const p = join(mkTmp(), "mid-write.jsonl");
+    writeFileSync(p, `${assistantLine(1000)}\n${assistantLine(7000)}\n{"type":"assistant","message":{"usa`);
+    let got = -1;
+    // A real reading survived, so nothing is reported: the value is a complete
+    // measurement of an earlier turn, the same one-flush lag the module already
+    // documents -- not an unknown.
+    const err = captureStderr(() => {
+      got = currentContextTokens(p);
+    });
+    expect(got).toBe(7000);
+    expect(err).toBe("");
+  });
+
+  test("#157 AC3: a transcript with ONLY a truncated line returns 0 AND reports that the size is unknown", () => {
+    const p = join(mkTmp(), "all-partial.jsonl");
+    writeFileSync(p, `{"type":"assistant","message":{"usage":{"input_tok`);
+    let got = -1;
+    const err = captureStderr(() => {
+      got = currentContextTokens(p);
+    });
+    expect(got).toBe(0); // fail-open: never throws, never wedges the drain
+    // ...but that 0 is NOT silently indistinguishable from a healthy small
+    // window: the operator is told the reading is unknown and cannot gate.
+    expect(err).toContain("not valid JSON");
+    expect(err).toContain("UNKNOWN");
+    expect(err).toContain(p);
+  });
+
+  test("#157: the skip is scoped to unparseable text -- a renamed usage key (valid JSON) still fails LOUD", () => {
+    const p = join(mkTmp(), "drift.jsonl");
+    writeFileSync(
+      p,
+      JSON.stringify({
+        type: "assistant",
+        requestId: "req_1",
+        message: { model: "claude-opus-4", id: "msg_1", usage: { input_TOKENS: 5, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
+      }) + "\n"
+    );
+    expect(() => currentContextTokens(p)).toThrow(/input_tokens/);
+  });
 });
 
 describe("resolveSessionTranscript", () => {

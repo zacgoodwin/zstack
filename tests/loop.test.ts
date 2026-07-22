@@ -2019,6 +2019,20 @@ describe("selectBatch (#131 ticket cap)", () => {
     const tickets = [ticket(1, "Ready"), ticket(2, "Ready", [1]), ticket(3, "Ready", [2])];
     expect(selectBatch(tickets, 2)).toEqual([1, 2]); // #3 excluded (its dep #2's chain root closes, but cap hit at 2)
   });
+
+  // #157 (#131 review finding 2): the Kahn walk closes NOTHING when every
+  // workable ticket waits on another workable ticket. It used to return an
+  // empty batch, which drainComplete reads as "drained" -- a silent clean exit
+  // that dropped the cycle. The stuck set is admitted instead, so nextAction's
+  // deadlock break can park it (the no-cap path's behavior).
+  test("#157: a cap over a fully cyclic workable set admits the stuck tickets instead of returning an empty batch", () => {
+    expect(selectBatch([ticket(1, "Ready", [2]), ticket(2, "Ready", [1])], 2)).toEqual([1, 2]);
+    // Still capped: a 3-cycle under cap 2 admits only the 2 lowest.
+    const three = [ticket(1, "Ready", [2]), ticket(2, "Ready", [3]), ticket(3, "Ready", [1])];
+    expect(selectBatch(three, 2)).toEqual([1, 2]);
+    // Nothing workable -> still an empty batch: there is no stuck work to surface.
+    expect(selectBatch([ticket(1, "Done")], 2)).toEqual([]);
+  });
 });
 
 describe("batch-scoped claiming + drain (#131)", () => {
@@ -2069,6 +2083,59 @@ describe("batch-scoped claiming + drain (#131)", () => {
     expect(drainComplete(s.tickets, s.lanes, s.batchTickets)).toBe(true);
     // Without the batch scope those 8 Ready tickets WOULD keep it alive.
     expect(drainComplete(s.tickets, s.lanes)).toBe(false);
+  });
+
+  // #157 AC2 (#131 review finding 2), end to end through the REAL ingest: a cap
+  // over a fully cyclic workable set (#1 depends #2, #2 depends #1). Before the
+  // fix selectBatch returned [], drainComplete read true, and the very first
+  // `next` was drain-complete -- the run exited clean and never surfaced the
+  // cycle. Reverting lanes.ts makes every assertion below fail.
+  test("#157 AC2: a cap over a fully cyclic workable set parks the cycle Blocked instead of exiting clean", () => {
+    const items = [
+      { number: 1, title: "t1", fields: { Status: "Ready" } },
+      { number: 2, title: "t2", fields: { Status: "Ready" } },
+    ];
+    const bodies = { "1": "Depends on #2", "2": "Depends on #1" };
+    const s = ingestBoardItems(null, items, bodies, { ticketLimit: 2, humanNeededPercent: 30 });
+    expect(s.batchTickets).toEqual([1, 2]);
+    expect(drainComplete(s.tickets, s.lanes, s.batchTickets)).toBe(false); // NOT a silent clean exit
+
+    const first = nextAction(s, 0);
+    expect(first).toMatchObject({ kind: "park", ticket: 1, status: "Blocked" });
+    expect((first as any).note).toContain("Dependency deadlock");
+
+    // It TERMINATES, and both cycle members reach a terminal status -- one park
+    // must not leave the other hanging, and the park path must not re-park a
+    // ticket forever (drainHappy throws past 500 steps).
+    const { state: end, log } = drainHappy(s);
+    expect(log[log.length - 1].kind).toBe("drain-complete");
+    expect(log.filter((a) => a.kind === "park").map((a) => (a as any).ticket)).toEqual([1, 2]);
+    expect(end.tickets.map((t) => t.status)).toEqual(["Blocked", "Blocked"]);
+
+    // A 3-cycle under a cap of 3: the first park is the deadlock break, and the
+    // other two then fall to the dead-dependency park (a cycle member is now
+    // Blocked) -- so a longer cycle terminates with ALL of it terminal too,
+    // never one parked and the rest hanging.
+    const cycle3 = state([ticket(1, "Ready", [2]), ticket(2, "Ready", [3]), ticket(3, "Ready", [1])]);
+    cycle3.batchTickets = selectBatch(cycle3.tickets, 3);
+    expect(cycle3.batchTickets).toEqual([1, 2, 3]);
+    const end3 = drainHappy(cycle3);
+    expect(end3.log[end3.log.length - 1].kind).toBe("drain-complete");
+    expect(end3.state.tickets.every((t) => t.status === "Blocked")).toBe(true);
+  });
+
+  // The other half of the same branch: "nothing closable" is NOT always a
+  // cycle. When the block is a dependency ANOTHER live session holds, the
+  // admitted stuck set must WAIT (that session will finish it), never park --
+  // nextAction's step-6 discriminator, unchanged, is what tells the two apart.
+  test("#157: a capped stuck set blocked on another session's in-flight dep waits, never parks", () => {
+    const s = state([
+      ticket(1, "Ready", [2]),
+      ticket(2, "Building", [], { claimedByOther: true }),
+    ]);
+    s.batchTickets = selectBatch(s.tickets, 2);
+    expect(s.batchTickets).toEqual([1]); // #2 is another session's, so only #1 is admitted
+    expect(nextAction(s, 0)).toEqual({ kind: "wait" });
   });
 
   // #131 review-bounce finding 1 (SEVERE) + finding 2 (MEDIUM): the real
