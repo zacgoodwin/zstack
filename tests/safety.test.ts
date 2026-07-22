@@ -10,7 +10,7 @@
 //   5. Quota exhaustion mid-loop: sweep pauses then resumes      -> "quota guard"
 //   6. Human moves a ticket mid-loop: the lane stops cleanly     -> "wave reconcile"
 import { test, expect, describe, afterEach } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -302,6 +302,14 @@ describe("orphaned reconcile claim self-heals (#144)", () => {
     writeFileSync(p, JSON.stringify(claim) + "\n");
     return p;
   }
+  // A pre-#144 claim: bare session string, no payload -- only its mtime dates it.
+  function seedLegacyClaim(dir: string, ageMs: number): string {
+    const p = `${loopLockPath(dir)}.reconcile`;
+    writeFileSync(p, "old-session\n");
+    const when = new Date(Date.now() - ageMs);
+    utimesSync(p, when, when);
+    return p;
+  }
   function reconcile(dir: string, session: string) {
     return acquireLoopLock(dir, { session, startedAt: NOW }, { nowMs: NOW, stalenessMs: STALE, reconcile: true });
   }
@@ -364,6 +372,96 @@ describe("orphaned reconcile claim self-heals (#144)", () => {
     expect(existsSync(claimPath)).toBe(false); // the winner released the claim
   });
 
+  // The test above can serialize by luck: judging a no-pid claim is pure fs work, so
+  // one racer often finishes the whole takeover before the next reads the claim. This
+  // one holds the racers OPEN inside the judgment: a claim carrying a live-but-RECYCLED
+  // pid (the #14 H12 case) forces every racer to shell out for the pid's start-time
+  // before it can call the claim dead, so they all leave that judgment together. A
+  // takeover that unlinks the dead claim and re-creates it is NOT a compare-and-swap
+  // under that load -- each racer deletes the claim the previous one just created and
+  // "wins" too (6-8 winners of 8, measured). Superseding by exclusive-create of the
+  // next generation never unlinks, so the create alone picks the winner.
+  test("N concurrent reconciles over a live-but-RECYCLED-pid claim: exactly one wins", async () => {
+    const dir = tmp();
+    mkdirSync(dir, { recursive: true });
+    // This test process is definitely alive; the recorded start-time cannot match it,
+    // so both files read "alive but recycled" => stale, at the cost of a real probe.
+    const recycled = { startedAt: 0, pid: process.pid, host: hostname(), startTime: "recycled" };
+    writeFileSync(loopLockPath(dir), JSON.stringify({ session: "crashed", ...recycled }) + "\n");
+    const claimPath = `${loopLockPath(dir)}.reconcile`;
+    writeFileSync(claimPath, JSON.stringify({ session: "killed", ...recycled }) + "\n");
+    const now = 10 * 60_000; // --staleness-minutes 1 => both seeded files are stale
+    const procs = Array.from({ length: 8 }, (_, i) =>
+      Bun.spawn(
+        ["bun", LOCKS, "acquire", "--dir", dir, "--session", `sess-${i}`, "--reconcile", "--now", String(now), "--staleness-minutes", "1"],
+        { stdout: "pipe", stderr: "pipe" }
+      )
+    );
+    const codes = await Promise.all(procs.map((p) => p.exited));
+    expect(codes.filter((c) => c === 0).length).toBe(1); // the mutual exclusion the claim exists for
+    expect(readLoopLock(dir)!.session).toMatch(/^sess-\d$/);
+    // The winner drops every generation it superseded, so the next run starts clean.
+    expect(existsSync(claimPath)).toBe(false);
+    expect(existsSync(`${claimPath}.1`)).toBe(false);
+  });
+
+  // Superseding leaves the dead generation on disk, so a crash inside the NEW claimed
+  // section must be recoverable the same way -- the chain never wedges, however deep.
+  test("a superseded generation that is itself orphaned self-heals again", () => {
+    const dir = tmp();
+    seedStale(dir);
+    const gen0 = seedClaim(dir, { session: "killed-1", startedAt: 0 });
+    const gen1 = `${gen0}.1`;
+    writeFileSync(gen1, JSON.stringify({ session: "killed-2", startedAt: 0 }) + "\n");
+
+    const res = reconcile(dir, "fresh");
+    expect(res.acquired).toBe(true);
+    expect(readLoopLock(dir)!.session).toBe("fresh");
+    expect(existsSync(gen0)).toBe(false); // every generation released, including ours
+    expect(existsSync(gen1)).toBe(false);
+    expect(existsSync(`${gen0}.2`)).toBe(false);
+  });
+
+  // The generation IN FORCE is the highest one, not the base file: a live reconcile that
+  // superseded an orphan must not be clobbered by a racer judging the orphan it replaced.
+  test("a live higher generation defers, even though the one it superseded is dead", () => {
+    const dir = tmp();
+    seedStale(dir);
+    const gen0 = seedClaim(dir, { session: "killed", startedAt: 0 }); // the orphan A superseded
+    const live = { session: "racer-A", startedAt: 0, pid: process.pid, host: hostname(), startTime: processStartTime(process.pid)! };
+    writeFileSync(`${gen0}.1`, JSON.stringify(live) + "\n"); // A, provably running
+
+    const res = reconcile(dir, "racer-B");
+    expect(res.acquired).toBe(false);
+    expect(res.reason).toBe("stale"); // still stale under A's claim
+    expect(readLoopLock(dir)!.session).toBe("crashed"); // B did not overwrite the lock
+    expect(JSON.parse(readFileSync(`${gen0}.1`, "utf8"))).toEqual(live); // A's claim untouched
+  });
+
+  // A pre-#144 claim is a bare session string: no payload, so only its mtime is legible.
+  // mtime is wall-clock and nowMs is injectable, so the age must be measured against one
+  // consistent clock -- comparing a real mtime to an injected nowMs made a day-old orphan
+  // read as live (negative age) and wedge, which is the bug #144 removes.
+  test("a legacy bare-session claim is judged by its real age under an injected clock", () => {
+    const dir = tmp();
+    seedStale(dir);
+    const claimPath = seedLegacyClaim(dir, 24 * 3600_000); // orphaned a day ago
+    const res = reconcile(dir, "fresh"); // NOW is a small injected clock, not wall time
+    expect(res.acquired).toBe(true);
+    expect(readLoopLock(dir)!.session).toBe("fresh");
+    expect(existsSync(claimPath)).toBe(false);
+  });
+
+  test("a legacy bare-session claim younger than the staleness window still defers", () => {
+    const dir = tmp();
+    seedStale(dir);
+    const claimPath = seedLegacyClaim(dir, 0); // written just now: a reconcile is running
+    const res = reconcile(dir, "fresh");
+    expect(res.acquired).toBe(false);
+    expect(res.reason).toBe("stale"); // the loop lock is still the stale one, under the claim
+    expect(readLoopLock(dir)!.session).toBe("crashed");
+    expect(readFileSync(claimPath, "utf8")).toBe("old-session\n"); // untouched
+  });
 });
 
 describe("staleness-minutes validation (M19)", () => {
