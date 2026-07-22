@@ -282,6 +282,61 @@ describe("z-loop-tick", () => {
     expect(written.humanNeededNotified).not.toBe(true);
   });
 
+  // #150: driven through two REAL wrapper ticks against the same --state file
+  // (not a hand-built prev), so state.json's persistence across invocations is
+  // what's under test, not just ingestBoardItems in isolation. Tick 1 leaves 3
+  // Blocked tickets fully drained with nothing else on the board -- a stand-in
+  // for "already parked from before this batch started". Tick 2 introduces a
+  // fresh batch of 10 Ready tickets while those 3 stay Blocked, untouched --
+  // the control must read 0%, not the false 3/10 = 30% a board-wide count
+  // would produce before a single lane of the new batch has run.
+  test("#150: a fresh batch's human-needed.json ignores 3 pre-existing Blocked tickets from a prior drained batch", () => {
+    const dir = mkTmp();
+    const home = makeConfigHome();
+    const tickTmp = join(dir, "tick-tmp");
+    const tickState = join(dir, "tick-state.json");
+
+    const priorItems = JSON.stringify([
+      { number: 1, title: "old1", url: "http://x/1", fields: { Status: "Blocked" } },
+      { number: 2, title: "old2", url: "http://x/2", fields: { Status: "Blocked" } },
+      { number: 3, title: "old3", url: "http://x/3", fields: { Status: "Blocked" } },
+    ]);
+    const priorBodies = JSON.stringify({ "1": "no deps", "2": "no deps", "3": "no deps" });
+    const stub = writeStubZBoard(dir, priorItems, priorBodies);
+    const tick1 = Bun.spawnSync(
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp],
+      { env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
+    );
+    expect(tick1.exitCode).toBe(0);
+    expect(JSON.parse(readFileSync(tickState, "utf8")).initialReadyCount).toBe(0); // nothing Ready yet, sanity
+
+    const freshNums = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+    const freshItems = JSON.stringify([
+      { number: 1, title: "old1", url: "http://x/1", fields: { Status: "Blocked" } },
+      { number: 2, title: "old2", url: "http://x/2", fields: { Status: "Blocked" } },
+      { number: 3, title: "old3", url: "http://x/3", fields: { Status: "Blocked" } },
+      ...freshNums.map((n) => ({ number: n, title: `r${n}`, url: `http://x/${n}`, fields: { Status: "Ready" } })),
+    ]);
+    const freshBodies = JSON.stringify(Object.fromEntries([1, 2, 3, ...freshNums].map((n) => [String(n), "no deps"])));
+    writeStubZBoard(dir, freshItems, freshBodies); // same stub path -- overwrites with the new board
+
+    const tick2 = Bun.spawnSync(
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp],
+      { env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
+    );
+    expect(tick2.exitCode).toBe(0);
+    const lines = tick2.stdout.toString().split(/\r?\n/).filter((l) => l.trim() !== "");
+    expect(JSON.parse(lines[0])).toEqual({ kind: "claim", ticket: 4, stage: "builder" });
+
+    const state = JSON.parse(readFileSync(tickState, "utf8"));
+    expect(state.initialReadyCount).toBe(10); // only the 10 new Ready, not the 3 old Blocked
+    expect(state.initialBatchTickets).toEqual(freshNums);
+
+    const hn = JSON.parse(readFileSync(join(tickTmp, "human-needed.json"), "utf8"));
+    expect(hn.blocked).toBe(0); // the 3 pre-existing Blocked tickets are excluded
+    expect(hn.tripped).toBe(false); // 0/10 = 0%, no false trip before a single lane of this batch ran
+  });
+
   // The test above only exercises the failure/unconfigured branch (`SENT` !=
   // "sent") of z-loop-tick's `[ "$SENT" = "sent" ] && human-needed-ack` line;
   // nothing previously drove the success branch end-to-end through the real
