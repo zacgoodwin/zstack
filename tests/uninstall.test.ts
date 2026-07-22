@@ -24,6 +24,15 @@ const REPO_ROOT = join(import.meta.dir, "..");
 const UNINSTALL_PATH = join(REPO_ROOT, "uninstall");
 const SKILL_PATH = join(REPO_ROOT, "z-uninstall", "SKILL.md");
 
+// A runnable `uninstall` in `dir`: the script plus lib/realpath.sh, which it
+// sources at startup (shared with ./setup so the ownership rule can never drift
+// between the two halves). A pack missing it cannot run at all.
+function putUninstall(dir: string): void {
+  cpSync(UNINSTALL_PATH, join(dir, "uninstall"));
+  mkdirSync(join(dir, "lib"), { recursive: true });
+  cpSync(join(REPO_ROOT, "lib", "realpath.sh"), join(dir, "lib", "realpath.sh"));
+}
+
 // Extract the FIRST ```bash fenced block from SKILL.md — the pack-resolution
 // snippet the skill prescribes before Step 2. AC2 runs THIS snippet (not a copy
 // of it) so a regression in the skill's own resolution trips the gate. Normalize
@@ -243,7 +252,7 @@ describe("#49 AC2 — symlinked pack: /z-uninstall keeps bin/z-setup-permissions
     // A real clone elsewhere, carrying bin/ and the real uninstall script.
     const clone = join(home, "zstack-clone");
     mkdirSync(join(clone, "bin"), { recursive: true });
-    cpSync(UNINSTALL_PATH, join(clone, "uninstall"));
+    putUninstall(clone);
     writeFileSync(join(clone, "bin", "z-setup-permissions"), "#!/usr/bin/env bash\necho ok\n");
     // The canonical macOS/Linux install: the pack entry is a symlink into the clone.
     symlinkSync(clone, join(skills, "zstack"));
@@ -282,7 +291,7 @@ describe("#49 AC3 — a sentinel COPY running its own uninstall is a 'registered
     // and we run THAT copy's own uninstall (so PACK_DIR == the copy).
     const copy = join(skills, "zstack");
     mkdirSync(copy, { recursive: true });
-    cpSync(UNINSTALL_PATH, join(copy, "uninstall"));
+    putUninstall(copy);
     writeFileSync(join(copy, ".zstack-registered"), "Created by zstack ./setup.\n");
     // The sweep list is derived from PACK_DIR/z-*/SKILL.md dirs (mirrors
     // setup's register()), so a realistic copy fixture needs the skill's
@@ -351,7 +360,7 @@ describe("AC2 — the pack cloned directly at the skills dir is left, rm -rf pri
     // uninstall script into it so PACK_DIR resolves to this location.
     const clone = join(skills, "zstack");
     mkdirSync(clone, { recursive: true });
-    cpSync(UNINSTALL_PATH, join(clone, "uninstall"));
+    putUninstall(clone);
     writeFileSync(join(clone, "VERSION"), "0.1.0\n"); // no sentinel: it's a clone
     // The sweep list is derived from PACK_DIR/z-*/SKILL.md dirs (mirrors
     // setup's register()), so a realistic clone fixture needs the skill's
@@ -432,7 +441,7 @@ describe("AC5 / #49 AC4 — running twice: the second run's output matches the d
     mkdirSync(skills, { recursive: true });
     const clone = join(skills, "zstack");
     mkdirSync(clone, { recursive: true });
-    cpSync(UNINSTALL_PATH, join(clone, "uninstall"));
+    putUninstall(clone);
     writeFileSync(join(clone, "VERSION"), "0.1.0\n"); // no sentinel: a bare clone
 
     const first = runUninstall({ home, uninstallPath: join(clone, "uninstall") });
@@ -460,7 +469,7 @@ describe("AC5 / #49 AC4 — running twice: the second run's output matches the d
     mkdirSync(skills, { recursive: true });
     const copy = join(skills, "zstack");
     mkdirSync(copy, { recursive: true });
-    cpSync(UNINSTALL_PATH, join(copy, "uninstall"));
+    putUninstall(copy);
     writeFileSync(join(copy, ".zstack-registered"), "Created by zstack ./setup.\n"); // sentinel: a registered copy
 
     const first = runUninstall({ home, uninstallPath: join(copy, "uninstall") });

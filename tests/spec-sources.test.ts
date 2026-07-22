@@ -9,7 +9,8 @@ import { test, expect, describe, beforeEach, afterEach, spyOn } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { discoverSpecSources, main, searchedDirs, ZError, type SpecSource } from "../lib/spec-sources.ts";
+import { discoverSpecSources, main, searchedDirs, type SpecSource } from "../lib/spec-sources.ts";
+import { ZError } from "../lib/config.ts";
 
 const dirs: string[] = [];
 function projectDir(): string {

@@ -10,13 +10,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   Board,
-  ZError,
   ghExecutor,
   type GraphQLExecutor,
   type GraphQLData,
   type GhSpawn,
   type GhProc,
 } from "../lib/board.ts";
+import { ZError } from "../lib/config.ts";
 import { loadConfig, resolveSlug, type BoardConfig } from "../lib/config.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
@@ -260,7 +260,7 @@ describe("list", () => {
         },
       })
     );
-    await expect(board.list("Todo")).rejects.toThrow(/same endCursor/);
+    await expect(board.list("Todo")).rejects.toThrow(/endCursor "CUR_STUCK" twice in a row/);
     expect(fetches).toBe(2); // page 1 issued CUR_STUCK, page 2 repeated it
   });
 

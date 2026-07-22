@@ -35,8 +35,6 @@ import {
 } from "./config.ts";
 import type { Stage } from "./loop.ts";
 
-export { ZError } from "./config.ts";
-
 // -- shapes -------------------------------------------------------------------
 
 export interface LaneLock {

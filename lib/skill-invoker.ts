@@ -7,15 +7,13 @@
 // so "green path invoked land-and-deploy -> canary -> document-release, in
 // that order" (issue #9 AC2) is a fact on disk, not a claim in prose.
 //
-// Same discipline as lib/locks.ts: paths are always injected. createFileInvoker
-// is the only production implementation and it takes a log path explicitly;
-// createRecordingInvoker is the in-memory test double tests assert against.
+// Same discipline as lib/locks.ts: paths are always injected. createInvoker
+// takes its log path explicitly, and omitting it yields the in-memory shape
+// tests assert against.
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { handleCliError, parseFlags, requireFlag } from "./cli.ts";
 import { ZError } from "./config.ts";
-
-export { ZError } from "./config.ts";
 
 export const SKILL_NAMES = [
   "qa-only",
@@ -46,36 +44,21 @@ function assertSkillName(skill: string): asserts skill is SkillName {
   }
 }
 
-// Production invoker: appends each invocation as a JSON line to logPath (a
-// file under the loop's report dir), so the order the orchestrator actually
-// invoked skills in survives a crash and is reviewable after the fact.
-export function createFileInvoker(logPath: string, now: () => number = Date.now): SkillInvoker {
+// Appends each invocation as a JSON line to logPath (a file under the loop's
+// report dir), so the order the orchestrator actually invoked skills in
+// survives a crash and is reviewable after the fact. `logPath` omitted =
+// in-memory only, zero filesystem writes -- the shape tests/endloop.test.ts
+// drives the red/green fixtures through, asserting on .log() directly. One
+// implementation: the persistence is the only thing that ever differed.
+export function createInvoker(logPath?: string, now: () => number = Date.now): SkillInvoker {
   const calls: SkillInvocation[] = [];
-  mkdirSync(dirname(logPath), { recursive: true });
+  if (logPath !== undefined) mkdirSync(dirname(logPath), { recursive: true });
   return {
     invoke(skill, note) {
       assertSkillName(skill);
       const entry: SkillInvocation = note !== undefined ? { skill, atMs: now(), note } : { skill, atMs: now() };
       calls.push(entry);
-      appendFileSync(logPath, JSON.stringify(entry) + "\n");
-      return entry;
-    },
-    log() {
-      return [...calls];
-    },
-  };
-}
-
-// Test double: identical contract, in-memory only, zero filesystem writes.
-// tests/endloop.test.ts drives the red/green fixtures through this and asserts
-// on .log() directly.
-export function createRecordingInvoker(now: () => number = () => 0): SkillInvoker {
-  const calls: SkillInvocation[] = [];
-  return {
-    invoke(skill, note) {
-      assertSkillName(skill);
-      const entry: SkillInvocation = note !== undefined ? { skill, atMs: now(), note } : { skill, atMs: now() };
-      calls.push(entry);
+      if (logPath !== undefined) appendFileSync(logPath, JSON.stringify(entry) + "\n");
       return entry;
     },
     log() {
@@ -105,7 +88,7 @@ export function main(argv: string[]): number {
       const skill = requireFlag(flags, "skill");
       assertSkillName(skill);
       const note = typeof flags.note === "string" ? flags.note : undefined;
-      const invoker = createFileInvoker(logPath);
+      const invoker = createInvoker(logPath);
       const entry = invoker.invoke(skill, note);
       console.log(JSON.stringify(entry));
       return 0;

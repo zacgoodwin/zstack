@@ -13,14 +13,11 @@
 // pure outputs into them (bin/z-board create, the Skill tool, lib/skill-invoker
 // for the audit log).
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { atomicWrite, handleCliError, readJson } from "./cli.ts";
-import { TERMINAL_STATUSES, ZError, projectsDir } from "./config.ts";
+import { TERMINAL_STATUSES, ZError } from "./config.ts";
 import { sumByStage, type FileSpend } from "./cost.ts";
 import type { CompletionEdge } from "./stage-prompts.ts";
 
-export { ZError } from "./config.ts";
 export type { CompletionEdge } from "./stage-prompts.ts";
 export { sumByStage } from "./cost.ts";
 
@@ -89,10 +86,6 @@ export function endLoopPlan(
 }
 
 // -- loop counter: read/increment/persist, atomic write, missing file = 0 -------
-
-export function defaultLoopCounterPath(slug: string, home = homedir()): string {
-  return join(projectsDir(home), slug, "loop-counter");
-}
 
 // Counter writes go through lib/cli.ts atomicWrite (tmp + rename) so a
 // concurrent reader never observes a half-written counter.

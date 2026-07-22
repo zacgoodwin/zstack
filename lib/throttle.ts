@@ -12,8 +12,6 @@ import { join } from "node:path";
 import { atomicWrite, handleCliError, parseFlags, requireFlag } from "./cli.ts";
 import { loadConfig, projectsDir, ZError } from "./config.ts";
 
-export { ZError } from "./config.ts";
-
 // -- on-disk paths (always injected; main() is the only default) ------------
 
 // Loop-tick state dir for a project: where bin/z-loop-tick persists the
