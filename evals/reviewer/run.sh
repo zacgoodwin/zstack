@@ -62,7 +62,10 @@ for i in $(seq 1 "$RUNS"); do
     {adversarialMarker, singlePassMarker, namesDefect, adversarialConfidence, pass}." \
     --add-dir "$OUT" --add-dir "$HERE" > "$OUT/grade-$i.json"
 
-  if [ "$(bun -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).pass===true)" "$OUT/grade-$i.json")" = "true" ]; then
+  # Write a plain string token, not a boolean: bun's console.log colorizes a
+  # bare boolean (\e[33mtrue\e[0m) even into a pipe, which no `= "true"` compare
+  # would ever match. process.stdout.write of a string never does.
+  if [ "$(bun -e "process.stdout.write(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).pass===true ? 'PASS' : 'FAIL')" "$OUT/grade-$i.json")" = "PASS" ]; then
     pass=$((pass+1))
   fi
 done
