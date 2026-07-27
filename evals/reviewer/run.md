@@ -58,6 +58,18 @@ Exit 0 = the fan-out beat single-pass on the planted defect in ≥ 4/5 trials;
 exit 1 = below threshold, with the per-trial grades in the run's temp output
 dir (printed on stdout) either way.
 
+**Exit 2 = HARNESS ERROR**, a distinct outcome from a low score: at least one
+grade file could not be read, so no measurement was taken. The reason for each
+unreadable grade is printed. Do not record an exit-2 run in "## Results" — rerun
+it. This exists because the grader is a live model writing free-form text, and
+`run.sh` used to parse it inline with a bare `JSON.parse`: a ```` ```json ````
+fence (which the grader emits more often than not) threw, and the trial scored
+FAIL regardless of the verdict. `evals/lib/grade.ts` now owns the extraction and
+tells "graded FAIL" apart from "unreadable" (#108).
+
+On a Windows/Git-Bash box, note `/tmp` is `%LOCALAPPDATA%\Temp` — the printed
+artifact path resolves there, not to a literal `C:\tmp`.
+
 ## Verifying the harness offline (free)
 
 The fixture and both prompts are checkable with zero cost — this asserts the

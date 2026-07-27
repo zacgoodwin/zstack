@@ -19,9 +19,15 @@ if [[ "$PROMPT" == *"Grade one reviewer trial"* ]]; then
     prose-nit) m=REVIEW-APPROVE;  b=false ;;
     *)         m=REVIEW-FINDINGS; b=true  ;;
   esac
-  cat << GRADE
-{"marker":"$m","blocked":$b,"namesIssue":true,"pass":${MOCK_CLAUDE_PASS:-true}}
-GRADE
+  GRADE_JSON="{\"marker\":\"$m\",\"blocked\":$b,\"namesIssue\":true,\"pass\":${MOCK_CLAUDE_PASS:-true}}"
+  # See evals/reviewer/mock-claude.sh: MOCK_CLAUDE_GRADE_WRAP reproduces the
+  # real grader's actual reply shapes, which bare JSON alone never did (#108).
+  case "${MOCK_CLAUDE_GRADE_WRAP:-none}" in
+    fence)  printf '```json\n%s\n```\n' "$GRADE_JSON" ;;
+    prose)  printf 'Here is the grade for this trial:\n\n%s\n\nLet me know if you need the reasoning.\n' "$GRADE_JSON" ;;
+    garbage) printf 'I was unable to grade this trial.\n' ;;
+    *)      printf '%s\n' "$GRADE_JSON" ;;
+  esac
   exit 0
 fi
 

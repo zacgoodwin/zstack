@@ -46,6 +46,7 @@ bun "$REPO/lib/stage-prompts.ts" prompt reviewer "$OUT/input.json" --adversarial
 bun "$REPO/lib/stage-prompts.ts" prompt reviewer "$OUT/input.json" --adversarial-mode always  > "$OUT/adversarial.txt"
 
 pass=0
+unreadable=0
 for i in $(seq 1 "$RUNS"); do
   # 4. Drive each prompt through a fresh live Agent (local Claude Code). The
   #    adversarial run fans out skeptics via the Agent tool from inside this run.
@@ -62,13 +63,28 @@ for i in $(seq 1 "$RUNS"); do
     {adversarialMarker, singlePassMarker, namesDefect, adversarialConfidence, pass}." \
     --add-dir "$OUT" --add-dir "$HERE" > "$OUT/grade-$i.json"
 
-  # Write a plain string token, not a boolean: bun's console.log colorizes a
-  # bare boolean (\e[33mtrue\e[0m) even into a pipe, which no `= "true"` compare
-  # would ever match. process.stdout.write of a string never does.
-  if [ "$(bun -e "process.stdout.write(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).pass===true ? 'PASS' : 'FAIL')" "$OUT/grade-$i.json")" = "PASS" ]; then
-    pass=$((pass+1))
-  fi
+  # The grader is a live model writing free-form text, so its JSON arrives
+  # fenced, prose-wrapped, or schema-drifted as often as not. evals/lib/grade.ts
+  # owns that extraction and, critically, separates a graded FAIL from a grade
+  # nobody could read -- parsing it inline used to throw on a ```json fence and
+  # score the trial FAIL regardless of the verdict (#108).
+  verdict="$(bun "$REPO/evals/lib/grade.ts" "$OUT/grade-$i.json" 2>>"$OUT/grade-errors.log" || true)"
+  case "$verdict" in
+    PASS) pass=$((pass+1)) ;;
+    FAIL) ;;
+    *)    unreadable=$((unreadable+1)) ;;
+  esac
 done
+
+# An unreadable grade is a harness failure, not evidence about the reviewer. Say
+# so and exit distinctly (2) rather than reporting a score that measures nothing
+# -- the failure mode that made #108's paid run look like a real 0/5.
+if [ "$unreadable" -gt 0 ]; then
+  echo "HARNESS ERROR: $unreadable of $RUNS grader outputs were unreadable; the tally below is not a measurement."
+  [ -f "$OUT/grade-errors.log" ] && sed 's/^/  /' "$OUT/grade-errors.log"
+  echo "artifacts in $OUT"
+  exit 2
+fi
 
 echo "adversarial surfaced the defect in $pass/$RUNS trials (pass threshold: 4/5)"
 echo "artifacts in $OUT"

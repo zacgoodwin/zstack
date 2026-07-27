@@ -22,6 +22,7 @@ CLAUDE_CMD="${CLAUDE_CMD:-claude -p}"
 NEED=$(( (RUNS * 4 + 4) / 5 ))   # ceil(0.8 * RUNS): >=4/5, and sane for a RUNS=1 smoke
 FIXTURES=(prose-nit weakened-ac wrong-runbook)
 overall=0
+harness_error=0
 
 for fix in "${FIXTURES[@]}"; do
   FIXDIR="$HERE/fixtures/$fix"
@@ -52,6 +53,7 @@ for fix in "${FIXTURES[@]}"; do
   bun "$REPO/lib/stage-prompts.ts" prompt reviewer "$OUT/input.json" --adversarial-mode off > "$OUT/prompt.txt"
 
   pass=0
+  unreadable=0
   for i in $(seq 1 "$RUNS"); do
     # 4. Drive a fresh live reviewer, then a fresh local grader. MOCK_FIXTURE
     #    selects the mock's canned output per fixture; real claude -p ignores it
@@ -62,17 +64,32 @@ for fix in "${FIXTURES[@]}"; do
       Return ONLY the JSON object rubric.md specifies: {marker, blocked, namesIssue, pass}." \
       --add-dir "$OUT" --add-dir "$HERE" > "$OUT/grade-$i.json"
 
-    # Write a plain string token, not a boolean: bun's console.log colorizes a
-    # bare boolean (\e[33mtrue\e[0m) even into a pipe, which no `= "true"`
-    # compare would ever match. process.stdout.write of a string never does.
-    if [ "$(bun -e "process.stdout.write(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).pass===true ? 'PASS' : 'FAIL')" "$OUT/grade-$i.json")" = "PASS" ]; then
-      pass=$((pass+1))
-    fi
+    # The grader is a live model writing free-form text, so its JSON arrives
+    # fenced, prose-wrapped, or schema-drifted as often as not. evals/lib/grade.ts
+    # owns that extraction and, critically, separates a graded FAIL from a grade
+    # nobody could read -- parsing it inline used to throw on a ```json fence and
+    # score the trial FAIL regardless of the verdict (#108).
+    verdict="$(bun "$REPO/evals/lib/grade.ts" "$OUT/grade-$i.json" 2>>"$OUT/grade-errors.log" || true)"
+    case "$verdict" in
+      PASS) pass=$((pass+1)) ;;
+      FAIL) ;;
+      *)    unreadable=$((unreadable+1)) ;;
+    esac
   done
+
+  if [ "$unreadable" -gt 0 ]; then
+    # A harness failure, not evidence about the reviewer -- never let it read as
+    # a low score (#108).
+    echo "[$fix] HARNESS ERROR: $unreadable of $RUNS grader outputs were unreadable  artifacts=$OUT"
+    [ -f "$OUT/grade-errors.log" ] && sed 's/^/  /' "$OUT/grade-errors.log"
+    harness_error=1
+    continue
+  fi
 
   echo "[$fix] correct classification in $pass/$RUNS trials (need $NEED)  artifacts=$OUT  worktree=$WORKTREE"
   [ "$pass" -ge "$NEED" ] || overall=1
 done
 
+[ "$harness_error" -eq 0 ] || { echo "HARNESS ERROR: at least one fixture produced unreadable grades; no score was measured."; exit 2; }
 [ "$overall" -eq 0 ] || { echo "FAIL: a fixture fell below threshold"; exit 1; }
 echo "PASS"

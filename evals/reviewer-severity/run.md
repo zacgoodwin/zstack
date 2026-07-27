@@ -23,6 +23,11 @@ evals/reviewer-severity/run.sh 5
 `RUNS` defaults to 5. The per-fixture bar is `ceil(0.8 * RUNS)` correct trials
 (≥ 4 of 5); the run PASSES only when all three fixtures clear it.
 
+Exit 1 = a fixture fell below its bar. **Exit 2 = HARNESS ERROR**: a grade file
+could not be read, so nothing was measured — rerun rather than recording it.
+Grade extraction is shared with `evals/reviewer/` via `evals/lib/grade.ts`, which
+handles the fenced and prose-wrapped JSON a live grader actually emits (#108).
+
 ## The three fixtures
 
 | Fixture | Diff | Correct verdict |

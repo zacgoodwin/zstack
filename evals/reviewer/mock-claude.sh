@@ -23,9 +23,17 @@ if [[ "$PROMPT" == *"Grade one reviewer trial"* ]]; then
   # GRADE step: rubric.md's JSON shape. Only `pass` is overridable
   # (MOCK_CLAUDE_PASS) so a test can drive the >=4/5 threshold both ways
   # without touching the other fields.
-  cat << GRADE
-{"adversarialMarker":"REVIEW-FINDINGS","singlePassMarker":"REVIEW-APPROVE","namesDefect":true,"adversarialConfidence":0,"pass":${MOCK_CLAUDE_PASS:-true}}
-GRADE
+  GRADE_JSON="{\"adversarialMarker\":\"REVIEW-FINDINGS\",\"singlePassMarker\":\"REVIEW-APPROVE\",\"namesDefect\":true,\"adversarialConfidence\":0,\"pass\":${MOCK_CLAUDE_PASS:-true}}"
+  # MOCK_CLAUDE_GRADE_WRAP reproduces how the REAL grader formats its reply.
+  # Bare JSON was the only shape this mock ever emitted, which is why the paid
+  # run on #108 hit a fence-parse bug the free smoke test could not see: 4 of 5
+  # real grade files came back fenced and scored FAIL regardless of verdict.
+  case "${MOCK_CLAUDE_GRADE_WRAP:-none}" in
+    fence)  printf '```json\n%s\n```\n' "$GRADE_JSON" ;;
+    prose)  printf 'Here is the grade for this trial:\n\n%s\n\nLet me know if you need the reasoning.\n' "$GRADE_JSON" ;;
+    garbage) printf 'I was unable to grade this trial.\n' ;;
+    *)      printf '%s\n' "$GRADE_JSON" ;;
+  esac
 elif [[ "$PROMPT" == *"Super-truth pass"* ]]; then
   # ADVERSARIAL prompt (only the adversarial branch carries this section
   # header, per lib/stage-prompts.ts's reviewerPrompt): canned fan-out finding
