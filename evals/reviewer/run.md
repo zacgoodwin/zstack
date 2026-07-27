@@ -226,3 +226,85 @@ half-open boundary, untested by the shipped suite); one stale parenthetical
 the old fixture, and the grading contract's "or the untested boundary case"
 disjunct covers the shipped defect regardless.
 
+
+**2026-07-27, ticket #108 round 3 (option (a): enlarge the fixture). Fixture
+enlarged and verified; it still does NOT discriminate, and the reason is
+structural rather than a matter of size.**
+
+The fixture went from 45 lines of source with one function to a realistic
+two-module keyed limiter: `src/window.ts` (three tiling helpers) plus
+`src/limiter.ts` (`KeyedRateLimiter` with `allow` / `peek` / `remaining` /
+`retryAfterMs` / `reset` / `resetAll` / `sweep` / `size`), 433 patch lines
+across 4 files, 9 acceptance criteria, 12 independent edge classes, 37 shipped
+tests. The planted defect moved to `peek`, which hand-rolls its window
+membership test as `now - bucket.windowStart <= this.durationMs` (closed)
+instead of routing through `withinWindow` (half-open). It is wrong ONLY at the
+exact boundary tick AND only when the bucket is exhausted — a two-condition
+conjunction requiring a three-call stateful construction that no acceptance
+criterion states.
+
+Verified mechanically before any reviewer saw it: the shipped suite is 37/37
+green with the defect present; an exhaustive differential (`peek` vs a twin
+limiter's `allow` across limits 1-3, durations 100/500, five call sequences,
+every probe tick to 2200) finds exactly 14 mismatches, ALL of them at
+`probe - windowStart == durationMs` and none anywhere else; `remaining`,
+`retryAfterMs`, `sweep` and a 20,000-step `allow` budget walk are correct
+throughout. Changing the one character to `<` drops the differential to 0
+mismatches and keeps the suite 37/37 green. The module has exactly one defect,
+in exactly the intended place.
+
+**Red-team result: 6 single-pass reviewers, 6 catches, across two designs.**
+Rather than spend the paid run to find out, the real single-pass prompt (built
+by `stage-prompts.ts prompt reviewer --adversarial-mode off`) was driven
+against the fixture by six independent frontier reviewers with code execution
+and an isolated materialized worktree each. Every one returned
+`REVIEW-FINDINGS` naming the defect at `src/limiter.ts:91` with a correct
+repro. A first design was killed by an acceptance criterion that stated a
+cross-function invariant ("any two parts of the module asked about the same
+tick agree on which window it is in") — all three reviewers executed it
+verbatim as a property check, the identical failure that killed round 1's
+stated invariant. Removing that clause and adding `peek` tests at ticks 1499,
+1500 and 1501 (all passing, so `peek` reads as thoroughly boundary-tested) did
+not help: the second three reviewers additionally identified the boundary test
+as constructed-to-pass, because it uses `limit 2` with a single charge where
+its neighbours use `limit 1`.
+
+**Why enlarging cannot fix this.** All six reviewers named the same tell, in
+their own words: `peek` is *the only place in the diff that computes window
+membership without calling `withinWindow`*. They found the defect by
+inconsistency detection, not by exhaustive reading — so the fixture's size is
+irrelevant to the search. The whole 433-line diff contains just 9 comparison
+sites and exactly one inline membership test; a 4,000-line diff would contain
+a few dozen and still exactly one, and it stays greppable. Single-pass
+attention was never the bottleneck the option-(a) framing assumed it was.
+
+That generalizes to a case analysis over the defect class `rubric.md` mandates
+(a criterion-3 boundary/off-by-one). Such a defect can sit (i) inline at a call
+site where a correct helper exists — locally inconsistent, which is what all
+six caught; (ii) inside the helper itself — but criterion 3 states
+`withinWindow(1500, 1000, 500)` → `false` as a literal example, so a
+code-executing reviewer runs it and catches it every time (this is what killed
+#102); or (iii) in a wrong argument passed to a correct helper — still a
+single anomalous call site. There is no fourth place to put it.
+
+**Score: not run.** A paid `run.sh 5` was not spent, because a trial passes
+only when single-pass MISSES, and single-pass caught it 6/6 under conditions
+at least as favourable as the eval's. The expected score is 0/5 for the same
+reason #102 and round 2 scored 0/5. The enlarged fixture is committed anyway:
+it is a strictly better artifact than what it replaces (a real multi-function
+surface, exhaustively verified, no `git apply` whitespace noise) and it is the
+right substrate the moment the defect class is unfrozen.
+
+**The open decision is now narrower than "make the defect subtler."** The
+mandated defect class and the goal are in conflict, and one of them has to
+move:
+- (i) Unfreeze the defect class. Let the plant be a defect that is NOT locally
+  anomalous — an emergent interaction between two individually-correct
+  functions (a capacity/eviction breach, a per-key isolation leak, an
+  ordering-dependent state bug). That requires editing `rubric.md`'s
+  "## The planted defect" section and its criterion-3 grading contract, which
+  #108 AC3 currently forbids, so it needs an explicit amendment to AC3.
+- (ii) Revise the claim. Accept that a single-pass frontier reviewer with code
+  execution catches locally-anomalous defects reliably, and re-target the eval
+  at what the fan-out plausibly does buy — breadth of coverage across many
+  independent findings — rather than a single planted needle.
