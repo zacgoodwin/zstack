@@ -135,11 +135,15 @@ const Q_PROJECT_ITEMS = `query ProjectItems($project: ID!, $cursor: String) {
 
 // projectItems ceiling: 20 boards per issue; ours must be among them or itemId
 // silently reports "not on project", so overflow throws via assertSinglePage.
+// assignees ceiling: 10 per issue (#148) -- claim()'s "sole assignee is me"
+// ownership check reads this list to decide whether a ticket is already ours;
+// a silently truncated page can misjudge a ticket claim() should refuse, so
+// overflow throws via assertSinglePage too, same as projectItems below.
 const Q_ISSUE_LOOKUP = `query IssueLookup($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     issue(number: $number) {
       id number title body
-      assignees(first: 10) { nodes { login } }
+      assignees(first: 10) { pageInfo { hasNextPage } nodes { login } }
       projectItems(first: 20) { pageInfo { hasNextPage } nodes { id project { number } } }
     }
   }
@@ -382,7 +386,7 @@ export class Board {
   // `gh issue view`, so the caller gate (tests/board.test.ts) stays satisfied.
   // The bodies map is keyed by issue number (as a string), the exact shape
   // loop.ts `ingest` consumes for dependency parsing.
-  async snapshot(): Promise<{ items: BoardItem[]; bodies: Record<string, string> }> {
+  async snapshot(): Promise<{ items: BoardItem[]; bodies: Record<string, string>; overCeiling: number[] }> {
     // #127: an empty read here is almost always a transient hiccup, not a truly
     // empty board -- and the drain loop trusts this snapshot to decide
     // drain-complete, so believing a bogus empty read falsely ends the batch and
@@ -395,15 +399,33 @@ export class Board {
     }
     const items: BoardItem[] = [];
     const bodies: Record<string, string> = {};
+    // #148: a per-item ceiling overflow (>20 labels/fieldValues) used to throw
+    // out of this loop and wedge the ENTIRE snapshot -- one runaway ticket took
+    // the whole drain down with it. Catch just that failure mode per node: skip
+    // the offending ticket (it never enters items/bodies this pass), record its
+    // number so the caller can name and park it, and keep reading the rest of
+    // the board. Any other error (a malformed connection, network/config
+    // failure) is not an ItemCeilingError and still propagates, wedging the
+    // whole snapshot as before -- those are not safe to silently step over.
+    const overCeiling: number[] = [];
     for (const n of nodes) {
-      const it = toItem(n);
+      let it: BoardItem | null;
+      try {
+        it = toItem(n);
+      } catch (e) {
+        if (e instanceof ItemCeilingError) {
+          overCeiling.push(e.issueNumber);
+          continue;
+        }
+        throw e;
+      }
       if (!it) continue;
       items.push(it);
       // A null/absent body (rare, but GitHub can return null) serializes as ""
       // so ingest's parseDependsOn never sees undefined.
       bodies[String(it.number)] = n.content?.body ?? "";
     }
-    return { items, bodies };
+    return { items, bodies, overCeiling };
   }
 
   async move(n: number, status: string): Promise<void> {
@@ -665,6 +687,10 @@ export class Board {
     if (!issue) throw new ZError(`Issue #${n} not found in ${this.cfg.owner}/${this.cfg.repo}.`);
     // Our project must be on the first page or itemId misreports "not on project".
     assertSinglePage(issue.projectItems, `projectItems for issue #${n} (ceiling: 20 boards per issue)`);
+    // #148: every caller of lookup() (claim, release, move, comment, fieldSet,
+    // link) reads issue.assignees through it -- guarding the one choke point
+    // guards them all, instead of a per-caller patch on just claim().
+    assertSinglePage(issue.assignees, `assignees for issue #${n} (ceiling: 10 assignees per issue)`);
     return issue as IssueNode;
   }
 
@@ -717,15 +743,38 @@ function assertSinglePage(conn: any, what: string): void {
   }
 }
 
+// #148: toItem's two per-item ceilings (fieldValues, labels) are the ones
+// snapshot() can recover from -- skip just that ticket, keep the rest of the
+// board intact, and name the ticket so the loop can park it. Wrapped in a
+// dedicated error type (still a ZError, so list() -- which does NOT catch
+// this -- keeps its existing fail-loud-for-the-whole-call behavior and every
+// existing message/test is unchanged) purely so snapshot() can distinguish
+// "this one item overflowed its ceiling" from any other failure shape (a
+// malformed connection, a config/network error) that must still wedge the
+// whole read rather than being silently swallowed per item.
+class ItemCeilingError extends ZError {
+  constructor(
+    readonly issueNumber: number,
+    message: string
+  ) {
+    super(message);
+  }
+}
+
 function toItem(node: any): BoardItem | null {
   const content = node?.content;
   if (!content || content.number === undefined) return null;
-  // fieldValues is nested per-item; overflow past first:20 (5 fields defined on
-  // the canonical board) would drop Status/Model/etc. silently.
-  assertSinglePage(node.fieldValues, `fieldValues for issue #${content.number} (ceiling: 20 values per item)`);
-  // labels rides content.labels (#130). Overflow past first:20 must throw, not
-  // silently drop a `skip-qa` that a lane's skip decision depends on.
-  assertSinglePage(content.labels, `labels for issue #${content.number} (ceiling: 20 labels per issue)`);
+  try {
+    // fieldValues is nested per-item; overflow past first:20 (5 fields defined
+    // on the canonical board) would drop Status/Model/etc. silently.
+    assertSinglePage(node.fieldValues, `fieldValues for issue #${content.number} (ceiling: 20 values per item)`);
+    // labels rides content.labels (#130). Overflow past first:20 must throw,
+    // not silently drop a `skip-qa` that a lane's skip decision depends on.
+    assertSinglePage(content.labels, `labels for issue #${content.number} (ceiling: 20 labels per issue)`);
+  } catch (e) {
+    if (e instanceof ZError) throw new ItemCeilingError(content.number, e.message);
+    throw e;
+  }
   const fields: Record<string, string | number> = {};
   for (const fv of node.fieldValues?.nodes ?? []) {
     const name = fv?.field?.name;
@@ -929,6 +978,18 @@ export async function main(argv: string[]): Promise<number> {
         atomicWrite(outItems, JSON.stringify(snap.items, null, 2));
         atomicWrite(outBodies, JSON.stringify(snap.bodies));
         console.log(`${snap.items.length} item(s), ${Object.keys(snap.bodies).length} body/ies`);
+        // #148: name every over-ceiling ticket on stderr -- loud, but a return
+        // of 0, so a runaway ticket's labels/fieldValues never wedges the tick
+        // (bin/z-loop-tick runs under `set -e`; a non-zero exit here would abort
+        // the whole drain, exactly the failure mode this fix removes). See
+        // docs/user-guide/troubleshooting.md for what to do about it.
+        if (snap.overCeiling.length > 0) {
+          console.error(
+            `OVER-CEILING: #${snap.overCeiling.join(", #")} exceeded a per-item pagination ceiling ` +
+              `(labels/fieldValues) and were skipped from this snapshot. See ` +
+              `docs/user-guide/troubleshooting.md.`
+          );
+        }
         return 0;
       }
       case "move": {
