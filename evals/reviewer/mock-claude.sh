@@ -51,12 +51,12 @@ elif [[ "$PROMPT" == *"Super-truth pass"* ]]; then
 REVIEW-FINDINGS: confidence=0 1. src/limiter.ts -- allow() charges the shared
 ceiling before checking the key's own budget, so rejected traffic spends
 globalLimit slots and starves other keys (criteria 4 and 5). 2. The constructor
-never validates globalLimit, so 0 is accepted and rejects everything (criterion
-8). 3. Nothing in the shipped path calls sweep(), so the key table grows without
-bound (criterion 7). 4. The middleware admits the request when the limiter
-throws (criterion 11). 5. The client id is used unnormalized, so case and
-whitespace variants each get their own budget (criterion 10). 6. Retry-After is
-emitted in milliseconds, not seconds (criterion 9).
+never validates globalLimit (criterion 8). 3. resetAll() also zeroes the shared
+ceiling, so admissions after a reset breach globalLimit inside the same window
+(criterion 5). 4. retryAfterMs() computes the wait from the key's stale bucket
+window, telling a ceiling-blocked key to retry NOW (criterion 6). 5. The client
+id is used unnormalized (criterion 10). 6. Retry-After rounds with Math.round,
+so sub-half-second waits emit 0 and clients retry early (criterion 9).
 (mock-claude canned finding, issue #71 structural check)
 ADVERSARIAL
 else

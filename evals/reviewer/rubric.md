@@ -44,26 +44,33 @@ three times. That difference is the product claim worth defending.
 
 ## The fixture
 
-`fixtures/multi-defect/` is a 735-line diff adding a keyed rate limiter
+`fixtures/multi-defect/` is a 771-line diff adding a keyed rate limiter
 (`src/window.ts`, `src/limiter.ts`) and its HTTP edge (`src/middleware.ts`),
-against a 12-criterion ticket. Its 54 shipped tests are green with every defect
+against a 12-criterion ticket. Its 55 shipped tests are green with every defect
 present. `defects.json` is the answer key: eight entries, each with the site,
 the mechanism, the criterion it violates, and a reproduction. Every one is
 verified to reproduce and to be unexercised by the shipped suite before the
 fixture ships (`run.md` records the verification run).
 
-The eight span five classes on purpose, so the report says WHICH kinds of defect
-a mode misses, not just how many:
+The mix is weighted by measurement, not variety for its own sake. The first
+paid run (run.md, 2026-07-28) showed site-local defects — a grep-able wrong
+line at the site a criterion names — are caught 5/5 by BOTH modes and carry no
+delta, while the one stateful-interaction defect carried all of it. This
+iteration therefore fixes the four saturated site-local plants outright (the
+fail-open catch, the ms-unit header, metrics-on-arrival, sweep-never-called are
+now correct code) and plants four interaction defects in their place: defects
+that only misbehave when two individually-correct paths meet under a specific
+multi-call construction.
 
 | id | class | criterion |
 |----|-------|-----------|
-| D1 | ordering interaction between two individually correct paths | 4, 5 |
+| D1 | ordering interaction (ceiling charged before the per-key check) | 4, 5 |
 | D2 | missing input validation | 8 |
-| D3 | absent reclamation / resource leak (a defect of omission) | 7 |
-| D4 | error path that swallows a failure | 11 |
+| D3 | reset interaction breaches the shared ceiling | 5 |
+| D4 | stale-state interaction: "retry now" while blocked by the ceiling | 6 |
 | D5 | unnormalized input at a trust boundary | 10 |
-| D6 | unit / spec violation | 9 |
-| D7 | observability counts the wrong event | 12 |
+| D6 | rounding direction lets clients retry early | 9 |
+| D7 | the error path's own repair re-enters the failed dependency | 11 |
 | D8 | a test that passes without the change | none directly |
 
 `defects.json` never enters the reviewer's input. The reviewer stays blinded to

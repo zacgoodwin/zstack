@@ -24,9 +24,11 @@ the reviewer's inner Agent-tool fan-out is allowed.
 
 - `fixtures/multi-defect/ticket.md` — the ticket body, carrying its 12
   `### Acceptance Criteria`.
-- `fixtures/multi-defect/diff.patch` — a 735-line, four-file diff (a keyed rate
-  limiter plus its HTTP middleware) that typechecks and is green on all 54 of
-  its own tests while hiding eight independent defects.
+- `fixtures/multi-defect/diff.patch` — a 771-line, four-file diff (a keyed rate
+  limiter plus its HTTP middleware) that typechecks and is green on all 55 of
+  its own tests while hiding eight independent defects, four of them stateful
+  interactions between individually-correct paths (the class the first paid run
+  showed carries the delta — rubric.md has the table).
 - `fixtures/multi-defect/defects.json` — the answer key: each defect's site,
   mechanism, the criterion it violates, and a reproduction. **Never part of the
   reviewer's input**; only the grader reads it.
