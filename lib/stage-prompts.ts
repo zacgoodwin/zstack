@@ -226,11 +226,32 @@ export function reviewerPrompt(input: ReviewerPromptInput, inputPath: string, ad
   assertReviewerInput(input);
   // ponytail: N=3 skeptics is a fixed ceiling (no config knob this ticket); a
   // per-project skeptic count is a follow-on if 3 proves too few/many.
+  //
+  // #191: three failure modes were measured in loop run 10, all from the same
+  // gap -- the block described the happy path (three verdicts arrive) and said
+  // nothing about what to do when fewer do. Reviewers hung waiting on a skeptic
+  // that never reported, ended a turn with no marker at all (parsed as CONFUSED,
+  // which SKIPS the ticket), or reported confidence=100 with no verdicts in hand,
+  // which the #62 gate then read as three independent agreements and merged on.
+  // Delivery is best-effort by nature (a sub-agent can die or time out), so the
+  // fix is to make the DENOMINATOR mandatory and machine-readable rather than to
+  // pretend delivery is reliable: `skeptics=<k>/3` is what lib/loop.ts's quorum
+  // gate reads. The k-to-confidence mapping is given as a lookup table, never a
+  // formula -- arithmetic in a model reply is exactly what PRINCIPLES.md forbids,
+  // and for k <= 3 the whole space is nine entries.
   const superTruth = adversarial
     ? `
 ## Super-truth pass (adversarial mode active)
 This card's blast radius earned an adversarial review; do NOT trust your single read. Spawn 3 INDEPENDENT skeptic sub-agents with the Agent tool -- nested \`claude -p\` is denied by the classifier, so use the Agent tool, not headless claude. Give each skeptic ONLY the four inputs you were given (this ticket, the acceptance criteria, the diff, the throwaway worktree); they are blinded exactly as you are. Task each one to REFUTE that the diff satisfies the acceptance criteria: find the one criterion it violates, the edge it breaks, a test that passes without the change. They work in isolation -- no skeptic sees another's verdict.
-Reconcile the three verdicts into an aggregated confidence 0-100: the percentage of skeptics that could NOT refute the diff (3/3 unrefuted = 100, 2/3 = 67, 1/3 = 33, 0/3 = 0). A criterion any skeptic refutes with concrete evidence is a finding, not a vote to be outnumbered -- surface it. Report the confidence in your exit marker below.
+
+Delivery is BEST-EFFORT and you must report how many verdicts arrived. A skeptic can die, time out, or come back with nothing usable; that is a delivery race, not evidence about the diff. Check for outstanding verdicts AT MOST ONCE per skeptic, then stop waiting and reconcile the \`k\` verdicts you actually hold (0 <= k <= 3). Do not spawn replacements. Do NOT end your turn without one of the exit markers below -- a final message with no marker is parsed as CONFUSED and SKIPS this ticket, which is the worst outcome available to you.
+
+Report BOTH tokens in your marker: \`skeptics=<k>/3\` -- the number of verdicts you actually received -- and \`confidence=<0-100>\`, the share of THOSE k that could not refute the diff. Read it off this table; do no arithmetic:
+- k=3: 3 unrefuted -> 100, 2 -> 67, 1 -> 33, 0 -> 0
+- k=2: 2 unrefuted -> 100, 1 -> 50, 0 -> 0
+- k=1: 1 unrefuted -> 100, 0 -> 0
+- k=0: nobody looked. Report \`skeptics=0/3\` and, as the confidence, YOUR OWN single-pass certainty that every criterion holds -- never 100, which would claim three independent agreements that never happened.
+A criterion any skeptic refutes with concrete evidence is a finding, not a vote to be outnumbered -- surface it. An honest low \`k\` costs this card one more review pass; an inflated one merges a diff nobody refuted, so report the number you actually have.
 `
     : "";
   // REVIEW-FINDINGS' confidence token rides inside the marker's note only on
@@ -241,6 +262,11 @@ Reconcile the three verdicts into an aggregated confidence 0-100: the percentage
   // confidence=<0-100> token below -- self-assessed on a single pass,
   // aggregated across skeptics when the super-truth pass ran.
   const conf = adversarial ? "confidence=<0-100> " : "";
+  // #191's denominator token, adversarial-only for the same reason the fan-out
+  // is: with no skeptics there is no `k` to report, and a single-pass prompt that
+  // demanded one would invite an invented number. So the inactive branch stays
+  // byte-identical (reviewer-single-pass.golden.txt).
+  const skept = adversarial ? "skeptics=<k>/3 " : "";
   return `${spawnStamp(tag)}You are an ADVERSARIAL REVIEWER in a fresh context, running UNATTENDED inside the zstack dev loop. You are blinded by design: your ONLY inputs are the ticket, its acceptance criteria, the diff, and a throwaway worktree of the head commit. There is no PR description, no plan rationale, no builder or QA transcript -- and any claim you cannot verify from these inputs yourself is unverified. Your job is to find the reasons this diff should NOT merge.
 
 ## Your inputs (read from the file -- do not look anywhere else)
@@ -257,8 +283,8 @@ Run the typecheck and the tests this diff touches here. Nothing you do in it lan
 - Security holes at trust boundaries; data-loss edges; error paths that swallow failures.
 ${superTruth}
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
-REVIEW-APPROVE: confidence=<0-100> <one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green -- confidence is your certainty every criterion holds (aggregated per the super-truth pass above when it ran); a score below the project's configured floor will NOT merge
-REVIEW-FINDINGS: ${conf}<numbered findings>          each with file:line and why it blocks the merge
+REVIEW-APPROVE: confidence=<0-100> ${skept}<one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green -- confidence is your certainty every criterion holds (aggregated per the super-truth pass above when it ran); a score below the project's configured floor will NOT merge
+REVIEW-FINDINGS: ${conf}${skept}<numbered findings>          each with file:line and why it blocks the merge
 NEEDS-HUMAN: <the judgment call>              a genuine spec ambiguity a human must settle
 BLOCKED: <reason>                             the throwaway worktree is unusable -- can't check out or execute the diff at all
 CONFUSED: <what makes no sense>`;

@@ -1186,6 +1186,28 @@ describe("validateConfig", () => {
     });
   });
 
+  // -- issue #191: the skeptic-delivery quorum knob ----------------------------
+  describe("minSkepticQuorum (issue #191)", () => {
+    // Bounded on BOTH ends, unlike maxReviewBounces: it is a quorum over a fixed
+    // 3-skeptic fan-out, so 4 could never be met and would park every adversarial
+    // review Blocked. 0 is the documented "disable" value.
+    test.each([4, 10, -1, 1.5, NaN, "2"])("rejects %p, naming the field and the 0-3 integer rule", (bad) => {
+      const cfg = goodConfig() as any;
+      cfg.minSkepticQuorum = bad;
+      expect(() => validateConfig(cfg)).toThrow(/"minSkepticQuorum" must be an integer 0-3 \(0 disables the gate\)/);
+    });
+
+    test("accepts 0 through 3 and is optional", () => {
+      const cfg = goodConfig() as any;
+      for (const ok of [0, 1, 2, 3]) {
+        cfg.minSkepticQuorum = ok;
+        expect(() => validateConfig(cfg)).not.toThrow();
+      }
+      delete cfg.minSkepticQuorum;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+  });
+
   // -- issue #63: the human-needed safety-control threshold knob --------------
   describe("humanNeededPercent (issue #63)", () => {
     // AC12: 0 is the documented "disable" value (unlike maxLanes/watchdogMinutes
@@ -1388,6 +1410,20 @@ describe("loadConfig deep validation", () => {
   test("explicit maxReviewBounces in config.json is honored through loadConfig, not overridden by the default", () => {
     const home = writeRaw("zstack", validRawConfig({ maxReviewBounces: 5 }));
     expect(loadConfig("zstack", home).maxReviewBounces).toBe(5);
+  });
+
+  // -- issue #191: minSkepticQuorum end to end through loadConfig -------------
+  test("#191: minSkepticQuorum above the 3-skeptic fan-out, negative, or fractional fails loadConfig", () => {
+    for (const bad of [4, -1, 1.5]) {
+      const home = writeRaw("zstack", validRawConfig({ minSkepticQuorum: bad }));
+      expect(() => loadConfig("zstack", home)).toThrow(/"minSkepticQuorum" must be an integer 0-3 \(0 disables the gate\)/);
+    }
+  });
+
+  test("#191: minSkepticQuorum absent -> loadConfig defaults it to 2, and an explicit 0 survives", () => {
+    expect(loadConfig("zstack", writeRaw("zstack", validRawConfig())).minSkepticQuorum).toBe(2);
+    // 0 disables the gate, so it must NOT be swallowed by the ?? default.
+    expect(loadConfig("zstack", writeRaw("zstack", validRawConfig({ minSkepticQuorum: 0 }))).minSkepticQuorum).toBe(0);
   });
 
   // -- issue #58: tickThrottleSeconds default-and-override through loadConfig --

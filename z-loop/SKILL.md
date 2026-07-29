@@ -76,12 +76,13 @@ mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports" 
 4. Read the loop knobs from config (defaults 3 lanes / 10 minutes / audits
    every 5th loop / 3 QA passes before Blocked / investigate from QA bounce 2 /
    human-needed at 30% parked / reviewer-confidence floor 70, block a
-   sub-floor approve / 2 reviewer->builder bounces before Blocked / no per-loop
+   sub-floor approve / 2 reviewer->builder bounces before Blocked / 2 of 3
+   skeptic verdicts required for an adversarial approve to merge / no per-loop
    ticket cap / context ceiling 550000 tokens):
 
 ```bash
-read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMAN_NEEDED_PERCENT MIN_REVIEWER_CONFIDENCE REVIEWER_BELOW_ACTION MAX_REVIEW_BOUNCES TICKET_LIMIT CONTEXT_TOKEN_LIMIT <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
-  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.humanNeededPercent, c.minReviewerConfidence, c.reviewerBelowThresholdAction, c.maxReviewBounces, c.ticketLimit, c.contextTokenLimit)")"
+read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMAN_NEEDED_PERCENT MIN_REVIEWER_CONFIDENCE REVIEWER_BELOW_ACTION MAX_REVIEW_BOUNCES MIN_SKEPTIC_QUORUM TICKET_LIMIT CONTEXT_TOKEN_LIMIT <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
+  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.humanNeededPercent, c.minReviewerConfidence, c.reviewerBelowThresholdAction, c.maxReviewBounces, c.minSkepticQuorum, c.ticketLimit, c.contextTokenLimit)")"
 ```
 
 5. **Startup orphan scan (C7).** A crashed prior loop leaves lane locks in
@@ -177,7 +178,7 @@ bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" \
   --max-qa-passes "$MAX_QA_PASSES" --qa-investigate-after "$QA_INVESTIGATE_AFTER" \
   --human-needed-percent "$HUMAN_NEEDED_PERCENT" \
   --min-reviewer-confidence "$MIN_REVIEWER_CONFIDENCE" --reviewer-below-threshold-action "$REVIEWER_BELOW_ACTION" \
-  --max-review-bounces "$MAX_REVIEW_BOUNCES" \
+  --max-review-bounces "$MAX_REVIEW_BOUNCES" --min-skeptic-quorum "$MIN_SKEPTIC_QUORUM" \
   --ticket-limit "$TICKET_LIMIT" --context-token-limit "$CONTEXT_TOKEN_LIMIT"
 ```
 

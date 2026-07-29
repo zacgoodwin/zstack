@@ -173,6 +173,12 @@ export function validateConfig(cfg: unknown): BoardConfig {
   // meaningless too; not requirePositiveNumber (which would silently accept
   // e.g. 2.5).
   requireNumber("maxReviewBounces", c.maxReviewBounces, { min: 1, integer: true, desc: "a positive integer (>= 1)" });
+  // minSkepticQuorum (issue #191): the skeptic-delivery floor. A count of
+  // verdicts out of the fixed 3-skeptic fan-out, so a fraction is meaningless and
+  // anything above 3 is unsatisfiable -- a max of 3 turns "quorum can never be
+  // met, every adversarial review parks Blocked" into a config error at write
+  // time. `0` legitimately disables the gate, so this is a non-negative guard.
+  requireNumber("minSkepticQuorum", c.minSkepticQuorum, { min: 0, max: 3, integer: true, desc: "an integer 0-3 (0 disables the gate)" });
   if (c.quota !== undefined) validateQuota(c.quota);
 
   // humanNeededPercent (issue #63): the mid-run breakdown notification's trip

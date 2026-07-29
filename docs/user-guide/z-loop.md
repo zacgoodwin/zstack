@@ -61,6 +61,19 @@ records the result. It never re-derives a scheduling decision in prose.
   (`retry`), or is ignored entirely (`off`). A `REVIEW-APPROVE` with no
   parseable confidence is treated the same as a sub-floor score — fail-closed,
   never a silent merge — whenever the gate is on.
+- **A confidence with nobody behind it does not merge either.** The aggregated
+  confidence is computed over the skeptics that actually *reported*, so ONE
+  skeptic answering "cannot refute" is `confidence=100` — which clears the
+  default floor of 70 and merges as though three independent reviews agreed. Sub-
+  agent delivery is best-effort (run 10 measured deliveries of 0 of 3), so the
+  reviewer now reports the denominator too: `skeptics=<k>/3`. Below config
+  `minSkepticQuorum` (default 2) the ticket does not merge; it re-spawns the
+  **reviewer** once — a thin review is not a bad diff, and rebuilding something
+  nobody faulted fixes nothing — and if the second reviewer also cannot reach
+  quorum, parks Blocked naming the delivery failure and saying the diff itself was
+  never faulted. That retry has its own budget, separate from `maxReviewBounces`,
+  so a delivery race never consumes the rebuild a genuine finding needs. A
+  single-pass review reports no `skeptics=` token and is untouched by this gate.
 - **Reviewer->builder bounces are capped.** A `REVIEW-FINDINGS` and a
   `reviewerBelowThresholdAction: "retry"` both send the ticket back to the
   builder from Review, and both draw on the same per-lane budget: at config

@@ -14,10 +14,12 @@
 // the extraction, and MOCK_CLAUDE_GRADE_WRAP lets the mock reproduce the real
 // grader's reply shapes. Deterministic and free -- no claude -p, no network.
 import { test, expect, describe, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { extractJsonObject, readGradeVerdict, verdictToken } from "../evals/lib/grade.ts";
+import { parseReviewerConfidence, parseSkepticQuorum } from "../lib/loop.ts";
+import { adversarialActive, reviewerPrompt, type AdversarialMode } from "../lib/stage-prompts.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const REVIEWER_DIR = join(REPO_ROOT, "evals", "reviewer");
@@ -289,4 +291,58 @@ describe("mocked end-to-end: evals/reviewer-severity/run.sh", () => {
     expect(r.stdout).toContain("HARNESS ERROR");
     expect(r.exitCode).toBe(2);
   }, E2E_TIMEOUT_MS);
+
+  // -- #191's skeptic-starved fixture -----------------------------------------
+  //
+  // It is the only fixture built ADVERSARIAL, because starvation is the thing it
+  // measures. If the per-fixture `adversarial-mode` hook silently stopped being
+  // read, the fixture would quietly build the single-pass prompt -- which carries
+  // no skeptics= token at all, so the reviewer could not report a denominator and
+  // the paid run would measure nothing while still printing a score.
+  test("#191: run.sh honors each fixture's adversarial-mode, and only skeptic-starved is adversarial", () => {
+    const r = runEval(SEVERITY_DIR, ["1"]);
+    expect(r.exitCode).toBe(0);
+    // run.sh prints the mode it actually resolved per fixture, so the hook's
+    // effect is observable without reparsing an msys temp path (#175).
+    expect(r.stdout).toMatch(/\[skeptic-starved\] correct classification in 1\/1.*mode=always/);
+    // The three classification fixtures stay on the single pass -- #191 must not
+    // have quietly turned the whole eval adversarial (and 4x more expensive).
+    for (const fix of ["prose-nit", "weakened-ac", "wrong-runbook"]) {
+      expect(r.stdout).toMatch(new RegExp(`\\[${fix}\\].*mode=off`));
+    }
+    // And the resolved mode is what actually reaches the constructor.
+    expect(readFileSync(join(SEVERITY_DIR, "run.sh"), "utf8")).toContain('--adversarial-mode "$MODE"');
+  }, E2E_TIMEOUT_MS);
+
+  // The other half of the chain: that mode, applied to that fixture, really does
+  // produce a prompt that can carry a denominator. Pure -- no subprocess.
+  test("#191: the skeptic-starved fixture's mode yields a prompt that demands the denominator", () => {
+    const mode = readFileSync(join(SEVERITY_DIR, "fixtures", "skeptic-starved", "adversarial-mode"), "utf8").trim();
+    expect(mode).toBe("always");
+    const prompt = reviewerPrompt(
+      { ticketBody: "b", acceptanceCriteria: "a", diff: "d", worktreePath: "/w" },
+      "/tmp/input.json",
+      adversarialActive(mode as AdversarialMode, 0, [])
+    );
+    expect(prompt).toContain("Super-truth pass");
+    expect(prompt).toContain("skeptics=<k>/3");
+    expect(prompt).toContain("Delivery is BEST-EFFORT");
+  });
+
+  // The mock stands in for a real reviewer, so its canned starved output must
+  // itself satisfy the rubric's pass rule -- otherwise the mock would "pass" the
+  // harness while modelling behavior the paid run would fail.
+  test("#191: the mock's starved output satisfies the rubric's pass rule", () => {
+    const proc = Bun.spawnSync(["bash", join(SEVERITY_DIR, "mock-claude.sh"), "the reviewer prompt"], {
+      env: { ...process.env, MOCK_FIXTURE: "skeptic-starved" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = proc.stdout.toString();
+    expect(out.trimStart().startsWith("REVIEW-APPROVE:")).toBe(true); // a marker, never a silent turn
+    expect(parseSkepticQuorum(out)).toEqual({ received: 0, of: 3 }); // an honest denominator
+    // NOT inflated: 0 verdicts must not carry confidence=100.
+    expect(parseReviewerConfidence(out)).not.toBe(100);
+    expect(parseReviewerConfidence(out)).toBeGreaterThan(0);
+  });
 });

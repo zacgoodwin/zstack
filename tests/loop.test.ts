@@ -20,7 +20,9 @@ import {
   markHumanNeededNotified,
   nextAction,
   parseReviewerConfidence,
+  parseSkepticQuorum,
   parseStageResult,
+  MAX_QUORUM_RETRIES,
   recordOutcome,
   recordProbe,
   resolveStageModel,
@@ -28,9 +30,10 @@ import {
   type LaneState,
   type LoopState,
   type Stage,
+  type StageOutcome,
   type TicketSnapshot,
 } from "../lib/loop.ts";
-import { ZError } from "../lib/config.ts";
+import { DEFAULT_MIN_SKEPTIC_QUORUM, ZError } from "../lib/config.ts";
 import { validateConfig } from "../lib/config-schema.ts";
 import {
   claimableTickets,
@@ -63,6 +66,15 @@ function ticket(number: number, status: TicketSnapshot["status"], dependsOn: num
 
 function lane(ticketNumber: number, stage: Stage, over: Partial<LaneState> = {}): LaneState {
   return { ticket: ticketNumber, stage, lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, ...over };
+}
+
+// #191: a review-approve outcome. `skeptics` is the skeptic-delivery denominator
+// the quorum gate reads; null means "no adversarial fan-out reported one", which
+// is what every case written before #191 meant -- so those cases keep judging
+// exactly the confidence floor they were written for, and the quorum path is
+// exercised by its own describe block below.
+function approve(confidence: number | null, skeptics: { received: number; of: number } | null = null): StageOutcome {
+  return { kind: "review-approve", confidence, skeptics };
 }
 
 function state(tickets: TicketSnapshot[], lanes: LaneState[] = [], maxLanes = 3, watchdogMinutes = 10): LoopState {
@@ -385,6 +397,7 @@ describe("reviewer confidence gate", () => {
     expect(parseStageResult("reviewer", "REVIEW-APPROVE: confidence=85 diff satisfies every criterion")).toEqual({
       kind: "review-approve",
       confidence: 85,
+      skeptics: null, // #191: no `skeptics=` token in this note -> no denominator
     });
   });
 
@@ -393,6 +406,7 @@ describe("reviewer confidence gate", () => {
     expect(parseStageResult("reviewer", "REVIEW-APPROVE: looks good, all criteria met")).toEqual({
       kind: "review-approve",
       confidence: null,
+      skeptics: null,
     });
   });
 
@@ -408,7 +422,7 @@ describe("reviewer confidence gate", () => {
   // outcome carrying `confidence`. Drives nextAction with the gate knobs under
   // test -- mirrors the maxQaPasses gate tests' fixture-then-nextAction shape.
   function reviewGate(confidence: number | null, minConfidence: number, belowAction: "block" | "retry" | "off"): Action {
-    const s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: { kind: "review-approve", confidence } })]);
+    const s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: approve(confidence) })]);
     s.minReviewerConfidence = minConfidence;
     s.reviewerBelowThresholdAction = belowAction;
     return nextAction(s, 0);
@@ -462,6 +476,181 @@ describe("reviewer confidence gate", () => {
 });
 
 // -- reviewer bounce cap (issue #76): maxReviewBounces ------------------------
+// -- skeptic quorum gate (issue #191) -----------------------------------------
+
+// The hole #191 closes, stated exactly: the adversarial reviewer aggregates
+// confidence over the skeptics that REPORTED, so one skeptic returning "cannot
+// refute" is confidence=100 -- which clears #62's default floor of 70 and merges
+// as though three independent reviews agreed. Loop run 10 measured deliveries of
+// 0-of-3, so this is the ordinary case under load, not an edge. The confidence
+// token cannot express the denominator; `skeptics=<k>/3` is the missing fact.
+describe("skeptic quorum gate (issue #191)", () => {
+  test("parses skeptics=<k>/<of> off a reviewer note", () => {
+    expect(parseSkepticQuorum("confidence=100 skeptics=3/3 all clear")).toEqual({ received: 3, of: 3 });
+    expect(parseSkepticQuorum("confidence=100 skeptics=0/3 nothing came back")).toEqual({ received: 0, of: 3 });
+    expect(parseSkepticQuorum("SKEPTICS=2/3")).toEqual({ received: 2, of: 3 }); // case-insensitive, like confidence
+  });
+
+  test("an absent token is null, and neither token disturbs the other", () => {
+    expect(parseSkepticQuorum("confidence=100 looks good")).toBeNull();
+    // Adjacency both ways: #62's regex must not read the quorum's digits and
+    // this one must not read the confidence's.
+    expect(parseReviewerConfidence("skeptics=1/3 confidence=67 ok")).toBe(67);
+    expect(parseSkepticQuorum("skeptics=1/3 confidence=67 ok")).toEqual({ received: 1, of: 3 });
+  });
+
+  test("an incoherent denominator reads as null, never as a pass", () => {
+    expect(parseSkepticQuorum("skeptics=4/3")).toBeNull(); // nobody delivered 4 of 3
+    expect(parseSkepticQuorum("skeptics=0/0")).toBeNull(); // no fan-out to have a quorum over
+    // A 3rd digit at that position is not a truncated match, same discipline as
+    // parseReviewerConfidence's (?!\d).
+    expect(parseSkepticQuorum("skeptics=1/300")).toBeNull();
+  });
+
+  test("parseStageResult carries both tokens off one REVIEW-APPROVE marker", () => {
+    expect(parseStageResult("reviewer", "REVIEW-APPROVE: confidence=100 skeptics=3/3 every criterion holds")).toEqual({
+      kind: "review-approve",
+      confidence: 100,
+      skeptics: { received: 3, of: 3 },
+    });
+  });
+
+  // One lane in Review with an approve that CLEARS the confidence floor, so the
+  // only thing left to decide is the quorum.
+  function quorumGate(
+    skeptics: { received: number; of: number } | null,
+    minSkepticQuorum: number,
+    laneOver: Partial<LaneState> = {}
+  ): Action {
+    const s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: approve(100, skeptics), ...laneOver })]);
+    s.minReviewerConfidence = 70;
+    s.reviewerBelowThresholdAction = "block";
+    s.minSkepticQuorum = minSkepticQuorum;
+    return nextAction(s, 0);
+  }
+
+  test("a full quorum merges", () => {
+    expect(quorumGate({ received: 3, of: 3 }, 2)).toMatchObject({ kind: "advance", ticket: 1, to: "merge" });
+    expect(quorumGate({ received: 2, of: 3 }, 2)).toMatchObject({ kind: "advance", ticket: 1, to: "merge" });
+  });
+
+  // THE headline case. Before #191 this merged: confidence=100 >= 70, gate done.
+  test("a short quorum re-spawns the REVIEWER, not the builder, and does not merge", () => {
+    const a = quorumGate({ received: 1, of: 3 }, 2);
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "reviewer" });
+    expect((a as { note: string }).note).toContain("skeptic quorum not met (1/3 verdicts delivered, 2 required)");
+    // Rebuilding a diff nobody faulted fixes nothing and pays a builder + a QA
+    // pass for it, so the retry must NOT go to the builder.
+    expect(a).not.toMatchObject({ to: "builder" });
+  });
+
+  test("zero verdicts re-spawns too, and says nobody looked", () => {
+    const a = quorumGate({ received: 0, of: 3 }, 2);
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "reviewer" });
+    expect((a as { note: string }).note).toContain("no verdicts at all");
+  });
+
+  test("the re-spawn's board status is Review, so the move is a no-op", () => {
+    // canTransition("Review","Review") is already legal and STATUS_FOR_STAGE
+    // maps reviewer -> Review, so the advance needs no new transition.
+    expect(canTransition("Review", "Review")).toBe(true);
+    let s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: approve(100, { received: 0, of: 3 }) })]);
+    s.minSkepticQuorum = 2;
+    s = applyAction(s, nextAction(s, 0), 0);
+    expect(s.tickets[0].status).toBe("Review");
+    expect(s.lanes[0].stage).toBe("reviewer");
+  });
+
+  test("the retry is spent once, then the ticket parks Blocked", () => {
+    const a = quorumGate({ received: 0, of: 3 }, 2, { quorumRetries: MAX_QUORUM_RETRIES });
+    expect(a).toMatchObject({ kind: "park", ticket: 1, status: "Blocked" });
+    const note = (a as { note: string }).note;
+    expect(note).toContain("environmental, not luck");
+    expect(note).toContain("lower minSkepticQuorum");
+    // The human must not read this as "the reviewer rejected the diff".
+    expect(note).toContain("The diff itself was never faulted.");
+  });
+
+  // Without applyAction's reviewer->reviewer increment, `spent` never grows and
+  // a project with broken sub-agent delivery re-spawns the same reviewer forever
+  // -- a paid infinite loop. This drives the real sequence to prove it converges.
+  test("a reviewer that starves twice terminates instead of looping forever", () => {
+    let s = state([ticket(1, "Review")], [lane(1, "reviewer")]);
+    s.minReviewerConfidence = 70;
+    s.minSkepticQuorum = 2;
+    const STARVED = "REVIEW-APPROVE: confidence=100 skeptics=0/3 no skeptic reported";
+
+    s = recordOutcome(s, 1, STARVED, 0);
+    const first = nextAction(s, 0);
+    expect(first).toMatchObject({ kind: "advance", to: "reviewer" });
+    s = applyAction(s, first, 0);
+    expect(s.lanes[0].quorumRetries).toBe(1);
+
+    s = recordOutcome(s, 1, STARVED, 0); // the re-spawned reviewer starves again
+    expect(nextAction(s, 0)).toMatchObject({ kind: "park", ticket: 1, status: "Blocked" });
+  });
+
+  // Two failures, two budgets: a delivery race must not consume the rebuild a
+  // genuine finding needs, and must not park the ticket under "review bounce cap
+  // reached" -- which would tell the human a reviewer faulted this diff twice.
+  test("a quorum re-spawn spends quorumRetries and leaves reviewBounces alone", () => {
+    let s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: approve(100, { received: 0, of: 3 }) })]);
+    s.minSkepticQuorum = 2;
+    s = applyAction(s, nextAction(s, 0), 0);
+    expect(s.lanes[0].quorumRetries).toBe(1);
+    expect(s.lanes[0].reviewBounces).toBe(0);
+    // And the converse: a real reviewer->builder bounce leaves quorumRetries at 0.
+    let t = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: { kind: "review-findings", note: "1) bad" } })]);
+    t.maxReviewBounces = 2;
+    t = applyAction(t, nextAction(t, 0), 0);
+    expect(t.lanes[0].reviewBounces).toBe(1);
+    expect(t.lanes[0].quorumRetries ?? 0).toBe(0);
+  });
+
+  test("minSkepticQuorum 0 disables the gate entirely", () => {
+    expect(quorumGate({ received: 0, of: 3 }, 0)).toMatchObject({ kind: "advance", ticket: 1, to: "merge" });
+  });
+
+  // A single-pass review reports no denominator by design, so the gate has
+  // nothing to judge -- #62's floor is the only thing that ruled, unchanged.
+  test("a review with no denominator is untouched by the gate", () => {
+    expect(quorumGate(null, 2)).toMatchObject({ kind: "advance", ticket: 1, to: "merge" });
+  });
+
+  // A lane's outcome is PERSISTED in state.json, so a loop upgraded onto #191
+  // mid-drain reads approve outcomes recorded before the field existed.
+  test("a pre-#191 persisted outcome with no skeptics key does not crash the tick", () => {
+    const s = state([ticket(1, "Review")], [lane(1, "reviewer")]);
+    // Exactly what the old code wrote: no `skeptics` key at all, not null.
+    (s.lanes[0] as { outcome: unknown }).outcome = { kind: "review-approve", confidence: 100 };
+    s.minSkepticQuorum = 2;
+    expect(nextAction(s, 0)).toMatchObject({ kind: "advance", ticket: 1, to: "merge" });
+  });
+
+  // Ordering: the confidence floor runs FIRST, so a below-floor approve parks
+  // with the truth-check note even when its quorum was full. Otherwise the
+  // quorum note would mask the more serious failure.
+  test("a below-floor confidence still parks on the truth check, quorum notwithstanding", () => {
+    const s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: approve(50, { received: 3, of: 3 }) })]);
+    s.minReviewerConfidence = 70;
+    s.reviewerBelowThresholdAction = "block";
+    s.minSkepticQuorum = 2;
+    expect(nextAction(s, 0)).toMatchObject({ kind: "park", status: "Blocked", note: "truth-check failed (confidence 50/100)" });
+  });
+
+  test("ingest threads --min-skeptic-quorum and preserves it across re-ingest", () => {
+    const items = [{ number: 1, title: "t", fields: { Status: "Ready" } }];
+    const first = ingestBoardItems(null, items, { "1": "body" }, { minSkepticQuorum: 1 });
+    expect(first.minSkepticQuorum).toBe(1);
+    // A re-ingest with no cfg keeps the captured value, like every sibling knob.
+    expect(ingestBoardItems(first, items, { "1": "body" }, {}).minSkepticQuorum).toBe(1);
+    // Default when nobody supplies one.
+    expect(ingestBoardItems(null, items, { "1": "body" }, {}).minSkepticQuorum).toBe(DEFAULT_MIN_SKEPTIC_QUORUM);
+    expect(DEFAULT_MIN_SKEPTIC_QUORUM).toBe(2); // a majority of the 3-skeptic fan-out
+  });
+
+});
+
 // #62 shipped reviewerBelowThresholdAction: "retry" with no cap on the
 // reviewer->builder bounce -- this closes it, mirroring the maxQaPasses gate
 // tests' fixture-then-nextAction shape above.
@@ -635,8 +824,8 @@ describe("merge ordering", () => {
     let s = state(
       [ticket(20, "Review"), ticket(21, "Review", [20])],
       [
-        lane(21, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
-        lane(20, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+        lane(21, "reviewer", { outcome: approve(100) }),
+        lane(20, "reviewer", { outcome: approve(100) }),
       ]
     );
     // The parent merges first even though the child's lane comes first in the array.
@@ -666,8 +855,8 @@ describe("merge-gate cycle parks instead of throwing (#146)", () => {
     const s = state(
       [ticket(10, "Review", [11]), ticket(11, "Review", [10])],
       [
-        lane(10, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
-        lane(11, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+        lane(10, "reviewer", { outcome: approve(100) }),
+        lane(11, "reviewer", { outcome: approve(100) }),
       ]
     );
     expect(() => nextAction(s, 0)).not.toThrow();
@@ -684,9 +873,9 @@ describe("merge-gate cycle parks instead of throwing (#146)", () => {
     let s = state(
       [ticket(10, "Review", [11]), ticket(11, "Review", [10]), ticket(30, "Review")],
       [
-        lane(10, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
-        lane(11, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
-        lane(30, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+        lane(10, "reviewer", { outcome: approve(100) }),
+        lane(11, "reviewer", { outcome: approve(100) }),
+        lane(30, "reviewer", { outcome: approve(100) }),
       ]
     );
     // The cycle doesn't block the independent lane: #30 merges this very tick.
@@ -710,8 +899,8 @@ describe("merge-gate cycle parks instead of throwing (#146)", () => {
     let s = state(
       [ticket(10, "Review", [11]), ticket(11, "Review", [10])],
       [
-        lane(10, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
-        lane(11, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+        lane(10, "reviewer", { outcome: approve(100) }),
+        lane(11, "reviewer", { outcome: approve(100) }),
       ]
     );
     const first = nextAction(s, 0);
@@ -956,22 +1145,25 @@ describe("ingest preserves state on a transient empty snapshot (#127)", () => {
 // -- fresh-stage guarantee (AC4): lane state carries no conversation id -------
 
 describe("fresh-stage lane state", () => {
-  test("LaneState carries exactly its eight scheduling fields and no session/conversation id", () => {
+  test("LaneState carries exactly its nine scheduling fields and no session/conversation id", () => {
     // Compile-time half: this constant stops typechecking if LaneState's key
-    // set ever drifts from the eight named here (issue #76 added reviewBounces,
-    // mirroring qaBounces; #125 added lastWroteStatus, the resync origin marker).
+    // set ever drifts from the nine named here (issue #76 added reviewBounces,
+    // mirroring qaBounces; #125 added lastWroteStatus, the resync origin marker;
+    // #191 added quorumRetries, a budget deliberately separate from
+    // reviewBounces). Every addition must be a deliberate edit here -- this gate
+    // is what keeps a conversation/session id from ever riding between stages.
     type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
     const _laneKeysExact: Exact<
       keyof LaneState,
-      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "workerDead" | "outcome" | "lastWroteStatus"
+      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "quorumRetries" | "workerDead" | "outcome" | "lastWroteStatus"
     > = true;
     void _laneKeysExact;
     // Runtime half: a fully-populated lane exposes exactly those keys, and none
     // of them smells like a carried conversation.
     const full: Required<LaneState> = {
-      ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, workerDead: false, outcome: { kind: "built" }, lastWroteStatus: "Building",
+      ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, quorumRetries: 0, workerDead: false, outcome: { kind: "built" }, lastWroteStatus: "Building",
     };
-    expect(Object.keys(full).sort()).toEqual(["lastActivityMs", "lastWroteStatus", "outcome", "qaBounces", "reviewBounces", "stage", "ticket", "workerDead"]);
+    expect(Object.keys(full).sort()).toEqual(["lastActivityMs", "lastWroteStatus", "outcome", "qaBounces", "quorumRetries", "reviewBounces", "stage", "ticket", "workerDead"]);
     for (const k of Object.keys(full)) {
       expect(k).not.toMatch(/conversation|session|context|transcript|agent/i);
     }
@@ -1005,7 +1197,7 @@ describe("parseStageResult", () => {
     expect(parseStageResult("builder", "BUILT: all green")).toEqual({ kind: "built" });
     expect(parseStageResult("builder", "NEEDS-INPUT: pick a currency")).toEqual({ kind: "needs-input", note: "pick a currency" });
     expect(parseStageResult("qa", "QA-BUGS: 1) x\n2) y")).toEqual({ kind: "qa-bugs", note: "1) x\n2) y" });
-    expect(parseStageResult("reviewer", "REVIEW-APPROVE: verified")).toEqual({ kind: "review-approve", confidence: null });
+    expect(parseStageResult("reviewer", "REVIEW-APPROVE: verified")).toEqual(approve(null));
     expect(parseStageResult("merge", "MERGED: https://pr/9")).toEqual({ kind: "merged", note: "https://pr/9" });
     expect(parseStageResult("merge", "BLOCKED: conflict gauntlet failed")).toEqual({ kind: "stage-blocked", note: "conflict gauntlet failed" });
   });
@@ -1107,7 +1299,7 @@ describe("stage/status desync fails soft (#110)", () => {
     let s = state(
       [ticket(1, "Building"), ticket(2, "Building")],
       [
-        lane(1, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }), // dragged Review -> Building
+        lane(1, "reviewer", { outcome: approve(100) }), // dragged Review -> Building
         lane(2, "builder", { outcome: { kind: "built" } }), // healthy, ready to advance
       ]
     );
@@ -1149,7 +1341,7 @@ describe("resync-on-lag vs genuine move-back (#116)", () => {
   test("AC2: two hops behind (reviewer lane at Building) is a genuine move-back -- stop-lane, and the ticket re-claims as a fresh builder", () => {
     let s = state(
       [ticket(1, "Building")],
-      [lane(1, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } })] // human dragged Review -> Building
+      [lane(1, "reviewer", { outcome: approve(100) })] // human dragged Review -> Building
     );
     const a = nextAction(s, 0);
     expect(a).toMatchObject({ kind: "stop-lane", ticket: 1 });
@@ -1173,7 +1365,7 @@ describe("resync-on-lag vs genuine move-back (#116)", () => {
 // stop-lane, even at one hop.
 describe("one-hop resync: lagged write vs genuine move-back by origin (#125)", () => {
   const reviewerLane = (over: Partial<LaneState> = {}) =>
-    lane(1, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, ...over });
+    lane(1, "reviewer", { outcome: approve(100), ...over });
 
   test("AC1: a reviewer lane one hop behind (board QA) with the loop's Review write still in flight resyncs to Review and advances to merge", () => {
     const s = state([ticket(1, "QA")], [reviewerLane({ lastWroteStatus: "Review" })]);
@@ -2362,7 +2554,7 @@ describe("ingestBoardItems: batch + context knobs (#131)", () => {
   });
 });
 
-describe("validateConfig: ticketLimit / contextTokenLimit (#131 AC10)", () => {
+describe("validateConfig: ticketLimit / contextTokenLimit (#131 AC10) + minSkepticQuorum (#191)", () => {
   const baseConfig = () => ({
     slug: "s",
     owner: "o",
@@ -2388,5 +2580,19 @@ describe("validateConfig: ticketLimit / contextTokenLimit (#131 AC10)", () => {
 
   test("ticketLimit 0 and contextTokenLimit 0 both pass (disabled is legal)", () => {
     expect(() => validateConfig({ ...baseConfig(), ticketLimit: 0, contextTokenLimit: 0 })).not.toThrow();
+  });
+
+  // #191: a quorum above the fixed 3-skeptic fan-out is unsatisfiable, so every
+  // adversarial review would park Blocked. That is a config error at write time,
+  // not a mystery at drain time.
+  test("minSkepticQuorum is bounded to the fan-out it is a quorum over", () => {
+    for (const bad of [4, 1.5, -1]) {
+      expect(() => validateConfig({ ...baseConfig(), minSkepticQuorum: bad })).toThrow(
+        /"minSkepticQuorum" must be an integer 0-3 \(0 disables the gate\)/
+      );
+    }
+    for (const ok of [0, 1, 2, 3]) {
+      expect(() => validateConfig({ ...baseConfig(), minSkepticQuorum: ok })).not.toThrow();
+    }
   });
 });

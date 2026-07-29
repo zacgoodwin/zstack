@@ -235,23 +235,37 @@ describe("pointer prompts are size-invariant to the payload (AC1)", () => {
   const HUGE = "X".repeat(100_000); // 100 KB ticketBody / diff
   const AC = "Y".repeat(100_000);
 
+  const TINY = "x"; // the same fields at 1 byte, for the invariance comparison
+
   // The builder/qa injection carries the huge body; the reviewer additionally
   // carries a huge diff + acceptance criteria. Every stage's input-<N>.json is
   // referenced by absolute path; the built prompt must not embed the payload.
-  const CASES: { stage: string; build: () => string; payloads: string[] }[] = [
-    { stage: "builder", build: () => builderPrompt({ ...BUILDER_INPUT, ticketBody: HUGE }, INPUT_PATH), payloads: [HUGE] },
-    { stage: "qa", build: () => qaPrompt({ ...QA_INPUT, ticketBody: HUGE }, INPUT_PATH), payloads: [HUGE] },
-    { stage: "reviewer", build: () => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: HUGE, diff: HUGE, acceptanceCriteria: AC }, INPUT_PATH), payloads: [HUGE, AC] },
+  //
+  // `cap` is a per-stage absolute ceiling, not the contract itself: the contract
+  // is INVARIANCE (`buildTiny().length === buildHuge().length`), asserted below,
+  // which is strictly stronger than any single number. The cap stays as a second
+  // guard so a future edit that inlines something unrelated still trips. #191
+  // raised the adversarial reviewer's alone, deliberately: hardening the
+  // super-truth block against starved skeptic delivery added ~1 KB of FIXED
+  // instructions. That is not the failure this test guards against -- its
+  // invariance assertion is unaffected -- so the number moved and every other
+  // stage kept 4 KB.
+  const CASES: { stage: string; build: (payload: string, ac: string) => string; cap: number; payloads: string[] }[] = [
+    { stage: "builder", build: (b) => builderPrompt({ ...BUILDER_INPUT, ticketBody: b }, INPUT_PATH), cap: 4096, payloads: [HUGE] },
+    { stage: "qa", build: (b) => qaPrompt({ ...QA_INPUT, ticketBody: b }, INPUT_PATH), cap: 4096, payloads: [HUGE] },
+    { stage: "reviewer", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH), cap: 4096, payloads: [HUGE, AC] },
     // The adversarial reviewer branch fans out skeptics but STILL points at the
     // file for its payload -- it must stay size-invariant too.
-    { stage: "reviewer (adversarial)", build: () => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: HUGE, diff: HUGE, acceptanceCriteria: AC }, INPUT_PATH, true), payloads: [HUGE, AC] },
-    { stage: "merge", build: () => mergePrompt(MERGE_INPUT, INPUT_PATH), payloads: [] },
+    { stage: "reviewer (adversarial)", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH, true), cap: 5120, payloads: [HUGE, AC] },
+    { stage: "merge", build: () => mergePrompt(MERGE_INPUT, INPUT_PATH), cap: 4096, payloads: [] },
   ];
 
   for (const c of CASES) {
-    test(`${c.stage}: 100 KB payload -> < 4 KB prompt, omits the payload, contains the absolute input path`, () => {
-      const p = c.build();
-      expect(p.length).toBeLessThan(4096);
+    test(`${c.stage}: 100 KB payload -> same-length prompt under ${c.cap}B, omits the payload, contains the absolute input path`, () => {
+      const p = c.build(HUGE, AC);
+      // The contract: a 100,000x bigger payload changes the prompt not at all.
+      expect(p.length).toBe(c.build(TINY, TINY).length);
+      expect(p.length).toBeLessThan(c.cap);
       for (const payload of c.payloads) expect(p).not.toContain(payload);
       expect(isAbsolute(INPUT_PATH)).toBe(true);
       expect(p).toContain(INPUT_PATH);
@@ -305,13 +319,57 @@ describe("adversarial reviewer prompt", () => {
   test("inactive prompt is byte-identical to the pinned single-pass baseline", () => {
     expect(reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, false)).toBe(SINGLE_PASS_BASELINE);
     // And the active prompt is the single pass PLUS exactly the super-truth
-    // block and REVIEW-FINDINGS' confidence token -- REVIEW-APPROVE's
-    // confidence (present in both) is part of the shared, unchanged body.
+    // block, REVIEW-FINDINGS' confidence token, and (#191) each marker's
+    // skeptics=<k>/3 denominator -- REVIEW-APPROVE's confidence (present in
+    // both) is part of the shared, unchanged body.
+    //
+    // The block is bounded by the section that FOLLOWS it, not by a phrase
+    // inside it: an earlier version matched lazily up to the first "below.\n",
+    // so lengthening the block (as #191 did) left its tail behind and the
+    // difference showed up as an unrelated-looking golden mismatch.
     const active = reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, true);
     const stripped = active
-      .replace(/\n## Super-truth pass[\s\S]*?below\.\n/, "")
+      .replace(/\n## Super-truth pass[\s\S]*?(?=\n## Exit contract)/, "")
+      .replaceAll("skeptics=<k>/3 ", "")
       .replace("REVIEW-FINDINGS: confidence=<0-100> ", "REVIEW-FINDINGS: ");
     expect(stripped).toBe(SINGLE_PASS_BASELINE);
+  });
+
+  // #191: the three run-10 failure modes the block now names explicitly.
+  // Reviewers hung on a skeptic that never reported, ended a turn with no marker
+  // (CONFUSED -> the ticket is SKIPPED), or reported confidence=100 holding zero
+  // verdicts -- which #62's gate read as three independent agreements.
+  test("the super-truth block makes delivery best-effort with a mandatory denominator", () => {
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
+    expect(active).toContain("Delivery is BEST-EFFORT");
+    expect(active).toContain("AT MOST ONCE per skeptic");
+    expect(active).toContain("Do not spawn replacements");
+    expect(active).toContain("Do NOT end your turn without one of the exit markers");
+    // Both markers carry the denominator, so a starved review is legible on
+    // either path.
+    expect(active).toContain("REVIEW-APPROVE: confidence=<0-100> skeptics=<k>/3");
+    expect(active).toContain("REVIEW-FINDINGS: confidence=<0-100> skeptics=<k>/3");
+  });
+
+  test("the k -> confidence mapping is an enumerated table, not a formula", () => {
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
+    expect(active).toContain("do no arithmetic");
+    // Every reachable (k, unrefuted) pair is spelled out, so the reviewer never
+    // computes 100*u/k in prose (PRINCIPLES.md, latent vs deterministic).
+    expect(active).toContain("k=3: 3 unrefuted -> 100, 2 -> 67, 1 -> 33, 0 -> 0");
+    expect(active).toContain("k=2: 2 unrefuted -> 100, 1 -> 50, 0 -> 0");
+    expect(active).toContain("k=1: 1 unrefuted -> 100, 0 -> 0");
+    // The k=0 case is the one that used to merge on a fabricated 100.
+    expect(active).toContain("skeptics=0/3");
+    expect(active).toContain("never 100");
+  });
+
+  // The denominator is adversarial-only: with no fan-out there is no k, and
+  // demanding one would invite an invented number.
+  test("the single pass demands no denominator", () => {
+    const inactive = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false);
+    expect(inactive).not.toContain("skeptics=");
+    expect(inactive).not.toContain("BEST-EFFORT");
   });
 });
 

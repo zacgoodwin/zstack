@@ -15,11 +15,18 @@ if [[ "$PROMPT" == *"Grade one reviewer trial"* ]]; then
   # GRADE step: rubric.md's JSON shape. Only `pass` is overridable
   # (MOCK_CLAUDE_PASS) so a test can drive the threshold both ways without
   # touching the other fields.
+  PASS="${MOCK_CLAUDE_PASS:-true}"
   case "${MOCK_FIXTURE:-}" in
-    prose-nit) m=REVIEW-APPROVE;  b=false ;;
-    *)         m=REVIEW-FINDINGS; b=true  ;;
+    # #191's fixture grades a DENOMINATOR, so its JSON carries a different shape
+    # (run.sh reads the shape from the fixture's grade-schema file). Only `pass`
+    # is common, which is all evals/lib/grade.ts requires.
+    skeptic-starved)
+      GRADE_JSON="{\"marker\":\"REVIEW-APPROVE\",\"skepticsToken\":\"skeptics=0/3\",\"claimedReceived\":0,\"inflated\":false,\"pass\":$PASS}" ;;
+    prose-nit)
+      GRADE_JSON="{\"marker\":\"REVIEW-APPROVE\",\"blocked\":false,\"namesIssue\":true,\"pass\":$PASS}" ;;
+    *)
+      GRADE_JSON="{\"marker\":\"REVIEW-FINDINGS\",\"blocked\":true,\"namesIssue\":true,\"pass\":$PASS}" ;;
   esac
-  GRADE_JSON="{\"marker\":\"$m\",\"blocked\":$b,\"namesIssue\":true,\"pass\":${MOCK_CLAUDE_PASS:-true}}"
   # See evals/reviewer/mock-claude.sh: MOCK_CLAUDE_GRADE_WRAP reproduces the
   # real grader's actual reply shapes, which bare JSON alone never did (#108).
   case "${MOCK_CLAUDE_GRADE_WRAP:-none}" in
@@ -49,6 +56,15 @@ B
     cat << 'C'
 REVIEW-FINDINGS: 1. docs/user-guide/backfill.md -- acceptance criteria 1 and 2 require Step 1 to snapshot every row BEFORE running the backfill; the diff runs the backfill first and snapshots only "if something looks wrong afterward", the reverse order. The prose IS the deliverable and a wrong safety runbook drives the operator into an unreversible data-loss action -- the carve-out applies. Blocks the merge.
 C
+    ;;
+  skeptic-starved)
+    # The INTENDED post-#191 behavior under starved delivery: a marker is still
+    # emitted (never a silent turn), the denominator is reported honestly, and the
+    # confidence is the reviewer's OWN single-pass certainty rather than the 100
+    # that an empty denominator used to produce.
+    cat << 'D'
+REVIEW-APPROVE: confidence=80 skeptics=0/3 all four acceptance criteria verified against the diff myself (exact multiple / short final chunk / empty input / non-positive size throws); src/chunk.test.ts covers all four and is green. I spawned 3 skeptics and checked once for each; none returned a usable verdict, so this score is my own single-pass certainty and NOT an aggregate -- reporting 100 here would claim three agreements that never happened.
+D
     ;;
   *)
     echo "REVIEW-CONFUSED: mock-claude received no MOCK_FIXTURE"
