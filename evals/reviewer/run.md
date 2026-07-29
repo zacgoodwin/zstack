@@ -444,3 +444,48 @@ criterion and every line. Two ways forward, both needing a human call:
   breadth across many independent findings in one diff, rather than one planted
   needle single-pass has to miss. That rewrites `rubric.md`'s pass contract and
   moves #59's claim and #113 with it.
+
+**2026-07-28, 5 trials, ticket #183 (first paid run of the re-targeted recall
+contract). Score: 2/5 — FAIL below threshold (exit 1), recorded honestly.**
+`run.sh`'s own report, verbatim:
+
+```
+per-defect catch rate over 5 trials (single -> adversarial):
+  D1 src/limiter.ts:allow         3/5 -> 5/5
+  D2 src/limiter.ts:constructor   4/5 -> 5/5
+  D3 src/middleware.ts (absence)  5/5 -> 5/5
+  D4 src/middleware.ts:handle     5/5 -> 5/5
+  D5 src/middleware.ts:handle     5/5 -> 5/5
+  D6 src/middleware.ts:handle     5/5 -> 5/5
+  D7 src/middleware.ts:handle     5/5 -> 5/5
+  D8 src/middleware.test.ts       5/5 -> 5/5
+mean recall: single 7.4/8 (93%), adversarial 8.0/8 (100%)
+mean findings matching no planted defect: single 0.0, adversarial 0.6
+adversarial named strictly more planted defects in 2/5 trials (pass threshold: 4/5)
+```
+
+All five grades parsed (no exit-2), and the grader was spot-checked against the
+raw outputs: trials 4 and 5 genuinely lack the D1 finding in the single-pass
+text and trial 5 also lacks D2, so the 2/5 is a measurement, not grader noise.
+
+**Reading.** The re-targeted contract discriminates in the right direction —
+adversarial was a perfect 40/40 across five trials while single-pass dropped
+defects only in the hardest class (D1, the ordering interaction, missed 2/5;
+D2, the missing validation, 1/5) — but the fixture saturates: six of eight
+defects are surfaced 5/5 by BOTH modes, so three trials were 8-vs-8 ties and
+ties are not passes. The signal and the fix are now visible in the same table:
+to discriminate at ≥4/5 the fixture needs more defects in the D1 class
+(stateful interactions between individually-correct paths) and fewer freebies
+(D4-D8, each caught every time by everyone). That is a fixture-difficulty
+iteration under an unchanged contract — the exact kind of tuning the old
+single-needle rubric could never expose, because it had no per-defect table to
+say WHICH defects carry the delta.
+
+**Caveat on this run.** It predates the blindness hardening landed immediately
+after: the reviewers ran with the repo as cwd, so `defects.json` was reachable
+in principle. Against contamination: single-pass MISSED defects (a key-reader
+would not), adversarial reported 0.6 findings per trial that match no key entry
+(a key-reader would return exactly the eight), and every finding carries an
+executed probe. Future runs are hardened regardless — both reviewer passes now
+run from inside the throwaway worktree with only `$OUT` granted, gate-tested in
+`tests/reviewer-recall.test.ts`.

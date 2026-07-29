@@ -28,6 +28,15 @@ RUNS="${1:-5}"
 CLAUDE_CMD="${CLAUDE_CMD:-claude -p}"
 OUT="$(mktemp -d)"
 
+# CLAUDE_CMD may be a repo-relative script (the mock, per run.md's smoke
+# command). The reviewer passes below run from inside the throwaway worktree,
+# so absolutize a relative script path now or the cd would break it.
+CMD_FIRST="${CLAUDE_CMD%% *}"
+if [ -f "$CMD_FIRST" ]; then
+  CMD_REST="${CLAUDE_CMD#"$CMD_FIRST"}"
+  CLAUDE_CMD="$(cd "$(dirname "$CMD_FIRST")" && pwd -P)/$(basename "$CMD_FIRST")$CMD_REST"
+fi
+
 # 1. Materialize diff.patch into a real throwaway directory so `worktreePath`
 #    is a live filesystem path the reviewer can actually inspect and run tests
 #    in -- mirroring production's `git worktree add ".worktrees/review-<N>" <head-sha>`
@@ -61,10 +70,14 @@ bun "$REPO/lib/stage-prompts.ts" prompt reviewer "$OUT/input.json" --adversarial
 for i in $(seq 1 "$RUNS"); do
   # 4. Drive each prompt through a fresh live Agent (local Claude Code). The
   #    adversarial run fans out skeptics via the Agent tool from inside this run.
-  #    --add-dir "$WORKTREE" grants the "run the typecheck and tests" step from
-  #    step 1 real filesystem access, same as --add-dir "$OUT" grants for I/O.
-  $CLAUDE_CMD "$(cat "$OUT/single.txt")"       --add-dir "$OUT" --add-dir "$WORKTREE" > "$OUT/single-$i.txt"
-  $CLAUDE_CMD "$(cat "$OUT/adversarial.txt")"  --add-dir "$OUT" --add-dir "$WORKTREE" > "$OUT/adversarial-$i.txt"
+  #    Each reviewer runs FROM the throwaway worktree (same as production) and
+  #    is granted only $OUT on top: this fixture is the first to ship an answer
+  #    key (defects.json) in the repo tree, and a reviewer whose cwd is the repo
+  #    could read the very list it is scored against. Blindness must not rest
+  #    on the subject honoring "do not look anywhere else" (gate-tested in
+  #    tests/reviewer-recall.test.ts).
+  ( cd "$WORKTREE" && $CLAUDE_CMD "$(cat "$OUT/single.txt")"      --add-dir "$OUT" ) > "$OUT/single-$i.txt"
+  ( cd "$WORKTREE" && $CLAUDE_CMD "$(cat "$OUT/adversarial.txt")" --add-dir "$OUT" ) > "$OUT/adversarial-$i.txt"
 
   # 5. Map BOTH outputs onto the answer key with a fresh local grader. This is
   #    the only latent step, and it is deliberately a matching task: no scoring,

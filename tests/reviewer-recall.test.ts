@@ -17,6 +17,8 @@
 //      carry a run that lost the other four.
 // Deterministic and free -- no claude -p, no network.
 import { test, expect, describe } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   readTrialGrade,
   scoreTrial,
@@ -28,6 +30,8 @@ import {
   type DefectKey,
   type TrialGrade,
 } from "../evals/lib/recall.ts";
+
+const REVIEWER_DIR = join(import.meta.dir, "..", "evals", "reviewer");
 
 const DEFECTS: DefectKey[] = [
   { id: "D1", site: "src/limiter.ts:allow", summary: "ceiling charged before the per-key check" },
@@ -227,7 +231,54 @@ describe("scoreRun", () => {
 });
 
 // ============================================================================
-// 4. formatReport -- the report run.sh prints is deterministic
+// 4. Blindness -- the reviewer must never be able to reach the answer key
+// ============================================================================
+//
+// This fixture is the first to ship an answer key (defects.json), which creates
+// a hole the old single-needle fixture could not have: the key sits in the repo
+// tree, so a reviewer whose working directory is the repo can read the very
+// list it is being scored against. The prompt tells it not to look anywhere but
+// its input file, but an eval's integrity cannot rest on the subject's
+// compliance. run.sh therefore runs both reviewer passes from INSIDE the
+// throwaway worktree (which is also what production does) and grants them only
+// $OUT, while the grader -- which is not blinded -- keeps repo access.
+
+describe("run.sh keeps the reviewer blinded to the answer key", () => {
+  const runSh = readFileSync(join(REVIEWER_DIR, "run.sh"), "utf8");
+  const reviewerCalls = runSh
+    .split("\n")
+    .filter((l) => l.includes("$CLAUDE_CMD") && (l.includes("single.txt") || l.includes("adversarial.txt")));
+
+  test("both reviewer passes are invoked, and from the worktree", () => {
+    expect(reviewerCalls).toHaveLength(2);
+    for (const call of reviewerCalls) expect(call).toContain('cd "$WORKTREE"');
+  });
+
+  test("neither reviewer pass is granted the fixture directory or the repo", () => {
+    for (const call of reviewerCalls) {
+      expect(call).not.toContain('--add-dir "$FIX"');
+      expect(call).not.toContain('--add-dir "$HERE"');
+      expect(call).not.toContain('--add-dir "$REPO"');
+    }
+  });
+
+  test("the grader still reaches the answer key -- it is not blinded", () => {
+    expect(runSh).toContain('--add-dir "$HERE"');
+    expect(runSh).toContain("defects.json");
+  });
+
+  test("the blinded input file carries exactly the four keys, never the answer key", () => {
+    const open = runSh.indexOf("JSON.stringify({");
+    const inputBuild = runSh.slice(open, runSh.indexOf("}));", open));
+    for (const key of ["ticketBody", "acceptanceCriteria", "diff", "worktreePath"]) {
+      expect(inputBuild).toContain(key);
+    }
+    expect(inputBuild).not.toContain("defects");
+  });
+});
+
+// ============================================================================
+// 5. formatReport -- the report run.sh prints is deterministic
 // ============================================================================
 
 describe("formatReport", () => {
