@@ -16,6 +16,13 @@ export interface ParsedArgs {
 // consumes no value and stores true (e.g. --reconcile, --json, --force).
 // `--key=value` is also accepted (split on the first `=`) as an alternative
 // to the space-separated form; both spellings land in the same `flags[key]`.
+// For a key listed in `booleans`, the `=` form coerces "true"/"false" to real
+// booleans -- NOT the raw string -- so callers that strictly compare
+// `flags.json === true` (lib/cost.ts, lib/locks.ts) see the same type
+// regardless of which spelling the caller typed. Any other value after `=`
+// on a boolean key (e.g. --json=maybe) is a loud usage error, matching the
+// trailing-value-flag error below rather than silently storing a truthy
+// string that `=== true` would then defeat.
 // A non-boolean flag with no following token (the flag is the last arg, or
 // followed by nothing) is a usage error, not a silent `undefined` value --
 // callers reading it via `str()`/`requireFlag` used to see "flag missing"
@@ -29,7 +36,15 @@ export function parseFlags(args: string[], booleans: string[] = []): ParsedArgs 
       const body = a.slice(2);
       const eq = body.indexOf("=");
       if (eq !== -1) {
-        flags[body.slice(0, eq)] = body.slice(eq + 1);
+        const key = body.slice(0, eq);
+        const raw = body.slice(eq + 1);
+        if (booleans.includes(key)) {
+          if (raw === "true") flags[key] = true;
+          else if (raw === "false") flags[key] = false;
+          else throw new ZError(`Flag --${key} is boolean; got --${key}=${raw} (expected true or false).`);
+        } else {
+          flags[key] = raw;
+        }
         continue;
       }
       const key = body;

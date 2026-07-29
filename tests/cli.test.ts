@@ -5,6 +5,15 @@
 // token, so there is no following token to consume) stored `undefined`
 // instead of erroring -- a caller reading it via `str()`/`requireFlag` saw
 // "flag missing", not "flag malformed", masking a typo'd command line.
+//
+// A third drift (caught in adversarial review): the initial `--flag=value`
+// fix assigned the raw string BEFORE checking `booleans.includes(key)`, so
+// a boolean flag parsed differently depending on which syntax the caller
+// used (`--json` -> true, `--json=true` -> the STRING "true"). Real callers
+// (lib/cost.ts:520 `flags.json === true`, lib/locks.ts:507
+// `flags.reconcile === true`) strictly compare against the boolean, so the
+// `=` form silently defeated them. The tests below cross both syntaxes with
+// both values for a boolean-listed key, plus the invalid-value case.
 import { test, expect, describe } from "bun:test";
 import { parseFlags } from "../lib/cli.ts";
 import { ZError } from "../lib/config.ts";
@@ -58,5 +67,37 @@ describe("parseFlags", () => {
   test("a boolean flag as the very last token is unaffected (no value to consume, no error)", () => {
     const { flags } = parseFlags(["--slug", "zstack", "--force"], ["force"]);
     expect(flags).toEqual({ slug: "zstack", force: true });
+  });
+
+  // Regression for the reintroduced bug: a boolean-listed key must coerce to
+  // a real boolean under BOTH spellings, so `flags.json === true` behaves
+  // identically regardless of which syntax the caller typed.
+  test("--flag=true on a boolean-listed key parses to the boolean true, not the string \"true\"", () => {
+    const { flags } = parseFlags(["--json=true"], ["json"]);
+    expect(flags.json).toBe(true);
+    expect(flags.json === true).toBe(true);
+  });
+
+  test("--flag=false on a boolean-listed key parses to the boolean false, not the string \"false\"", () => {
+    const { flags } = parseFlags(["--json=false"], ["json"]);
+    expect(flags.json).toBe(false);
+    expect(flags.json === true).toBe(false);
+  });
+
+  test("space form and =true form agree for the same boolean-listed key", () => {
+    const spaceForm = parseFlags(["--json"], ["json"]);
+    const eqForm = parseFlags(["--json=true"], ["json"]);
+    expect(spaceForm.flags.json).toBe(eqForm.flags.json);
+    expect(eqForm.flags.json).toBe(true);
+  });
+
+  test("--flag=maybe on a boolean-listed key throws a loud ZError instead of storing a truthy string", () => {
+    expect(() => parseFlags(["--json=maybe"], ["json"])).toThrow(ZError);
+    expect(() => parseFlags(["--json=maybe"], ["json"])).toThrow(/--json/);
+  });
+
+  test("--flag=value on a non-boolean key is unaffected by the boolean coercion path", () => {
+    const { flags } = parseFlags(["--slug=true"]);
+    expect(flags).toEqual({ slug: "true" });
   });
 });

@@ -21,8 +21,11 @@ and Merge stages of a dev loop unattended: `/z-setup` provisions a GitHub
 ProjectV2 board, `/z-plan` turns a spec into grounded tickets, `/z-loop`
 drains the Ready queue through fresh-agent builder → QA → adversarial-review →
 merge lanes, `/z-status` reports, `/z-update`/`/z-uninstall` handle the
-install lifecycle. Each skill is one directory (`SKILL.md` + `bin/` shim +
-`lib/*.ts`), the same layout gstack uses.
+install lifecycle. Each skill is one directory holding only `SKILL.md` (plus
+an occasional static asset, e.g. `z-plan/tiers.json`, `z-setup/board-template.json`);
+the executable code lives in the shared top-level `bin/` (one shim per
+command) and `lib/*.ts` (the deterministic core), not inside the skill
+directories.
 
 **Deterministic core decides, agents execute.** Every scheduling, transition,
 merge-order, and cost decision is computed by bun TypeScript under `lib/`
