@@ -24,9 +24,11 @@ the reviewer's inner Agent-tool fan-out is allowed.
 
 - `fixtures/multi-defect/ticket.md` — the ticket body, carrying its 12
   `### Acceptance Criteria`.
-- `fixtures/multi-defect/diff.patch` — a 735-line, four-file diff (a keyed rate
-  limiter plus its HTTP middleware) that typechecks and is green on all 54 of
-  its own tests while hiding eight independent defects.
+- `fixtures/multi-defect/diff.patch` — a 771-line, four-file diff (a keyed rate
+  limiter plus its HTTP middleware) that typechecks and is green on all 55 of
+  its own tests while hiding eight independent defects, four of them stateful
+  interactions between individually-correct paths (the class the first paid run
+  showed carries the delta — rubric.md has the table).
 - `fixtures/multi-defect/defects.json` — the answer key: each defect's site,
   mechanism, the criterion it violates, and a reproduction. **Never part of the
   reviewer's input**; only the grader reads it.
@@ -489,3 +491,66 @@ would not), adversarial reported 0.6 findings per trial that match no key entry
 executed probe. Future runs are hardened regardless — both reviewer passes now
 run from inside the throwaway worktree with only `$OUT` granted, gate-tested in
 `tests/reviewer-recall.test.ts`.
+
+**2026-07-28, 5 trials, ticket #183 iteration 2 (interaction-weighted fixture,
+hardened blindness). Score: 1/5 — FAIL below threshold (exit 1), recorded
+honestly.** `run.sh`'s report, verbatim:
+
+```
+per-defect catch rate over 5 trials (single -> adversarial):
+  D1 src/limiter.ts:allow                 4/5 -> 5/5
+  D2 src/limiter.ts:constructor           5/5 -> 5/5
+  D3 src/limiter.ts:resetAll              0/5 -> 0/5
+  D4 src/limiter.ts:retryAfterMs          5/5 -> 5/5
+  D5 src/middleware.ts:handle             5/5 -> 5/5
+  D6 src/middleware.ts:retryAfterSeconds  5/5 -> 5/5
+  D7 src/middleware.ts:handle (catch)     5/5 -> 5/5
+  D8 src/middleware.test.ts               5/5 -> 5/5
+mean recall: single 6.8/8 (85%), adversarial 7.0/8 (88%)
+mean findings matching no planted defect: single 0.2, adversarial 0.4
+adversarial named strictly more planted defects in 1/5 trials (pass threshold: 4/5)
+```
+
+All five grades parsed. Grader verified against the raw text both ways: the one
+strict win (trial 2: single 6, adversarial 7 — single missed D1) is real, and
+the D3 misses are real — **zero of the ten reviewer outputs contain the string
+`resetAll` at all**. This run used the hardened harness (reviewers cwd = the
+throwaway worktree, answer key unreachable), so it carries no contamination
+caveat.
+
+**Reading 1 — the difficulty dial has two stable settings and a knife edge.**
+Three of the four new interaction defects (D4 stale-window retry, D6 rounding
+direction, D7 catch re-entry) were caught 5/5 by BOTH modes: each violates a
+criterion a code-executing reviewer probes directly, and a probe that
+constructs the state finds it regardless of how many paths interact. D3 — the
+one defect whose two interacting pieces no criterion connects (nothing links
+`resetAll` to the ceiling) — was caught by NOBODY: not one single-pass read,
+not one of fifteen skeptics across five fan-outs. Between "probe-able from a
+stated criterion" (everyone catches) and "no criterion hints at the
+construction" (no one does) sits only the D1-style knife edge, and it is
+narrow: across both paid runs single-pass missed D1 3 times in 10 while
+adversarial caught it 10/10.
+
+**Reading 2 — defects sharing a criterion mask each other.** D1 and D3 both
+violate criterion 5. Every reviewer that audited criterion 5 found D1 first —
+it is upstream in `allow()`, reachable by the criterion's own example — and
+stopped hunting for a second violation of an already-violated criterion. A
+fixture design rule for any future iteration: one planted defect per
+criterion, or the second is invisible behind the first.
+
+**Reading 3 — the eval is now measuring the mechanism, not the fixture.** Two
+honest runs put the fan-out's value-add at +0.2 to +0.6 named defects per
+review (93→100% and 85→88% mean recall), concentrated entirely on
+ordering-interaction defects. The three skeptics run the SAME refute-the-diff
+prompt against the SAME four inputs, so they inherit the same criteria-indexed
+search the single pass uses — redundancy narrows variance (adversarial's
+recall is more consistent) but does not widen the search. That is evidence
+about issue #59's mechanism: a ≥4/5 strictly-more threshold is out of reach of
+prompt-identical skeptics on criterion-complete tickets. What would plausibly
+move it — skeptics with DIVERSE assignments (per-subsystem, per-criterion,
+state-machine walking) so the fan-out searches space the single pass does not —
+is a #59 mechanism change, out of scope for #183 and filed as a follow-up.
+
+The threshold was not tuned to the result. The fixture stays as the better
+substrate either way: eight verified defects, one of which (D3) is now a
+standing example of a real bug the current adversarial mode cannot see.

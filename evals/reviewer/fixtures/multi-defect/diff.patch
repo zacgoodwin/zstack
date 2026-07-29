@@ -223,10 +223,10 @@ index 0000000..a393ac8
 +});
 diff --git a/src/limiter.ts b/src/limiter.ts
 new file mode 100644
-index 0000000..16380ae
+index 0000000..44cf083
 --- /dev/null
 +++ b/src/limiter.ts
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,205 @@
 +import { msUntilWindowEnd, windowStartFor, withinWindow } from "./window.ts";
 +
 +// Per-key fixed-window rate limiting with a process-wide ceiling.
@@ -352,7 +352,10 @@ index 0000000..16380ae
 +   */
 +  retryAfterMs(key: string, now: number): number {
 +    if (this.peek(key, now)) return 0;
-+    return msUntilWindowEnd(now, windowStartFor(now, this.durationMs), this.durationMs);
++    // Wait until the window the key's budget is charged to closes.
++    const bucket = this.buckets.get(key);
++    const start = bucket !== undefined ? bucket.windowStart : windowStartFor(now, this.durationMs);
++    return msUntilWindowEnd(now, start, this.durationMs);
 +  }
 +
 +  /** Drop `key`'s bucket, restoring its full budget immediately. */
@@ -363,6 +366,9 @@ index 0000000..16380ae
 +  /** Drop every bucket. */
 +  resetAll(): void {
 +    this.buckets.clear();
++    // A full reset starts the process from a clean slate.
++    this.shared.windowStart = 0;
++    this.shared.count = 0;
 +  }
 +
 +  /**
@@ -428,10 +434,10 @@ index 0000000..16380ae
 +}
 diff --git a/src/middleware.test.ts b/src/middleware.test.ts
 new file mode 100644
-index 0000000..8276d5e
+index 0000000..81c0b07
 --- /dev/null
 +++ b/src/middleware.test.ts
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,133 @@
 +import { test, expect } from "bun:test";
 +import { KeyedRateLimiter } from "./limiter.ts";
 +import { rateLimitMiddleware, type RequestLike, type ResponseLike } from "./middleware.ts";
@@ -534,6 +540,16 @@ index 0000000..8276d5e
 +  expect(nexted).toBe(true);
 +});
 +
++test("a rejected request counts as rejected, not admitted", () => {
++  const limiter = new KeyedRateLimiter({ limit: 1, durationMs: 500 });
++  const m = mw(limiter, () => 1000);
++  m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  expect(m.metrics.admitted).toBe(1);
++  expect(m.metrics.rejected).toBe(2);
++});
++
 +test("metrics count the traffic the middleware handled", () => {
 +  const limiter = new KeyedRateLimiter({ limit: 5, durationMs: 500 });
 +  const m = mw(limiter, () => 1000);
@@ -557,10 +573,10 @@ index 0000000..8276d5e
 +});
 diff --git a/src/middleware.ts b/src/middleware.ts
 new file mode 100644
-index 0000000..9e876ae
+index 0000000..09bf60b
 --- /dev/null
 +++ b/src/middleware.ts
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,98 @@
 +import type { KeyedRateLimiter } from "./limiter.ts";
 +
 +// HTTP edge for the keyed rate limiter.
@@ -608,32 +624,52 @@ index 0000000..9e876ae
 +  readonly metrics: RateLimitMetrics;
 +}
 +
++/** How many requests pass between housekeeping sweeps of idle buckets. */
++const SWEEP_EVERY = 512;
++
++/** `Retry-After` is seconds on the wire (RFC 9110); the limiter speaks ms. */
++function retryAfterSeconds(ms: number): string {
++  return String(Math.round(ms / 1000));
++}
++
 +export function rateLimitMiddleware(options: RateLimitMiddlewareOptions): RateLimitMiddleware {
 +  const header = options.header ?? "x-client-id";
 +  const anonymousKey = options.anonymousKey ?? "anonymous";
 +  const metrics: RateLimitMetrics = { admitted: 0, rejected: 0 };
++  let seen = 0;
 +
 +  const handle = (req: RequestLike, res: ResponseLike, next: () => void): void => {
 +    const now = options.now();
 +    const key = req.headers[header] ?? anonymousKey;
-+    metrics.admitted += 1;
++
++    // Reclamation runs in the shipped path, not merely on demand: a process
++    // fronting many short-lived client ids must keep its key table bounded.
++    seen += 1;
++    if (seen % SWEEP_EVERY === 0) options.limiter.sweep(now);
 +
 +    let allowed: boolean;
 +    try {
 +      allowed = options.limiter.allow(key, now);
 +    } catch {
-+      // A limiter fault must never take the endpoint down with it.
-+      allowed = true;
++      // The limiter is unavailable. Refuse rather than admit -- a broken
++      // limiter must never become an open door -- and still tell the client
++      // when it is worth coming back.
++      metrics.rejected += 1;
++      res.statusCode = 429;
++      res.setHeader("Retry-After", retryAfterSeconds(options.limiter.retryAfterMs(key, now)));
++      res.end("rate limited");
++      return;
 +    }
 +
 +    if (allowed) {
++      metrics.admitted += 1;
 +      next();
 +      return;
 +    }
 +
 +    metrics.rejected += 1;
 +    res.statusCode = 429;
-+    res.setHeader("Retry-After", String(options.limiter.retryAfterMs(key, now)));
++    res.setHeader("Retry-After", retryAfterSeconds(options.limiter.retryAfterMs(key, now)));
 +    res.end("rate limited");
 +  };
 +
