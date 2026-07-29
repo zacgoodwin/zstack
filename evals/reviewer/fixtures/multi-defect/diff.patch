@@ -1,9 +1,9 @@
 diff --git a/src/limiter.test.ts b/src/limiter.test.ts
 new file mode 100644
-index 0000000..edd5cf9
+index 0000000..a393ac8
 --- /dev/null
 +++ b/src/limiter.test.ts
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,217 @@
 +import { test, expect } from "bun:test";
 +import { KeyedRateLimiter } from "./limiter.ts";
 +
@@ -218,19 +218,15 @@ index 0000000..edd5cf9
 +  expect(() => new KeyedRateLimiter(opts({ durationMs: 0 }))).toThrow(RangeError);
 +  expect(() => new KeyedRateLimiter(opts({ durationMs: -500 }))).toThrow(RangeError);
 +});
-+test("rejects a non-positive or non-integer globalLimit", () => {
-+  expect(() => new KeyedRateLimiter(opts({ globalLimit: 0 }))).toThrow(RangeError);
-+  expect(() => new KeyedRateLimiter(opts({ globalLimit: 2.5 }))).toThrow(RangeError);
-+});
 +test("rejects an idle ttl shorter than one window", () => {
 +  expect(() => new KeyedRateLimiter(opts({ idleTtlMs: 499 }))).toThrow(RangeError);
 +});
 diff --git a/src/limiter.ts b/src/limiter.ts
 new file mode 100644
-index 0000000..b501cae
+index 0000000..16380ae
 --- /dev/null
 +++ b/src/limiter.ts
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,199 @@
 +import { msUntilWindowEnd, windowStartFor, withinWindow } from "./window.ts";
 +
 +// Per-key fixed-window rate limiting with a process-wide ceiling.
@@ -292,9 +288,6 @@ index 0000000..b501cae
 +  constructor(options: RateLimiterOptions) {
 +    assertPositiveInt("limit", options.limit);
 +    assertPositiveInt("durationMs", options.durationMs);
-+    if (options.globalLimit !== undefined) {
-+      assertPositiveInt("globalLimit", options.globalLimit);
-+    }
 +    const idleTtlMs = options.idleTtlMs ?? options.durationMs * 10;
 +    assertPositiveInt("idleTtlMs", idleTtlMs);
 +    if (idleTtlMs < options.durationMs) {
@@ -353,9 +346,9 @@ index 0000000..b501cae
 +
 +  /**
 +   * Milliseconds the caller should wait before retrying, or 0 when `key` can be
-+   * served right now. Suitable for a `Retry-After` header. Whichever budget is
-+   * closed -- the key's own or the shared ceiling -- both refill when the
-+   * current window does, so one wait covers either.
++   * served right now. Whichever budget is closed -- the key's own or the shared
++   * ceiling -- both refill when the current window does, so one wait covers
++   * either.
 +   */
 +  retryAfterMs(key: string, now: number): number {
 +    if (this.peek(key, now)) return 0;
@@ -432,6 +425,219 @@ index 0000000..b501cae
 +    }
 +    return existing;
 +  }
++}
+diff --git a/src/middleware.test.ts b/src/middleware.test.ts
+new file mode 100644
+index 0000000..8276d5e
+--- /dev/null
++++ b/src/middleware.test.ts
+@@ -0,0 +1,123 @@
++import { test, expect } from "bun:test";
++import { KeyedRateLimiter } from "./limiter.ts";
++import { rateLimitMiddleware, type RequestLike, type ResponseLike } from "./middleware.ts";
++
++const makeRes = (): ResponseLike & { headers: Record<string, string>; body: string | undefined } => {
++  const headers: Record<string, string> = {};
++  return {
++    statusCode: 0,
++    headers,
++    body: undefined,
++    setHeader(name: string, value: string) {
++      headers[name] = value;
++    },
++    end(body?: string) {
++      this.body = body;
++    },
++  };
++};
++
++const req = (headers: Record<string, string | undefined> = {}): RequestLike => ({ headers });
++
++const mw = (limiter: KeyedRateLimiter, now: () => number) => rateLimitMiddleware({ limiter, now });
++
++test("a request under the limit reaches the handler chain", () => {
++  const limiter = new KeyedRateLimiter({ limit: 2, durationMs: 500 });
++  const m = mw(limiter, () => 1000);
++  const res = makeRes();
++  let nexted = false;
++  m.handle(req({ "x-client-id": "acme" }), res, () => {
++    nexted = true;
++  });
++  expect(nexted).toBe(true);
++  expect(res.statusCode).toBe(0);
++});
++
++test("a client over its budget is answered 429 and never reaches the handler", () => {
++  const limiter = new KeyedRateLimiter({ limit: 1, durationMs: 500 });
++  const m = mw(limiter, () => 1000);
++  m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  const res = makeRes();
++  let nexted = false;
++  m.handle(req({ "x-client-id": "acme" }), res, () => {
++    nexted = true;
++  });
++  expect(nexted).toBe(false);
++  expect(res.statusCode).toBe(429);
++  expect(res.body).toBe("rate limited");
++});
++
++test("a 429 tells the client when to come back", () => {
++  const limiter = new KeyedRateLimiter({ limit: 1, durationMs: 500 });
++  const m = mw(limiter, () => 1000);
++  m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  const res = makeRes();
++  m.handle(req({ "x-client-id": "acme" }), res, () => {});
++  expect(res.headers["Retry-After"]).toBeDefined();
++});
++
++test("the middleware answers 429 when the limiter refuses the request", () => {
++  // Stubbed so the test does not depend on window arithmetic.
++  const limiter = { allow: () => true, retryAfterMs: () => 1000 } as unknown as KeyedRateLimiter;
++  const m = mw(limiter, () => 1000);
++  const res = makeRes();
++  let nexted = false;
++  m.handle(req({ "x-client-id": "acme" }), res, () => {
++    nexted = true;
++  });
++  expect(nexted).toBe(true);
++});
++
++test("each client id gets its own budget", () => {
++  const limiter = new KeyedRateLimiter({ limit: 1, durationMs: 500 });
++  const m = mw(limiter, () => 1000);
++  m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  const res = makeRes();
++  let nexted = false;
++  m.handle(req({ "x-client-id": "globex" }), res, () => {
++    nexted = true;
++  });
++  expect(nexted).toBe(true);
++});
++
++test("requests with no client header share the anonymous budget", () => {
++  const limiter = new KeyedRateLimiter({ limit: 1, durationMs: 500 });
++  const m = mw(limiter, () => 1000);
++  m.handle(req(), makeRes(), () => {});
++  const res = makeRes();
++  m.handle(req(), res, () => {});
++  expect(res.statusCode).toBe(429);
++});
++
++test("the client header is configurable", () => {
++  const limiter = new KeyedRateLimiter({ limit: 1, durationMs: 500 });
++  const m = rateLimitMiddleware({ limiter, now: () => 1000, header: "x-api-key" });
++  const res = makeRes();
++  let nexted = false;
++  m.handle(req({ "x-api-key": "acme" }), res, () => {
++    nexted = true;
++  });
++  expect(nexted).toBe(true);
++});
++
++test("metrics count the traffic the middleware handled", () => {
++  const limiter = new KeyedRateLimiter({ limit: 5, durationMs: 500 });
++  const m = mw(limiter, () => 1000);
++  for (let i = 0; i < 3; i++) m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  expect(m.metrics.admitted).toBe(3);
++  expect(m.metrics.rejected).toBe(0);
++});
++
++test("a new window lets a throttled client back in", () => {
++  const limiter = new KeyedRateLimiter({ limit: 1, durationMs: 500 });
++  let clock = 1000;
++  const m = mw(limiter, () => clock);
++  m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  clock = 1500;
++  const res = makeRes();
++  let nexted = false;
++  m.handle(req({ "x-client-id": "acme" }), res, () => {
++    nexted = true;
++  });
++  expect(nexted).toBe(true);
++});
+diff --git a/src/middleware.ts b/src/middleware.ts
+new file mode 100644
+index 0000000..9e876ae
+--- /dev/null
++++ b/src/middleware.ts
+@@ -0,0 +1,78 @@
++import type { KeyedRateLimiter } from "./limiter.ts";
++
++// HTTP edge for the keyed rate limiter.
++//
++// One middleware sits in front of the handler chain: it derives the client key
++// from a request header, asks the limiter whether this request fits the key's
++// budget, and either calls `next()` or answers 429 with a `Retry-After` telling
++// the client when its budget returns.
++//
++// The limiter itself is transport-agnostic (see limiter.ts); everything that
++// knows about requests, responses and status codes lives here.
++
++/** The slice of a Node-style request this middleware reads. */
++export interface RequestLike {
++  headers: Record<string, string | undefined>;
++}
++
++/** The slice of a Node-style response this middleware writes. */
++export interface ResponseLike {
++  statusCode: number;
++  setHeader(name: string, value: string): void;
++  end(body?: string): void;
++}
++
++/** Counts for the process's own dashboards. */
++export interface RateLimitMetrics {
++  /** Requests the middleware let through to the handler chain. */
++  admitted: number;
++  /** Requests the middleware answered with 429. */
++  rejected: number;
++}
++
++export interface RateLimitMiddlewareOptions {
++  limiter: KeyedRateLimiter;
++  /** Monotonic clock in milliseconds; injected so tests can drive time. */
++  now: () => number;
++  /** Header carrying the client id. Defaults to `x-client-id`. */
++  header?: string;
++  /** Key used for requests that arrive without the header. */
++  anonymousKey?: string;
++}
++
++export interface RateLimitMiddleware {
++  handle(req: RequestLike, res: ResponseLike, next: () => void): void;
++  readonly metrics: RateLimitMetrics;
++}
++
++export function rateLimitMiddleware(options: RateLimitMiddlewareOptions): RateLimitMiddleware {
++  const header = options.header ?? "x-client-id";
++  const anonymousKey = options.anonymousKey ?? "anonymous";
++  const metrics: RateLimitMetrics = { admitted: 0, rejected: 0 };
++
++  const handle = (req: RequestLike, res: ResponseLike, next: () => void): void => {
++    const now = options.now();
++    const key = req.headers[header] ?? anonymousKey;
++    metrics.admitted += 1;
++
++    let allowed: boolean;
++    try {
++      allowed = options.limiter.allow(key, now);
++    } catch {
++      // A limiter fault must never take the endpoint down with it.
++      allowed = true;
++    }
++
++    if (allowed) {
++      next();
++      return;
++    }
++
++    metrics.rejected += 1;
++    res.statusCode = 429;
++    res.setHeader("Retry-After", String(options.limiter.retryAfterMs(key, now)));
++    res.end("rate limited");
++  };
++
++  return { handle, metrics };
 +}
 diff --git a/src/window.test.ts b/src/window.test.ts
 new file mode 100644

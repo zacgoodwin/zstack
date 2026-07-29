@@ -1,11 +1,19 @@
 # /z-loop adversarial reviewer eval
 
-Measures issue #59's REVIEW QUALITY claim: adversarial mode surfaces a subtle
-planted defect that single-pass review approves. **Paid lane** (LLM calls), NOT
-in the gate suite (`bun test`). Every LLM call goes through **local Claude Code
+Measures issue #59's REVIEW QUALITY claim. **Paid lane** (LLM calls), NOT in the
+gate suite (`bun test`). Every LLM call goes through **local Claude Code
 (`claude -p`)** — never a hosted API (PRINCIPLES.md "LLM access"). The
-deterministic half of #59 is gate-tested in `tests/stage-prompts.test.ts`; this
-eval covers only the latent half a predicate can't.
+deterministic half of #59 is gate-tested in `tests/stage-prompts.test.ts` and
+this eval's scoring in `tests/reviewer-recall.test.ts`; the paid lane covers
+only the latent half a predicate can't.
+
+**What it asks:** how much of what is wrong does one review cycle surface? Both
+modes review the same diff, which carries eight independent planted defects, and
+a trial passes when the adversarial fan-out names strictly more of them than the
+single pass. It used to ask something narrower — does adversarial catch one
+needle single-pass approves — and that contract was abandoned after four fixture
+redesigns and 16 real single-pass reads showed it cannot be satisfied. The
+evidence is in "## Results" below and the reasoning in `rubric.md`.
 
 The reviewer's active prompt spawns skeptic sub-agents via the **Agent tool**
 (nested `claude -p` is denied by the classifier — MEMORY). The outer `claude -p`
@@ -14,16 +22,16 @@ the reviewer's inner Agent-tool fan-out is allowed.
 
 ## Inputs
 
-- `fixtures/planted-defect/ticket.md` — the ticket body, carrying its
-  `### Acceptance Criteria`. Criteria 4 (keys are independent) and 5 (the shared
-  ceiling counts admissions) are the two the defect violates.
-- `fixtures/planted-defect/diff.patch` — a four-file diff (`src/window.ts` +
-  `src/limiter.ts` and their tests) that typechecks and is green on all 46
-  tests, hiding one ordering defect: `allow()` charges the shared ceiling before
-  checking the key's own budget, so rejected traffic spends shared slots and
-  starves other keys. No test pairs rejected traffic with a second key under a
-  tight ceiling, so nothing green exercises the bug.
-- `rubric.md` — the per-trial pass contract and the ≥ 4/5 threshold (AC11).
+- `fixtures/multi-defect/ticket.md` — the ticket body, carrying its 12
+  `### Acceptance Criteria`.
+- `fixtures/multi-defect/diff.patch` — a 735-line, four-file diff (a keyed rate
+  limiter plus its HTTP middleware) that typechecks and is green on all 54 of
+  its own tests while hiding eight independent defects.
+- `fixtures/multi-defect/defects.json` — the answer key: each defect's site,
+  mechanism, the criterion it violates, and a reproduction. **Never part of the
+  reviewer's input**; only the grader reads it.
+- `rubric.md` — the per-trial pass rule and the ≥ 4/5 threshold (AC11).
+- `../lib/recall.ts` — the deterministic scorer.
 - `../../lib/stage-prompts.ts` — the prompt constructor under test.
 
 ## What the harness does
@@ -35,40 +43,45 @@ driven through a fresh live Agent for N trials:
 - **single-pass** ← `--adversarial-mode off` → `reviewerPrompt(input, false)`.
 - **adversarial** ← `--adversarial-mode always` → `reviewerPrompt(input, true)`.
 
-A trial passes when the adversarial run ends `REVIEW-FINDINGS:` naming the
-planted defect with a below-100 `confidence=`, AND the single-pass run ends
-`REVIEW-APPROVE:` (rubric.md). Pass the eval at ≥ 4/5.
+A fresh local grader then does the only latent job in the eval: for each defect
+id, did that output actually name it (same site, same mechanism)? Everything
+after that is code — `evals/lib/recall.ts` counts, aggregates and thresholds, so
+no number in the report is read out of a model's prose.
+
+A trial passes when adversarial names **strictly more** planted defects than
+single-pass. A tie is not a pass. Pass the eval at ≥ 4/5 trials, or
+`ceil(0.8 × N)` for a run of N.
 
 ## Running it
-
-`run.sh` (issue #71) is the runnable harness, extracted verbatim from this
-section's former inline bash to match `evals/planner/run.sh`'s shape. Every
-LLM call goes through `$CLAUDE_CMD` (default `claude -p`) — never a hosted API
-(PRINCIPLES.md "LLM access").
 
 ```bash
 # The real (paid) run -- nightly, or before ship:
 evals/reviewer/run.sh 5
 
 # The free, structural smoke test (exercises every branch of run.sh's
-# plumbing -- both prompt shapes, the grade JSON parse, the >=4/5 threshold,
-# the exit code -- with a canned mock-claude.sh instead of real claude -p.
-# Says nothing about real model quality; see "## Results" below for that):
+# plumbing -- both prompt shapes, the per-defect grade parse, recall.ts's
+# threshold, the exit code -- with a canned mock-claude.sh instead of real
+# claude -p. Says nothing about real model quality; see "## Results" for that):
 CLAUDE_CMD="evals/reviewer/mock-claude.sh" evals/reviewer/run.sh 5
 ```
 
-Exit 0 = the fan-out beat single-pass on the planted defect in ≥ 4/5 trials;
-exit 1 = below threshold, with the per-trial grades in the run's temp output
-dir (printed on stdout) either way.
+Exit 0 = the fan-out beat single-pass on breadth in ≥ 4/5 trials; exit 1 = below
+threshold, with the per-defect catch table and both mean recalls printed either
+way.
 
 **Exit 2 = HARNESS ERROR**, a distinct outcome from a low score: at least one
-grade file could not be read, so no measurement was taken. The reason for each
-unreadable grade is printed. Do not record an exit-2 run in "## Results" — rerun
-it. This exists because the grader is a live model writing free-form text, and
-`run.sh` used to parse it inline with a bare `JSON.parse`: a ```` ```json ````
-fence (which the grader emits more often than not) threw, and the trial scored
-FAIL regardless of the verdict. `evals/lib/grade.ts` now owns the extraction and
-tells "graded FAIL" apart from "unreadable" (#108).
+grade could not be read, so no measurement was taken. Every unreadable grade is
+named with its reason. Do not record an exit-2 run in "## Results" — rerun it.
+`recall.ts` treats a missing defect id or a non-boolean verdict as unreadable
+rather than as a miss, because scoring drift as "not found" would understate
+recall and turn a harness fault into a measurement. This is the #108 failure
+mode one level up: `run.sh` used to parse the grade inline with a bare
+`JSON.parse`, and a ```` ```json ```` fence (which the grader emits more often
+than not) threw and scored the trial FAIL regardless of the verdict.
+
+The mock exercises those paths for free: `MOCK_CLAUDE_PASS=false` drives a tie
+(exit 1), `MOCK_CLAUDE_GRADE_WRAP=fence|prose` the real grader's reply shapes,
+and `MOCK_CLAUDE_GRADE_WRAP=drift|garbage` the unreadable path (exit 2).
 
 On a Windows/Git-Bash box, note `/tmp` is `%LOCALAPPDATA%\Temp` — the printed
 artifact path resolves there, not to a literal `C:\tmp`.
@@ -80,7 +93,7 @@ input stays four-key-blinded and the two branches diverge exactly as the gate
 tests pin, without any `claude -p`:
 
 ```bash
-FIX=evals/reviewer/fixtures/planted-defect
+FIX=evals/reviewer/fixtures/multi-defect
 AC="$(awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$FIX/ticket.md")"
 bun -e "import {readFileSync,writeFileSync} from 'node:fs';
   writeFileSync('/tmp/rv.json', JSON.stringify({ticketBody:readFileSync('$FIX/ticket.md','utf8'),
@@ -98,6 +111,7 @@ Documentation only — the command; scheduling is the user's cron/routine:
 # Nightly, real claude -p, 5 trials:
 0 4 * * * cd /path/to/zstack-1 && evals/reviewer/run.sh 5
 ```
+
 
 ## Results
 
