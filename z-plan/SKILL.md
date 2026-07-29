@@ -244,7 +244,17 @@ Group the spec's work into these epics before drafting individual tickets.
 
 ---
 
-## Step 4 — Draft each ticket body to the schema, then gate it
+## Step 4 — Draft each ticket's title + body to the schema, then gate both
+
+A ticket needs a **drafted title** before its body: a specific, human-triageable
+sentence naming the actual change (`slugifyTitle` drives idempotent re-plan
+matching — Step 9 — and humans triage the board by title alone). Gated by
+`validateTicketTitle` (`lib/ticket-schema.ts`, issue #155): rejects
+empty/whitespace-only titles, titles under the minimum length, ALL-CAPS
+titles, and a tiny stoplist of generic phrases ("change in behavior", "fix
+bug", "update code", "misc") — the #133 lesson, a ticket titled literally
+"CHANGE IN BEHAVIOR" over an otherwise well-formed body. Deterministic only —
+no model-judged "title quality"; that stays out of scope here.
 
 Every ticket body MUST contain these sections (the schema in
 `lib/ticket-schema.ts`; `### Acceptance Criteria` is an h3 subsection of Plan,
@@ -273,16 +283,22 @@ the rest are h2):
 - `Depends on: #A, #B` — optional line; omit it when the ticket has no
   dependencies. When present it names the issues this ticket waits on.
 
-Gate every body before it touches the board — this is deterministic, so run the
-script, never eyeball it. Always pass `--check-paths` with the repo root so a
-hallucinated or stale `## Files` path fails here, at plan time, not at build
-time in a fresh worktree:
+Gate every title AND body before either touches the board — this is
+deterministic, so run the script, never eyeball it. Always pass
+`--check-paths` with the repo root (a hallucinated or stale `## Files` path
+fails here, at plan time, not at build time in a fresh worktree) and always
+pass `--title` with the drafted title, so a generic/ALL-CAPS title fails
+here too, before any board write:
 
 ```bash
-"$Z_LINT" /path/to/ticket-body.md --check-paths "$REPO_ROOT"   # exit 0 = valid; exit 1 prints each gap on stderr
+"$Z_LINT" /path/to/ticket-body.md --check-paths "$REPO_ROOT" --title "$TITLE"   # exit 0 = valid; exit 1 prints each gap on stderr
 ```
 
-Do not file a ticket whose body does not pass `z-ticket-lint`. The gate is the
+Do not file a ticket whose title or body does not pass `z-ticket-lint`. A
+title-gate failure means: pick a different, specific title and re-run the
+gate — never file the ticket with the rejected title, and never retitle an
+existing board ticket as a side effect of this gate (existing titles are out
+of scope; see the ticket that added this check, issue #155). The gate is the
 same one the loop's planning pass runs, so "all mandatory sections present"
 means one thing everywhere.
 
@@ -413,7 +429,8 @@ calls, an earlier ticket in the chain). For each dependency:
    by title slug (Step 9's `slugifyTitle`) so you don't miss one under a reworded
    title.
 2. **Create it if missing** — `"$Z_BOARD" create --title ... --body-file ...
-   --milestone ...` (its body must pass `z-ticket-lint` too).
+   --milestone ...` (its title and body must pass `z-ticket-lint` too — Step 4's
+   gate, including `--title`).
 3. **Link both directions** — `"$Z_BOARD" link <N> <M>` records "N Depends on
    #M" on N and "M Blocks #N" on M (idempotent; re-running never double-links).
 4. **Pull dependents into Ready** — a dependency that must be analyzed next moves
