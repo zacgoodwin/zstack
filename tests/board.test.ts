@@ -1048,28 +1048,123 @@ describe("quota guard", () => {
 
 // -- #153: the reading rides every query instead of a pre-call probe ----------
 // The probe costs 0 GraphQL POINTS but is a real HTTP request, and it was
-// issued before EVERY call -- doubling round trips and latency across a 100+
-// tick drain, out of the same request budget the tick throttle protects.
+// issued before EVERY gql() call -- doubling round trips and latency out of the
+// same request budget the tick throttle protects.
+//
+// WHAT THE SAVING ACTUALLY IS, and where it is not. `bin/z-board` is
+// `exec bun lib/board.ts "$@"`: one OS process per subcommand, and main() builds
+// exactly ONE Board in it. The cached reading is a per-instance field, so it
+// never survives a subcommand boundary -- the saving is strictly WITHIN one
+// process, and it is one request per gql() call after the first. A subcommand
+// making G backend calls costs G+1 requests where it used to cost 2G:
+//
+//   G  before  after   subcommands
+//   1    2       2     list/snapshot of a single-page board, field-get, quota
+//   2    4       3     move, comment, claim's lookup+write pair
+//   3    6       4     create, field-set, a 3-page snapshot
+//   P   2P      P+1    any paginated read -- approaches half as P grows
+//
+// So a one-call subcommand saves NOTHING, and the "halving" is asymptotic in
+// calls-per-process, not a flat 50%. The tests below measure each shape on the
+// real lifecycle (a fresh Board per subcommand, as main() does) rather than on
+// one long-lived Board, which production never has.
 describe("piggybacked quota reading (#153)", () => {
   const at = (iso: string) => Date.parse(iso);
 
-  // AC1: request count across N subcommand calls.
-  test("N calls cost N+1 requests, not 2N: only the first call of a process still probes", async () => {
-    const calls: Call[] = [];
-    const board = new Board(CFG, makeExecutor({ calls }));
-    const N = 10;
-    for (let i = 0; i < N; i++) await board.list("In progress");
+  // AC1: HTTP requests across N subcommand calls, counted per subcommand on a
+  // FRESH Board each time -- the process boundary production actually has.
+  test("across N subcommand calls, each costs G+1 requests instead of 2G", async () => {
+    const body = tmpBodyFile("Body.\n");
+    const shapes: Array<[string, (b: Board) => Promise<unknown>, number]> = [
+      // name, subcommand, G (gql calls it makes)
+      ["list", (b) => b.list("In progress"), 1],
+      ["field-get", (b) => b.fieldGet(5, "Model"), 1],
+      ["move", (b) => b.move(5, "Done"), 2],
+      ["comment", (b) => b.comment(5, body), 2],
+      ["field-set", (b) => b.fieldSet(5, "Model", "opus"), 2],
+      ["create", (b) => b.create("T", body, "zstack-v1"), 3],
+    ];
+    const N = 10; // ten subcommand invocations of each shape = ten processes
+    const measured: Record<string, { before: number; after: number }> = {};
 
-    const TODAY = 2 * N; // probe + query for every call, before this change
-    expect(calls.length).toBe(N + 1);
-    expect(calls.length).toBeLessThanOrEqual(TODAY / 2 + 1); // roughly half, and no more
-    expect(calls.filter((c) => c.op === "RateLimit").length).toBe(1); // nothing to piggyback on yet
-    expect(calls.filter((c) => c.op === "ProjectItems").length).toBe(N);
-    // ...and every one of those queries carried the selection, so each reading
-    // came back with its payload rather than from a request of its own.
-    for (const c of calls.filter((x) => x.op === "ProjectItems")) {
-      expect(selectsRateLimit(c.doc!)).toBe(true);
+    for (const [name, run, G] of shapes) {
+      const calls: Call[] = [];
+      for (let i = 0; i < N; i++) await run(new Board(CFG, makeExecutor({ calls })));
+      const backendOps = calls.filter((c) => c.op !== "RateLimit").length;
+      expect(backendOps).toBe(N * G); // the shape really does make G calls per run
+      // Before this change every gql() spent a probe of its own: 2 requests per
+      // backend op. Now: one probe per PROCESS, then one request per op.
+      measured[name] = { before: 2 * backendOps, after: calls.length };
+      expect(calls.length).toBe(N * (G + 1));
+      expect(calls.filter((c) => c.op === "RateLimit").length).toBe(N); // one per process
+      // Every query carried the selection, so its reading came back with the
+      // payload instead of costing a request; mutations cannot carry it.
+      for (const c of calls) {
+        if (c.op === "RateLimit") continue;
+        expect(selectsRateLimit(c.doc!)).toBe(!/^\s*mutation\b/.test(c.doc!));
+      }
     }
+
+    // The measured table, asserted rather than narrated. Note list/field-get:
+    // a single-call subcommand is 20 -> 20, no saving at all.
+    expect(measured).toEqual({
+      "list": { before: 20, after: 20 },
+      "field-get": { before: 20, after: 20 },
+      "move": { before: 40, after: 30 },
+      "comment": { before: 40, after: 30 },
+      "field-set": { before: 40, after: 30 },
+      "create": { before: 60, after: 40 },
+    });
+  });
+
+  // The ticket's own motivating workload: bin/z-loop-tick:52 shells exactly one
+  // `z-board snapshot` per tick, one process each. Its cost is the page count,
+  // and the board is designed to exceed one 100-item page (auto-archive forced
+  // off, Done issues stay open -- lib/board.ts listNodes). At P pages a tick
+  // goes 2P -> P+1; at one page it goes 2 -> 2 and the drain saves nothing.
+  test("a drain's per-tick snapshot: P pages cost P+1 requests per tick, not 2P", async () => {
+    const item = (n: number) => ({
+      content: { number: n, title: `T${n}`, url: `http://x/${n}`, body: `body ${n}` },
+      fieldValues: {
+        nodes: [{ __typename: "ProjectV2ItemFieldSingleSelectValue", name: "Todo", field: { name: "Status" } }],
+      },
+    });
+    // A P-page board: cursors CUR_1..CUR_{P-1}, then the last page ends it.
+    const pagedBoard = (P: number, calls: Call[]) =>
+      new Board(
+        CFG,
+        makeExecutor({
+          calls,
+          overrides: {
+            ProjectItems: (vars) => {
+              const page = vars.cursor ? Number(String(vars.cursor).replace("CUR_", "")) : 0;
+              const last = page === P - 1;
+              return {
+                node: {
+                  items: {
+                    pageInfo: { hasNextPage: !last, endCursor: last ? null : `CUR_${page + 1}` },
+                    nodes: [item(page + 1)],
+                  },
+                },
+              };
+            },
+          },
+        })
+      );
+
+    const TICKS = 5;
+    for (const [P, expected] of [[3, 4], [2, 3], [1, 2]] as const) {
+      const calls: Call[] = [];
+      for (let t = 0; t < TICKS; t++) {
+        const snap = await pagedBoard(P, calls).snapshot(); // fresh process per tick
+        expect(snap.items.length).toBe(P);
+      }
+      const before = 2 * calls.filter((c) => c.op !== "RateLimit").length;
+      expect(before).toBe(TICKS * 2 * P);
+      expect(calls.length).toBe(TICKS * expected); // P+1 per tick
+    }
+    // Measured across a 5-tick drain of a 3-page board: 30 requests -> 20.
+    // A single-page board is 10 -> 10: this change removes nothing there.
   });
 
   // The pagination loop is many gql() calls inside ONE subcommand: they were

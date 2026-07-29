@@ -251,9 +251,15 @@ export class Board {
   private threshold: number;
   private mode: "sleep" | "abort";
   // #153: the freshest quota reading, piggybacked off the previous response.
-  // Per-instance, and the CLI builds exactly one Board per process, so "no
-  // reading yet" is the first call of a process -- the only place a separate
-  // probe request is still spent (plus after a wait; see enforceQuota).
+  // Per-instance, and bin/z-board is `exec bun lib/board.ts` -- one process per
+  // subcommand, one Board in it -- so this NEVER survives a subcommand
+  // boundary. "No reading yet" is the first call of a process: the only place a
+  // separate probe request is still spent (plus after a wait; see
+  // enforceQuota). The saving is therefore strictly within one process, one
+  // request per gql() call after the first: a subcommand making G backend calls
+  // costs G+1 requests instead of 2G. G=1 subcommands (list/snapshot of a
+  // single-page board, field-get, quota) save nothing; the paginated reads and
+  // multi-call writes do. Measured per shape in tests/board.test.ts.
   private lastQuota?: QuotaStatus;
 
   constructor(
@@ -273,7 +279,8 @@ export class Board {
   // #153: guard on the reading that rode the PREVIOUS response, then piggyback
   // the next reading onto this request. Before, every call spent a separate
   // Q_RATE_LIMIT HTTP request first -- free in GraphQL points, but a real round
-  // trip that doubled requests and latency across a 100+ tick drain.
+  // trip, so a pagination pass or a multi-call write cost twice the requests
+  // and twice the round-trip latency it needed to.
   private async gql(query: string, variables: Record<string, unknown> = {}) {
     await this.enforceQuota();
     const doc = piggybackRateLimit(query);
@@ -709,7 +716,8 @@ function opName(query: string): string {
 // #153: appends `rateLimit { remaining resetAt }` to a QUERY document so the
 // quota reading rides the response instead of costing a separate HTTP request
 // before every single call. The probe is free in GraphQL points but is a real
-// round trip, and it doubled requests and latency across a 100+ tick drain.
+// round trip, and it doubled the requests of every multi-call process (see the
+// lastQuota comment for the exact shape of the saving, and where there is none).
 //
 // Mutations are returned untouched ON PURPOSE: `rateLimit` is a field of the
 // Query root only -- GitHub's Mutation type has no such field (verified by

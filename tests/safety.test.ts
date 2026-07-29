@@ -846,9 +846,32 @@ describe("control 5: quota guard (pause/resume, no bypass)", () => {
       docs.push(query);
       if (op === "RateLimit") return next();
       if (op === "ProjectItems") return { ...next(), node: { items: { nodes: [] } } };
+      if (op === "IssueLookup")
+        return {
+          ...next(),
+          repository: {
+            issue: {
+              id: "I_1",
+              number: 1,
+              title: "t",
+              body: "",
+              assignees: { nodes: [] },
+              projectItems: { pageInfo: { hasNextPage: false }, nodes: [{ id: "PVTI_1", project: { number: 1 } }] },
+            },
+          },
+        };
+      // A mutation reaching the executor is the FAILURE the guard tests below
+      // watch for, so it must succeed rather than throw -- an unguarded write
+      // has to show up as an extra entry in `calls`, not as an error that could
+      // be mistaken for the guard firing.
+      if (op === "SetSingleSelect") return { updateProjectV2ItemFieldValue: { clientMutationId: null } };
       throw new Error(`unexpected op ${op}`);
     };
   }
+  // Same board, abort mode: the guard firing is directly observable as a throw
+  // BEFORE the guarded op goes out, which is what makes the proofs below
+  // runtime proofs rather than shape checks.
+  const ABORT_CFG: BoardConfig = { ...CFG, quota: { threshold: 200, mode: "abort" } };
 
   test("remaining < threshold mid-sweep sleeps until reset, then resumes", async () => {
     const slept: number[] = [];
@@ -868,26 +891,57 @@ describe("control 5: quota guard (pause/resume, no bypass)", () => {
 
   // #153 moved WHERE the reading comes from (the previous response, not a probe
   // before every call) without moving the guard itself. The invariant this
-  // proves is unchanged: no op reaches the executor unguarded.
+  // proves is unchanged and it is proved the same way as before -- by watching
+  // the guard FIRE: in abort mode a low reading must stop the guarded op before
+  // it reaches the executor, so anything that shows up in `calls` after a low
+  // reading arrived got there unguarded. A shape check on the outgoing document
+  // cannot prove this: piggybackRateLimit() rewrites the query whether or not
+  // enforceQuota() ran.
   test("no code path reaches the executor without the guard (runtime proof)", async () => {
+    // 1. Cold: the process-start probe reads low. The list query never goes out.
+    const cold: string[] = [];
+    const coldBoard = new Board(ABORT_CFG, sweepExecutor([LOW], cold), async () => {});
+    await expect(coldBoard.list("Building")).rejects.toThrow(/quota exhausted/);
+    expect(cold).toEqual(["RateLimit"]);
+
+    // 2. Warm, query path: the reading rode the PREVIOUS response. The guard has
+    // to re-run on it -- a guard that ran once per process and then trusted its
+    // cache forever would let this second list straight through.
+    const warm: string[] = [];
+    const warmBoard = new Board(ABORT_CFG, sweepExecutor([HEALTHY, LOW], warm), async () => {});
+    await warmBoard.list("Building"); // probe HEALTHY; this response piggybacks LOW
+    await expect(warmBoard.list("QA")).rejects.toThrow(/quota exhausted/);
+    expect(warm).toEqual(["RateLimit", "ProjectItems"]); // the second list never went out
+
+    // 3. Warm, mutation path: a mutation carries no reading of its own, so it is
+    // judged entirely by the one that rode the preceding query. The write must
+    // not reach the executor.
+    const write: string[] = [];
+    const writeBoard = new Board(ABORT_CFG, sweepExecutor([HEALTHY, LOW], write), async () => {});
+    await expect(writeBoard.move(1, "Ready")).rejects.toThrow(/quota exhausted/);
+    expect(write).toEqual(["RateLimit", "IssueLookup"]); // SetSingleSelect never went out
+  });
+
+  // The #153 request-count claim, stated as the invariant production actually
+  // holds: WITHIN one process the probe is spent once and every query after it
+  // carries its own reading. Mutations carry none -- rateLimit is a field of
+  // GitHub's Query root, and appending it to a mutation is a validation error --
+  // so they ride the freshest query reading. (They are NOT always preceded by a
+  // query: create() issues CreateIssue then AddProjectItem back to back.)
+  test("within one process the probe is spent once and every query carries its own reading", async () => {
     const calls: string[] = [];
     const docs: string[] = [];
     const board = new Board(CFG, sweepExecutor([HEALTHY], calls, docs), async () => {});
     await board.list("Building");
-    await board.move(0, "Ready").catch(() => {}); // item lookup may 404, fine
+    await board.move(1, "Ready");
     const carries = (doc: string) => /rateLimit \{ remaining resetAt \}/.test(doc);
 
     expect(calls[0]).toBe("RateLimit"); // first call of the process: no reading to ride yet
-    // ...and never again, because every response since carried one. This is the
-    // whole point: the probe used to be request #1 of every single call.
-    expect(calls.filter((c) => c === "RateLimit").length).toBe(1);
+    expect(calls.filter((c) => c === "RateLimit").length).toBe(1); // ...and never again
     for (let i = 1; i < calls.length; i++) {
-      // Each later op is a query carrying the selection, or a mutation (which
-      // cannot carry it -- Query-root field) riding the preceding reading.
-      expect(carries(docs[i]) || /^\s*mutation\b/.test(docs[i])).toBe(true);
-      if (!carries(docs[i])) expect(carries(docs[i - 1])).toBe(true);
+      expect(carries(docs[i])).toBe(!/^\s*mutation\b/.test(docs[i]));
     }
-    expect(calls.filter((c) => c === "ProjectItems").length).toBeGreaterThan(0);
+    expect(calls).toEqual(["RateLimit", "ProjectItems", "IssueLookup", "SetSingleSelect"]);
   });
 
   test("no code path reaches the executor without the guard (structural proof)", () => {
