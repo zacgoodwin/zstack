@@ -20,6 +20,7 @@ import {
   type TicketError,
 } from "../lib/ticket-schema.ts";
 import { estimate, loadRates, type Buckets } from "../lib/estimate.ts";
+import { QUOTA_REPROBE_ROUNDS } from "../lib/board.ts";
 
 const TICKETS = join(import.meta.dir, "fixtures", "tickets");
 const read = (name: string) => readFileSync(join(TICKETS, name), "utf8");
@@ -1107,9 +1108,9 @@ describe("docs/user-guide/z-setup.md: sleep quota mode documents bounded abort (
     );
     // The description must say sleep mode re-probes, not just waits and proceeds.
     expect(docs).toMatch(/quota\.mode.*sleep.*re-probes/s);
-    // Must name the bound (3 rounds) so the doc and QUOTA_REPROBE_ROUNDS (line 47
-    // of lib/board.ts) cannot silently drift apart.
-    expect(docs).toContain("retries up to 3 bounded rounds");
+    // Must name the bound so the doc and QUOTA_REPROBE_ROUNDS (lib/board.ts)
+    // cannot silently drift apart.
+    expect(docs).toContain(`retries up to ${QUOTA_REPROBE_ROUNDS} bounded rounds`);
     // Must state that it aborts rather than unconditionally proceeding.
     expect(docs).toMatch(/aborts the run loudly.*unverified quota/s);
     // Must mention both the first and final readings for distinguishing persistent low quota.

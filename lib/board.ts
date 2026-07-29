@@ -44,7 +44,7 @@ const SNAPSHOT_RETRY_MS = 500;
 // buffer atop the freshest resetAt rather than re-waking on the exact same
 // skewed edge. ponytail: fixed 3-round cap / 1s buffer, not adaptive -- upgrade
 // path is backing off the buffer if real clock skew ever exceeds it.
-const QUOTA_REPROBE_ROUNDS = 3;
+export const QUOTA_REPROBE_ROUNDS = 3;
 const QUOTA_REPROBE_BUFFER_MS = 1000;
 
 // One cursor-pagination loop for every connection the pack walks: Board's
