@@ -16,13 +16,31 @@ a bug a single read misses.
 
 ## The planted defect
 
-`src/window.ts` implements a half-open rate-limit window `[start, start+duration)`
-but writes the end check as `now <= end` instead of `now < end`. That inclusive
-`<=` makes the boundary tick `start + durationMs` read as *inside* the window,
-violating **acceptance criterion 3** (`withinWindow(1500, 1000, 500)` must be
-`false`). The added `window.test.ts` exercises criteria 1, 2, and 4 but NOT the
-boundary case (criterion 3), so the suite is green and the defect hides — a real
-"a path the diff adds that no test exercises" for the reviewer to catch.
+`src/limiter.ts`'s `allow()` charges the shared process-wide ceiling BEFORE it
+checks the key's own budget, so a request the per-key budget turns away has
+already spent a shared slot. The ceiling ends up counting arrivals where
+**criterion 5** defines it over admissions, and one key hammering a closed
+budget starves every other key — **criterion 4**, keys are independent. With
+`limit 1, durationMs 500, globalLimit 3`: `allow("a",1000)` → `true`,
+`allow("a",1100)` → `false`, `allow("a",1200)` → `false`, then `allow("b",1300)`
+→ `false`, though the process has admitted exactly one request against a ceiling
+of three. Swapping the two guard lines fixes it.
+
+The defect is deliberately NOT locally anomalous: `admitShared()` is a correct
+global limiter, `live()` is a correct per-key roll, every `src/window.ts` helper
+is correct and boundary-tested, and the added tests cover per-key isolation and
+the ceiling — just never rejected traffic and a second key under a tight ceiling
+in the same test. Nothing in the diff reads as the one line that differs from
+its neighbours; surfacing it takes constructing a two-key sequence in which
+rejected traffic precedes a legitimate request.
+
+**Why this class.** Rounds 1-3 of #108 planted a criterion-3 boundary/off-by-one
+instead, and a single-pass reviewer with code execution caught it every time
+(12/12 real reads): such a defect is either stated executably in a criterion,
+which the reviewer runs, or visible as the one expression that differs from the
+surrounding pattern, which the reviewer greps. `run.md`'s "## Results" records
+that evidence. The class was unfrozen by an amendment to #108's AC3; the pass
+threshold and the single-pass-must-approve delta rule below were NOT.
 
 ## Per-trial grading
 
@@ -38,17 +56,19 @@ throwaway worktree path) through a fresh live Agent:
 A trial **passes** when BOTH hold:
 
 1. The **adversarial** run's final message starts with `REVIEW-FINDINGS:` and the
-   findings name the boundary/off-by-one defect on criterion 3 (the `<=`-vs-`<`
-   end check, or the untested boundary case). Its `confidence=` token is present
-   and below threshold (< 100 — at least one skeptic refuted).
+   findings name the planted defect described above — the criterion it violates
+   and the mechanism (the shared ceiling charged before the per-key budget is
+   checked, so rejected traffic spends shared slots and starves other keys), not
+   an unrelated nit. Its `confidence=` token is present and below threshold
+   (< 100 — at least one skeptic refuted).
 2. The **single-pass** run's final message starts with `REVIEW-APPROVE:` (the
    subtle defect slips a single read). If single-pass ALSO catches it, the trial
    is inconclusive for this rubric, not a pass — the eval measures the *delta*
    the fan-out buys, and no delta means no evidence.
 
 Grading marker lines is deterministic; a fresh local `claude -p` grader confirms
-the adversarial findings actually name criterion 3's boundary defect (not some
-unrelated nit) and returns `{adversarialMarker, singlePassMarker, namesDefect,
+the adversarial findings actually name the planted defect (not some unrelated
+nit) and returns `{adversarialMarker, singlePassMarker, namesDefect,
 adversarialConfidence, pass}` per trial.
 
 ## Pass threshold

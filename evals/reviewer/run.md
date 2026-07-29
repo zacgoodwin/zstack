@@ -15,11 +15,14 @@ the reviewer's inner Agent-tool fan-out is allowed.
 ## Inputs
 
 - `fixtures/planted-defect/ticket.md` — the ticket body, carrying its
-  `### Acceptance Criteria`. Criterion 3 is the boundary the defect violates.
-- `fixtures/planted-defect/diff.patch` — a two-file diff (`src/window.ts` +
-  `src/window.test.ts`) that typechecks, is green, and hides a `<=`-vs-`<`
-  off-by-one on the half-open window's end. The test file skips the boundary
-  case, so nothing green exercises the bug.
+  `### Acceptance Criteria`. Criteria 4 (keys are independent) and 5 (the shared
+  ceiling counts admissions) are the two the defect violates.
+- `fixtures/planted-defect/diff.patch` — a four-file diff (`src/window.ts` +
+  `src/limiter.ts` and their tests) that typechecks and is green on all 46
+  tests, hiding one ordering defect: `allow()` charges the shared ceiling before
+  checking the key's own budget, so rejected traffic spends shared slots and
+  starves other keys. No test pairs rejected traffic with a second key under a
+  tight ceiling, so nothing green exercises the bug.
 - `rubric.md` — the per-trial pass contract and the ≥ 4/5 threshold (AC11).
 - `../../lib/stage-prompts.ts` — the prompt constructor under test.
 
@@ -32,9 +35,9 @@ driven through a fresh live Agent for N trials:
 - **single-pass** ← `--adversarial-mode off` → `reviewerPrompt(input, false)`.
 - **adversarial** ← `--adversarial-mode always` → `reviewerPrompt(input, true)`.
 
-A trial passes when the adversarial run ends `REVIEW-FINDINGS:` naming
-criterion 3's boundary defect with a below-100 `confidence=`, AND the single-pass
-run ends `REVIEW-APPROVE:` (rubric.md). Pass the eval at ≥ 4/5.
+A trial passes when the adversarial run ends `REVIEW-FINDINGS:` naming the
+planted defect with a below-100 `confidence=`, AND the single-pass run ends
+`REVIEW-APPROVE:` (rubric.md). Pass the eval at ≥ 4/5.
 
 ## Running it
 
@@ -308,3 +311,108 @@ move:
   execution catches locally-anomalous defects reliably, and re-target the eval
   at what the fan-out plausibly does buy — breadth of coverage across many
   independent findings — rather than a single planted needle.
+
+
+**2026-07-27, 5 trials, human-run on `main`'s fixture. Score: 0/5 — a clean
+reproduction of #102, not a measurement of any round-1-to-3 redesign.** The
+`run.sh 5` run was made from a branch that still carried the ORIGINAL
+`<=`-vs-`<` fixture (every redesign lives on #108's ticket branch, unmerged), so
+it measured round 0. All five graders parsed — three bare JSON, one fenced, one
+schema-drifted to booleans — and `evals/lib/grade.ts` read all five, confirming
+the #108 grader-parse fix works and that this 0/5 is a graded score rather than
+the old "unreadable graded as FAIL". All five single-pass outputs named
+`src/window.ts:8` with the same executed counter-example. The run also surfaced
+the CRLF issue now fixed in `.gitattributes`: `git apply` reported "trailing
+whitespace" on 21 added lines because a Windows checkout rewrote `diff.patch` to
+CRLF.
+
+**2026-07-28, ticket #108 round 4 (option (i): the defect class unfrozen). The
+fixture is rebuilt around a non-anomalous ordering defect and verified; a
+single-pass reviewer still catches it 4/4. With rounds 1-3 that is 16 real
+single-pass reads over three defect classes and 16 catches, and the reason is
+now structural in a way no fixture inside this harness can route around.**
+
+The AC3 amendment (recorded on #108) unfroze the *defect class* — `rubric.md`'s
+"## The planted defect" description and the criterion-3 clause in its grading
+contract — while leaving the ≥4/5 threshold and the single-pass-must-approve
+delta rule frozen. The fixture was rebuilt to use it.
+
+**The round-4 fixture.** `src/limiter.ts` gains a shared process-wide ceiling
+(`globalLimit`) over the per-key budgets, and round 3's `peek` tell is gone —
+`peek` now routes through `withinWindow` like everything else, so no line in the
+diff computes window membership its own way. The planted defect is an ordering
+interaction between two individually-correct pieces: `allow()` charges the
+shared ceiling (`admitShared`, a correct global limiter on its own) BEFORE it
+checks the key's own budget (`live()`, a correct per-key roll on its own), so a
+request the per-key budget turns away has already spent a shared slot. The
+ceiling ends up counting arrivals where criterion 5 defines it over admissions,
+and one key hammering a closed budget starves every other key (criterion 4).
+Swapping the two guard lines is the whole fix.
+
+Verified mechanically before any reviewer saw it: 46/46 tests green with the
+defect present, typecheck clean, and an exhaustive differential against an
+independently written reference model (per-key limits 1-3 × ceilings 1-4 × all
+3⁶ key sequences over a tick schedule that crosses a window boundary — 8,748
+sequences, 52,488 calls) finds 990 mismatches, **every one** of them the shipped
+code rejecting what the model admits, and **every one** preceded by an earlier
+rejection in the same window. With no ceiling configured the differential is 0
+mismatches: the defect is unreachable without `globalLimit`. Swapping the two
+lines takes the differential to 0 everywhere and keeps all 46 tests green, so
+the module holds exactly one defect in exactly the intended place. The shipped
+suite covers per-key isolation and the ceiling separately but never pairs
+rejected traffic with a second key under a tight ceiling, which is the only
+construction that shows the bug.
+
+**Red-team result: 4 single-pass reviewers, 4 catches.** The real single-pass
+prompt (`stage-prompts.ts prompt reviewer --adversarial-mode off`) was driven
+against the fixture by four independent frontier reviewers with code execution
+and the materialized worktree, exactly as `run.sh` builds it. All four returned
+`REVIEW-FINDINGS` naming `src/limiter.ts:91-92` with a correct mechanism; one
+opened "probed the one ordering I distrusted", another "the diff still has a
+defect the suite does not exercise", a third named criteria 5 and 4 explicitly.
+Removing the local anomaly did not help, because they were not finding it by
+inconsistency detection this time — they were auditing criterion 5 against the
+code that implements it.
+
+**Why no fixture in this harness can produce the delta.** The reviewer is given
+the complete acceptance criteria and the complete diff, and it executes code. A
+planted defect must violate a stated criterion, or the rubric cannot grade it —
+so the criteria list is a complete index into where the defect can be. A
+code-executing reviewer audits each criterion against its implementation, which
+means it reads the defect's home function under suspicion no matter how the
+defect is written. That closes all three doors at once: stated-executably (round
+1), locally anomalous (rounds 2-3), and non-anomalous but criterion-indexed
+(round 4). Enlarging the diff does not help — round 3 went to 433 lines and this
+round to 529 — because the audit is driven by the criteria list, not the line
+count.
+
+The arithmetic says the same thing from the other side. Single-pass and the
+three skeptics are the same model on the same blinded inputs. If catching were
+independent with probability *p*, a trial passes with probability
+`(1-p)·(1-(1-p)³)`, which peaks at **~47%** (p≈0.37) — so even at the
+theoretical optimum P(≥4/5) ≈ 0.15, and same-model draws are correlated, not
+independent, which only makes it worse. A ≥4/5 score therefore requires a
+*structural* asymmetry — the refute framing systematically finding what the
+verify-then-approve framing systematically stops short of — not a luckier
+fixture. Sixteen reads say the criteria-driven audit removes that asymmetry.
+
+**Score: `run.sh 5` not spent.** A trial passes only when single-pass MISSES,
+and single-pass caught this 4/4 under conditions identical to the eval's. The
+expected headline is 0/5 for the same reason #102, round 2 and round 3 were
+0/5. The round-4 fixture is committed regardless: it is the better artifact
+(non-anomalous defect, 46 tests, exhaustively differentiated, LF-clean patch)
+and it is what any re-targeted claim would be measured against.
+
+**What is left is a claim decision, not a fixture decision.** The eval's
+per-trial contract — adversarial catches AND single-pass approves — cannot be
+satisfied by fixture design inside a harness that hands the reviewer every
+criterion and every line. Two ways forward, both needing a human call:
+- (a) Change the fixture FORMAT so the criteria stop indexing the defect: a
+  small diff perturbing a large pre-existing codebase, where the changed lines
+  are clean and the break is in unchanged code the diff does not show. `run.sh`
+  materializes the worktree from `diff.patch` alone, so this needs a harness
+  amendment (a base tree plus a patch), which #108 AC3 still forbids.
+- (b) Re-target what the eval measures, at what the fan-out plausibly does buy:
+  breadth across many independent findings in one diff, rather than one planted
+  needle single-pass has to miss. That rewrites `rubric.md`'s pass contract and
+  moves #59's claim and #113 with it.

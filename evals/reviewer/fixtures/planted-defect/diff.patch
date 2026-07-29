@@ -1,13 +1,15 @@
 diff --git a/src/limiter.test.ts b/src/limiter.test.ts
 new file mode 100644
-index 0000000..c5f7acb
+index 0000000..edd5cf9
 --- /dev/null
 +++ b/src/limiter.test.ts
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,221 @@
 +import { test, expect } from "bun:test";
 +import { KeyedRateLimiter } from "./limiter.ts";
 +
-+const opts = (over: Partial<{ limit: number; durationMs: number; idleTtlMs: number }> = {}) => ({
++const opts = (
++  over: Partial<{ limit: number; durationMs: number; globalLimit: number; idleTtlMs: number }> = {}
++) => ({
 +  limit: 2,
 +  durationMs: 500,
 +  ...over,
@@ -52,6 +54,47 @@ index 0000000..c5f7acb
 +  expect(l.size).toBe(2);
 +});
 +
++// -- the shared ceiling --
++test("the shared ceiling caps admissions across every key", () => {
++  const l = new KeyedRateLimiter(opts({ globalLimit: 3 }));
++  expect(l.allow("a", 1000)).toBe(true);
++  expect(l.allow("b", 1000)).toBe(true);
++  expect(l.allow("c", 1000)).toBe(true);
++  expect(l.allow("d", 1000)).toBe(false);
++});
++test("the shared ceiling refills with the window", () => {
++  const l = new KeyedRateLimiter(opts({ globalLimit: 3 }));
++  expect(l.allow("a", 1000)).toBe(true);
++  expect(l.allow("b", 1000)).toBe(true);
++  expect(l.allow("c", 1000)).toBe(true);
++  expect(l.allow("d", 1400)).toBe(false);
++  expect(l.allow("d", 1500)).toBe(true);
++});
++test("the ceiling counts across keys, not per key", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 5, globalLimit: 2 }));
++  expect(l.allow("a", 1000)).toBe(true);
++  expect(l.allow("b", 1000)).toBe(true);
++  expect(l.allow("a", 1100)).toBe(false);
++});
++test("a key's own budget still binds under a generous ceiling", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1, globalLimit: 10 }));
++  expect(l.allow("a", 1000)).toBe(true);
++  expect(l.allow("a", 1100)).toBe(false);
++  expect(l.allow("b", 1100)).toBe(true);
++});
++test("a rejected request does not consume the key's own budget", () => {
++  const l = new KeyedRateLimiter(opts({ globalLimit: 1 }));
++  expect(l.allow("a", 1000)).toBe(true);
++  expect(l.allow("b", 1000)).toBe(false);
++  expect(l.remaining("b", 1000)).toBe(2);
++});
++test("no ceiling is applied when globalLimit is unset", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1 }));
++  for (const key of ["a", "b", "c", "d", "e"]) {
++    expect(l.allow(key, 1000)).toBe(true);
++  }
++});
++
 +// -- remaining --
 +test("an unknown key has its full budget", () => {
 +  expect(new KeyedRateLimiter(opts()).remaining("nobody", 1000)).toBe(2);
@@ -90,6 +133,11 @@ index 0000000..c5f7acb
 +  l.allow("a", 1000);
 +  expect(l.retryAfterMs("a", 1600)).toBe(0);
 +});
++test("a key shut out by the shared ceiling waits for the same window", () => {
++  const l = new KeyedRateLimiter(opts({ globalLimit: 1 }));
++  l.allow("a", 1000);
++  expect(l.retryAfterMs("b", 1200)).toBe(300);
++});
 +
 +// -- peek --
 +test("peek reports an unknown key as admissible", () => {
@@ -123,6 +171,12 @@ index 0000000..c5f7acb
 +  l.allow("a", 1000);
 +  expect(l.peek("a", 1501)).toBe(true);
 +  expect(l.peek("a", 2000)).toBe(true);
++});
++test("peek reports a spent shared ceiling as inadmissible", () => {
++  const l = new KeyedRateLimiter(opts({ globalLimit: 1 }));
++  l.allow("a", 1000);
++  expect(l.peek("b", 1000)).toBe(false);
++  expect(l.peek("b", 1500)).toBe(true);
 +});
 +
 +// -- reset --
@@ -164,23 +218,31 @@ index 0000000..c5f7acb
 +  expect(() => new KeyedRateLimiter(opts({ durationMs: 0 }))).toThrow(RangeError);
 +  expect(() => new KeyedRateLimiter(opts({ durationMs: -500 }))).toThrow(RangeError);
 +});
++test("rejects a non-positive or non-integer globalLimit", () => {
++  expect(() => new KeyedRateLimiter(opts({ globalLimit: 0 }))).toThrow(RangeError);
++  expect(() => new KeyedRateLimiter(opts({ globalLimit: 2.5 }))).toThrow(RangeError);
++});
 +test("rejects an idle ttl shorter than one window", () => {
 +  expect(() => new KeyedRateLimiter(opts({ idleTtlMs: 499 }))).toThrow(RangeError);
 +});
 diff --git a/src/limiter.ts b/src/limiter.ts
 new file mode 100644
-index 0000000..bfa56e3
+index 0000000..b501cae
 --- /dev/null
 +++ b/src/limiter.ts
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,202 @@
 +import { msUntilWindowEnd, windowStartFor, withinWindow } from "./window.ts";
 +
-+// Per-key fixed-window rate limiting.
++// Per-key fixed-window rate limiting with a process-wide ceiling.
 +//
 +// Each key gets its own budget of `limit` requests per `durationMs` window,
 +// judged against the window the request's tick falls in (see window.ts for the
-+// half-open tiling rule). Callers pass a monotonic clock: `now` never
-+// decreases across calls, so a bucket's window can only ever move forward.
++// half-open tiling rule). `globalLimit` puts a second, shared ceiling over the
++// whole process for the same window, so one busy box cannot admit more work
++// than it can carry no matter how the traffic is spread across keys.
++//
++// Callers pass a monotonic clock: `now` never decreases across calls, so a
++// window can only ever move forward.
 +//
 +// Buckets are kept in a Map and reclaimed by `sweep()`, so a process that sees
 +// many short-lived keys does not grow without bound.
@@ -190,6 +252,11 @@ index 0000000..bfa56e3
 +  limit: number;
 +  /** Window length in integer milliseconds. */
 +  durationMs: number;
++  /**
++   * Requests the process admits per window across ALL keys. Unset means no
++   * shared ceiling: every key is bounded only by its own `limit`.
++   */
++  globalLimit?: number;
 +  /**
 +   * How long a key may go untouched before `sweep()` may reclaim it. Defaults
 +   * to ten windows. Never shorter than one window: reclaiming a key whose
@@ -216,12 +283,18 @@ index 0000000..bfa56e3
 +export class KeyedRateLimiter {
 +  private readonly limit: number;
 +  private readonly durationMs: number;
++  private readonly globalLimit: number;
 +  private readonly idleTtlMs: number;
 +  private readonly buckets = new Map<string, Bucket>();
++  /** The process-wide ceiling's window, tiled exactly like every bucket's. */
++  private readonly shared = { windowStart: 0, count: 0 };
 +
 +  constructor(options: RateLimiterOptions) {
 +    assertPositiveInt("limit", options.limit);
 +    assertPositiveInt("durationMs", options.durationMs);
++    if (options.globalLimit !== undefined) {
++      assertPositiveInt("globalLimit", options.globalLimit);
++    }
 +    const idleTtlMs = options.idleTtlMs ?? options.durationMs * 10;
 +    assertPositiveInt("idleTtlMs", idleTtlMs);
 +    if (idleTtlMs < options.durationMs) {
@@ -231,6 +304,7 @@ index 0000000..bfa56e3
 +    }
 +    this.limit = options.limit;
 +    this.durationMs = options.durationMs;
++    this.globalLimit = options.globalLimit ?? Number.POSITIVE_INFINITY;
 +    this.idleTtlMs = idleTtlMs;
 +  }
 +
@@ -247,6 +321,7 @@ index 0000000..bfa56e3
 +  allow(key: string, now: number): boolean {
 +    const bucket = this.live(key, now);
 +    bucket.lastSeen = now;
++    if (!this.admitShared(now)) return false;
 +    if (bucket.count >= this.limit) return false;
 +    bucket.count += 1;
 +    return true;
@@ -254,21 +329,21 @@ index 0000000..bfa56e3
 +
 +  /**
 +   * Whether a request from `key` would be admitted at tick `now`, without
-+   * charging it.
++   * charging it -- neither the key's budget nor the shared ceiling moves.
 +   */
 +  peek(key: string, now: number): boolean {
++    if (this.sharedRemaining(now) <= 0) return false;
 +    const bucket = this.buckets.get(key);
 +    if (bucket === undefined) return true;
 +    // Read-only, so this cannot go through `live()` -- that rolls the bucket
 +    // onto a new window and resets its count, which would make a peek mutate
-+    // the state it is only supposed to report on. The bucket's window is still
-+    // the live one while `now` has not run past a full duration from its open.
-+    const sameWindow = now - bucket.windowStart <= this.durationMs;
-+    if (!sameWindow) return true;
++    // the state it is only supposed to report on. A bucket whose window has
++    // closed is worth a full budget to the window `now` falls in.
++    if (!withinWindow(now, bucket.windowStart, this.durationMs)) return true;
 +    return bucket.count < this.limit;
 +  }
 +
-+  /** Budget left for `key` in the window `now` falls in. */
++  /** Budget left for `key`'s own limit in the window `now` falls in. */
 +  remaining(key: string, now: number): number {
 +    const bucket = this.buckets.get(key);
 +    if (bucket === undefined) return this.limit;
@@ -277,14 +352,14 @@ index 0000000..bfa56e3
 +  }
 +
 +  /**
-+   * Milliseconds the caller should wait before retrying, or 0 when `key` has
-+   * budget right now. Suitable for a `Retry-After` header.
++   * Milliseconds the caller should wait before retrying, or 0 when `key` can be
++   * served right now. Suitable for a `Retry-After` header. Whichever budget is
++   * closed -- the key's own or the shared ceiling -- both refill when the
++   * current window does, so one wait covers either.
 +   */
 +  retryAfterMs(key: string, now: number): number {
-+    const bucket = this.buckets.get(key);
-+    if (bucket === undefined) return 0;
-+    if (bucket.count < this.limit) return 0;
-+    return msUntilWindowEnd(now, bucket.windowStart, this.durationMs);
++    if (this.peek(key, now)) return 0;
++    return msUntilWindowEnd(now, windowStartFor(now, this.durationMs), this.durationMs);
 +  }
 +
 +  /** Drop `key`'s bucket, restoring its full budget immediately. */
@@ -312,6 +387,27 @@ index 0000000..bfa56e3
 +      }
 +    }
 +    return removed;
++  }
++
++  /**
++   * Take a slot from the process-wide ceiling for the window `now` falls in,
++   * rolling that window forward first. False once the process has spent
++   * `globalLimit` inside this window.
++   */
++  private admitShared(now: number): boolean {
++    if (!withinWindow(now, this.shared.windowStart, this.durationMs)) {
++      this.shared.windowStart = windowStartFor(now, this.durationMs);
++      this.shared.count = 0;
++    }
++    if (this.shared.count >= this.globalLimit) return false;
++    this.shared.count += 1;
++    return true;
++  }
++
++  /** Slots left under the shared ceiling in the window `now` falls in. */
++  private sharedRemaining(now: number): number {
++    if (!withinWindow(now, this.shared.windowStart, this.durationMs)) return this.globalLimit;
++    return Math.max(0, this.globalLimit - this.shared.count);
 +  }
 +
 +  /**
