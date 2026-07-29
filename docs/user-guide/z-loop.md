@@ -97,6 +97,18 @@ records the result. It never re-derives a scheduling decision in prose.
   one, re-spawns builder — so `builder-3.jsonl` might follow one bounce of
   each kind, not necessarily three QA passes). This naming is what lets the
   end-of-loop report break spend down by stage instead of only by ticket.
+- **Sub-agent transcripts count too.** A stage that spawns its own sub-agents —
+  the adversarial reviewer's 3 skeptics are the case that matters — lands each
+  one beside its parent as `<stage>-<attempt>-sub-<agentId>.jsonl`, and those
+  tokens are that stage's spend. Collection is by **parentage**, not by
+  timestamp: `lib/transcripts.ts` walks the harness's own `parentAgentId` links
+  from the stage agent's transcript, found by an opaque spawn tag the prompt
+  carries. Before this (#190), a prose step said "take the file for that spawn"
+  and the skeptics were collected by nobody, so every adversarial review's
+  Actual undercounted by the majority of what it spent. A modification-time
+  sweep is not a substitute — three lanes drain concurrently, so sibling
+  reviewers' skeptics interleave in one flat directory, and the sweep tried by
+  hand during a real run gave a reviewer with 3 skeptics 8 transcripts.
 - **Per-stage model routing.** The merge stage is mechanical (`gh pr create`, a
   conflict check, `gh pr merge`) and doesn't need the ticket's build-tier
   model; the `stageModels` config knob (default `{"merge": "haiku"}`)
@@ -298,8 +310,10 @@ the batch (`state/transcripts/*/*.jsonl`), folded per-stage by
 `lib/endloop.ts`'s `sumByStage`. All five rows always render, `$0.00`
 included — a run with no reviewer bounces still shows the full shape instead
 of a table that grows and shrinks between loops. `other` catches any
-transcript file whose name doesn't match `<stage>-<attempt>.jsonl` (e.g. a
-manually-dropped file). A loop run's report predating this feature simply has
+transcript file whose name doesn't match `<stage>-<attempt>.jsonl` or
+`<stage>-<attempt>-sub-<agentId>.jsonl` (e.g. a manually-dropped file); stage
+attribution splits on the first `-`, so a sub-agent's spend lands in the row of
+the stage that spawned it. A loop run's report predating this feature simply has
 no `## Spend by stage` section at all — the field is optional and the rest of
 the report is unaffected.
 

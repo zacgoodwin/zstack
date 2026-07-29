@@ -223,7 +223,9 @@ export interface EndLoopReportInput {
 // Fixed row order for the "## Spend by stage" table (ticket #83 plan item 3):
 // every row renders, including $0.00 ones, so a run with no reviewer bounces
 // still shows the shape rather than a shrinking table. "other" catches any
-// transcript file whose name doesn't match `<stage>-<attempt>.jsonl`.
+// transcript file whose name doesn't match `<stage>-<attempt>.jsonl` or
+// `<stage>-<attempt>-sub-<agentId>.jsonl` (lib/transcripts.ts, #190 -- a
+// stage's sub-agents bucket under the stage that spawned them).
 const SPEND_STAGE_ORDER = ["builder", "qa", "reviewer", "merge", "other"] as const;
 
 // Pure markdown render of the whole loop's outcome (issue #9 AC4): verdict with

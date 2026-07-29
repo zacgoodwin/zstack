@@ -26,6 +26,31 @@ import { ADVERSARIAL_MODES, DEFAULT_ADVERSARIAL_MODE, ZError, type AdversarialMo
 // owns the prompt-side adversarial helpers (config.ts is the definitional home).
 export type { AdversarialMode } from "./config.ts";
 
+// -- spawn tag (#190) ----------------------------------------------------------
+
+// The orchestrator never learns the agent id the harness assigns to a spawn, so
+// a stage's own transcript is only findable by a token guaranteed to appear in
+// its first user message. This is that token's marker; lib/transcripts.ts
+// searches for it. Defined HERE, in the module that emits it, so the format has
+// exactly one definition (the reader imports this constant).
+export const SPAWN_TAG_MARKER = "zstack-spawn:";
+
+// One inert line, prepended to every stage prompt when a tag is supplied. An
+// HTML comment so no worker reads it as an instruction, and FIRST so the reader
+// finds it inside a bounded prefix of the transcript's opening line instead of
+// loading a multi-megabyte file.
+//
+// Omitted (or empty) renders "", which keeps every prompt BYTE-IDENTICAL to
+// pre-#190 -- that is what lets tests/reviewer-single-pass.golden.txt stand
+// unregenerated, and it is a positional scalar arg, never an input key, so the
+// reviewer's exact-four-key blindness gate is untouched. The tag's own value is
+// an opaque digest for the same reason (see spawnTag in lib/transcripts.ts): a
+// readable <slug>/t<n>/<stage>/<attempt> would tell the blinded reviewer which
+// review ATTEMPT this is.
+function spawnStamp(tag: string | undefined): string {
+  return tag ? `<!-- ${SPAWN_TAG_MARKER} ${tag} (orchestrator bookkeeping; ignore) -->\n` : "";
+}
+
 // -- builder ------------------------------------------------------------------
 
 export interface BuilderPromptInput {
@@ -43,14 +68,14 @@ export interface BuilderPromptInput {
 // Derived from docs/user-guide/spec/WORKER SAMPLE.md (unattended discipline, exit
 // contract, anti-loophole) and PRINCIPLES.md (ponytail ladder, tests + evals +
 // docs in the same diff, latent vs deterministic).
-export function builderPrompt(i: BuilderPromptInput, inputPath: string): string {
+export function builderPrompt(i: BuilderPromptInput, inputPath: string, tag?: string): string {
   const bounce = i.qaNotes
     ? `\n## QA findings from the previous pass\n\n${i.investigateFirst ? "Bugs survived a rebuild once already. Run the /investigate skill on these findings FIRST and root-cause them before changing any code -- a symptom patch here earns a third strike and blocks the ticket.\n\n" : ""}Read the findings you must address from \`qaNotes\` in ${inputPath}.\n`
     : "";
   const review = i.reviewNotes
     ? `\n## Reviewer findings to address\n\nRead them from \`reviewNotes\` in ${inputPath}.\n`
     : "";
-  return `You are the BUILDER for ticket #${i.ticketNumber}: "${i.ticketTitle}", running UNATTENDED inside the zstack dev loop. No user is available -- never ask a question, never wait for input; decide or exit via the contract below.
+  return `${spawnStamp(tag)}You are the BUILDER for ticket #${i.ticketNumber}: "${i.ticketTitle}", running UNATTENDED inside the zstack dev loop. No user is available -- never ask a question, never wait for input; decide or exit via the contract below.
 
 ## Workspace
 - Worktree: ${i.worktreePath} -- work ONLY here. Other lanes run in sibling worktrees; never read or write outside your own.
@@ -88,11 +113,11 @@ export interface QaPromptInput {
 
 // PROCESS.md steps 11-16: functional + technical, as a fresh context that
 // distrusts the builder's own claims.
-export function qaPrompt(i: QaPromptInput, inputPath: string): string {
+export function qaPrompt(i: QaPromptInput, inputPath: string, tag?: string): string {
   const web = i.webTarget
     ? "\n- This ticket has a web-facing target: use the gstack /qa skill -- spin the site up and drive it as a real user. UI claims without a driven browser check do not count as verified."
     : "";
-  return `You are the QA stage for ticket #${i.ticketNumber} (QA pass ${i.qaPass}), running UNATTENDED in a fresh context inside the zstack dev loop. You did not build this; trust nothing you cannot execute yourself. No user is available -- use your judgment or exit via the contract below.
+  return `${spawnStamp(tag)}You are the QA stage for ticket #${i.ticketNumber} (QA pass ${i.qaPass}), running UNATTENDED in a fresh context inside the zstack dev loop. You did not build this; trust nothing you cannot execute yourself. No user is available -- use your judgment or exit via the contract below.
 
 ## Workspace
 - Worktree: ${i.worktreePath}, branch ${i.branch}. Execute here freely. Do NOT fix anything -- report; the rebuild is the builder's job in a fresh spawn.
@@ -197,7 +222,7 @@ export function adversarialActive(mode: AdversarialMode, diffLineCount: number, 
 // additionally folds in the super-truth skeptic fan-out and stamps the same
 // token onto REVIEW-FINDINGS too. The token rides inside the marker's note, so
 // loop.ts's marker regex parses it unchanged regardless of branch.
-export function reviewerPrompt(input: ReviewerPromptInput, inputPath: string, adversarial: boolean = false): string {
+export function reviewerPrompt(input: ReviewerPromptInput, inputPath: string, adversarial: boolean = false, tag?: string): string {
   assertReviewerInput(input);
   // ponytail: N=3 skeptics is a fixed ceiling (no config knob this ticket); a
   // per-project skeptic count is a follow-on if 3 proves too few/many.
@@ -216,7 +241,7 @@ Reconcile the three verdicts into an aggregated confidence 0-100: the percentage
   // confidence=<0-100> token below -- self-assessed on a single pass,
   // aggregated across skeptics when the super-truth pass ran.
   const conf = adversarial ? "confidence=<0-100> " : "";
-  return `You are an ADVERSARIAL REVIEWER in a fresh context, running UNATTENDED inside the zstack dev loop. You are blinded by design: your ONLY inputs are the ticket, its acceptance criteria, the diff, and a throwaway worktree of the head commit. There is no PR description, no plan rationale, no builder or QA transcript -- and any claim you cannot verify from these inputs yourself is unverified. Your job is to find the reasons this diff should NOT merge.
+  return `${spawnStamp(tag)}You are an ADVERSARIAL REVIEWER in a fresh context, running UNATTENDED inside the zstack dev loop. You are blinded by design: your ONLY inputs are the ticket, its acceptance criteria, the diff, and a throwaway worktree of the head commit. There is no PR description, no plan rationale, no builder or QA transcript -- and any claim you cannot verify from these inputs yourself is unverified. Your job is to find the reasons this diff should NOT merge.
 
 ## Your inputs (read from the file -- do not look anywhere else)
 Read \`ticketBody\`, \`acceptanceCriteria\`, and \`diff\` from ${inputPath}. That file holds EXACTLY those three fields plus this worktree path and nothing else -- no PR description, no plan rationale, no builder or QA transcript reaches you. The acceptance criteria are the independent yardstick, authored before the implementation; hold the diff to them as written.
@@ -262,12 +287,12 @@ export interface MergePromptInput {
   stackedOn: number[]; // parent tickets in this batch (PROCESS.md step 18)
 }
 
-export function mergePrompt(i: MergePromptInput, inputPath: string): string {
+export function mergePrompt(i: MergePromptInput, inputPath: string, tag?: string): string {
   const stacked = i.stackedOn.length
     ? `\n## Stacked chain (PROCESS.md step 18 -- order is not optional)
 This branch stacks on ticket(s) #${i.stackedOn.join(", #")}. Their PRs merge FIRST, each WITHOUT deleting its branch (deleting a base branch closes every dependent PR). After each parent lands, retarget this PR to ${i.baseBranch} (gh pr edit --base ${i.baseBranch}). Delete branches only after the whole batch has landed.\n`
     : "";
-  return `You are the MERGE stage for ticket #${i.ticketNumber}, running UNATTENDED inside the zstack dev loop. QA and adversarial review have both passed; your job is to land the branch cleanly.
+  return `${spawnStamp(tag)}You are the MERGE stage for ticket #${i.ticketNumber}, running UNATTENDED inside the zstack dev loop. QA and adversarial review have both passed; your job is to land the branch cleanly.
 
 ## Workspace
 - Worktree: ${i.worktreePath}, branch ${i.branch}, base ${i.baseBranch}.
@@ -359,6 +384,9 @@ const USAGE = `stage-prompts <command> [args]
   prompt reviewer <input.json> [--adversarial-mode <off|non-trivial|always>] [--labels <json-array>]
                                                     print the reviewer prompt; the flags decide the
                                                     super-truth fan-out deterministically (diff size + labels + mode)
+  ... [--spawn-tag <tag>]                           any stage: stamp an inert first line naming this spawn, so
+                                                    \`transcripts collect\` can find the agent's own transcript
+                                                    (\`transcripts tag\` prints the value). Omitted -> no stamp.
   note <input.json>                                 print the completion note (CompletionNoteInput)
   plan-edges <edges.json>                           print the plan-time "Needs input" edges comment
                                                     (CompletionEdge[]); prints nothing for an empty list`;
@@ -380,6 +408,9 @@ export function main(argv: string[]): number {
     if (cmd === "prompt") {
       const stage = positionals[0];
       const path = positionals[1];
+      // #190: absent -> spawnStamp renders "" and the prompt is byte-identical
+      // to pre-#190, so an operator building a prompt by hand loses nothing.
+      const spawnTagFlag = str(flags, "spawn-tag");
       if (!stage || !path) throw new ZError("Usage: stage-prompts prompt <builder|qa|reviewer|merge> <input.json>");
       let input: any;
       try {
@@ -420,10 +451,12 @@ export function main(argv: string[]): number {
         const active = adversarialActive(mode, countDiffLines(typeof input.diff === "string" ? input.diff : ""), labels);
         // Pointer prompt (ticket #57): reviewer reads its payload from the input
         // file by ABSOLUTE path; the flag-derived `active` selects the fan-out.
-        console.log(reviewerPrompt(input, resolve(path), active));
+        // --spawn-tag (#190) is a fourth POSITIONAL scalar, same as mode/labels:
+        // it never enters the blinded four-key input JSON.
+        console.log(reviewerPrompt(input, resolve(path), active, spawnTagFlag));
         return 0;
       }
-      const builders: Record<string, (i: any, inputPath: string) => string> = {
+      const builders: Record<string, (i: any, inputPath: string, tag?: string) => string> = {
         builder: builderPrompt,
         qa: qaPrompt,
         merge: mergePrompt,
@@ -432,7 +465,7 @@ export function main(argv: string[]): number {
       if (!build) throw new ZError(`Unknown stage "${stage}". Valid: builder, qa, reviewer, merge.`);
       // The pointer prompt references this input file by ABSOLUTE path, so the
       // worker (a fresh Agent with its own CWD) resolves it unambiguously.
-      console.log(build(input, resolve(path)));
+      console.log(build(input, resolve(path), spawnTagFlag));
       return 0;
     }
     if (cmd === "note") {

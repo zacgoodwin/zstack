@@ -19,6 +19,7 @@ import {
   shSingleQuote,
   ADVERSARIAL_TRIGGER_LABELS,
   REVIEWER_INPUT_KEYS,
+  SPAWN_TAG_MARKER,
   type BuilderPromptInput,
   type CompletionEdge,
   type CompletionNoteInput,
@@ -314,6 +315,56 @@ describe("adversarial reviewer prompt", () => {
   });
 });
 
+// -- spawn tag (#190) ---------------------------------------------------------
+
+// The stamp lib/transcripts.ts searches for. Two properties matter and are
+// pinned per stage: omitting the tag leaves the prompt BYTE-IDENTICAL to
+// pre-#190 (which is what lets reviewer-single-pass.golden.txt stand
+// unregenerated), and supplying one adds EXACTLY one leading line and changes
+// nothing else.
+describe("spawn tag stamp (#190)", () => {
+  const TAG = "zs-a1b2c3d4e5f6";
+  const STAMP = `<!-- ${SPAWN_TAG_MARKER} ${TAG} (orchestrator bookkeeping; ignore) -->\n`;
+  const STAGES: [string, (tag?: string) => string][] = [
+    ["builder", (t) => builderPrompt(BUILDER_INPUT, INPUT_PATH, t)],
+    ["qa", (t) => qaPrompt(QA_INPUT, INPUT_PATH, t)],
+    ["reviewer (single pass)", (t) => reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false, t)],
+    ["reviewer (adversarial)", (t) => reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true, t)],
+    ["merge", (t) => mergePrompt(MERGE_INPUT, INPUT_PATH, t)],
+  ];
+
+  for (const [name, build] of STAGES) {
+    test(`${name}: omitted tag is byte-identical to no stamp at all`, () => {
+      expect(build(undefined)).toBe(build());
+      // An empty string is the shell's "unset variable" case: `--spawn-tag ""`
+      // must not stamp a tagless marker that then matches nothing.
+      expect(build("")).toBe(build());
+      expect(build()).not.toContain(SPAWN_TAG_MARKER);
+    });
+
+    test(`${name}: a tag adds exactly one leading line and nothing else`, () => {
+      const tagged = build(TAG);
+      expect(tagged).toBe(STAMP + build());
+      // First line, so lib/transcripts.ts finds it inside its bounded prefix
+      // read of the transcript's opening line.
+      expect(tagged.split("\n")[0]).toContain(`${SPAWN_TAG_MARKER} ${TAG}`);
+      expect(tagged.split(SPAWN_TAG_MARKER)).toHaveLength(2);
+    });
+  }
+
+  // Blindness (issue #8 AC3) is why the tag is an opaque digest rather than
+  // `<slug>/t<n>/<stage>/<attempt>`: a readable tag would tell the reviewer this
+  // is review ATTEMPT 2, i.e. that an earlier review rejected the diff. The
+  // constructor cannot enforce the value's shape, but it must not be the place
+  // that composes a readable one -- it stamps exactly what it is handed.
+  test("the reviewer's stamp carries only the opaque tag it was handed", () => {
+    const tagged = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true, TAG);
+    const stamp = tagged.split("\n")[0];
+    expect(stamp).toBe(STAMP.trimEnd());
+    for (const leak of ["attempt", "t42", "/reviewer/"]) expect(stamp).not.toContain(leak);
+  });
+});
+
 // -- builder prompt -----------------------------------------------------------
 
 describe("builder prompt", () => {
@@ -538,6 +589,44 @@ describe("stage-prompts CLI", () => {
     const leaky = join(dir, "leaky-cli.json");
     writeFileSync(leaky, JSON.stringify({ ...REVIEWER_INPUT, prDescription: "trust me" }));
     const bad = run("prompt", "reviewer", leaky, "--adversarial-mode", "always");
+    expect(bad.exitCode).toBe(1);
+    expect(bad.stderr.toString()).toContain("blinded by design");
+  });
+
+  // #190: the flag every stage accepts. It rides as a FLAG, so the reviewer's
+  // blinded four-key input JSON is untouched -- same treatment as
+  // --adversarial-mode / --labels above.
+  test("--spawn-tag stamps every stage; omitting it changes nothing", () => {
+    const TAG = "zs-000102030405";
+    const inputs: [string, unknown][] = [
+      ["builder", BUILDER_INPUT],
+      ["qa", QA_INPUT],
+      ["reviewer", REVIEWER_INPUT],
+      ["merge", MERGE_INPUT],
+    ];
+    for (const [stage, input] of inputs) {
+      const file = join(dir, `spawn-${stage}.json`);
+      writeFileSync(file, JSON.stringify(input));
+
+      const tagged = run("prompt", stage, file, "--spawn-tag", TAG);
+      expect(tagged.exitCode).toBe(0);
+      expect(tagged.stdout.toString().split("\n")[0]).toContain(`${SPAWN_TAG_MARKER} ${TAG}`);
+
+      const plain = run("prompt", stage, file);
+      expect(plain.exitCode).toBe(0);
+      expect(plain.stdout.toString()).not.toContain(SPAWN_TAG_MARKER);
+      // The stamp is additive: strip the first line and the two agree byte for
+      // byte, for every stage.
+      expect(tagged.stdout.toString().split("\n").slice(1).join("\n")).toBe(plain.stdout.toString());
+    }
+  });
+
+  // A leaky input file must still fail loudly WITH the flag present -- the tag
+  // must not become a fifth smuggled key by another route.
+  test("--spawn-tag does not weaken the reviewer's blindness gate", () => {
+    const leaky = join(dir, "leaky-spawn.json");
+    writeFileSync(leaky, JSON.stringify({ ...REVIEWER_INPUT, planRationale: "because" }));
+    const bad = run("prompt", "reviewer", leaky, "--spawn-tag", "zs-000102030405");
     expect(bad.exitCode).toBe(1);
     expect(bad.stderr.toString()).toContain("blinded by design");
   });
