@@ -1091,3 +1091,28 @@ describe("z-plan/SKILL.md: --reestimate re-estimates Backlog + Ready (issue #134
     expect(docs).toMatch(/never\s*\n?\s*promotes a ticket to Ready and never edits a body/);
   });
 });
+
+// -- z-setup.md sleep quota mode doc canary (issue #166) -----
+// After #147 merged bounded quota abort, z-setup.md's sleep quota mode
+// description needed to reflect the new behavior: wait, re-probe, retry up to
+// a bound, then abort loudly. This canary pins the exact contract strings in
+// docs/user-guide/z-setup.md so a future edit that silently drops the bound or
+// the re-probe mention fails loudly here instead of shipping with drift between
+// the page and the code constant QUOTA_REPROBE_ROUNDS (lib/board.ts:47).
+describe("docs/user-guide/z-setup.md: sleep quota mode documents bounded abort (issue #166)", () => {
+  test("sleep quota mode description names bounded re-probe rounds and abort behavior", () => {
+    const docs = readFileSync(
+      join(import.meta.dir, "..", "docs", "user-guide", "z-setup.md"),
+      "utf8"
+    );
+    // The description must say sleep mode re-probes, not just waits and proceeds.
+    expect(docs).toMatch(/quota\.mode.*sleep.*re-probes/s);
+    // Must name the bound (3 rounds) so the doc and QUOTA_REPROBE_ROUNDS (line 47
+    // of lib/board.ts) cannot silently drift apart.
+    expect(docs).toContain("retries up to 3 bounded rounds");
+    // Must state that it aborts rather than unconditionally proceeding.
+    expect(docs).toMatch(/aborts the run loudly.*unverified quota/s);
+    // Must mention both the first and final readings for distinguishing persistent low quota.
+    expect(docs).toContain("first and final");
+  });
+});

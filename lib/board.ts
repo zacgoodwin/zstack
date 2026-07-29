@@ -325,6 +325,7 @@ export class Board {
     // hard 403 with no re-check. Re-probe after every wake and only proceed on
     // a healthy reading. Bounded rounds, then fail loud naming both readings --
     // never a tight retry loop hammering the API.
+    const firstRemaining = rl.remaining;
     for (let round = 0; round < QUOTA_REPROBE_ROUNDS; round++) {
       await this.sleepToReset(rl.resetAt, round === 0 ? 0 : QUOTA_REPROBE_BUFFER_MS);
       rl = await this.probeRateLimit();
@@ -332,7 +333,8 @@ export class Board {
     }
     throw new ZError(
       `GraphQL quota still below threshold after waking and re-probing ${QUOTA_REPROBE_ROUNDS} time(s): ` +
-        `${rl.remaining} < ${this.threshold} remaining. Resets at ${rl.resetAt}. Refusing to keep sleeping -- ` +
+        `first reading ${firstRemaining}, final reading ${rl.remaining}, both < ${this.threshold} remaining. ` +
+        `Resets at ${rl.resetAt}. Refusing to keep sleeping -- ` +
         `clock skew or an early wake means the reset window may not actually be open yet.`
     );
   }
