@@ -37,19 +37,21 @@ if [[ "$PROMPT" == *"Grade one reviewer trial"* ]]; then
 elif [[ "$PROMPT" == *"Super-truth pass"* ]]; then
   # ADVERSARIAL prompt (only the adversarial branch carries this section
   # header, per lib/stage-prompts.ts's reviewerPrompt): canned fan-out finding
-  # naming criterion 3's boundary defect, confidence below 100.
+  # naming the planted defect, confidence below 100.
   cat << ADVERSARIAL
-REVIEW-FINDINGS: confidence=0 1. src/window.ts -- the end-of-window check uses
-an inclusive \`<=\` instead of the half-open \`<\`, violating acceptance
-criterion 3 (withinWindow(1500, 1000, 500) must be false). 2. window.test.ts
-has no test for criterion 3, so the shipped suite is green despite the bug.
+REVIEW-FINDINGS: confidence=0 1. src/limiter.ts -- allow() charges the shared
+ceiling before checking the key's own budget, so a request the per-key limit
+rejects has already spent a globalLimit slot; one key hammering a closed budget
+starves every other key, violating acceptance criteria 4 and 5. 2. No test
+pairs rejected traffic with a second key under a tight ceiling, so the shipped
+suite is green despite the bug.
 (mock-claude canned finding, issue #71 structural check)
 ADVERSARIAL
 else
   # SINGLE-PASS prompt: canned unconditional approval, the intended-design
   # outcome the eval measures a delta against.
   cat << SINGLE
-REVIEW-APPROVE: confidence=90 all four acceptance criteria read as satisfied
+REVIEW-APPROVE: confidence=90 every acceptance criterion reads as satisfied
 against the diff and the shipped tests are green. (mock-claude canned
 approval, issue #71 structural check)
 SINGLE

@@ -374,6 +374,18 @@ Removing the local anomaly did not help, because they were not finding it by
 inconsistency detection this time — they were auditing criterion 5 against the
 code that implements it.
 
+**The adversarial half and the amended grading contract were validated live.**
+One adversarial trial plus one grader run (paid, roughly a fifth of a full
+`run.sh 5`) against the same materialized worktree: the fan-out returned
+`REVIEW-FINDINGS: confidence=0` — 3/3 skeptics refuting, all three
+independently landing on the planted defect, the reviewer reproducing it
+itself. The grader, reading the AMENDED `rubric.md`, returned
+`namesDefect: true` for the new defect class and `pass: false` solely on rubric
+condition 2 (single-pass also caught it), and `evals/lib/grade.ts` read its
+fenced JSON as a graded FAIL rather than an unreadable one. So nothing in the
+fan-out or the grading contract is broken: adversarial finds the defect, the
+rubric scores it, and the trial still fails purely because there is no delta.
+
 **Why no fixture in this harness can produce the delta.** The reviewer is given
 the complete acceptance criteria and the complete diff, and it executes code. A
 planted defect must violate a stated criterion, or the rubric cannot grade it —
@@ -396,8 +408,10 @@ independent, which only makes it worse. A ≥4/5 score therefore requires a
 verify-then-approve framing systematically stops short of — not a luckier
 fixture. Sixteen reads say the criteria-driven audit removes that asymmetry.
 
-**Score: `run.sh 5` not spent.** A trial passes only when single-pass MISSES,
-and single-pass caught this 4/4 under conditions identical to the eval's. The
+**Score: no full `run.sh 5` spent** (only the four single-pass probes and the
+one adversarial + grader trial above). A trial passes only when single-pass
+MISSES, and single-pass caught this 4/4 under conditions identical to the
+eval's — the one graded trial that did run scored FAIL on exactly that. The
 expected headline is 0/5 for the same reason #102, round 2 and round 3 were
 0/5. The round-4 fixture is committed regardless: it is the better artifact
 (non-anomalous defect, 46 tests, exhaustively differentiated, LF-clean patch)
