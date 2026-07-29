@@ -25,6 +25,7 @@ import {
   main,
   peekLoopCounter,
   readLoopCounter,
+  synthesizeFindings,
   writeLoopCounter,
   type EndLoopActionKind,
   type EndLoopReportInput,
@@ -139,8 +140,80 @@ describe("AC1: red regression -> zero deploy, bugs filed with repro", () => {
     expect(bugs[0].title).toContain(FINDING_A.title);
   });
 
-  test("a red verdict with zero findings is refused loudly (nothing to file)", () => {
-    expect(() => endLoopPlan({ verdict: "red", evidence: "build failed", findings: [] }, 1)).toThrow(ZError);
+});
+
+// ============================================================================
+// issue #151 -- red + zero findings degrades to a generic bug, never throws
+// ============================================================================
+describe("issue #151: red verdict + zero findings degrades instead of crashing", () => {
+  const RED_EMPTY: RegressionResult = { verdict: "red", evidence: "build failed", findings: [] };
+
+  test("endLoopPlan no longer throws; plan is the same [file-bugs, report] shape as red-with-findings", () => {
+    expect(() => endLoopPlan(RED_EMPTY, 1)).not.toThrow();
+    expect(endLoopPlan(RED_EMPTY, 1)).toEqual(["file-bugs", "report"]);
+  });
+
+  test("synthesizeFindings supplies exactly one generic finding with repro + first-suspect file", () => {
+    const findings = synthesizeFindings(RED_EMPTY);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].title).toContain("no structured findings");
+    expect(findings[0].repro).toContain(RED_EMPTY.evidence);
+    expect(findings[0].firstSuspectFile.length).toBeGreaterThan(0);
+  });
+
+  test("synthesizeFindings is a no-op for red-with-findings and for green (byte-identical passthrough)", () => {
+    const redWithFindings = redRegression([FINDING_A]);
+    expect(synthesizeFindings(redWithFindings)).toBe(redWithFindings.findings); // same reference, untouched
+    expect(synthesizeFindings(GREEN)).toBe(GREEN.findings);
+  });
+
+  test("driving the degraded plan through file-bugs files exactly one bug draft, zero deploy calls", () => {
+    const plan = endLoopPlan(RED_EMPTY, 1);
+    const invoker = createInvoker();
+    const synthesized = synthesizeFindings(RED_EMPTY);
+    const { bugs } = simulateEndOfLoop(plan, { ...RED_EMPTY, findings: synthesized }, 1, invoker);
+
+    expect(invoker.log()).toEqual([]); // no deploy actions
+    expect(bugs).toHaveLength(1);
+    expect(bugs[0].body).toContain("## Repro");
+    expect(bugs[0].body).toContain("## First suspect");
+    expect(bugs[0].title).toContain("no structured findings");
+  });
+
+  test("the report names the empty-findings anomaly explicitly, still says NO deploy", () => {
+    const report = buildEndLoopReport({
+      regression: RED_EMPTY,
+      loopCount: 1,
+      auditsRan: false,
+      tickets: [],
+      edges: [],
+      bugsFiled: [{ number: 40, title: "[regression] " + synthesizeFindings(RED_EMPTY)[0].title }],
+    });
+    expect(report).toContain("NO deploy");
+    expect(report).toMatch(/anomaly/i);
+    expect(report).toContain("#40");
+  });
+
+  test("byte-identity: red-with-findings and green reports are unchanged by the anomaly wiring", () => {
+    const redReport = buildEndLoopReport({
+      regression: redRegression([FINDING_A]),
+      loopCount: 2,
+      auditsRan: false,
+      tickets: [],
+      edges: [],
+      bugsFiled: [{ number: 30, title: "[regression] " + FINDING_A.title }],
+    });
+    expect(redReport).not.toMatch(/anomaly/i);
+
+    const greenReport = buildEndLoopReport({
+      regression: GREEN,
+      loopCount: 1,
+      auditsRan: false,
+      tickets: [],
+      edges: [],
+      bugsFiled: [],
+    });
+    expect(greenReport).not.toMatch(/anomaly/i);
   });
 });
 

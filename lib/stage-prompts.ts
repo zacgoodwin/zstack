@@ -369,10 +369,14 @@ export function main(argv: string[]): number {
     console.log(USAGE);
     return cmd ? 0 : 1;
   }
-  // Shared CLI plumbing (lib/cli.ts): the reviewer's two optional flags
-  // (--adversarial-mode, --labels) split out here, positionals keep their order.
-  const { positionals, flags } = parseFlags(argv.slice(1));
   try {
+    // Shared CLI plumbing (lib/cli.ts): the reviewer's two optional flags
+    // (--adversarial-mode, --labels) split out here, positionals keep their
+    // order. Moved inside the try (issue #156): parseFlags can now throw a
+    // loud ZError on a trailing value-flag, and that needs the same
+    // handleCliError epilogue every other usage error in this function gets,
+    // not an uncaught throw out of main().
+    const { positionals, flags } = parseFlags(argv.slice(1));
     if (cmd === "prompt") {
       const stage = positionals[0];
       const path = positionals[1];

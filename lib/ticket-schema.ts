@@ -8,7 +8,7 @@
 // and never in a prompt.
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { parseFlags, str } from "./cli.ts";
+import { handleCliError, parseFlags, str } from "./cli.ts";
 import { roundCents } from "./estimate.ts";
 
 export type TicketErrorCode = "missing" | "malformed" | "empty" | "bad-path";
@@ -222,6 +222,92 @@ export function validateTicketBody(md: string, repoRoot?: string): TicketValidat
   return { ok: errors.length === 0, errors };
 }
 
+// Title gate (issue #155): the board shows the cost of an ungated title --
+// #133 landed titled "CHANGE IN BEHAVIOR" over an extremely detailed body.
+// Titles matter mechanically, not just cosmetically: slugifyTitle (below)
+// drives idempotent re-plan matching, and humans triage the board by title
+// alone. Deterministic regex/lookup only -- no model-judged "title quality"
+// (PRINCIPLES.md, latent vs deterministic; that's future scope, not this
+// ticket's).
+export type TicketTitleErrorCode = "empty" | "too-short" | "all-caps" | "generic";
+
+export interface TicketTitleError {
+  code: TicketTitleErrorCode;
+  message: string;
+}
+
+export interface TicketTitleValidation {
+  ok: boolean;
+  errors: TicketTitleError[];
+}
+
+// Below this many characters a title can't carry enough signal for board
+// triage ("Fix", "WIP", "x") regardless of what else it says.
+export const MIN_TITLE_LENGTH = 10;
+
+// The tiny stoplist named in the plan: titles that ARE (modulo case and
+// punctuation) one of these phrases and nothing else, e.g. the literal #133
+// offender "CHANGE IN BEHAVIOR". Deliberately an equality check against the
+// whole normalized title, not a substring search -- a real title that merely
+// mentions one of these phrases as part of a specific sentence (e.g. this
+// very ticket's title, which quotes "CHANGE IN BEHAVIOR" as its example) is
+// not itself generic and must keep passing.
+export const GENERIC_TITLE_STOPLIST = ["change in behavior", "fix bug", "update code", "misc"];
+
+// Strips everything but letters/digits/spaces, lowercases, and collapses
+// whitespace -- so "CHANGE IN BEHAVIOR", "Change in behavior.", and
+// "change   in  behavior!" all normalize identically for the stoplist check.
+function normalizeForStoplist(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N} ]+/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Deterministic title gate (issue #155): rejects empty/whitespace-only
+// titles, titles under MIN_TITLE_LENGTH, ALL-CAPS titles, and the generic
+// stoplist above. Reports every violation found, same "don't stop at the
+// first problem" contract as validateTicketBody.
+export function validateTicketTitle(title: string): TicketTitleValidation {
+  const errors: TicketTitleError[] = [];
+  const trimmed = title.trim();
+
+  if (trimmed === "") {
+    errors.push({ code: "empty", message: "Title is empty or whitespace-only." });
+    return { ok: false, errors }; // nothing else meaningful to check
+  }
+
+  if (trimmed.length < MIN_TITLE_LENGTH) {
+    errors.push({
+      code: "too-short",
+      message: `Title ${JSON.stringify(trimmed)} is ${trimmed.length} chars, under the ${MIN_TITLE_LENGTH}-char minimum.`,
+    });
+  }
+
+  // ALL-CAPS: at least one letter, and every letter present is uppercase (so
+  // a title with no letters at all -- pure punctuation/digits -- never
+  // triggers this for lack of anything to compare).
+  const letters = trimmed.replace(/[^a-zA-Z]/g, "");
+  if (letters.length > 0 && letters === letters.toUpperCase() && letters !== letters.toLowerCase()) {
+    errors.push({
+      code: "all-caps",
+      message: `Title ${JSON.stringify(trimmed)} is ALL-CAPS; write a real sentence describing the change.`,
+    });
+  }
+
+  const norm = normalizeForStoplist(trimmed);
+  const genericHit = GENERIC_TITLE_STOPLIST.find((phrase) => norm === phrase);
+  if (genericHit) {
+    errors.push({
+      code: "generic",
+      message: `Title ${JSON.stringify(trimmed)} is a generic stoplisted title ("${genericHit}"); name the actual change.`,
+    });
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
 // Kebab-case ASCII slug of a ticket title, used to match an existing ticket on a
 // re-plan so z-plan updates instead of duplicating. Stable: the output contains
 // only [a-z0-9-] with single hyphens and no leading/trailing hyphen, so
@@ -310,7 +396,7 @@ export function shouldSplitForCost(parentTier: string, childTiers: string[]): Sp
 }
 
 // -- CLI ---------------------------------------------------------------------
-const USAGE = `z-ticket-lint <ticket-body.md> [--check-paths <repoRoot>]
+const USAGE = `z-ticket-lint <ticket-body.md> [--check-paths <repoRoot>] [--title <string>]
 
   Validates a ticket body file against the ticket schema (lib/ticket-schema.ts).
   Exit 0 = valid; exit 1 = invalid (errors on stderr) or a usage/read error.
@@ -318,7 +404,10 @@ const USAGE = `z-ticket-lint <ticket-body.md> [--check-paths <repoRoot>]
   Optional: a "## Files" section listing repo-relative paths, one per
   top-level bullet ("- \`path\` ..."); an absolute path or one containing ".."
   always fails (bad-path). --check-paths <repoRoot> additionally requires every
-  Files path to exist under repoRoot (a bullet ending "(new)" is exempt).`;
+  Files path to exist under repoRoot (a bullet ending "(new)" is exempt).
+  --title <string> additionally gates the ticket's title (validateTicketTitle):
+  rejects empty/whitespace-only titles, titles under ${MIN_TITLE_LENGTH} chars,
+  ALL-CAPS titles, and the generic stoplist (${GENERIC_TITLE_STOPLIST.map((p) => `"${p}"`).join(", ")}).`;
 
 export function main(argv: string[]): number {
   // Help is answered BEFORE parseFlags: to the parser "--help" is just a flag
@@ -328,10 +417,22 @@ export function main(argv: string[]): number {
     console.log(USAGE);
     return argv[0] ? 0 : 1;
   }
-  const { positionals, flags } = parseFlags(argv);
+  // --check-paths always needs a <repoRoot> value; a bare trailing
+  // "--check-paths" with nothing after it is now parseFlags' own loud usage
+  // error (issue #156), so it's caught here the same way every other CLI
+  // usage error in this function is: message on stderr, exit 1, never an
+  // uncaught throw out of main().
+  let parsed: ReturnType<typeof parseFlags>;
+  try {
+    parsed = parseFlags(argv);
+  } catch (e) {
+    return handleCliError(e);
+  }
+  const { positionals, flags } = parsed;
   const repoRoot = str(flags, "check-paths");
-  if ("check-paths" in flags && repoRoot === undefined) {
-    console.error("--check-paths requires a <repoRoot> argument.");
+  const title = str(flags, "title");
+  if ("title" in flags && title === undefined) {
+    console.error("--title requires a <string> argument.");
     return 1;
   }
   const path = positionals[0];
@@ -348,13 +449,28 @@ export function main(argv: string[]): number {
     return 1;
   }
 
-  const result = validateTicketBody(md, repoRoot);
-  if (result.ok) {
-    console.log(`${path}: OK (all mandatory sections present)`);
+  const bodyResult = validateTicketBody(md, repoRoot);
+  // --title is optional: omit it and only the body schema gates, unchanged
+  // from before this ticket.
+  const titleResult = title !== undefined ? validateTicketTitle(title) : { ok: true, errors: [] };
+
+  if (bodyResult.ok && titleResult.ok) {
+    const titleNote = title !== undefined ? "; title OK" : "";
+    console.log(`${path}: OK (all mandatory sections present${titleNote})`);
     return 0;
   }
-  console.error(`${path}: ${result.errors.length} schema error(s):`);
-  for (const e of result.errors) console.error(`  [${e.code}] ${e.section}: ${e.message}`);
+
+  // Report every violated rule, title first, naming exactly which rule (the
+  // error code) each one broke -- CLAUDE.md: report the whole gap, not just
+  // the first problem found.
+  if (!titleResult.ok) {
+    console.error(`title ${JSON.stringify(title)}: ${titleResult.errors.length} title error(s):`);
+    for (const e of titleResult.errors) console.error(`  [${e.code}] title: ${e.message}`);
+  }
+  if (!bodyResult.ok) {
+    console.error(`${path}: ${bodyResult.errors.length} schema error(s):`);
+    for (const e of bodyResult.errors) console.error(`  [${e.code}] ${e.section}: ${e.message}`);
+  }
   return 1;
 }
 
