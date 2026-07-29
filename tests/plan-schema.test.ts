@@ -14,6 +14,9 @@ import {
   shouldSplitForCost,
   slugifyTitle,
   validateTicketBody,
+  validateTicketTitle,
+  GENERIC_TITLE_STOPLIST,
+  MIN_TITLE_LENGTH,
   SPLIT_MAX_FILES,
   SPLIT_MAX_STEPS,
   TIER_ESTIMATES,
@@ -286,6 +289,165 @@ describe("slugifyTitle", () => {
   test("punctuation-only or empty input slugs to the empty string", () => {
     expect(slugifyTitle("!!!")).toBe("");
     expect(slugifyTitle("")).toBe("");
+  });
+});
+
+// -- validateTicketTitle: the deterministic title gate (issue #155) ---------
+describe("validateTicketTitle: rejects empty/whitespace-only titles", () => {
+  test("empty string fails with 'empty', no other checks run", () => {
+    const r = validateTicketTitle("");
+    expect(r.ok).toBe(false);
+    expect(r.errors).toEqual([{ code: "empty", message: expect.any(String) }]);
+  });
+
+  test("whitespace-only fails with 'empty'", () => {
+    const r = validateTicketTitle("   \t  ");
+    expect(r.ok).toBe(false);
+    expect(r.errors).toHaveLength(1);
+    expect(r.errors[0].code).toBe("empty");
+  });
+});
+
+describe("validateTicketTitle: minimum length", () => {
+  test("a title under the minimum length fails with 'too-short', naming the length", () => {
+    const r = validateTicketTitle("Fix it");
+    expect(r.ok).toBe(false);
+    const e = r.errors.find((e) => e.code === "too-short");
+    expect(e).toBeDefined();
+    expect(e?.message).toContain(`${MIN_TITLE_LENGTH}`);
+  });
+
+  test("a title at exactly the minimum length passes the length check", () => {
+    const title = "x".repeat(MIN_TITLE_LENGTH);
+    expect(validateTicketTitle(title).errors.find((e) => e.code === "too-short")).toBeUndefined();
+  });
+
+  test("a title one char under the minimum fails the length check", () => {
+    const title = "x".repeat(MIN_TITLE_LENGTH - 1);
+    const r = validateTicketTitle(title);
+    expect(r.errors.find((e) => e.code === "too-short")).toBeDefined();
+  });
+});
+
+describe('validateTicketTitle: the #133 case -- "CHANGE IN BEHAVIOR" (issue #155 setup)', () => {
+  test('"CHANGE IN BEHAVIOR" fails, naming BOTH the all-caps and generic rule', () => {
+    const r = validateTicketTitle("CHANGE IN BEHAVIOR");
+    expect(r.ok).toBe(false);
+    const codes = r.errors.map((e) => e.code).sort();
+    expect(codes).toEqual(["all-caps", "generic"]);
+  });
+});
+
+describe("validateTicketTitle: ALL-CAPS titles", () => {
+  test("a fully uppercase title fails with 'all-caps'", () => {
+    const r = validateTicketTitle("REWRITE THE WHOLE SERVICE");
+    expect(r.errors.some((e) => e.code === "all-caps")).toBe(true);
+  });
+
+  test("a title with any lowercase letter does not trigger all-caps", () => {
+    const r = validateTicketTitle("Add a z-stop command");
+    expect(r.errors.some((e) => e.code === "all-caps")).toBe(false);
+  });
+
+  test("a bare acronym (e.g. 'API') has no lowercase letters to compare against, so it also trips all-caps -- but too-short fires alongside it, so it fails either way", () => {
+    const r = validateTicketTitle("API");
+    expect(r.errors.some((e) => e.code === "all-caps")).toBe(true);
+    expect(r.errors.some((e) => e.code === "too-short")).toBe(true);
+  });
+
+  test("a title mixing an uppercase acronym with lowercase prose does not trigger all-caps", () => {
+    const r = validateTicketTitle("API rate limits: fix 429 responses on /v1/users");
+    expect(r.errors.some((e) => e.code === "all-caps")).toBe(false);
+  });
+
+  test("a title with no letters at all (numbers/punctuation only) never triggers all-caps", () => {
+    const r = validateTicketTitle("#134 / #132 -- 2026-07-29");
+    expect(r.errors.some((e) => e.code === "all-caps")).toBe(false);
+  });
+});
+
+describe("validateTicketTitle: generic stoplist", () => {
+  test.each(GENERIC_TITLE_STOPLIST)("the bare stoplisted phrase %s fails with 'generic'", (phrase) => {
+    const r = validateTicketTitle(phrase);
+    expect(r.errors.some((e) => e.code === "generic")).toBe(true);
+  });
+
+  test("stoplist match is case- and punctuation-insensitive on the WHOLE title", () => {
+    expect(validateTicketTitle("Fix Bug.").errors.some((e) => e.code === "generic")).toBe(true);
+    expect(validateTicketTitle("  misc  ").errors.some((e) => e.code === "generic")).toBe(true);
+    expect(validateTicketTitle("Update   Code!!!").errors.some((e) => e.code === "generic")).toBe(true);
+  });
+
+  test("a specific title that merely MENTIONS a stoplisted phrase (not equal to it) does not fail generic -- substring is not enough", () => {
+    // This ticket's own title quotes "CHANGE IN BEHAVIOR" as its motivating
+    // example; the gate must not flag titles that reference the phrase
+    // inside a real, specific sentence.
+    const r = validateTicketTitle(
+      'z-ticket-lint gains a deterministic title gate -- reject generic titles like "CHANGE IN BEHAVIOR"'
+    );
+    expect(r.errors.some((e) => e.code === "generic")).toBe(false);
+  });
+
+  test('"fix bug" as a substring of a specific title (e.g. "Fix bug in login causing crash") does not fail generic', () => {
+    const r = validateTicketTitle("Fix bug in login causing crash on empty password");
+    expect(r.errors.some((e) => e.code === "generic")).toBe(false);
+  });
+});
+
+describe("validateTicketTitle: pass cases -- the board's current well-formed titles (issue #155 AC2)", () => {
+  test.each([
+    "Add -reestimate flag to /z-plan", // #134
+    "Add a z-stop command", // #132
+    "[loop][safety] empty-snapshot guard misses truncated-but-nonzero reads; short snapshot still drops live lanes", // #138
+  ])("%s passes with zero errors", (title) => {
+    const r = validateTicketTitle(title);
+    expect(r.ok).toBe(true);
+    expect(r.errors).toEqual([]);
+  });
+});
+
+describe("z-ticket-lint CLI: --title (issue #155)", () => {
+  let logs: ReturnType<typeof spyOn>;
+  let errs: ReturnType<typeof spyOn>;
+  beforeEach(() => {
+    logs = spyOn(console, "log").mockImplementation(() => {});
+    errs = spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    logs.mockRestore();
+    errs.mockRestore();
+  });
+
+  test('--title "CHANGE IN BEHAVIOR" exits 1, naming the all-caps/generic rule (AC1)', () => {
+    const code = main([join(TICKETS, "good.md"), "--title", "CHANGE IN BEHAVIOR"]);
+    expect(code).toBe(1);
+    const printed = errs.mock.calls.flat().join("\n");
+    expect(printed).toMatch(/all-caps/);
+    expect(printed).toMatch(/generic/);
+  });
+
+  test("--title with a well-formed board title passes alongside a valid body (AC2)", () => {
+    expect(main([join(TICKETS, "good.md"), "--title", "Add a z-stop command"])).toBe(0);
+  });
+
+  test("omitting --title entirely is unchanged: only the body schema gates", () => {
+    expect(main([join(TICKETS, "good.md")])).toBe(0);
+  });
+
+  test("--title accepted before the body path too (flag order is not fixed)", () => {
+    expect(main(["--title", "Add a z-stop command", join(TICKETS, "good.md")])).toBe(0);
+  });
+
+  test("--title with no value errors loud and exits 1", () => {
+    expect(main([join(TICKETS, "good.md"), "--title"])).toBe(1);
+  });
+
+  test("a bad title AND a bad body both get reported, not just the first found", () => {
+    const code = main([join(TICKETS, "missing-ac.md"), "--title", "misc"]);
+    expect(code).toBe(1);
+    const printed = errs.mock.calls.flat().join("\n");
+    expect(printed).toMatch(/generic/);
+    expect(printed).toMatch(/Acceptance Criteria/);
   });
 });
 

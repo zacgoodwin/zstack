@@ -1,0 +1,771 @@
+diff --git a/src/limiter.test.ts b/src/limiter.test.ts
+new file mode 100644
+index 0000000..a393ac8
+--- /dev/null
++++ b/src/limiter.test.ts
+@@ -0,0 +1,217 @@
++import { test, expect } from "bun:test";
++import { KeyedRateLimiter } from "./limiter.ts";
++
++const opts = (
++  over: Partial<{ limit: number; durationMs: number; globalLimit: number; idleTtlMs: number }> = {}
++) => ({
++  limit: 2,
++  durationMs: 500,
++  ...over,
++});
++
++// -- the window budget --
++test("admits up to the limit inside one window, then rejects", () => {
++  const l = new KeyedRateLimiter(opts());
++  expect(l.allow("a", 1100)).toBe(true);
++  expect(l.allow("a", 1200)).toBe(true);
++  expect(l.allow("a", 1300)).toBe(false);
++});
++test("a fresh window restores the budget", () => {
++  const l = new KeyedRateLimiter(opts());
++  expect(l.allow("a", 1100)).toBe(true);
++  expect(l.allow("a", 1200)).toBe(true);
++  expect(l.allow("a", 1600)).toBe(true);
++});
++test("a request landing on a window boundary is admitted", () => {
++  const l = new KeyedRateLimiter(opts());
++  expect(l.allow("a", 1400)).toBe(true);
++  expect(l.allow("a", 1500)).toBe(true);
++});
++test("an exhausted budget is restored exactly on the boundary tick", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1 }));
++  expect(l.allow("a", 1000)).toBe(true);
++  expect(l.allow("a", 1400)).toBe(false);
++  expect(l.allow("a", 1500)).toBe(true);
++});
++test("a long idle gap rolls to the window the request falls in", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1 }));
++  expect(l.allow("a", 1000)).toBe(true);
++  expect(l.allow("a", 5000)).toBe(true);
++});
++
++// -- per-key isolation --
++test("one key exhausting its budget does not affect another", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1 }));
++  expect(l.allow("a", 1000)).toBe(true);
++  expect(l.allow("a", 1100)).toBe(false);
++  expect(l.allow("b", 1100)).toBe(true);
++  expect(l.size).toBe(2);
++});
++
++// -- the shared ceiling --
++test("the shared ceiling caps admissions across every key", () => {
++  const l = new KeyedRateLimiter(opts({ globalLimit: 3 }));
++  expect(l.allow("a", 1000)).toBe(true);
++  expect(l.allow("b", 1000)).toBe(true);
++  expect(l.allow("c", 1000)).toBe(true);
++  expect(l.allow("d", 1000)).toBe(false);
++});
++test("the shared ceiling refills with the window", () => {
++  const l = new KeyedRateLimiter(opts({ globalLimit: 3 }));
++  expect(l.allow("a", 1000)).toBe(true);
++  expect(l.allow("b", 1000)).toBe(true);
++  expect(l.allow("c", 1000)).toBe(true);
++  expect(l.allow("d", 1400)).toBe(false);
++  expect(l.allow("d", 1500)).toBe(true);
++});
++test("the ceiling counts across keys, not per key", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 5, globalLimit: 2 }));
++  expect(l.allow("a", 1000)).toBe(true);
++  expect(l.allow("b", 1000)).toBe(true);
++  expect(l.allow("a", 1100)).toBe(false);
++});
++test("a key's own budget still binds under a generous ceiling", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1, globalLimit: 10 }));
++  expect(l.allow("a", 1000)).toBe(true);
++  expect(l.allow("a", 1100)).toBe(false);
++  expect(l.allow("b", 1100)).toBe(true);
++});
++test("a rejected request does not consume the key's own budget", () => {
++  const l = new KeyedRateLimiter(opts({ globalLimit: 1 }));
++  expect(l.allow("a", 1000)).toBe(true);
++  expect(l.allow("b", 1000)).toBe(false);
++  expect(l.remaining("b", 1000)).toBe(2);
++});
++test("no ceiling is applied when globalLimit is unset", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1 }));
++  for (const key of ["a", "b", "c", "d", "e"]) {
++    expect(l.allow(key, 1000)).toBe(true);
++  }
++});
++
++// -- remaining --
++test("an unknown key has its full budget", () => {
++  expect(new KeyedRateLimiter(opts()).remaining("nobody", 1000)).toBe(2);
++});
++test("remaining counts down with each admitted request", () => {
++  const l = new KeyedRateLimiter(opts());
++  l.allow("a", 1000);
++  expect(l.remaining("a", 1100)).toBe(1);
++  l.allow("a", 1100);
++  expect(l.remaining("a", 1200)).toBe(0);
++});
++test("remaining reports a full budget once the window has passed", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1 }));
++  l.allow("a", 1000);
++  expect(l.remaining("a", 1200)).toBe(0);
++  expect(l.remaining("a", 1600)).toBe(1);
++});
++
++// -- retryAfterMs --
++test("a key with budget waits for nothing", () => {
++  const l = new KeyedRateLimiter(opts());
++  l.allow("a", 1000);
++  expect(l.retryAfterMs("a", 1100)).toBe(0);
++});
++test("an exhausted key waits until its window closes", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1 }));
++  l.allow("a", 1000);
++  expect(l.retryAfterMs("a", 1100)).toBe(400);
++  expect(l.retryAfterMs("a", 1499)).toBe(1);
++});
++test("an unknown key waits for nothing", () => {
++  expect(new KeyedRateLimiter(opts()).retryAfterMs("nobody", 1000)).toBe(0);
++});
++test("once the window has passed there is nothing left to wait for", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1 }));
++  l.allow("a", 1000);
++  expect(l.retryAfterMs("a", 1600)).toBe(0);
++});
++test("a key shut out by the shared ceiling waits for the same window", () => {
++  const l = new KeyedRateLimiter(opts({ globalLimit: 1 }));
++  l.allow("a", 1000);
++  expect(l.retryAfterMs("b", 1200)).toBe(300);
++});
++
++// -- peek --
++test("peek reports an unknown key as admissible", () => {
++  expect(new KeyedRateLimiter(opts()).peek("nobody", 1000)).toBe(true);
++});
++test("peek does not charge the budget it reports on", () => {
++  const l = new KeyedRateLimiter(opts());
++  l.allow("a", 1000);
++  expect(l.peek("a", 1100)).toBe(true);
++  expect(l.peek("a", 1100)).toBe(true);
++  expect(l.remaining("a", 1100)).toBe(1);
++});
++test("peek reports an exhausted key as inadmissible", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1 }));
++  l.allow("a", 1000);
++  expect(l.peek("a", 1200)).toBe(false);
++});
++test("peek still reports the closed budget on the window's last tick", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1 }));
++  l.allow("a", 1000);
++  expect(l.peek("a", 1499)).toBe(false);
++});
++test("peek and remaining agree on the budget a boundary tick opens", () => {
++  const l = new KeyedRateLimiter(opts());
++  l.allow("a", 1000);
++  expect(l.peek("a", 1500)).toBe(true);
++  expect(l.remaining("a", 1500)).toBe(2);
++});
++test("peek sees a fresh budget once the window has rolled past", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1 }));
++  l.allow("a", 1000);
++  expect(l.peek("a", 1501)).toBe(true);
++  expect(l.peek("a", 2000)).toBe(true);
++});
++test("peek reports a spent shared ceiling as inadmissible", () => {
++  const l = new KeyedRateLimiter(opts({ globalLimit: 1 }));
++  l.allow("a", 1000);
++  expect(l.peek("b", 1000)).toBe(false);
++  expect(l.peek("b", 1500)).toBe(true);
++});
++
++// -- reset --
++test("reset restores a key's budget immediately", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1 }));
++  l.allow("a", 1000);
++  expect(l.allow("a", 1100)).toBe(false);
++  l.reset("a");
++  expect(l.allow("a", 1100)).toBe(true);
++});
++test("resetAll drops every bucket", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1 }));
++  l.allow("a", 1000);
++  l.allow("b", 1000);
++  l.resetAll();
++  expect(l.size).toBe(0);
++});
++
++// -- sweep --
++test("sweep reclaims a key idle for the full ttl and reports the count", () => {
++  const l = new KeyedRateLimiter(opts({ idleTtlMs: 1000 }));
++  l.allow("a", 1000);
++  expect(l.sweep(1500)).toBe(0);
++  expect(l.size).toBe(1);
++  expect(l.sweep(2000)).toBe(1);
++  expect(l.size).toBe(0);
++});
++test("a rejected request still keeps its key alive", () => {
++  const l = new KeyedRateLimiter(opts({ limit: 1, idleTtlMs: 1000 }));
++  expect(l.allow("a", 1000)).toBe(true);
++  expect(l.allow("a", 1200)).toBe(false);
++  expect(l.sweep(2100)).toBe(0);
++});
++
++// -- constructor contract --
++test("rejects a non-positive or non-integer limit or duration", () => {
++  expect(() => new KeyedRateLimiter(opts({ limit: 0 }))).toThrow(RangeError);
++  expect(() => new KeyedRateLimiter(opts({ limit: 1.5 }))).toThrow(RangeError);
++  expect(() => new KeyedRateLimiter(opts({ durationMs: 0 }))).toThrow(RangeError);
++  expect(() => new KeyedRateLimiter(opts({ durationMs: -500 }))).toThrow(RangeError);
++});
++test("rejects an idle ttl shorter than one window", () => {
++  expect(() => new KeyedRateLimiter(opts({ idleTtlMs: 499 }))).toThrow(RangeError);
++});
+diff --git a/src/limiter.ts b/src/limiter.ts
+new file mode 100644
+index 0000000..44cf083
+--- /dev/null
++++ b/src/limiter.ts
+@@ -0,0 +1,205 @@
++import { msUntilWindowEnd, windowStartFor, withinWindow } from "./window.ts";
++
++// Per-key fixed-window rate limiting with a process-wide ceiling.
++//
++// Each key gets its own budget of `limit` requests per `durationMs` window,
++// judged against the window the request's tick falls in (see window.ts for the
++// half-open tiling rule). `globalLimit` puts a second, shared ceiling over the
++// whole process for the same window, so one busy box cannot admit more work
++// than it can carry no matter how the traffic is spread across keys.
++//
++// Callers pass a monotonic clock: `now` never decreases across calls, so a
++// window can only ever move forward.
++//
++// Buckets are kept in a Map and reclaimed by `sweep()`, so a process that sees
++// many short-lived keys does not grow without bound.
++
++export interface RateLimiterOptions {
++  /** Requests admitted per key per window. */
++  limit: number;
++  /** Window length in integer milliseconds. */
++  durationMs: number;
++  /**
++   * Requests the process admits per window across ALL keys. Unset means no
++   * shared ceiling: every key is bounded only by its own `limit`.
++   */
++  globalLimit?: number;
++  /**
++   * How long a key may go untouched before `sweep()` may reclaim it. Defaults
++   * to ten windows. Never shorter than one window: reclaiming a key whose
++   * window is still open would hand it a fresh budget early.
++   */
++  idleTtlMs?: number;
++}
++
++interface Bucket {
++  /** Start tick of the window this bucket's `count` belongs to. */
++  windowStart: number;
++  /** Requests admitted so far inside `windowStart`'s window. */
++  count: number;
++  /** Tick of the most recent call that touched this bucket. */
++  lastSeen: number;
++}
++
++function assertPositiveInt(name: string, value: number): void {
++  if (!Number.isInteger(value) || value <= 0) {
++    throw new RangeError(`${name} must be a positive integer, got ${value}`);
++  }
++}
++
++export class KeyedRateLimiter {
++  private readonly limit: number;
++  private readonly durationMs: number;
++  private readonly globalLimit: number;
++  private readonly idleTtlMs: number;
++  private readonly buckets = new Map<string, Bucket>();
++  /** The process-wide ceiling's window, tiled exactly like every bucket's. */
++  private readonly shared = { windowStart: 0, count: 0 };
++
++  constructor(options: RateLimiterOptions) {
++    assertPositiveInt("limit", options.limit);
++    assertPositiveInt("durationMs", options.durationMs);
++    const idleTtlMs = options.idleTtlMs ?? options.durationMs * 10;
++    assertPositiveInt("idleTtlMs", idleTtlMs);
++    if (idleTtlMs < options.durationMs) {
++      throw new RangeError(
++        `idleTtlMs (${idleTtlMs}) must be at least durationMs (${options.durationMs})`
++      );
++    }
++    this.limit = options.limit;
++    this.durationMs = options.durationMs;
++    this.globalLimit = options.globalLimit ?? Number.POSITIVE_INFINITY;
++    this.idleTtlMs = idleTtlMs;
++  }
++
++  /** Number of keys currently holding a bucket. */
++  get size(): number {
++    return this.buckets.size;
++  }
++
++  /**
++   * Admit the request from `key` at tick `now` when the window that tick falls
++   * in still has budget, and charge it. Rejected requests still refresh
++   * `lastSeen`, so a key hammering a closed budget is not reclaimed mid-window.
++   */
++  allow(key: string, now: number): boolean {
++    const bucket = this.live(key, now);
++    bucket.lastSeen = now;
++    if (!this.admitShared(now)) return false;
++    if (bucket.count >= this.limit) return false;
++    bucket.count += 1;
++    return true;
++  }
++
++  /**
++   * Whether a request from `key` would be admitted at tick `now`, without
++   * charging it -- neither the key's budget nor the shared ceiling moves.
++   */
++  peek(key: string, now: number): boolean {
++    if (this.sharedRemaining(now) <= 0) return false;
++    const bucket = this.buckets.get(key);
++    if (bucket === undefined) return true;
++    // Read-only, so this cannot go through `live()` -- that rolls the bucket
++    // onto a new window and resets its count, which would make a peek mutate
++    // the state it is only supposed to report on. A bucket whose window has
++    // closed is worth a full budget to the window `now` falls in.
++    if (!withinWindow(now, bucket.windowStart, this.durationMs)) return true;
++    return bucket.count < this.limit;
++  }
++
++  /** Budget left for `key`'s own limit in the window `now` falls in. */
++  remaining(key: string, now: number): number {
++    const bucket = this.buckets.get(key);
++    if (bucket === undefined) return this.limit;
++    if (!withinWindow(now, bucket.windowStart, this.durationMs)) return this.limit;
++    return Math.max(0, this.limit - bucket.count);
++  }
++
++  /**
++   * Milliseconds the caller should wait before retrying, or 0 when `key` can be
++   * served right now. Whichever budget is closed -- the key's own or the shared
++   * ceiling -- both refill when the current window does, so one wait covers
++   * either.
++   */
++  retryAfterMs(key: string, now: number): number {
++    if (this.peek(key, now)) return 0;
++    // Wait until the window the key's budget is charged to closes.
++    const bucket = this.buckets.get(key);
++    const start = bucket !== undefined ? bucket.windowStart : windowStartFor(now, this.durationMs);
++    return msUntilWindowEnd(now, start, this.durationMs);
++  }
++
++  /** Drop `key`'s bucket, restoring its full budget immediately. */
++  reset(key: string): void {
++    this.buckets.delete(key);
++  }
++
++  /** Drop every bucket. */
++  resetAll(): void {
++    this.buckets.clear();
++    // A full reset starts the process from a clean slate.
++    this.shared.windowStart = 0;
++    this.shared.count = 0;
++  }
++
++  /**
++   * Reclaim buckets untouched for at least `idleTtlMs`, returning how many were
++   * dropped. Because `idleTtlMs` is never shorter than one window, a reclaimed
++   * bucket's window has always already closed, so this can never hand a key a
++   * fresh budget ahead of schedule.
++   */
++  sweep(now: number): number {
++    let removed = 0;
++    for (const [key, bucket] of this.buckets) {
++      if (now - bucket.lastSeen >= this.idleTtlMs) {
++        this.buckets.delete(key);
++        removed += 1;
++      }
++    }
++    return removed;
++  }
++
++  /**
++   * Take a slot from the process-wide ceiling for the window `now` falls in,
++   * rolling that window forward first. False once the process has spent
++   * `globalLimit` inside this window.
++   */
++  private admitShared(now: number): boolean {
++    if (!withinWindow(now, this.shared.windowStart, this.durationMs)) {
++      this.shared.windowStart = windowStartFor(now, this.durationMs);
++      this.shared.count = 0;
++    }
++    if (this.shared.count >= this.globalLimit) return false;
++    this.shared.count += 1;
++    return true;
++  }
++
++  /** Slots left under the shared ceiling in the window `now` falls in. */
++  private sharedRemaining(now: number): number {
++    if (!withinWindow(now, this.shared.windowStart, this.durationMs)) return this.globalLimit;
++    return Math.max(0, this.globalLimit - this.shared.count);
++  }
++
++  /**
++   * `key`'s bucket, rolled onto the window `now` falls in and created if
++   * absent. Mutating by design: callers that must not change state read
++   * `this.buckets` directly.
++   */
++  private live(key: string, now: number): Bucket {
++    const existing = this.buckets.get(key);
++    if (existing === undefined) {
++      const fresh: Bucket = {
++        windowStart: windowStartFor(now, this.durationMs),
++        count: 0,
++        lastSeen: now,
++      };
++      this.buckets.set(key, fresh);
++      return fresh;
++    }
++    if (!withinWindow(now, existing.windowStart, this.durationMs)) {
++      existing.windowStart = windowStartFor(now, this.durationMs);
++      existing.count = 0;
++    }
++    return existing;
++  }
++}
+diff --git a/src/middleware.test.ts b/src/middleware.test.ts
+new file mode 100644
+index 0000000..81c0b07
+--- /dev/null
++++ b/src/middleware.test.ts
+@@ -0,0 +1,133 @@
++import { test, expect } from "bun:test";
++import { KeyedRateLimiter } from "./limiter.ts";
++import { rateLimitMiddleware, type RequestLike, type ResponseLike } from "./middleware.ts";
++
++const makeRes = (): ResponseLike & { headers: Record<string, string>; body: string | undefined } => {
++  const headers: Record<string, string> = {};
++  return {
++    statusCode: 0,
++    headers,
++    body: undefined,
++    setHeader(name: string, value: string) {
++      headers[name] = value;
++    },
++    end(body?: string) {
++      this.body = body;
++    },
++  };
++};
++
++const req = (headers: Record<string, string | undefined> = {}): RequestLike => ({ headers });
++
++const mw = (limiter: KeyedRateLimiter, now: () => number) => rateLimitMiddleware({ limiter, now });
++
++test("a request under the limit reaches the handler chain", () => {
++  const limiter = new KeyedRateLimiter({ limit: 2, durationMs: 500 });
++  const m = mw(limiter, () => 1000);
++  const res = makeRes();
++  let nexted = false;
++  m.handle(req({ "x-client-id": "acme" }), res, () => {
++    nexted = true;
++  });
++  expect(nexted).toBe(true);
++  expect(res.statusCode).toBe(0);
++});
++
++test("a client over its budget is answered 429 and never reaches the handler", () => {
++  const limiter = new KeyedRateLimiter({ limit: 1, durationMs: 500 });
++  const m = mw(limiter, () => 1000);
++  m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  const res = makeRes();
++  let nexted = false;
++  m.handle(req({ "x-client-id": "acme" }), res, () => {
++    nexted = true;
++  });
++  expect(nexted).toBe(false);
++  expect(res.statusCode).toBe(429);
++  expect(res.body).toBe("rate limited");
++});
++
++test("a 429 tells the client when to come back", () => {
++  const limiter = new KeyedRateLimiter({ limit: 1, durationMs: 500 });
++  const m = mw(limiter, () => 1000);
++  m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  const res = makeRes();
++  m.handle(req({ "x-client-id": "acme" }), res, () => {});
++  expect(res.headers["Retry-After"]).toBeDefined();
++});
++
++test("the middleware answers 429 when the limiter refuses the request", () => {
++  // Stubbed so the test does not depend on window arithmetic.
++  const limiter = { allow: () => true, retryAfterMs: () => 1000 } as unknown as KeyedRateLimiter;
++  const m = mw(limiter, () => 1000);
++  const res = makeRes();
++  let nexted = false;
++  m.handle(req({ "x-client-id": "acme" }), res, () => {
++    nexted = true;
++  });
++  expect(nexted).toBe(true);
++});
++
++test("each client id gets its own budget", () => {
++  const limiter = new KeyedRateLimiter({ limit: 1, durationMs: 500 });
++  const m = mw(limiter, () => 1000);
++  m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  const res = makeRes();
++  let nexted = false;
++  m.handle(req({ "x-client-id": "globex" }), res, () => {
++    nexted = true;
++  });
++  expect(nexted).toBe(true);
++});
++
++test("requests with no client header share the anonymous budget", () => {
++  const limiter = new KeyedRateLimiter({ limit: 1, durationMs: 500 });
++  const m = mw(limiter, () => 1000);
++  m.handle(req(), makeRes(), () => {});
++  const res = makeRes();
++  m.handle(req(), res, () => {});
++  expect(res.statusCode).toBe(429);
++});
++
++test("the client header is configurable", () => {
++  const limiter = new KeyedRateLimiter({ limit: 1, durationMs: 500 });
++  const m = rateLimitMiddleware({ limiter, now: () => 1000, header: "x-api-key" });
++  const res = makeRes();
++  let nexted = false;
++  m.handle(req({ "x-api-key": "acme" }), res, () => {
++    nexted = true;
++  });
++  expect(nexted).toBe(true);
++});
++
++test("a rejected request counts as rejected, not admitted", () => {
++  const limiter = new KeyedRateLimiter({ limit: 1, durationMs: 500 });
++  const m = mw(limiter, () => 1000);
++  m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  expect(m.metrics.admitted).toBe(1);
++  expect(m.metrics.rejected).toBe(2);
++});
++
++test("metrics count the traffic the middleware handled", () => {
++  const limiter = new KeyedRateLimiter({ limit: 5, durationMs: 500 });
++  const m = mw(limiter, () => 1000);
++  for (let i = 0; i < 3; i++) m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  expect(m.metrics.admitted).toBe(3);
++  expect(m.metrics.rejected).toBe(0);
++});
++
++test("a new window lets a throttled client back in", () => {
++  const limiter = new KeyedRateLimiter({ limit: 1, durationMs: 500 });
++  let clock = 1000;
++  const m = mw(limiter, () => clock);
++  m.handle(req({ "x-client-id": "acme" }), makeRes(), () => {});
++  clock = 1500;
++  const res = makeRes();
++  let nexted = false;
++  m.handle(req({ "x-client-id": "acme" }), res, () => {
++    nexted = true;
++  });
++  expect(nexted).toBe(true);
++});
+diff --git a/src/middleware.ts b/src/middleware.ts
+new file mode 100644
+index 0000000..09bf60b
+--- /dev/null
++++ b/src/middleware.ts
+@@ -0,0 +1,98 @@
++import type { KeyedRateLimiter } from "./limiter.ts";
++
++// HTTP edge for the keyed rate limiter.
++//
++// One middleware sits in front of the handler chain: it derives the client key
++// from a request header, asks the limiter whether this request fits the key's
++// budget, and either calls `next()` or answers 429 with a `Retry-After` telling
++// the client when its budget returns.
++//
++// The limiter itself is transport-agnostic (see limiter.ts); everything that
++// knows about requests, responses and status codes lives here.
++
++/** The slice of a Node-style request this middleware reads. */
++export interface RequestLike {
++  headers: Record<string, string | undefined>;
++}
++
++/** The slice of a Node-style response this middleware writes. */
++export interface ResponseLike {
++  statusCode: number;
++  setHeader(name: string, value: string): void;
++  end(body?: string): void;
++}
++
++/** Counts for the process's own dashboards. */
++export interface RateLimitMetrics {
++  /** Requests the middleware let through to the handler chain. */
++  admitted: number;
++  /** Requests the middleware answered with 429. */
++  rejected: number;
++}
++
++export interface RateLimitMiddlewareOptions {
++  limiter: KeyedRateLimiter;
++  /** Monotonic clock in milliseconds; injected so tests can drive time. */
++  now: () => number;
++  /** Header carrying the client id. Defaults to `x-client-id`. */
++  header?: string;
++  /** Key used for requests that arrive without the header. */
++  anonymousKey?: string;
++}
++
++export interface RateLimitMiddleware {
++  handle(req: RequestLike, res: ResponseLike, next: () => void): void;
++  readonly metrics: RateLimitMetrics;
++}
++
++/** How many requests pass between housekeeping sweeps of idle buckets. */
++const SWEEP_EVERY = 512;
++
++/** `Retry-After` is seconds on the wire (RFC 9110); the limiter speaks ms. */
++function retryAfterSeconds(ms: number): string {
++  return String(Math.round(ms / 1000));
++}
++
++export function rateLimitMiddleware(options: RateLimitMiddlewareOptions): RateLimitMiddleware {
++  const header = options.header ?? "x-client-id";
++  const anonymousKey = options.anonymousKey ?? "anonymous";
++  const metrics: RateLimitMetrics = { admitted: 0, rejected: 0 };
++  let seen = 0;
++
++  const handle = (req: RequestLike, res: ResponseLike, next: () => void): void => {
++    const now = options.now();
++    const key = req.headers[header] ?? anonymousKey;
++
++    // Reclamation runs in the shipped path, not merely on demand: a process
++    // fronting many short-lived client ids must keep its key table bounded.
++    seen += 1;
++    if (seen % SWEEP_EVERY === 0) options.limiter.sweep(now);
++
++    let allowed: boolean;
++    try {
++      allowed = options.limiter.allow(key, now);
++    } catch {
++      // The limiter is unavailable. Refuse rather than admit -- a broken
++      // limiter must never become an open door -- and still tell the client
++      // when it is worth coming back.
++      metrics.rejected += 1;
++      res.statusCode = 429;
++      res.setHeader("Retry-After", retryAfterSeconds(options.limiter.retryAfterMs(key, now)));
++      res.end("rate limited");
++      return;
++    }
++
++    if (allowed) {
++      metrics.admitted += 1;
++      next();
++      return;
++    }
++
++    metrics.rejected += 1;
++    res.statusCode = 429;
++    res.setHeader("Retry-After", retryAfterSeconds(options.limiter.retryAfterMs(key, now)));
++    res.end("rate limited");
++  };
++
++  return { handle, metrics };
++}
+diff --git a/src/window.test.ts b/src/window.test.ts
+new file mode 100644
+index 0000000..820e5c4
+--- /dev/null
++++ b/src/window.test.ts
+@@ -0,0 +1,49 @@
++import { test, expect } from "bun:test";
++import { msUntilWindowEnd, windowStartFor, withinWindow } from "./window.ts";
++
++// -- windowStartFor --
++test("a mid-window tick maps to that window's start", () => {
++  expect(windowStartFor(1300, 500)).toBe(1000);
++});
++test("a boundary tick opens its own window", () => {
++  expect(windowStartFor(1500, 500)).toBe(1500);
++});
++test("tick 0 opens the first window", () => {
++  expect(windowStartFor(0, 500)).toBe(0);
++});
++test("a degenerate duration is guarded", () => {
++  expect(windowStartFor(1000, 0)).toBe(1000);
++});
++
++// -- withinWindow: the half-open rule --
++test("the open tick is inside its window", () => {
++  expect(withinWindow(1000, 1000, 500)).toBe(true);
++});
++test("one ms before the next boundary is still this window", () => {
++  expect(withinWindow(1499, 1000, 500)).toBe(true);
++});
++test("the end tick belongs to the next window, never this one", () => {
++  expect(withinWindow(1500, 1000, 500)).toBe(false);
++});
++test("a tick before the window is outside", () => {
++  expect(withinWindow(999, 1000, 500)).toBe(false);
++});
++test("a degenerate duration admits nothing", () => {
++  expect(withinWindow(1000, 1000, 0)).toBe(false);
++});
++test("every tick is a member of the window it selects", () => {
++  for (const now of [0, 1, 499, 500, 1300, 1500, 2999, 10_000]) {
++    expect(withinWindow(now, windowStartFor(now, 500), 500)).toBe(true);
++  }
++});
++
++// -- msUntilWindowEnd --
++test("counts down to the next window's open", () => {
++  expect(msUntilWindowEnd(1000, 1000, 500)).toBe(500);
++  expect(msUntilWindowEnd(1300, 1000, 500)).toBe(200);
++  expect(msUntilWindowEnd(1499, 1000, 500)).toBe(1);
++});
++test("a tick outside the window has nothing to wait for", () => {
++  expect(msUntilWindowEnd(1500, 1000, 500)).toBe(0);
++  expect(msUntilWindowEnd(999, 1000, 500)).toBe(0);
++});
+diff --git a/src/window.ts b/src/window.ts
+new file mode 100644
+index 0000000..8965db2
+--- /dev/null
++++ b/src/window.ts
+@@ -0,0 +1,33 @@
++// Fixed-window tiling of the timeline.
++//
++// The timeline is cut into windows of `durationMs` starting at tick 0. Window
++// k is the HALF-OPEN interval [k*durationMs, (k+1)*durationMs): the tick that
++// OPENS a window belongs to it, and the tick exactly `durationMs` later opens
++// the NEXT window, never the one it ends.
++//
++// That rule is the whole point of the module. Treat a window as closed at both
++// ends and one of two things happens: a burst straddling a boundary is counted
++// twice and slips the limit, or a request landing exactly on the tick is
++// rejected even though a fresh window just opened for it.
++
++/** The start tick of the window `now` falls in. */
++export function windowStartFor(now: number, durationMs: number): number {
++  if (durationMs <= 0) return now;
++  return Math.floor(now / durationMs) * durationMs;
++}
++
++/** Whether `now` is a member of the half-open window `[start, start + durationMs)`. */
++export function withinWindow(now: number, start: number, durationMs: number): boolean {
++  if (durationMs <= 0) return false;
++  return now >= start && now < start + durationMs;
++}
++
++/**
++ * Milliseconds from `now` until the window opened at `start` closes -- i.e.
++ * until the next window opens and budget is restored. Zero when `now` is not
++ * inside that window, since there is nothing to wait for.
++ */
++export function msUntilWindowEnd(now: number, start: number, durationMs: number): number {
++  if (!withinWindow(now, start, durationMs)) return 0;
++  return start + durationMs - now;
++}

@@ -1,0 +1,70 @@
+{
+  "fixture": "multi-defect",
+  "note": "The answer key for evals/reviewer, iteration 2 (#183). The live grader sees this file and each reviewer output, and answers only the latent question: for each defect, did that output name it? All counting and thresholding happens in evals/lib/recall.ts. Every entry reproduces and none is caught by the shipped 55-test suite (evals/reviewer/run.md records the verification). Iterated after the first paid run: the mix is now weighted toward stateful interactions (D1, D3, D4, D7), the class the run showed carries the single-vs-adversarial delta; the first run's saturated site-local defects (fail-open catch, ms-unit header, metrics-on-arrival, sweep-never-called) are fixed in this diff, not planted.",
+  "defects": [
+    {
+      "id": "D1",
+      "site": "src/limiter.ts:allow",
+      "summary": "the shared ceiling is charged before the per-key budget is checked, so a request the key's own limit rejects has already spent a shared slot",
+      "violates": "criteria 4 and 5",
+      "repro": "limit 1, durationMs 500, globalLimit 3: allow(a,1000)=true, allow(a,1100)=false, allow(a,1200)=false, then allow(b,1300)=false though the process admitted exactly one request against a ceiling of three",
+      "class": "ordering interaction between two individually correct paths"
+    },
+    {
+      "id": "D2",
+      "site": "src/limiter.ts:constructor",
+      "summary": "globalLimit is never validated, so a non-positive or non-integer ceiling is accepted instead of throwing RangeError",
+      "violates": "criterion 8",
+      "repro": "new KeyedRateLimiter({limit:5,durationMs:500,globalLimit:0}) constructs without throwing, then rejects every request forever",
+      "class": "missing input validation"
+    },
+    {
+      "id": "D3",
+      "site": "src/limiter.ts:resetAll",
+      "summary": "resetAll() also zeroes the shared ceiling counter, so admissions after a reset breach globalLimit within the same window",
+      "violates": "criterion 5",
+      "repro": "limit 5, durationMs 500, globalLimit 2: allow(a,1000)=true, allow(b,1000)=true, allow(c,1000)=false, resetAll(), then allow(c,1100)=true and allow(d,1200)=true -- four admissions land in window [1000,1500) against a ceiling of two",
+      "class": "reset interaction breaches an unrelated invariant"
+    },
+    {
+      "id": "D4",
+      "site": "src/limiter.ts:retryAfterMs",
+      "summary": "the wait is computed from the key's own (possibly stale) bucket window, so a key blocked by the shared ceiling while its bucket is stale is told to retry NOW (0) though it cannot be served",
+      "violates": "criterion 6",
+      "repro": "limit 5, durationMs 500, globalLimit 1: allow(a,1000)=true, allow(b,1600)=true fills the shared window [1500,2000); peek(a,1700)=false but retryAfterMs(a,1700)=0 -- the correct wait is 300",
+      "class": "stale-state interaction between two individually correct paths"
+    },
+    {
+      "id": "D5",
+      "site": "src/middleware.ts:handle",
+      "summary": "the client id is used exactly as sent, so whitespace and case variants are separate buckets and one client bypasses its own limit",
+      "violates": "criterion 10",
+      "repro": "limit 1: sending acme, 'acme ', ' acme', ACME, Acme in one window yields 5 admissions",
+      "class": "unnormalized input at a trust boundary"
+    },
+    {
+      "id": "D6",
+      "site": "src/middleware.ts:retryAfterSeconds",
+      "summary": "Retry-After is converted to seconds with Math.round, so a sub-half-second wait rounds to 0 and the client retries before its budget has returned (the criterion requires rounding that never retries early, i.e. ceil)",
+      "violates": "criterion 9",
+      "repro": "limit 1, durationMs 500: allow(a,1000), then a 429 at now=1100 has 400ms remaining and emits Retry-After: 0; the correct header is 1",
+      "class": "rounding direction violates a stated safety property"
+    },
+    {
+      "id": "D7",
+      "site": "src/middleware.ts:handle (catch)",
+      "summary": "the fail-closed catch rebuilds Retry-After by calling retryAfterMs on the SAME broken limiter, so the second throw escapes handle(): the request is neither admitted nor answered 429 -- the endpoint crashes",
+      "violates": "criterion 11",
+      "repro": "a limiter whose allow() and retryAfterMs() throw: handle() propagates the exception; next() never runs and end() is never called",
+      "class": "the error path's own repair re-enters the failed dependency"
+    },
+    {
+      "id": "D8",
+      "site": "src/middleware.test.ts",
+      "summary": "the test named for the 429 path stubs the limiter to ADMIT, so the reject path it claims to cover never runs and its assertion agrees with the stub instead of the test's name",
+      "violates": "no criterion directly; it is the reviewer's own 'tests that pass without the change' check, and it leaves criterion 9's reject path effectively untested",
+      "repro": "under that test's own stub the response status stays 0 and the handler runs, so the test passes with the middleware's entire reject branch deleted",
+      "class": "test that passes without the change"
+    }
+  ]
+}

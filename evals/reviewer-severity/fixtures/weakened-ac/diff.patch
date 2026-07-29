@@ -1,0 +1,32 @@
+diff --git a/src/clamp.ts b/src/clamp.ts
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/src/clamp.ts
+@@ -0,0 +1,5 @@
++// clamp n into [lo, hi].
++export function clamp(n: number, lo: number, hi: number): number {
++  if (lo > hi) [lo, hi] = [hi, lo]; // tolerate reversed bounds
++  return n < lo ? lo : n > hi ? hi : n;
++}
+diff --git a/src/clamp.test.ts b/src/clamp.test.ts
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/src/clamp.test.ts
+@@ -0,0 +1,15 @@
++import { test, expect } from "bun:test";
++import { clamp } from "./clamp.ts";
++
++test("within bounds returns n (AC1)", () => {
++  expect(clamp(5, 0, 10)).toBe(5);
++});
++test("below lo returns lo (AC2)", () => {
++  expect(clamp(-3, 0, 10)).toBe(0);
++});
++test("above hi returns hi (AC3)", () => {
++  expect(clamp(42, 0, 10)).toBe(10);
++});
++test("reversed bounds are tolerated (AC4)", () => {
++  expect(clamp(5, 10, 0)).toBe(5);
++});

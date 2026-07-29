@@ -120,19 +120,27 @@ comments (below).
 2. **Milestones per `epicStyle`.** Groups work into epics. Only `milestones` is
    supported today; the `issue-type` style (epic issue + sub-issues) is not yet
    supported (issue #14).
-3. **Drafts each ticket to the schema and gates it.** Mandatory sections:
-   `## Context`, `## Plan`, `### Acceptance Criteria` (setup → action → expected,
-   authored before any code), `## Tests + evals`, `## Docs pages touched`,
-   `## Out of scope`. Two optional sections: `Depends on:` and `## Files` — one
-   bullet per file the grounding pass (step 1 above) discovered, each a path
-   like `lib/board.ts` in the bullet's first backticked span followed by a
-   one-clause role; a file the ticket will create (doesn't exist yet) is
-   suffixed literally `(new)`. This is the map the builder/QA/reviewer stages
-   reuse instead of re-discovering the same files with fresh glob/grep every
-   stage. Every body must pass `bin/z-ticket-lint --check-paths <repoRoot>`
-   before it hits the board — `--check-paths` also verifies every `## Files`
-   path actually exists (skipping `(new)` bullets), so a hallucinated or stale
-   path fails here, at plan time, not later in a build worktree.
+3. **Drafts each ticket's title and body to the schema and gates both.**
+   Mandatory sections: `## Context`, `## Plan`, `### Acceptance Criteria`
+   (setup → action → expected, authored before any code), `## Tests + evals`,
+   `## Docs pages touched`, `## Out of scope`. Two optional sections:
+   `Depends on:` and `## Files` — one bullet per file the grounding pass (step
+   1 above) discovered, each a path like `lib/board.ts` in the bullet's first
+   backticked span followed by a one-clause role; a file the ticket will
+   create (doesn't exist yet) is suffixed literally `(new)`. This is the map
+   the builder/QA/reviewer stages reuse instead of re-discovering the same
+   files with fresh glob/grep every stage. Every title and body must pass
+   `bin/z-ticket-lint --check-paths <repoRoot> --title "<drafted title>"`
+   before either hits the board — `--check-paths` also verifies every `##
+   Files` path actually exists (skipping `(new)` bullets), so a hallucinated
+   or stale path fails here, at plan time, not later in a build worktree.
+   `--title` (issue #155) rejects an empty/whitespace-only title, a title
+   under the minimum length, an ALL-CAPS title, and a small stoplist of
+   generic titles ("change in behavior", "fix bug", "update code", "misc") —
+   the lesson from #133, which landed titled literally "CHANGE IN BEHAVIOR"
+   over an otherwise well-formed body. Deterministic rules only; retitling an
+   existing board ticket and any model-judged "title quality" check are both
+   out of scope for this gate.
 4. **Plan-time edges comment.** Once the body passes the lint gate, chosen
    defaults, spec-ambiguous calls, and data-loss-ish behaviors the PLAN itself
    introduces are collected as `{check, doStep, expect}` edges and, when
