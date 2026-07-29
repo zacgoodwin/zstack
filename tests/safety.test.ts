@@ -10,12 +10,13 @@
 //   5. Quota exhaustion mid-loop: sweep pauses then resumes      -> "quota guard"
 //   6. Human moves a ticket mid-loop: the lane stops cleanly     -> "wave reconcile"
 import { test, expect, describe, afterEach } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   acquireLoopLock,
   confirmIdentity,
+  currentClaim,
   inspectLoopLock,
   laneLockPath,
   listLaneLocks,
@@ -461,6 +462,81 @@ describe("orphaned reconcile claim self-heals (#144)", () => {
     expect(res.reason).toBe("stale"); // the loop lock is still the stale one, under the claim
     expect(readLoopLock(dir)!.session).toBe("crashed");
     expect(readFileSync(claimPath, "utf8")).toBe("old-session\n"); // untouched
+  });
+});
+
+// ============================================================================
+// issue #164 -- releasing a claim must cost what the DIRECTORY holds, not what the
+// generation number counts, and the claim lookup must fail loud like listLaneLocks.
+// ============================================================================
+describe("claim release scans the locks dir, not the generation counter (#164)", () => {
+  const STALE = 60 * 60_000;
+  const NOW = STALE + 1;
+
+  // A stale loop.lock plus one orphaned generation file, aged past the window so only
+  // its mtime is needed to judge it dead (the pre-#144 bare-session claim shape).
+  function seed(dir: string, genSuffix: string): string {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(loopLockPath(dir), JSON.stringify({ session: "crashed", startedAt: 0 }) + "\n");
+    const p = `${loopLockPath(dir)}.reconcile${genSuffix}`;
+    writeFileSync(p, "old-session\n");
+    const when = new Date(Date.now() - 24 * 3600_000);
+    utimesSync(p, when, when);
+    return p;
+  }
+  const claimFilesIn = (dir: string) => readdirSync(dir).filter((n) => n.startsWith("loop.lock.reconcile"));
+
+  // The wedge: releaseClaim used to unlink generations 0..gen one by one, so a single
+  // hand-planted high generation cost that many syscalls. Measured on this fixture
+  // before the fix: 38.6s for .2000000 (QA measured 94.7s on their box; the cost is
+  // linear in the suffix, so a ten-digit name stalls a run for days). Directory-driven
+  // release is O(files present) -- two unlinks here, regardless of the number.
+  test("a hand-planted loop.lock.reconcile.2000000 no longer stalls the acquire", () => {
+    const dir = tmp();
+    const orphan = seed(dir, ".2000000");
+
+    const t0 = performance.now();
+    const res = acquireLoopLock(dir, { session: "fresh", startedAt: NOW }, { nowMs: NOW, stalenessMs: STALE, reconcile: true });
+    const elapsedMs = performance.now() - t0;
+
+    expect(res.acquired).toBe(true);
+    expect(readLoopLock(dir)!.session).toBe("fresh");
+    expect(existsSync(orphan)).toBe(false); // the planted generation is gone
+    expect(claimFilesIn(dir)).toEqual([]); // and so is the one we took over it
+    expect(elapsedMs).toBeLessThan(1000); // was ~38_600ms on the counting release
+  });
+
+  // Item 2: `.007` parses as generation 7 but lives at its own path. The counting
+  // release reconstructed `.7`, deleted nothing, and left the padded file as residue.
+  test("a zero-padded generation is removed, not reconstructed as an unpadded name", () => {
+    const dir = tmp();
+    const padded = seed(dir, ".007");
+
+    const res = acquireLoopLock(dir, { session: "fresh", startedAt: NOW }, { nowMs: NOW, stalenessMs: STALE, reconcile: true });
+
+    expect(res.acquired).toBe(true);
+    expect(existsSync(padded)).toBe(false);
+    expect(claimFilesIn(dir)).toEqual([]); // no loop.lock.reconcile* residue at all
+  });
+
+  // Item 3: currentClaim's readdir swallowed EVERY error as "no claim", while its
+  // sibling listLaneLocks fails loud on anything but ENOENT. A false "no claim" is the
+  // dangerous direction -- it tells the caller to create generation 0 and take the mutex.
+  test("an unreadable locks dir propagates from the claim lookup, like listLaneLocks", () => {
+    const notADir = join(tmp(), "locks");
+    writeFileSync(notADir, "i am a file, not a directory");
+    let caught: unknown;
+    try {
+      currentClaim(join(notADir, "loop.lock.reconcile"));
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ZError);
+    expect((caught as ZError).message).toContain(notADir);
+  });
+
+  test("a missing locks dir still reads as no claim (fresh project)", () => {
+    expect(currentClaim(join(tmp(), "never-created", "loop.lock.reconcile"))).toBeNull();
   });
 });
 

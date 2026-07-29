@@ -17,6 +17,15 @@
 //     crash inside the claimed section self-heals too: the next run supersedes it with
 //     the next generation (`loop.lock.reconcile.1`, `.2`, ...) (issue #144).
 //
+// `--pid` exists but /z-loop deliberately does NOT pass it, so in production AGE decides
+// (issue #164 item 4). The loop is an in-session agent, not a process: the only pid its
+// SKILL steps can name is the shell running the acquire command, whose lifetime is not
+// the loop's. A pid that dies before the loop does inverts this layer's safety -- a dead
+// pid reads "stale" instantly, so a second /z-loop would be told to --reconcile OVER a
+// running loop. Age fails the other way (an already-finished loop looks live until the
+// window elapses), which merely refuses, and --reconcile is the documented way out. Only
+// a caller that can name a pid living exactly as long as the loop should pass --pid.
+//
 // Same discipline as lib/setup-permissions.ts: EVERY path is a parameter here.
 // Only main() computes the real ~/.zstack directory, so every test in
 // tests/safety.test.ts is structurally incapable of touching a real lock.
@@ -363,9 +372,9 @@ function claimReconcile(
   body: string,
   opts: { nowMs: number; stalenessMs: number; isAlive?: (pid: number) => boolean }
 ): number | null {
-  const current = currentClaimGen(claimPath);
-  if (current !== null && claimLiveness(claimGenPath(claimPath, current), opts) === "live") return null;
-  const gen = current === null ? 0 : current + 1;
+  const current = currentClaim(claimPath);
+  if (current !== null && claimLiveness(current.path, opts) === "live") return null;
+  const gen = current === null ? 0 : current.gen + 1;
   try {
     writeFileSync(claimGenPath(claimPath, gen), body, { flag: "wx", mode: 0o600 }); // exclusive create, owner-only
     return gen;
@@ -375,33 +384,73 @@ function claimReconcile(
   }
 }
 
-// The generation in force, or null when no claim file exists at all. Highest wins, so a
-// racer reading mid-release (which drops superseded generations first) still sees the
-// live one and defers.
-function currentClaimGen(claimPath: string): number | null {
+// Every claim file ACTUALLY on disk for this claim path -- the base
+// `loop.lock.reconcile` plus any `.<digits>` generation beside it -- each paired with
+// the generation number its name parses to. The directory is the source of truth, not
+// the counter: enumerating is what lets releaseClaim delete the files that exist rather
+// than the ones it would reconstruct from a count (issue #164, items 1 and 2).
+//
+// Only ENOENT ("no locks dir yet => no claim") is swallowed, matching listLaneLocks: an
+// unreadable or non-directory locks path must not be reported as "no claim in force",
+// because that verdict makes the caller create generation 0 and take the mutex. Fail
+// loud naming the path instead.
+function claimGenFiles(claimPath: string): { path: string; gen: number }[] {
   const base = basename(claimPath);
+  const dir = dirname(claimPath);
   let names: string[];
   try {
-    names = readdirSync(dirname(claimPath));
-  } catch {
-    return null; // no locks dir yet => no claim
+    names = readdirSync(dir);
+  } catch (e: any) {
+    if (e?.code === "ENOENT") return [];
+    throw new ZError(`Cannot read locks dir ${dir}: ${e?.message ?? e}`);
   }
-  let gen: number | null = null;
+  const out: { path: string; gen: number }[] = [];
   for (const name of names) {
     if (!name.startsWith(base)) continue;
     const suffix = name.slice(base.length);
-    const g = suffix === "" ? 0 : /^\.\d+$/.test(suffix) ? Number(suffix.slice(1)) : NaN;
-    if (Number.isInteger(g) && (gen === null || g > gen)) gen = g;
+    if (suffix !== "" && !/^\.\d+$/.test(suffix)) continue;
+    // A zero-padded `.007` parses as 7 but keeps its own path, so it is judged and
+    // removed as the file it is -- never reconstructed as `.7` and left behind.
+    out.push({ path: join(dir, name), gen: suffix === "" ? 0 : Number(suffix.slice(1)) });
   }
-  return gen;
+  return out;
 }
 
-// Drop the claim we hold. Our own generation goes LAST: while it is on disk it is the
-// generation in force, so a racer reading mid-release judges OUR claim (live, until we
-// finish) rather than a superseded one.
+// The claim in force -- the highest generation on disk, with the real path it lives at --
+// or null when no claim file exists at all. Highest wins, so a racer reading mid-release
+// (which drops superseded generations first) still sees the live one and defers.
+// Exported for the gate test that proves an unreadable locks dir propagates (#164).
+export function currentClaim(claimPath: string): { path: string; gen: number } | null {
+  let cur: { path: string; gen: number } | null = null;
+  for (const f of claimGenFiles(claimPath)) if (cur === null || f.gen > cur.gen) cur = f;
+  return cur;
+}
+
+// Drop the claim we hold: every generation on disk, ours LAST. While ours is on disk it
+// is the generation in force, so a racer reading mid-release judges OUR claim (live,
+// until we finish) rather than a superseded one. Scanning the directory (instead of
+// counting 0..gen) keeps release O(files present) rather than O(the generation number):
+// a hand-planted `loop.lock.reconcile.2000000` used to cost two million unlink syscalls
+// and stall the run for a minute-plus, the same wedge class #144 exists to remove (#164).
+//
+// Only generations up to ours are dropped. A HIGHER one means a racer judged our claim
+// dead and superseded us while we were inside the claimed section (possible when our own
+// claim is unverifiable -- no pid, aged past the window); that racer's claim is in force
+// now, and unlinking it would leave the mutex free for a third process to enter beside
+// it. The old counting release had this property for free by never looking past `gen`;
+// keep it explicitly now that the directory, not the counter, drives the loop.
 function releaseClaim(claimPath: string, gen: number): void {
-  for (let g = 0; g < gen; g++) rmSync(claimGenPath(claimPath, g), { force: true }); // the orphans we superseded
-  rmSync(claimGenPath(claimPath, gen), { force: true });
+  const ours = claimGenPath(claimPath, gen);
+  try {
+    for (const f of claimGenFiles(claimPath)) {
+      if (f.gen <= gen && f.path !== ours) rmSync(f.path, { force: true });
+    }
+  } catch {
+    // Unlike the judgment path above, release must NEVER fail loud: this runs in a
+    // finally, and throwing here would leave the mutex held for a staleness window.
+    // Drop ours below regardless; any orphan left behind self-heals on the next run.
+  }
+  rmSync(ours, { force: true });
 }
 
 // Liveness of an existing claim file. A claim written before #144 holds a bare session

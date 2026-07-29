@@ -93,6 +93,11 @@ read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMA
 # a) Second-invocation guard: refuse if another loop is live, naming its session.
 #    A crashed loop leaves a STALE lock; --reconcile clears it (a LIVE lock never
 #    clears -- you cannot reconcile over a running loop).
+#    Deliberately NO --pid (#164): the loop is an in-session agent, not a process, so
+#    the only pid nameable here is this shell's -- and it can end while the loop runs.
+#    A dead recorded pid reads STALE instantly, which would invite the next invocation
+#    to --reconcile over a LIVE loop. Age decides instead (lockStalenessMinutes), which
+#    fails toward refusing. See docs/user-guide/troubleshooting.md.
 bun "$PACK/lib/locks.ts" acquire --slug "$SLUG" --session "$SESSION" ${RECONCILE:+--reconcile} \
   || exit 1   # the CLI already printed which session holds it and what to do
 
@@ -593,7 +598,9 @@ Two lock kinds live under `$LOCKS` (`~/.zstack/projects/<slug>/locks/`):
   the live session**: `Refusing to start: a /z-loop is already running on this
   project in session "<session>" ...`. A crashed loop's lock is judged *stale*
   (dead pid on the SAME host, or older than the config `lockStalenessMinutes`) and
-  reported as such rather than live.
+  reported as such rather than live. Step 0 passes **no `--pid`** (#164), so in
+  production the *age* rule is the one that fires — a crashed loop's lock reads stale
+  after `lockStalenessMinutes`, not the instant its process dies.
 
 > **UNSUPPORTED: two loops under the same GitHub login on different machines.**
 > The second-invocation guard is the `loop.lock`, and that lock lives in local
