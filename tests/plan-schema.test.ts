@@ -23,6 +23,7 @@ import {
   type TicketError,
 } from "../lib/ticket-schema.ts";
 import { estimate, loadRates, type Buckets } from "../lib/estimate.ts";
+import { BOARD_STATUSES } from "../lib/config.ts";
 
 const TICKETS = join(import.meta.dir, "fixtures", "tickets");
 const read = (name: string) => readFileSync(join(TICKETS, name), "utf8");
@@ -1074,6 +1075,23 @@ describe("z-plan/SKILL.md: --reestimate re-estimates Backlog + Ready (issue #134
     return next < 0 ? rest : rest.slice(0, next);
   }
 
+  // "## Dry-run / eval mode" bundles three sibling paragraphs (--backlog,
+  // --ticket, --reestimate), each opening with an inline bold marker rather
+  // than its own "##" heading. Slice from one marker to the next so a
+  // per-flag assertion binds to only its own paragraph -- issue #160: the
+  // AC10 canary previously ran against the WHOLE section, so it was also
+  // satisfied by the pre-existing --backlog paragraph's identical "No board
+  // writes, no GitHub writes" sentence, and stayed green if that guarantee
+  // was deleted from the --reestimate paragraph alone.
+  function paragraph(sectionText: string, marker: string): string {
+    const start = sectionText.indexOf(marker);
+    if (start < 0) return "";
+    const rest = sectionText.slice(start + marker.length);
+    const next = rest.search(/\n\*\*`/);
+    const end = next < 0 ? sectionText.length : start + marker.length + next;
+    return sectionText.slice(start, end);
+  }
+
   test("--reestimate is parsed as its own flag alongside --backlog/--ticket/--dry-run", () => {
     const step1 = section(zPlan(), "## Step 1 —");
     expect(step1).toContain("--reestimate) REESTIMATE_ONLY=1");
@@ -1112,8 +1130,23 @@ describe("z-plan/SKILL.md: --reestimate re-estimates Backlog + Ready (issue #134
     // must NOT satisfy this -- the excluded statuses have to be named right
     // next to "left ... untouched" (review finding 3: the old
     // /left\s*\n?\s*untouched/ regex alone was too generic).
+    //
+    // Derived from lib/config.ts (issue #160), not a hand-written string: the
+    // scan only reads/writes Backlog + Ready, so "every other status" is
+    // BOARD_STATUSES minus those two, in the config's own order. Pinning this
+    // literally in the test meant a correct future docs fix (e.g. adding a
+    // status this enumeration had omitted) would fail the gate for getting
+    // MORE accurate; deriving it means the expectation moves with the config
+    // instead of needing a hand-edit in lockstep.
+    const excludedStatuses = BOARD_STATUSES.filter(
+      (s) => s !== "Backlog" && s !== "Ready"
+    );
+    expect(excludedStatuses.length).toBeGreaterThan(0);
+    const excludedPattern = excludedStatuses
+      .map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join("\\/");
     expect(step12).toMatch(
-      /\(Building\/QA\/Review\/Blocked\/Skipped\/Done\)\s+is\s+left\s*\n?\s*untouched/
+      new RegExp(`\\(${excludedPattern}\\)\\s+is\\s+left\\s*\\n?\\s*untouched`)
     );
   });
 
@@ -1227,10 +1260,45 @@ describe("z-plan/SKILL.md: --reestimate re-estimates Backlog + Ready (issue #134
   });
 
   test("--dry-run --reestimate emits changes to stdout with no board writes (AC10)", () => {
-    const dryRun = section(zPlan(), "## Dry-run / eval mode");
-    expect(dryRun).toContain("--dry-run --reestimate");
-    expect(dryRun).toMatch(/composes like `--dry-run --backlog`/);
-    expect(dryRun).toMatch(/No board writes, no\s*\n?\s*GitHub writes/);
+    // Scoped to the --reestimate paragraph only (issue #160). The whole
+    // "## Dry-run / eval mode" section also carries the --backlog paragraph's
+    // identical "No board writes, no GitHub writes" sentence, so asserting
+    // against the full section was satisfied by that unrelated paragraph and
+    // stayed green even if the --reestimate paragraph's own guarantee was
+    // deleted.
+    const dryRunSection = section(zPlan(), "## Dry-run / eval mode");
+    const reestimateParagraph = paragraph(
+      dryRunSection,
+      "**`--dry-run --reestimate`**"
+    );
+    expect(reestimateParagraph).not.toBe("");
+    expect(reestimateParagraph).toContain("--dry-run --reestimate");
+    expect(reestimateParagraph).toMatch(/composes like `--dry-run --backlog`/);
+    expect(reestimateParagraph).toMatch(/No board writes, no\s*\n?\s*GitHub writes/);
+  });
+
+  test("scoped AC10 slice still fails when the WHOLE --dry-run --reestimate paragraph is removed", () => {
+    // Proves the scoping itself, not just the assertion: if a future edit
+    // deletes the entire --reestimate paragraph (not just the guarantee
+    // sentence inside it), the scoped slice must come back empty rather than
+    // silently falling through to a sibling paragraph -- otherwise the AC10
+    // test above could still pass against leftover text it was never meant
+    // to see.
+    const dryRunSection = section(zPlan(), "## Dry-run / eval mode");
+    const marker = "**`--dry-run --reestimate`**";
+    const markerStart = dryRunSection.indexOf(marker);
+    expect(markerStart).toBeGreaterThan(-1);
+    // Everything up to the marker, i.e. the section with the whole
+    // --reestimate paragraph (marker through end of section) cut off.
+    const withoutParagraph = dryRunSection.slice(0, markerStart);
+
+    // The scoped slice comes back empty -- the marker itself is gone --
+    // rather than silently matching a leftover sibling paragraph.
+    const reestimateParagraph = paragraph(withoutParagraph, marker);
+    expect(reestimateParagraph).toBe("");
+    // So the real AC10 assertions, run against this mutated text, fail loud:
+    expect(reestimateParagraph).not.toContain("--dry-run --reestimate");
+    expect(reestimateParagraph).not.toMatch(/No board writes, no\s*\n?\s*GitHub writes/);
   });
 
   test("Done criteria names --reestimate", () => {

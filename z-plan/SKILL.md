@@ -661,7 +661,7 @@ TMP="$HOME/.zstack/projects/$SLUG/z-plan/tmp"; mkdir -p "$TMP"
 "$Z_BOARD" list --status Ready --json --slug "$SLUG" > "$TMP/reest-ready.json"
 ```
 
-Every other status (Building/QA/Review/Blocked/Skipped/Done) is left
+Every other status (Questions/Building/QA/Review/Blocked/Skipped/Done) is left
 untouched — this step reads and writes nothing outside Backlog + Ready.
 
 For each ticket number `<N>` in the combined Backlog + Ready list:

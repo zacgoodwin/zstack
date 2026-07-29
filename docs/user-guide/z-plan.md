@@ -109,7 +109,7 @@ no-op. A ticket with no prior Estimate gets all three fields written but no
 (`## Subtasks (in order)`) are skipped, same as the Backlog scan. It never
 promotes a ticket to Ready and never edits a body — only the Model / Model
 Effort / Estimate fields and, at most, one comment change. Every other
-status (Building, QA, Review, Blocked, Skipped, Done) is left untouched.
+status (Questions, Building, QA, Review, Blocked, Skipped, Done) is left untouched.
 `/z-plan --dry-run --reestimate` previews the run with no board writes and no
 comments (below).
 
