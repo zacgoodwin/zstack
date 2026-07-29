@@ -12,7 +12,7 @@
 import { test, expect, describe, afterEach } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   acquireLoopLock,
   confirmIdentity,
@@ -537,6 +537,143 @@ describe("claim release scans the locks dir, not the generation counter (#164)",
 
   test("a missing locks dir still reads as no claim (fresh project)", () => {
     expect(currentClaim(join(tmp(), "never-created", "loop.lock.reconcile"))).toBeNull();
+  });
+
+  // The `f.gen <= gen` guard in releaseClaim. Scanning the directory means release now
+  // SEES generations the counting version never looked at, so the stop-at-ours condition
+  // has to be explicit. A racer may supersede us WHILE we are inside the claimed section
+  // (legal: our own claim carries no verifiable pid, so once it ages past the window a
+  // racer is entitled to judge it dead and create the next generation). Dropping that
+  // higher generation on the way out would free the mutex for a THIRD process to enter the
+  // section beside the racer -- the two-reconciles-in-one-section hazard #144 exists to
+  // prevent. Verified both ways: with the guard, A's `.1` survives and the third acquire
+  // defers; with `f.gen <= gen &&` deleted, `.1` is unlinked and the third acquire wins.
+  test("release drops only up to OUR generation, never a racer's higher claim", () => {
+    const dir = tmp();
+    mkdirSync(dir, { recursive: true });
+    // A pid with no host/startTime is unattributable, so liveness consults isAlive and
+    // then falls through to age -- which makes isAlive a deterministic interleave hook.
+    const staleLock = JSON.stringify({ session: "crashed", startedAt: 0, pid: 4242 }) + "\n";
+    writeFileSync(loopLockPath(dir), staleLock);
+    const claimPath = `${loopLockPath(dir)}.reconcile`;
+    const racer = {
+      session: "racer-A",
+      startedAt: 0,
+      pid: process.pid,
+      host: hostname(),
+      startTime: processStartTime(process.pid)!,
+    };
+
+    // Call 1 is the inspect BEFORE the claim; call 2 is the inspect UNDER it. Writing A's
+    // generation on call 2 puts a live higher claim on disk while we hold generation 0.
+    let inspects = 0;
+    const isAlive = () => {
+      if (++inspects === 2) writeFileSync(`${claimPath}.1`, JSON.stringify(racer) + "\n");
+      return false; // dead pid -> stale, both times
+    };
+
+    const res = acquireLoopLock(
+      dir,
+      { session: "ours", startedAt: NOW },
+      { nowMs: NOW, stalenessMs: STALE, reconcile: true, isAlive }
+    );
+    expect(inspects).toBeGreaterThanOrEqual(2); // the interleave actually fired
+    expect(res.acquired).toBe(true); // we took gen 0 and finished our section
+    expect(existsSync(claimPath)).toBe(false); // ours (gen 0) released
+    expect(existsSync(`${claimPath}.1`)).toBe(true); // A's live claim survived our release
+    expect(JSON.parse(readFileSync(`${claimPath}.1`, "utf8"))).toEqual(racer); // untouched
+
+    // A is still inside its own claimed section, so its claim -- not the loop lock -- is
+    // all that keeps a third process out. Put the lock back in the state A will act on.
+    writeFileSync(loopLockPath(dir), JSON.stringify({ session: "crashed", startedAt: 0 }) + "\n");
+    const third = acquireLoopLock(
+      dir,
+      { session: "third", startedAt: NOW },
+      { nowMs: NOW, stalenessMs: STALE, reconcile: true }
+    );
+    expect(third.acquired).toBe(false); // never two reconciles in one claimed section
+    expect(readLoopLock(dir)!.session).toBe("crashed"); // and it cleared nothing
+  });
+
+  // A directory planted at a claim's name is an undeletable "file" on every platform:
+  // rmSync without `recursive` throws (EFAULT under Bun on Windows) and `force: true` does
+  // NOT suppress it -- force only swallows ENOENT. The same shape a real Windows EPERM/
+  // EBUSY takes when another process holds the file open.
+  const sabotage = (path: string) => {
+    rmSync(path, { force: true });
+    mkdirSync(path);
+  };
+
+  // releaseClaim runs in acquireLoopLock's `finally`, so ANY throw out of it discards a
+  // successful acquire and reports a crash to a caller that is in fact holding the loop
+  // lock -- a wedge. The unlink of our OWN generation used to sit outside the try that
+  // promised this could not happen. Observed before the fix: acquireLoopLock threw
+  // EFAULT and the caller never saw {acquired: true}.
+  test("an undeletable claim file cannot turn a successful acquire into a throw", () => {
+    const dir = tmp();
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(loopLockPath(dir), JSON.stringify({ session: "crashed", startedAt: 0, pid: 4242 }) + "\n");
+    const claimPath = `${loopLockPath(dir)}.reconcile`;
+
+    // Call 2 is the inspect UNDER our claim: swap our own claim file for a directory, so
+    // the release that follows cannot unlink it.
+    let inspects = 0;
+    const isAlive = () => {
+      if (++inspects === 2) sabotage(claimPath);
+      return false;
+    };
+
+    const res = acquireLoopLock(
+      dir,
+      { session: "ours", startedAt: NOW },
+      { nowMs: NOW, stalenessMs: STALE, reconcile: true, isAlive }
+    );
+    expect(inspects).toBeGreaterThanOrEqual(2);
+    expect(res.acquired).toBe(true); // the acquire really happened, and was reported
+    expect(readLoopLock(dir)!.session).toBe("ours");
+    expect(existsSync(claimPath)).toBe(true); // the stuck claim is left behind
+
+    // ...and leaving it is safe, which is what the release comment claims: the next run
+    // judges it (unreadable => stale) and SUPERSEDES it rather than waiting on it.
+    writeFileSync(loopLockPath(dir), JSON.stringify({ session: "crashed", startedAt: 0 }) + "\n");
+    const next = acquireLoopLock(dir, { session: "next", startedAt: NOW }, { nowMs: NOW, stalenessMs: STALE, reconcile: true });
+    expect(next.acquired).toBe(true);
+    expect(existsSync(`${claimPath}.1`)).toBe(false); // the generation it took is released
+  });
+
+  // The cleanup guard is per-unlink, not per-loop: one stuck generation must not abort the
+  // removal of the deletable ones beside it. Observed with a single try around the whole
+  // loop: sabotaging generation 0 left generation 1 on disk too, and if the blocker never
+  // becomes deletable the abort repeats and orphans accumulate.
+  test("one undeletable generation does not abort cleanup of the deletable ones", () => {
+    const dir = tmp();
+    const gen1 = seed(dir, ".1"); // stale loop.lock + a dead legacy generation 1
+    const gen0 = `${loopLockPath(dir)}.reconcile`;
+    mkdirSync(gen0); // generation 0: unreadable (=> judged stale) and undeletable
+
+    const res = acquireLoopLock(dir, { session: "fresh", startedAt: NOW }, { nowMs: NOW, stalenessMs: STALE, reconcile: true });
+
+    expect(res.acquired).toBe(true); // took generation 2 over the two dead ones
+    expect(existsSync(gen1)).toBe(false); // the deletable sibling was still cleaned up
+    expect(existsSync(`${gen0}.2`)).toBe(false); // and so was ours
+    expect(existsSync(gen0)).toBe(true); // only the genuinely stuck one survives
+  });
+
+  // Item 1 removed an O(gen) stall; a generation past 2^53 is the same wedge class with a
+  // worse ending. `9007199254740992 + 1 === 9007199254740992`, so superseding it means
+  // exclusive-creating its OWN name: EEXIST, defer, forever. Observed before the guard:
+  // acquired=false on every --reconcile against this fixture, permanently. The code can
+  // never write such a name (generations step by one), so it is not a claim at all.
+  test("a generation number too large to increment is not treated as a claim", () => {
+    const dir = tmp();
+    const planted = seed(dir, ".9007199254740992");
+
+    const res = acquireLoopLock(dir, { session: "fresh", startedAt: NOW }, { nowMs: NOW, stalenessMs: STALE, reconcile: true });
+
+    expect(res.acquired).toBe(true); // --reconcile is not refused forever
+    expect(readLoopLock(dir)!.session).toBe("fresh");
+    expect(existsSync(planted)).toBe(true); // inert residue, not a lock: never judged, never dropped
+    expect(claimFilesIn(dir)).toEqual([basename(planted)]); // and we left nothing of our own
   });
 });
 

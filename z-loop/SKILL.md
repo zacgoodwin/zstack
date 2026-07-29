@@ -96,8 +96,11 @@ read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMA
 #    Deliberately NO --pid (#164): the loop is an in-session agent, not a process, so
 #    the only pid nameable here is this shell's -- and it can end while the loop runs.
 #    A dead recorded pid reads STALE instantly, which would invite the next invocation
-#    to --reconcile over a LIVE loop. Age decides instead (lockStalenessMinutes), which
-#    fails toward refusing. See docs/user-guide/troubleshooting.md.
+#    to --reconcile over a LIVE loop. Age decides instead (lockStalenessMinutes) -- but
+#    age errs BOTH ways, not just toward refusing: loop.lock is stamped once and never
+#    re-stamped, so a drain running longer than the window (default 60m) reads STALE
+#    WHILE LIVE, and a --reconcile taken on that message clobbers the running loop.
+#    Hazard documented, not closed. See docs/user-guide/troubleshooting.md.
 bun "$PACK/lib/locks.ts" acquire --slug "$SLUG" --session "$SESSION" ${RECONCILE:+--reconcile} \
   || exit 1   # the CLI already printed which session holds it and what to do
 
@@ -600,7 +603,12 @@ Two lock kinds live under `$LOCKS` (`~/.zstack/projects/<slug>/locks/`):
   (dead pid on the SAME host, or older than the config `lockStalenessMinutes`) and
   reported as such rather than live. Step 0 passes **no `--pid`** (#164), so in
   production the *age* rule is the one that fires — a crashed loop's lock reads stale
-  after `lockStalenessMinutes`, not the instant its process dies.
+  after `lockStalenessMinutes`, not the instant its process dies. That rule errs in
+  **both** directions: `loop.lock` is stamped once at start and never re-stamped, so a
+  drain that runs longer than `lockStalenessMinutes` (default 60m) reads *stale while it
+  is still live*, and an operator who `--reconcile`s on that message releases the running
+  loop's claims, parks its in-flight tickets and prunes its worktrees. Confirm the prior
+  loop is really gone before reconciling; see docs/user-guide/troubleshooting.md.
 
 > **UNSUPPORTED: two loops under the same GitHub login on different machines.**
 > The second-invocation guard is the `loop.lock`, and that lock lives in local

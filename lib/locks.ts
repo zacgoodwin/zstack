@@ -22,9 +22,24 @@
 // SKILL steps can name is the shell running the acquire command, whose lifetime is not
 // the loop's. A pid that dies before the loop does inverts this layer's safety -- a dead
 // pid reads "stale" instantly, so a second /z-loop would be told to --reconcile OVER a
-// running loop. Age fails the other way (an already-finished loop looks live until the
-// window elapses), which merely refuses, and --reconcile is the documented way out. Only
-// a caller that can name a pid living exactly as long as the loop should pass --pid.
+// running loop.
+//
+// Age is a ONE-SIDED rule too, and it is not one-sided in the safe direction only.
+// `loop.lock` is stamped once at acquire and NEVER re-stamped (only lane locks re-stamp),
+// so its age is the loop's elapsed RUN time, not its idle time. Both errors are real:
+//   * under DEFAULT_LOCK_STALENESS_MINUTES (60): an already-finished loop that never
+//     released still reads "live". Harmless -- it only refuses, and --reconcile is the
+//     documented way out.
+//   * over it: a loop that is STILL RUNNING reads "stale", and the acquire error below
+//     tells the operator the previous loop "likely crashed. Re-run /z-loop with
+//     --reconcile" -- which would release the live run's claims, park its in-flight
+//     tickets back to Ready and prune its worktrees underneath it. A full drain routinely
+//     runs past an hour (loop run 9 took ~7), so this is the ordinary case for a long run.
+// The shell pid was rejected because it fails the SAME dangerous way on a shorter fuse,
+// not because age is safe. Closing the hazard means re-stamping loop.lock on a heartbeat
+// or sizing lockStalenessMinutes to the expected run -- a change to the mutual-exclusion
+// contract, tracked separately; #164 documents it only. Only a caller that can name a pid
+// living exactly as long as the loop should pass --pid.
 //
 // Same discipline as lib/setup-permissions.ts: EVERY path is a parameter here.
 // Only main() computes the real ~/.zstack directory, so every test in
@@ -409,9 +424,17 @@ function claimGenFiles(claimPath: string): { path: string; gen: number }[] {
     if (!name.startsWith(base)) continue;
     const suffix = name.slice(base.length);
     if (suffix !== "" && !/^\.\d+$/.test(suffix)) continue;
+    const gen = suffix === "" ? 0 : Number(suffix.slice(1));
+    // Past 2^53 a float stops counting: `gen + 1 === gen`, so claimReconcile would try to
+    // supersede `.9007199254740992` with its own name, hit EEXIST and defer -- refusing
+    // every --reconcile forever, a worse wedge than the O(gen) stall #164 removes and
+    // reachable through the same hand-planted-file threat model. The code never writes
+    // such a name (generations only ever step by one), so a name that cannot be
+    // incremented is not a claim: skip it. It is then inert residue instead of a lock.
+    if (!Number.isSafeInteger(gen)) continue;
     // A zero-padded `.007` parses as 7 but keeps its own path, so it is judged and
     // removed as the file it is -- never reconstructed as `.7` and left behind.
-    out.push({ path: join(dir, name), gen: suffix === "" ? 0 : Number(suffix.slice(1)) });
+    out.push({ path: join(dir, name), gen });
   }
   return out;
 }
@@ -439,18 +462,34 @@ export function currentClaim(claimPath: string): { path: string; gen: number } |
 // now, and unlinking it would leave the mutex free for a third process to enter beside
 // it. The old counting release had this property for free by never looking past `gen`;
 // keep it explicitly now that the directory, not the counter, drives the loop.
+//
+// Release must NEVER fail loud: it runs in a finally, so a throw discards a SUCCESSFUL
+// acquire and reports a crash while the loop lock is actually held -- the caller stops
+// and the lock sits there for a staleness window. `force: true` only suppresses ENOENT;
+// EPERM/EBUSY/EFAULT are real (on Windows, a file another process holds open, or a
+// directory planted at a claim's name), so EVERY unlink is guarded individually. Per file
+// rather than per loop: one undeletable generation must not abort the cleanup of the
+// deletable ones beside it, and dropping ours is the step that frees the mutex.
 function releaseClaim(claimPath: string, gen: number): void {
   const ours = claimGenPath(claimPath, gen);
+  let files: { path: string; gen: number }[] = [];
   try {
-    for (const f of claimGenFiles(claimPath)) {
-      if (f.gen <= gen && f.path !== ours) rmSync(f.path, { force: true });
-    }
+    files = claimGenFiles(claimPath);
   } catch {
-    // Unlike the judgment path above, release must NEVER fail loud: this runs in a
-    // finally, and throwing here would leave the mutex held for a staleness window.
-    // Drop ours below regardless; any orphan left behind self-heals on the next run.
+    // Unlike the judgment path above, an unreadable locks dir is not fatal here: drop
+    // ours below anyway. Anything left behind is judged and superseded by the next run.
   }
-  rmSync(ours, { force: true });
+  for (const f of files) if (f.gen <= gen && f.path !== ours) dropClaimFile(f.path);
+  dropClaimFile(ours);
+}
+
+function dropClaimFile(path: string): void {
+  try {
+    rmSync(path, { force: true });
+  } catch {
+    // Undeletable right now (held open, or not a regular file). Leaving it is safe: it
+    // is judged like any other orphan on the next run and superseded, never unlinked.
+  }
 }
 
 // Liveness of an existing claim file. A claim written before #144 holds a bare session

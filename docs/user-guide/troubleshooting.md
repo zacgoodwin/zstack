@@ -63,12 +63,27 @@ only pid its steps could name is the shell that ran the acquire command, and tha
 shell can end while the loop keeps running. A recorded pid that dies first is worse
 than none — the live loop's own lock would read *stale*, and the next invocation
 would be told to `--reconcile` over a running loop, which is exactly what this lock
-prevents. Age fails the safe way instead: a finished-but-uncleared lock looks live
-until `lockStalenessMinutes` (default 60) elapses, so the loop refuses to start and
-`--reconcile` is the one-word way out. So: after a crash where the lock was not
-released, expect to wait out the window or pass `--reconcile`, and do not read
-"already running" as proof that a process is alive. Pass `--pid` only from a caller
-whose pid lives exactly as long as the loop does.
+prevents.
+
+**Age is one-sided too, and it errs in both directions.** `loop.lock` is stamped
+once, when the loop starts, and is never re-stamped (only lane locks re-stamp), so
+its age is the loop's *elapsed run time*, not its idle time.
+
+- **Under `lockStalenessMinutes`** (default 60): a loop that already finished without
+  releasing its lock still reads *live*. Harmless — the next run refuses to start and
+  `--reconcile` is the one-word way out.
+- **Over `lockStalenessMinutes`**: a loop that is **still running** reads *stale*, and
+  the acquire message says the previous loop "likely crashed. Re-run /z-loop with
+  `--reconcile`." Taking that advice while the first loop is alive releases its claims,
+  parks its in-flight tickets back to Ready, and prunes its worktrees out from under it.
+  A full drain routinely runs longer than an hour (loop run 9 took about seven), so this
+  is the ordinary case for a long run, not an edge.
+
+So: **do not `--reconcile` on the strength of the stale message alone.** Confirm the
+prior loop is really gone first — check `/z-status`, the run report, or the session
+itself. Do not read "already running" as proof that a process is alive, and do not read
+"stale" as proof that one is dead. Pass `--pid` only from a caller whose pid lives
+exactly as long as the loop does.
 
 `--reconcile` serializes its clear-and-replace through a one-shot claim file,
 `locks/loop.lock.reconcile`. If a run is killed mid-reconcile the claim can be left
