@@ -638,7 +638,7 @@ describe("SetupBoard.apply — pre-flight input validation (F9)", () => {
     expect(backend.calls).toEqual([]); // nothing reached the backend, mutation or read
   });
 
-  // -- issue #82 (AC6): stageModels default only for a brand-new project ------
+  // -- issue #82, revised by #156: stageModels default on created AND adopted
   test("a brand-new project's config includes the stageModels default and passes validateConfig", async () => {
     const backend = setupBackend();
     const setup = new SetupBoard(backend.exec);
@@ -648,35 +648,32 @@ describe("SetupBoard.apply — pre-flight input validation (F9)", () => {
     expect(() => validateConfig(result.config)).not.toThrow();
   });
 
-  // Re-running setup against an existing config (adoption) never touches
-  // stageModels -- neither injecting the default nor stripping a key the
-  // config didn't have. Simulates a config written BEFORE this ticket (no
-  // stageModels key at all): a second apply/write against the now-existing
-  // project must leave the file byte-identical. Also issue #97 AC2 (no-drift
-  // re-run over a prior config carrying none of the four preserved optional
-  // fields stays byte-identical): the second apply() now reads this SAME
-  // `home`'s config.json (via buildConfig's priorOptionalFields), so this test
-  // doubles as proof that reading it back injects nothing new.
-  test("re-running setup against an existing config without stageModels leaves it byte-identical", async () => {
+  // Issue #156: adopting an existing project whose on-disk config predates
+  // this knob (no stageModels key at all, the shape a config written before
+  // #156 would have) now gets the SAME default a brand-new project gets --
+  // it used to be left out entirely on the adopt path (created === false),
+  // a latent inconsistency between created and adopted config.json if the
+  // pack default ever changed. The runtime `resolveStageModel` fallback in
+  // lib/loop.ts is untouched; this is only about what buildConfig writes.
+  test("adopting an existing project without stageModels gets the same default a brand-new project gets", async () => {
     const backend = setupBackend();
     const setup = new SetupBoard(backend.exec);
     const home = testHome();
 
     // First run creates the project; strip stageModels to simulate a config
     // that predates this ticket, then write it -- the "existing config
-    // without the key" AC6 names.
+    // without the key" scenario.
     const first = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
     delete (first.config as any).stageModels;
     const path = writeConfig(first.config, home);
-    const before = readFileSync(path, "utf8");
 
     // Second run adopts the now-existing project (created === false) and reads
     // the file just written above from the same `home`.
     const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
     expect(second.created).toBe(false);
-    expect(second.config.stageModels).toBeUndefined(); // adoption never injects the default
+    expect(second.config.stageModels).toEqual({ merge: "haiku" }); // adoption now injects the default too
     writeConfig(second.config, home);
-    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(JSON.parse(readFileSync(path, "utf8")).stageModels).toEqual({ merge: "haiku" });
   });
 
   // -- issue #97 AC1: a re-apply that genuinely rewrites the config (the board
@@ -746,7 +743,7 @@ describe("SetupBoard.apply — pre-flight input validation (F9)", () => {
 
     const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
     expect(second.config.quota).toEqual({ threshold: 100, mode: "sleep" }); // fresh default, nothing preserved
-    expect(second.config.stageModels).toBeUndefined(); // adoption path -- no default injected either
+    expect(second.config.stageModels).toEqual({ merge: "haiku" }); // issue #156: default written on adopt too
   });
 
   // Reviewer finding 1 (blocker): a validly-parsed JSON value whose SHAPE is

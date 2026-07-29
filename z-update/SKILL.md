@@ -49,7 +49,7 @@ can't misread its own file mid-pull) only holds if it runs unmodified.
 Three outcomes:
 
 1. **Success** — exit 0, output ends with `zstack setup complete.` after a line
-   like `zstack update: 0.1.1.0 -> 0.1.2.0`. Skill registrations for every host
+   like `zstack update: 1.0.0.0 -> 1.0.1.0`. Skill registrations for every host
    `setup` covers (Claude Code, and Codex/Factory if installed) are refreshed.
 2. **No resolvable git source** — exit non-zero, a message naming the exact
    `git clone` + `cd ... && ./setup` commands to reinstall from git. Nothing on

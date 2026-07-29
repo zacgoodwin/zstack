@@ -14,15 +14,32 @@ export interface ParsedArgs {
 
 // `--key value` pairs plus positionals, in one pass. A key listed in `booleans`
 // consumes no value and stores true (e.g. --reconcile, --json, --force).
+// `--key=value` is also accepted (split on the first `=`) as an alternative
+// to the space-separated form; both spellings land in the same `flags[key]`.
+// A non-boolean flag with no following token (the flag is the last arg, or
+// followed by nothing) is a usage error, not a silent `undefined` value --
+// callers reading it via `str()`/`requireFlag` used to see "flag missing"
+// instead of "flag malformed", masking a typo'd command line.
 export function parseFlags(args: string[], booleans: string[] = []): ParsedArgs {
   const positionals: string[] = [];
   const flags: Record<string, string | boolean> = {};
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a.startsWith("--")) {
-      const key = a.slice(2);
-      if (booleans.includes(key)) flags[key] = true;
-      else flags[key] = args[++i];
+      const body = a.slice(2);
+      const eq = body.indexOf("=");
+      if (eq !== -1) {
+        flags[body.slice(0, eq)] = body.slice(eq + 1);
+        continue;
+      }
+      const key = body;
+      if (booleans.includes(key)) {
+        flags[key] = true;
+      } else {
+        const value = args[++i];
+        if (value === undefined) throw new ZError(`Flag --${key} needs a value (got none).`);
+        flags[key] = value;
+      }
     } else {
       positionals.push(a);
     }
