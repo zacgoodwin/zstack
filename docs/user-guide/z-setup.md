@@ -143,8 +143,10 @@ change them.
 - `quota.threshold` (default 100) — the GitHub GraphQL rate-limit guard trips
   when remaining points fall below this before any board call.
 - `quota.mode` (default `"sleep"`) — `"sleep"` waits until the rate-limit window
-  resets (`resetAt`) and then proceeds; `"abort"` fails the call immediately
-  instead of waiting.
+  resets, re-probes the quota, and retries up to 3 bounded rounds. If the quota
+  is still below threshold after 3 rounds, it aborts the run loudly with both
+  readings (first and final) rather than proceeding on an unverified quota;
+  `"abort"` fails the call immediately instead of waiting.
 - `adversarialMode` (default `"non-trivial"`, values `off` | `non-trivial` |
   `always`) — when the Review stage fans out independent skeptic sub-agents
   (super-truth) instead of a single pass. `non-trivial` activates on a diff of

@@ -1027,7 +1027,7 @@ describe("quota guard", () => {
       () => at("2026-07-18T23:00:00Z")
     );
     await expect(board.list("In progress")).rejects.toThrow(
-      /quota still below threshold after waking and re-probing 3 time\(s\).*150 < 200 remaining/s
+      /quota still below threshold after waking and re-probing 3 time\(s\): first reading 150, final reading 150, both < 200 remaining/s
     );
     expect(slept.length).toBe(3); // bounded: initial sleep + 2 re-probe sleeps, then it gives up -- never unbounded
   });
