@@ -250,6 +250,11 @@ export interface QuotaStatus {
 export class Board {
   private threshold: number;
   private mode: "sleep" | "abort";
+  // #153: the freshest quota reading, piggybacked off the previous response.
+  // Per-instance, and the CLI builds exactly one Board per process, so "no
+  // reading yet" is the first call of a process -- the only place a separate
+  // probe request is still spent (plus after a wait; see enforceQuota).
+  private lastQuota?: QuotaStatus;
 
   constructor(
     private cfg: BoardConfig,
@@ -263,10 +268,24 @@ export class Board {
   }
 
   // The only guarded path to the backend. Every subcommand calls gql(); the
-  // quota probe is enforced here so no call path can bypass it (issue #2).
+  // quota guard is enforced here so no call path can bypass it (issue #2).
+  //
+  // #153: guard on the reading that rode the PREVIOUS response, then piggyback
+  // the next reading onto this request. Before, every call spent a separate
+  // Q_RATE_LIMIT HTTP request first -- free in GraphQL points, but a real round
+  // trip that doubled requests and latency across a 100+ tick drain.
   private async gql(query: string, variables: Record<string, unknown> = {}) {
     await this.enforceQuota();
-    return this.exec(query, variables);
+    const doc = piggybackRateLimit(query);
+    const data = await this.exec(doc, variables);
+    // Only a piggybacked document carries a reading (mutations cannot -- see
+    // piggybackRateLimit). Same loud format-drift guard as the probe: a
+    // response that lost the block must fail, never leave the next call
+    // running on a reading nobody checked.
+    if (doc !== query) {
+      this.lastQuota = readRateLimit(data.rateLimit, `rateLimit piggybacked on ${opName(query)}`);
+    }
+    return data;
   }
 
   // One probe reading, with the format-drift guard applied every time it is
@@ -276,19 +295,7 @@ export class Board {
   // straight into a hard 403 with no pause.
   private async probeRateLimit(): Promise<QuotaStatus> {
     const data = await this.exec(Q_RATE_LIMIT, {});
-    const rl = data.rateLimit;
-    if (
-      !rl ||
-      typeof rl !== "object" ||
-      typeof rl.remaining !== "number" ||
-      typeof rl.resetAt !== "string"
-    ) {
-      throw new ZError(
-        `GraphQL rateLimit probe returned no usable {remaining, resetAt} (got ${JSON.stringify(rl)}). ` +
-          `GitHub's rateLimit response may have changed -- refusing to run unguarded against the API quota.`
-      );
-    }
-    return rl as QuotaStatus;
+    return readRateLimit(data.rateLimit, "rateLimit probe");
   }
 
   // Sleeps until resetAt (+ bufferMs headroom). A malformed resetAt yields NaN;
@@ -306,14 +313,15 @@ export class Board {
     await this.sleep(Math.max(0, resetMs - this.now()) + bufferMs);
   }
 
-  // Probes remaining points and either waits for the window to reset or
-  // aborts. Calls exec() directly via probeRateLimit() (not gql) because the
-  // probe IS the guard -- gating it on itself would recurse. GitHub's
-  // rateLimit query costs 0 points, so the extra probe per call is free.
-  // ponytail: probes before every call rather than piggybacking rateLimit onto
-  // each query; upgrade path is inlining it.
+  // Checks remaining points and either waits for the window to reset or
+  // aborts. Reads the piggybacked reading from the previous response (#153) and
+  // spends a separate probe request ONLY where there is nothing to piggyback
+  // on: the first call of a process, and after every wait (the sleep itself
+  // issues no request, so the post-wake re-check of #147 has no response to
+  // ride). Probes call exec() directly via probeRateLimit(), not gql, because
+  // the probe IS the guard -- gating it on itself would recurse.
   private async enforceQuota(): Promise<void> {
-    let rl = await this.probeRateLimit();
+    let rl = (this.lastQuota ??= await this.probeRateLimit());
     if (rl.remaining >= this.threshold) return;
     if (this.mode === "abort") {
       throw new ZError(
@@ -327,7 +335,10 @@ export class Board {
     // never a tight retry loop hammering the API.
     for (let round = 0; round < QUOTA_REPROBE_ROUNDS; round++) {
       await this.sleepToReset(rl.resetAt, round === 0 ? 0 : QUOTA_REPROBE_BUFFER_MS);
-      rl = await this.probeRateLimit();
+      // The re-probe is the freshest reading there is: cache it, or a following
+      // MUTATION (which carries no piggybacked reading of its own) would still
+      // be judged by the pre-sleep low one and sleep all over again.
+      rl = this.lastQuota = await this.probeRateLimit();
       if (rl.remaining >= this.threshold) return;
     }
     throw new ZError(
@@ -338,9 +349,9 @@ export class Board {
   }
 
   async quota(): Promise<QuotaStatus> {
-    // Reporting quota must never be gated on quota, so probe directly.
-    const data = await this.exec(Q_RATE_LIMIT, {});
-    return data.rateLimit as QuotaStatus;
+    // Reporting quota must never be gated on quota, so probe directly (and get
+    // the same format-drift guard, rather than casting an unchecked shape).
+    return this.probeRateLimit();
   }
 
   // The cursor-paginated ProjectItems node list behind BOTH list() and
@@ -687,6 +698,57 @@ export class Board {
     if (!id) throw new ZError(`GitHub user "${login}" not found.`);
     return id;
   }
+}
+
+// Names the operation for error messages, same convention the fixture routers
+// key off (`query Foo` / `mutation Bar`).
+function opName(query: string): string {
+  return query.match(/(?:query|mutation)\s+(\w+)/)?.[1] ?? "an unnamed operation";
+}
+
+// #153: appends `rateLimit { remaining resetAt }` to a QUERY document so the
+// quota reading rides the response instead of costing a separate HTTP request
+// before every single call. The probe is free in GraphQL points but is a real
+// round trip, and it doubled requests and latency across a 100+ tick drain.
+//
+// Mutations are returned untouched ON PURPOSE: `rateLimit` is a field of the
+// Query root only -- GitHub's Mutation type has no such field (verified by
+// introspecting __type(name:"Mutation")), so appending it to a mutation would
+// make the API reject every write this pack performs. A mutation therefore
+// runs on the freshest query reading. Every mutation here is preceded in the
+// same command by a lookup/meta query, and the longest un-refreshed run is the
+// two writes at the tail of create(), so the reading is at most a couple of
+// calls stale against a threshold of 100+ points.
+// ponytail: no client-side point accounting between queries; the upgrade path
+// is decrementing the cached reading by each mutation's cost if some future
+// workload ever chains more than a handful of mutations without a query.
+function piggybackRateLimit(query: string): string {
+  if (!/^\s*query\b/.test(query)) return query;
+  const close = query.lastIndexOf("}");
+  if (close === -1) {
+    throw new ZError(
+      `GraphQL query has no selection set to piggyback rateLimit onto: ${JSON.stringify(query.slice(0, 60))}`
+    );
+  }
+  return `${query.slice(0, close)}  rateLimit { remaining resetAt }\n}`;
+}
+
+// The single format-drift guard for every quota reading, probed or piggybacked
+// -- same discipline as lib/cost.ts. A missing/renamed rateLimit must fail
+// LOUDLY: failing open means the loop runs unguarded straight into a hard 403.
+function readRateLimit(rl: any, source: string): QuotaStatus {
+  if (
+    !rl ||
+    typeof rl !== "object" ||
+    typeof rl.remaining !== "number" ||
+    typeof rl.resetAt !== "string"
+  ) {
+    throw new ZError(
+      `GraphQL ${source} returned no usable {remaining, resetAt} (got ${JSON.stringify(rl)}). ` +
+        `GitHub's rateLimit response may have changed -- refusing to run unguarded against the API quota.`
+    );
+  }
+  return rl as QuotaStatus;
 }
 
 // Line-exact relation-line presence check (F1). Trailing whitespace/CR is

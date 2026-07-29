@@ -71,6 +71,10 @@ function loadFixture(name: string): GraphQLData {
 interface Call {
   op: string;
   vars: Record<string, any>;
+  // The document as it reached the executor -- the only way to assert WHAT
+  // lib/board.ts actually sent (#153 rewrites queries, never mutations).
+  // Optional so the hand-built backends below can keep pushing {op, vars}.
+  doc?: string;
 }
 
 // Fixture-routing executor. Overrides win; otherwise RateLimit uses the named
@@ -81,39 +85,80 @@ interface Call {
 // a plain string behaves as before (same fixture every probe). The sequence
 // repeats its last entry once exhausted, so a "stays low forever" test can
 // supply a single low fixture.
+//
+// #153: every QUERY document now selects `rateLimit { remaining resetAt }`, so
+// a real response carries the reading ALONGSIDE its payload -- verified live
+// against GitHub. The harness completes that recording for any query response
+// that has no block of its own, drawing from the very same named sequence the
+// direct probe consumes, so a test drives probe and piggyback readings through
+// one knob. Mutation documents carry no selection (rateLimit is a Query-root
+// field only) and are left exactly as recorded. dropRateLimit models GitHub
+// dropping the block outright -- the format-drift path.
 function makeExecutor(
   opts: {
     rateLimit?: string | string[];
     overrides?: Record<string, GraphQLData | ((vars: any) => GraphQLData)>;
     calls?: Call[];
+    dropRateLimit?: boolean;
   } = {}
 ): GraphQLExecutor {
   let rateLimitCall = 0;
+  const nextRateLimit = (): GraphQLData => {
+    const seq = opts.rateLimit ?? "rate-limit-healthy";
+    const name = Array.isArray(seq) ? seq[Math.min(rateLimitCall++, seq.length - 1)] : seq;
+    return loadFixture(name);
+  };
   return async (query, variables) => {
     const op = opName(query);
-    opts.calls?.push({ op, vars: variables });
+    opts.calls?.push({ op, vars: variables, doc: query });
     const override = opts.overrides?.[op];
+    let data: GraphQLData;
     if (override !== undefined) {
-      return typeof override === "function" ? override(variables) : override;
+      data = typeof override === "function" ? override(variables) : override;
+    } else if (op === "RateLimit") {
+      return nextRateLimit();
+    } else {
+      const fixture = FIXTURE_BY_OP[op];
+      if (!fixture) throw new Error(`no fixture registered for op ${op}`);
+      data = loadFixture(fixture);
+      // The recorded project-items fixture predates the F3 malformed-response
+      // guard and omits pageInfo; a REAL ProjectItems response always carries it
+      // (it is selected in the query), so complete the recording here rather
+      // than weaken the guard.
+      if (op === "ProjectItems" && data.node?.items && !data.node.items.pageInfo) {
+        data.node.items.pageInfo = { hasNextPage: false, endCursor: null };
+      }
     }
-    if (op === "RateLimit") {
-      const seq = opts.rateLimit ?? "rate-limit-healthy";
-      const name = Array.isArray(seq) ? seq[Math.min(rateLimitCall++, seq.length - 1)] : seq;
-      return loadFixture(name);
+    // The direct probe's own response is whatever the test declared -- never
+    // completed here, or a RateLimit override could not model format drift.
+    if (op === "RateLimit") return data;
+    // A recorded query fixture carries its own block; an explicit rateLimit
+    // sequence overrides it so one knob still drives the guard call by call,
+    // and an inline override with no block gets the healthy default.
+    if (!selectsRateLimit(query)) return data;
+    if (opts.dropRateLimit) {
+      // GitHub stops returning the block: the format-drift path.
+      const { rateLimit: _dropped, ...rest } = data;
+      return rest;
     }
-    const fixture = FIXTURE_BY_OP[op];
-    if (!fixture) throw new Error(`no fixture registered for op ${op}`);
-    const data = loadFixture(fixture);
-    // The recorded project-items fixture predates the F3 malformed-response
-    // guard and omits pageInfo; a REAL ProjectItems response always carries it
-    // (it is selected in the query), so complete the recording here rather
-    // than weaken the guard.
-    if (op === "ProjectItems" && data.node?.items && !data.node.items.pageInfo) {
-      data.node.items.pageInfo = { hasNextPage: false, endCursor: null };
+    const forced = opts.rateLimit !== undefined;
+    if (forced || data.rateLimit === undefined) {
+      data = { ...data, rateLimit: nextRateLimit().rateLimit };
     }
     return data;
   };
 }
+
+// Does this document ask for the piggybacked reading? True for the queries
+// lib/board.ts rewrites, false for mutations.
+function selectsRateLimit(query: string): boolean {
+  return /\brateLimit\s*\{\s*remaining\s+resetAt\s*\}/.test(query);
+}
+
+// The reading every hand-built backend below returns on its QUERY responses --
+// exactly where GitHub puts the piggybacked block (#153). Mutation responses
+// carry none: rateLimit is a field of the Query root only.
+const HEALTHY_RATE_LIMIT = { remaining: 5000, resetAt: "2026-07-19T00:00:00Z" };
 
 const tmpPaths: string[] = [];
 function tmpBodyFile(content: string): string {
@@ -759,9 +804,10 @@ function linkBackend(
     calls.push({ op, vars });
     switch (op) {
       case "RateLimit":
-        return { rateLimit: { remaining: 5000, resetAt: "2026-07-19T00:00:00Z" } };
+        return { rateLimit: HEALTHY_RATE_LIMIT };
       case "IssueLookup":
         return {
+          rateLimit: HEALTHY_RATE_LIMIT,
           repository: {
             issue: {
               id: `I_${vars.number}`,
@@ -1000,6 +1046,145 @@ describe("quota guard", () => {
   });
 });
 
+// -- #153: the reading rides every query instead of a pre-call probe ----------
+// The probe costs 0 GraphQL POINTS but is a real HTTP request, and it was
+// issued before EVERY call -- doubling round trips and latency across a 100+
+// tick drain, out of the same request budget the tick throttle protects.
+describe("piggybacked quota reading (#153)", () => {
+  const at = (iso: string) => Date.parse(iso);
+
+  // AC1: request count across N subcommand calls.
+  test("N calls cost N+1 requests, not 2N: only the first call of a process still probes", async () => {
+    const calls: Call[] = [];
+    const board = new Board(CFG, makeExecutor({ calls }));
+    const N = 10;
+    for (let i = 0; i < N; i++) await board.list("In progress");
+
+    const TODAY = 2 * N; // probe + query for every call, before this change
+    expect(calls.length).toBe(N + 1);
+    expect(calls.length).toBeLessThanOrEqual(TODAY / 2 + 1); // roughly half, and no more
+    expect(calls.filter((c) => c.op === "RateLimit").length).toBe(1); // nothing to piggyback on yet
+    expect(calls.filter((c) => c.op === "ProjectItems").length).toBe(N);
+    // ...and every one of those queries carried the selection, so each reading
+    // came back with its payload rather than from a request of its own.
+    for (const c of calls.filter((x) => x.op === "ProjectItems")) {
+      expect(selectsRateLimit(c.doc!)).toBe(true);
+    }
+  });
+
+  // The pagination loop is many gql() calls inside ONE subcommand: they were
+  // the worst of the doubling and now cost one request per page.
+  test("a paginated list spends one request per page, not two", async () => {
+    const calls: Call[] = [];
+    const page = (nodes: number[], pageInfo: any) => ({
+      node: {
+        items: {
+          pageInfo,
+          nodes: nodes.map((n) => ({
+            content: { number: n, title: `T${n}`, url: `http://x/${n}` },
+            fieldValues: {
+              nodes: [{ __typename: "ProjectV2ItemFieldSingleSelectValue", name: "Todo", field: { name: "Status" } }],
+            },
+          })),
+        },
+      },
+    });
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        calls,
+        overrides: {
+          ProjectItems: (vars) =>
+            vars.cursor === "CUR_1"
+              ? page([2], { hasNextPage: false, endCursor: null })
+              : page([1], { hasNextPage: true, endCursor: "CUR_1" }),
+        },
+      })
+    );
+    await board.list("Todo");
+    expect(calls.map((c) => c.op)).toEqual(["RateLimit", "ProjectItems", "ProjectItems"]); // today: 4 requests
+  });
+
+  // Mutations cannot carry the selection: rateLimit is a field of GitHub's
+  // Query root ONLY (introspection: __type(name:"Mutation") has no such
+  // field), so appending it would make the API reject every write. They run on
+  // the freshest query reading instead -- and still drop their own probe.
+  test("a mutating subcommand sends an untouched mutation document and still drops its probe", async () => {
+    const calls: Call[] = [];
+    const board = new Board(CFG, makeExecutor({ calls }));
+    await board.move(5, "Done");
+
+    expect(calls.map((c) => c.op)).toEqual(["RateLimit", "IssueLookup", "SetSingleSelect"]); // today: 4 requests
+    const lookup = calls.find((c) => c.op === "IssueLookup")!;
+    expect(lookup.doc!.match(/rateLimit/g)!.length).toBe(1); // appended exactly once
+    const mutation = calls.find((c) => c.op === "SetSingleSelect")!;
+    expect(mutation.doc).not.toContain("rateLimit"); // untouched -- the API would reject it
+  });
+
+  // AC2: a LOW reading that arrived piggybacked must gate the next call exactly
+  // as a probed one does.
+  test("a piggybacked low reading makes the next call wait, then re-probe, exactly as a probe does", async () => {
+    const slept: number[] = [];
+    // probe healthy -> call 1's response piggybacks LOW -> call 2 waits, and
+    // the post-wake re-probe (#147) comes back ok.
+    const board = new Board(
+      CFG,
+      makeExecutor({ rateLimit: ["rate-limit-healthy", "rate-limit-low", "rate-limit-ok"] }),
+      async (ms) => void slept.push(ms),
+      () => at("2026-07-18T23:00:00Z")
+    );
+    const first = await board.list("In progress");
+    expect(first.length).toBeGreaterThan(0);
+    expect(slept).toEqual([]); // the probed reading was healthy: nothing to wait for
+
+    const second = await board.list("In progress");
+    expect(slept).toEqual([at("2026-07-18T23:30:00Z") - at("2026-07-18T23:00:00Z")]);
+    expect(second.length).toBeGreaterThan(0); // proceeded once the re-probe was healthy
+  });
+
+  test("a piggybacked low reading aborts the next call in abort mode, before it goes out", async () => {
+    const slept: number[] = [];
+    const calls: Call[] = [];
+    const abortCfg: BoardConfig = { ...CFG, quota: { threshold: 200, mode: "abort" } };
+    const board = new Board(
+      abortCfg,
+      makeExecutor({ calls, rateLimit: ["rate-limit-healthy", "rate-limit-low"] }),
+      async (ms) => void slept.push(ms)
+    );
+    await board.list("In progress");
+    await expect(board.list("In progress")).rejects.toThrow(/quota exhausted: 150 < 200 remaining/);
+    expect(slept).toEqual([]);
+    expect(calls.length).toBe(2); // probe + the first query; the aborted call never went out
+  });
+
+  // AC3: format drift. The piggybacked block disappearing is the same class of
+  // failure as a renamed probe field -- fail loudly, never leave the NEXT call
+  // running on a reading nobody checked.
+  test("a response that lost its rateLimit block fails loudly instead of running unguarded", async () => {
+    const board = new Board(CFG, makeExecutor({ dropRateLimit: true }));
+    await expect(board.list("In progress")).rejects.toThrow(ZError);
+    await expect(board.list("In progress")).rejects.toThrow(
+      /rateLimit piggybacked on ProjectItems returned no usable \{remaining, resetAt\}/
+    );
+  });
+
+  test("a piggybacked block with a non-numeric remaining fails just as loudly", async () => {
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        // The override carries its own (broken) block, so nothing is completed.
+        overrides: {
+          ProjectItems: {
+            node: { items: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } },
+            rateLimit: { remaining: "lots", resetAt: "2026-07-18T23:30:00Z" },
+          },
+        },
+      })
+    );
+    await expect(board.list("In progress")).rejects.toThrow(/piggybacked on ProjectItems returned no usable/);
+  });
+});
+
 // -- AC4: claim atomicity ----------------------------------------------------
 // A stateful in-memory backend shared by "concurrent" Board instances. Assignee
 // mutations are additive and returned in assignment order, exactly as GitHub
@@ -1012,9 +1197,10 @@ function claimBackend(initial: string[] = []) {
     calls.push({ op: opName(query), vars });
     switch (opName(query)) {
       case "RateLimit":
-        return { rateLimit: { remaining: 5000, resetAt: "2026-07-19T00:00:00Z" } };
+        return { rateLimit: HEALTHY_RATE_LIMIT };
       case "IssueLookup":
         return {
+          rateLimit: HEALTHY_RATE_LIMIT,
           repository: {
             issue: {
               id: "I_9",
@@ -1027,7 +1213,7 @@ function claimBackend(initial: string[] = []) {
           },
         };
       case "UserId":
-        return { user: { id: `U_${vars.login}` } };
+        return { rateLimit: HEALTHY_RATE_LIMIT, user: { id: `U_${vars.login}` } };
       case "AddAssignees": {
         const l = login(vars.user);
         if (!assignees.includes(l)) assignees.push(l);
@@ -1039,7 +1225,10 @@ function claimBackend(initial: string[] = []) {
         return { removeAssigneesFromAssignable: { clientMutationId: null } };
       }
       case "IssueAssignees":
-        return { repository: { issue: { assignees: { nodes: assignees.map((l) => ({ login: l })) } } } };
+        return {
+          rateLimit: HEALTHY_RATE_LIMIT,
+          repository: { issue: { assignees: { nodes: assignees.map((l) => ({ login: l })) } } },
+        };
       default:
         throw new Error(`claimBackend: unexpected op ${opName(query)}`);
     }
