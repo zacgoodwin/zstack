@@ -1,0 +1,15 @@
+diff --git a/docs/user-guide/backfill.md b/docs/user-guide/backfill.md
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/docs/user-guide/backfill.md
+@@ -0,0 +1,9 @@
++# Backfill runbook
++
++## Step 1 -- run the backfill
++
++Kick off the job against the target table right away.
++
++## Step 2 -- snapshot only if something looks wrong
++
++If a row looks off afterward, snapshot it before you re-run that row.

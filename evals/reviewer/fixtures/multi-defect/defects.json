@@ -1,0 +1,70 @@
+{
+  "fixture": "multi-defect",
+  "note": "The answer key for evals/reviewer. The live grader sees this file and each reviewer output, and answers only the latent question: for each defect, did that output name it? All counting and thresholding happens in evals/lib/recall.ts. Every entry below reproduces (evals/reviewer/run.md records the verification) and none is caught by the shipped 54-test suite.",
+  "defects": [
+    {
+      "id": "D1",
+      "site": "src/limiter.ts:allow",
+      "summary": "the shared ceiling is charged before the per-key budget is checked, so a request the key's own limit rejects has already spent a shared slot",
+      "violates": "criteria 4 and 5",
+      "repro": "limit 1, durationMs 500, globalLimit 3: allow(a,1000)=true, allow(a,1100)=false, allow(a,1200)=false, then allow(b,1300)=false though the process admitted exactly one request against a ceiling of three",
+      "class": "ordering interaction between two individually correct paths"
+    },
+    {
+      "id": "D2",
+      "site": "src/limiter.ts:constructor",
+      "summary": "globalLimit is never validated, so a non-positive or non-integer ceiling is accepted instead of throwing RangeError",
+      "violates": "criterion 8",
+      "repro": "new KeyedRateLimiter({limit:5,durationMs:500,globalLimit:0}) constructs without throwing, then rejects every request forever",
+      "class": "missing input validation"
+    },
+    {
+      "id": "D3",
+      "site": "src/middleware.ts (absence)",
+      "summary": "nothing in the shipped path ever calls sweep(), so the bucket table grows without bound under short-lived client ids",
+      "violates": "criterion 7",
+      "repro": "drive 2000 distinct x-client-id values through handle(): limiter.size reaches 2000 and no code in the diff outside limiter.ts mentions sweep",
+      "class": "absent reclamation / resource leak"
+    },
+    {
+      "id": "D4",
+      "site": "src/middleware.ts:handle",
+      "summary": "a limiter that throws is swallowed and the request is admitted, so an unavailable limiter becomes an open door",
+      "violates": "criterion 11",
+      "repro": "stub allow() to throw: handle() calls next() and leaves statusCode 0",
+      "class": "error path that swallows a failure"
+    },
+    {
+      "id": "D5",
+      "site": "src/middleware.ts:handle",
+      "summary": "the client id is used exactly as sent, so whitespace and case variants are separate buckets and one client bypasses its own limit",
+      "violates": "criterion 10",
+      "repro": "limit 1: sending acme, 'acme ', ' acme', ACME, Acme in one window yields 5 admissions",
+      "class": "unnormalized input at a trust boundary"
+    },
+    {
+      "id": "D6",
+      "site": "src/middleware.ts:handle",
+      "summary": "Retry-After is emitted in milliseconds, where HTTP defines the header in seconds",
+      "violates": "criterion 9",
+      "repro": "limit 1 at now=1100 in a 500ms window: Retry-After is \"400\"; the correct value is \"1\"",
+      "class": "unit / spec violation"
+    },
+    {
+      "id": "D7",
+      "site": "src/middleware.ts:handle",
+      "summary": "metrics.admitted is incremented on arrival rather than on admission, so it counts every request including the ones answered 429",
+      "violates": "criterion 12",
+      "repro": "limit 1, four requests from one key: metrics.admitted=4 and metrics.rejected=3, though only one request reached the handler",
+      "class": "observability counts the wrong event"
+    },
+    {
+      "id": "D8",
+      "site": "src/middleware.test.ts",
+      "summary": "the test named for the 429 path stubs the limiter to ADMIT, so the reject path it claims to cover never runs and its assertion agrees with the stub instead of the test's name",
+      "violates": "no criterion directly; it is the reviewer's own 'tests that pass without the change' check, and it leaves criterion 9 effectively untested",
+      "repro": "under that test's own stub the response status stays 0 and the handler runs, so the test passes with the middleware's entire reject branch deleted",
+      "class": "test that passes without the change"
+    }
+  ]
+}

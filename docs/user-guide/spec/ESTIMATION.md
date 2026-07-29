@@ -24,9 +24,9 @@ If these rates have not been updated in the last 14 days, check the current rate
 
 **Model recommendation:** every ticket plan names the Claude model and the level of effort to execute with — the most cost-efficient model that finishes the ticket with a minimal number of issues. Cost efficiency includes rework: a cheaper model that produces bugs, review churn, or a second attempt costs more than the tier it saved, so when in doubt between two tiers, pick the higher one. Rules of thumb:
 
-- **Haiku** — mechanical, tightly-specified, low-blast-radius work: renames, config/doc updates, small isolated fixes already pinned by existing tests.
-- **Sonnet** — standard single-service features on familiar patterns, with a clear spec and a test harness that catches mistakes cheaply.
-- **Opus** — cross-service or schema/engine/migration work, security-sensitive code, ambiguous specs, gnarly debugging, or anything where a botched attempt is expensive to unwind.
-- **Fable** — the hardest tickets, where even Opus is likely to need a second attempt: epic-level architecture, subtle correctness-critical engine/allocation math, deep multi-service refactors, or debugging that has already defeated a lower tier. At 2x Opus pricing it earns its cost only when one clean pass replaces two.
+- **Haiku** — mechanical, tightly-specified, low-blast-radius work: renames, config/doc updates, small isolated fixes already pinned by existing tests. Default effort: `medium`.
+- **Sonnet** — standard single-service features on familiar patterns, with a clear spec and a test harness that catches mistakes cheaply. Default effort: `medium`.
+- **Opus** — cross-service or schema/engine/migration work, security-sensitive code, ambiguous specs, gnarly debugging, or anything where a botched attempt is expensive to unwind. Default effort: `xhigh`.
+- **Fable** — the hardest tickets, where even Opus is likely to need a second attempt: epic-level architecture, subtle correctness-critical engine/allocation math, deep multi-service refactors, or debugging that has already defeated a lower tier. At 2x Opus pricing it earns its cost only when one clean pass replaces two. Default effort: `medium`; assign `xhigh` only for the hardest calls.
 
 State the recommendation and a one-line why next to the estimate in the plan comment; add the Model, Effort and Estimate into their respective fields. Add how much $ was consumed in doing this to the "Actual" field.
