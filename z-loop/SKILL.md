@@ -478,10 +478,14 @@ PLAN=$(bun "$PACK/lib/endloop.ts" plan "$TMP/regression.json" "$LOOP_COUNT" "$AU
 ```
 
 **3a. Red path** (`$PLAN` is `["file-bugs","report"]`) — every finding becomes
-a Backlog bug, NO deploy Skill is ever invoked:
+a Backlog bug, NO deploy Skill is ever invoked. Iterate
+`bun "$PACK/lib/endloop.ts" findings "$TMP/regression.json"`, NEVER
+`regression.json`'s raw `.findings` directly -- a red verdict with an empty
+`findings[]` (a gate-wiring anomaly, not a real "nothing to file") degrades to
+one generic bug there instead of this step silently doing nothing (issue #151):
 
 ```bash
-jq -c '.findings[]' "$TMP/regression.json" | while read -r FINDING; do
+bun "$PACK/lib/endloop.ts" findings "$TMP/regression.json" | jq -c '.[]' | while read -r FINDING; do
   echo "$FINDING" > "$TMP/finding.json"
   bun "$PACK/lib/endloop.ts" bug "$TMP/finding.json" regression "$LOOP_COUNT" > "$TMP/bug.json"
   jq -r .body "$TMP/bug.json" > "$TMP/bug-body.md"
