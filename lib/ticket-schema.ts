@@ -8,7 +8,7 @@
 // and never in a prompt.
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { parseFlags, str } from "./cli.ts";
+import { handleCliError, parseFlags, str } from "./cli.ts";
 import { roundCents } from "./estimate.ts";
 
 export type TicketErrorCode = "missing" | "malformed" | "empty" | "bad-path";
@@ -417,12 +417,19 @@ export function main(argv: string[]): number {
     console.log(USAGE);
     return argv[0] ? 0 : 1;
   }
-  const { positionals, flags } = parseFlags(argv);
-  const repoRoot = str(flags, "check-paths");
-  if ("check-paths" in flags && repoRoot === undefined) {
-    console.error("--check-paths requires a <repoRoot> argument.");
-    return 1;
+  // --check-paths always needs a <repoRoot> value; a bare trailing
+  // "--check-paths" with nothing after it is now parseFlags' own loud usage
+  // error (issue #156), so it's caught here the same way every other CLI
+  // usage error in this function is: message on stderr, exit 1, never an
+  // uncaught throw out of main().
+  let parsed: ReturnType<typeof parseFlags>;
+  try {
+    parsed = parseFlags(argv);
+  } catch (e) {
+    return handleCliError(e);
   }
+  const { positionals, flags } = parsed;
+  const repoRoot = str(flags, "check-paths");
   const title = str(flags, "title");
   if ("title" in flags && title === undefined) {
     console.error("--title requires a <string> argument.");

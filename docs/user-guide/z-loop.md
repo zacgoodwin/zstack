@@ -335,9 +335,9 @@ model rate key defined in `references/rates.json` (the same lookup
 family substring); an unknown value fails `validateConfig` loudly, naming
 `stageModels.<stage>`, never silently at spawn time.
 
-`/z-setup` writes `{"merge": "haiku"}` into every newly-created project's
-config. An adopted or already-configured project keeps whatever it already
-has — add the key by hand to opt in (see
+`/z-setup` writes `{"merge": "haiku"}` into every project's config, whether it
+creates the project or adopts an existing one (issue #156) — hand-edit
+`config.json` to change it (see
 [z-setup.md → Config knobs](z-setup.md#config-knobs-hand-edit-configjson-after-setup)).
 
 **It survives a later `z-setup` re-apply (issue #97).** Re-running `/z-setup`

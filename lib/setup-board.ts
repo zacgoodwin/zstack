@@ -560,7 +560,7 @@ export class SetupBoard {
 
     // Re-read only if we changed something; a no-op run reuses the state it read.
     const finalState = actions.length ? await this.readFields(header.id) : state;
-    const config = buildConfig(finalState, { owner, repo, repositoryId, ...opts }, this.shape, created);
+    const config = buildConfig(finalState, { owner, repo, repositoryId, ...opts }, this.shape);
     validateConfig(config);
     return { config, actions, created, dropped };
   }
@@ -666,16 +666,7 @@ function priorOptionalFields(slug: string, home: string): PreservedOptionalField
 function buildConfig(
   state: ProjectState,
   ctx: { owner: string; repo: string; repositoryId: string } & ApplyOptions,
-  shape: BoardShape = DEFAULT_SHAPE,
-  // Issue #82: stageModels' pack default ({merge: "haiku"}) is written ONLY
-  // for a brand-new project (created === true). An adopted/pre-existing
-  // project's config is left exactly as buildConfig would otherwise produce
-  // it -- no stageModels key at all -- so a re-run against an already-set-up
-  // board never injects (or silently drops) the knob; a user who wants it on
-  // an existing project adds it to config.json by hand (documented). That
-  // hand-added value, once on disk, then wins over this default on every
-  // later re-apply regardless of `created` (see priorOptionalFields, #97).
-  created = false
+  shape: BoardShape = DEFAULT_SHAPE
 ): BoardConfig {
   const status = state.fields.find((f) => f.name === STATUS_FIELD_NAME);
   if (!status) throw new ZError(`Status field missing on "${state.title}" after setup.`);
@@ -706,7 +697,14 @@ function buildConfig(
     maxLanes: ctx.maxLanes ?? DEFAULT_MAX_LANES,
     watchdogMinutes: ctx.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES,
     quota: { ...DEFAULT_QUOTA },
-    ...(created ? { stageModels: { merge: "haiku" } } : {}),
+    // Issue #82, revised by #156: this default used to be written ONLY for a
+    // brand-new project (the caller passed created === true) -- an
+    // adopted/pre-existing project's on-disk config had no stageModels key at
+    // all, a latent inconsistency if the default ever changed, since created
+    // and adopted projects would silently diverge. Written unconditionally
+    // now, create or adopt alike; a hand-added value already on disk still
+    // wins over it on every re-apply (the `...prior` spread below).
+    stageModels: { merge: "haiku" },
     ...prior, // issue #97: a hand-added value in the prior config.json wins over every default above
   };
 }
