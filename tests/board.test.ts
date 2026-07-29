@@ -343,6 +343,37 @@ describe("single-page ceiling guards", () => {
     await expect(board.move(5, "Done")).rejects.toThrow(/projectItems for issue #5.*truncated/);
   });
 
+  // #148: assignees(first: 10) had no guard at all -- more than 10 assignees
+  // silently truncated the list claim()'s "sole assignee is me" ownership
+  // check reads, which could misjudge a ticket claim() should have refused.
+  test("assignees overflow throws loud instead of silently truncating the claim check (#148)", async () => {
+    const calls: Call[] = [];
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        calls,
+        overrides: {
+          IssueLookup: {
+            repository: {
+              issue: {
+                id: "I_9",
+                number: 9,
+                title: "T9",
+                body: "",
+                assignees: { pageInfo: { hasNextPage: true }, nodes: [{ login: "alice" }] },
+                projectItems: { pageInfo: { hasNextPage: false }, nodes: [] },
+              },
+            },
+          },
+        },
+      })
+    );
+    await expect(board.claim(9, "bob")).rejects.toThrow(/assignees for issue #9.*truncated/);
+    // The overflow throws inside lookup(), before UserId/AddAssignees ever
+    // run -- no claim was written on the truncated read.
+    expect(calls.some((c) => c.op === "AddAssignees" || c.op === "UserId")).toBe(false);
+  });
+
   test("milestones overflow throws instead of a bogus 'not found'", async () => {
     const board = new Board(
       CFG,
@@ -399,6 +430,8 @@ describe("snapshot", () => {
     expect(snap.items[0].fields.Status).toBe("Done");
     // Bodies keyed by issue number as a string -- exactly what loop.ts ingest consumes.
     expect(snap.bodies).toEqual({ "4": "body four", "5": "body five" });
+    // No per-item ceiling was hit on a healthy read (#148).
+    expect(snap.overCeiling).toEqual([]);
     // Items are byte-identical to a plain all-status list() over the same board:
     // snapshot replaces the SKILL's hand-assembled 9-list + per-body fetch.
     const listBoard = new Board(CFG, makeExecutor({ overrides: { ProjectItems: boardPage(nodes) } }));
@@ -423,19 +456,61 @@ describe("snapshot", () => {
     expect((await bare.snapshot()).items[0].labels).toEqual([]);
   });
 
-  test("a labels connection past its single page throws instead of dropping skip-qa (#130)", async () => {
+  // #148: a labels overflow used to throw board.snapshot() itself, wedging the
+  // ENTIRE snapshot -- and with it the drain -- over one runaway ticket.
+  // Now it degrades just that item: the rest of the board still returns, and
+  // the offending ticket is named in overCeiling instead of silently dropped.
+  test("a labels ceiling on one item degrades just that ticket -- the rest of the board still returns (#148)", async () => {
+    const board = new Board(
+      CFG,
+      makeExecutor({ overrides: { ProjectItems: loadFixture("project-items-over-ceiling") } })
+    );
+    const snap = await board.snapshot();
+    // #21 (labels overflow) never enters items/bodies this pass.
+    expect(snap.items.map((i) => i.number)).toEqual([22]);
+    expect(snap.bodies).toEqual({ "22": "healthy body" });
+    // Named by number, never silently dropped.
+    expect(snap.overCeiling).toEqual([21]);
+  });
+
+  // A fieldValues overflow is the same per-item ceiling family (both guarded
+  // inside toItem) and degrades the same way.
+  test("a fieldValues ceiling on one item also degrades just that ticket (#148)", async () => {
     const overflowNode = {
       content: {
         number: 5,
         title: "T5",
         url: "http://x/5",
         body: "b",
+        labels: { pageInfo: { hasNextPage: false }, nodes: [] },
+      },
+      fieldValues: { pageInfo: { hasNextPage: true }, nodes: [] },
+    };
+    const board = new Board(
+      CFG,
+      makeExecutor({ overrides: { ProjectItems: boardPage([overflowNode, nodeWithBody(6, "Ready", "b6")]) } })
+    );
+    const snap = await board.snapshot();
+    expect(snap.items.map((i) => i.number)).toEqual([6]);
+    expect(snap.overCeiling).toEqual([5]);
+  });
+
+  // list() is unaffected by #148 -- it still fails loud for the whole call, the
+  // existing behavior asserted in "single-page ceiling guards" above (both the
+  // fieldValues case there and the equivalent labels case, since ItemCeilingError
+  // is still a ZError with the same message toItem always produced).
+  test("list() still throws on a labels ceiling overflow (unlike snapshot -- #148 scopes the degrade to snapshot only)", async () => {
+    const overflowNode = {
+      content: {
+        number: 5,
+        title: "T5",
+        url: "http://x/5",
         labels: { pageInfo: { hasNextPage: true }, nodes: [] },
       },
       fieldValues: { pageInfo: { hasNextPage: false }, nodes: [] },
     };
     const board = new Board(CFG, makeExecutor({ overrides: { ProjectItems: boardPage([overflowNode]) } }));
-    await expect(board.snapshot()).rejects.toThrow(/labels for issue #5.*truncated/);
+    await expect(board.list("Todo")).rejects.toThrow(/labels for issue #5.*truncated/);
   });
 
   test("a ticket with a null/absent body serializes as an empty string, never undefined", async () => {
