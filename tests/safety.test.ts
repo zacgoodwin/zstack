@@ -16,12 +16,16 @@ import { join } from "node:path";
 import {
   acquireLoopLock,
   confirmIdentity,
+  heartbeatPath,
   inspectLoopLock,
   laneLockPath,
   listLaneLocks,
   loopLockLiveness,
   loopLockPath,
   main as locksMain,
+  readHeartbeat,
+  releaseLoopLock,
+  writeHeartbeat,
   processAlive,
   processStartTime,
   readLaneLock,
@@ -34,6 +38,7 @@ import {
 import { ZError } from "../lib/config.ts";
 import {
   applyReconcile,
+  assertNotReconcilingLiveLoop,
   hasOrphans,
   reconcileBoardMoves,
   reconcilePlan,
@@ -223,6 +228,155 @@ describe("control 1: loop lock (second-invocation refusal)", () => {
 });
 
 // ============================================================================
+// issue #198 -- a loop that outlives lockStalenessMinutes must still read LIVE
+//
+// loop.lock is stamped once at acquire and never re-stamped (only lane locks
+// re-stamp), and production never passes --pid, so liveness reduced to
+// `now - startedAt > stalenessMs`. Every real drain outlives the 60-minute
+// default, so the lock read stale WHILE LIVE and locks.ts told the operator the
+// loop "likely crashed. Re-run /z-loop with --reconcile" -- which prunes the
+// live run's worktrees and parks its tickets. Reproduced against run 10's own
+// lock: state=stale, age_minutes=198, has_pid=false.
+//
+// The fix is a sidecar heartbeat file, NOT a re-stamp of loop.lock: that file's
+// {flag:"wx"} exclusive create IS the H11 CAS guarantee (pinned structurally
+// below), and overwriting it would allow both resurrection of a released lock
+// and TOCTOU stomping of a reconciler's replacement.
+// ============================================================================
+describe("loop lock heartbeat (#198)", () => {
+  const STALE = 60 * 60_000; // 60 min staleness (config default)
+  const MIN = 60_000;
+
+  test("a loop beating every 30 min reads LIVE at 198 minutes (the measured failure)", () => {
+    const d = tmp();
+    acquireLoopLock(d, { session: "sess-A", startedAt: 0 }, { nowMs: 0, stalenessMs: STALE });
+    // Beat on the cadence a real drain produces, out past the window.
+    for (let t = 30 * MIN; t <= 198 * MIN; t += 30 * MIN) {
+      expect(writeHeartbeat(d, "sess-A", t)).toBe("stamped");
+    }
+    const st = inspectLoopLock(d, 198 * MIN, STALE);
+    expect(st.state).toBe("live"); // on pre-#198 code this is "stale"
+    expect(st.lastSeenAt).toBe(180 * MIN); // the last beat, not startedAt
+  });
+
+  test("a loop that genuinely dies still goes stale and is still reconcilable", () => {
+    const d = tmp();
+    acquireLoopLock(d, { session: "sess-A", startedAt: 0 }, { nowMs: 0, stalenessMs: STALE });
+    writeHeartbeat(d, "sess-A", 0);
+    // No further beats: the loop crashed at t=0.
+    expect(inspectLoopLock(d, STALE + 1, STALE).state).toBe("stale");
+    const res = acquireLoopLock(
+      d,
+      { session: "next", startedAt: STALE + 1 },
+      { nowMs: STALE + 1, stalenessMs: STALE, reconcile: true }
+    );
+    expect(res.acquired).toBe(true);
+  });
+
+  test("no beat file: liveness is byte-identical to pre-#198 age behaviour", () => {
+    const d = tmp();
+    acquireLoopLock(d, { session: "s", startedAt: 0 }, { nowMs: 0, stalenessMs: STALE });
+    expect(existsSync(heartbeatPath(d))).toBe(false);
+    expect(inspectLoopLock(d, STALE, STALE).state).toBe("live"); // exactly at budget
+    expect(inspectLoopLock(d, STALE + 1, STALE).state).toBe("stale"); // one ms past
+  });
+
+  test("a beat naming a different session is ignored (no mutex needed)", () => {
+    const d = tmp();
+    acquireLoopLock(d, { session: "sess-A", startedAt: 0 }, { nowMs: 0, stalenessMs: STALE });
+    // A reconciler took over and B is beating; A's lock must still be judged by
+    // A's own anchor, never kept alive by a stranger's beat.
+    writeFileSync(
+      heartbeatPath(d),
+      JSON.stringify({ session: "sess-B", lastSeenAt: 198 * MIN }) + "\n"
+    );
+    expect(inspectLoopLock(d, 198 * MIN, STALE).state).toBe("stale");
+  });
+
+  test("beating never resurrects a released lock", () => {
+    const d = tmp();
+    expect(writeHeartbeat(d, "sess-A", 1000)).toBe("not-held");
+    expect(existsSync(loopLockPath(d))).toBe(false);
+    expect(existsSync(heartbeatPath(d))).toBe(false);
+  });
+
+  test("beating never keeps a foreign lock alive", () => {
+    const d = tmp();
+    acquireLoopLock(d, { session: "sess-A", startedAt: 0 }, { nowMs: 0, stalenessMs: STALE });
+    expect(writeHeartbeat(d, "sess-B", 198 * MIN)).toBe("foreign");
+    expect(existsSync(heartbeatPath(d))).toBe(false);
+    expect(inspectLoopLock(d, 198 * MIN, STALE).state).toBe("stale");
+  });
+
+  test("release removes the beat", () => {
+    const d = tmp();
+    acquireLoopLock(d, { session: "s", startedAt: 0 }, { nowMs: 0, stalenessMs: STALE });
+    writeHeartbeat(d, "s", 1000);
+    expect(existsSync(heartbeatPath(d))).toBe(true);
+    releaseLoopLock(d);
+    expect(existsSync(heartbeatPath(d))).toBe(false);
+  });
+
+  test("a corrupt beat degrades to startedAt instead of throwing", () => {
+    const d = tmp();
+    acquireLoopLock(d, { session: "s", startedAt: 0 }, { nowMs: 0, stalenessMs: STALE });
+    writeFileSync(heartbeatPath(d), "%%% not json");
+    // Deliberately the opposite of readLoopLock's fail-loud: misreading the lock
+    // risks two loops, misreading the beat can only make us conservative.
+    expect(readHeartbeat(d)).toBeNull();
+    expect(() => inspectLoopLock(d, 1000, STALE)).not.toThrow();
+    expect(inspectLoopLock(d, STALE + 1, STALE).state).toBe("stale");
+  });
+
+  // The second layer. The heartbeat removes the TRIGGER (a live loop reading
+  // stale); this removes the DAMAGE (reconcile trusting a comment). Before #198
+  // lib/reconcile.ts never read the loop lock at all -- the "only called once the
+  // lock is free/stale" precondition was prose, so a --reconcile against a live
+  // loop parked its tickets and force-deleted its builders' worktrees.
+  test("reconcile refuses against a live loop, and lets the owning loop through", () => {
+    const d = tmp();
+    const cfg = { lockStalenessMinutes: 60 };
+    acquireLoopLock(d, { session: "sess-A", startedAt: 0 }, { nowMs: 0, stalenessMs: STALE });
+
+    // A bare human invocation: no session, live lock -> refuse.
+    expect(() => assertNotReconcilingLiveLoop(d, 1000, cfg, undefined)).toThrow(/already|running/i);
+    // A DIFFERENT loop -> refuse, naming the holder.
+    expect(() => assertNotReconcilingLiveLoop(d, 1000, cfg, "sess-B")).toThrow(/sess-A/);
+    // The owning loop's own recovery pass (SKILL Step 0 reconciles after acquiring) -> allowed.
+    expect(() => assertNotReconcilingLiveLoop(d, 1000, cfg, "sess-A")).not.toThrow();
+    // Stale -> allowed with no session at all, so crash recovery still works.
+    expect(() => assertNotReconcilingLiveLoop(d, STALE + 1, cfg, undefined)).not.toThrow();
+  });
+
+  test("a heartbeat keeps reconcile refusing past the staleness window", () => {
+    const d = tmp();
+    const cfg = { lockStalenessMinutes: 60 };
+    acquireLoopLock(d, { session: "sess-A", startedAt: 0 }, { nowMs: 0, stalenessMs: STALE });
+    writeHeartbeat(d, "sess-A", 190 * MIN);
+    // Without the beat this lock reads stale at 198m and reconcile would proceed
+    // -- the exact sequence that could have clobbered run 10.
+    expect(() => assertNotReconcilingLiveLoop(d, 198 * MIN, cfg, undefined)).toThrow(/sess-A/);
+  });
+
+  test("the production CLI path: acquire -> beat -> inspect reads live past the window", () => {
+    const d = tmp();
+    expect(locksMain(["acquire", "--dir", d, "--session", "s", "--now", "0"])).toBe(0);
+    expect(locksMain(["beat", "--dir", d, "--session", "s", "--now", String(198 * MIN)])).toBe(0);
+    const out: string[] = [];
+    const orig = console.log;
+    console.log = (m?: unknown) => void out.push(String(m));
+    try {
+      locksMain(["inspect", "--dir", d, "--now", String(198 * MIN)]);
+    } finally {
+      console.log = orig;
+    }
+    const parsed = JSON.parse(out.join("\n"));
+    expect(parsed.state).toBe("live");
+    expect(parsed.lastSeenAt).toBe(198 * MIN);
+  });
+});
+
+// ============================================================================
 // issue #14 H11 + M19 -- stale+reconcile CAS race, and staleness-flag validation
 // ============================================================================
 describe("stale+reconcile keeps the exclusive-create guard (H11)", () => {
@@ -280,6 +434,15 @@ describe("stale+reconcile keeps the exclusive-create guard (H11)", () => {
     // takes the lock with an exclusive create -- proof the CAS wasn't abandoned.
     expect(src).toContain(".reconcile"); // claim-file mutex
     expect(src).toMatch(/writeFileSync\(path, body, \{ flag: "wx"/); // exclusive create on the reconcile path
+  });
+
+  // #198 put the liveness heartbeat in a SIDECAR file precisely so this stays
+  // true. A future refactor that "simplifies" the beat into loop.lock would need
+  // an overwrite, which destroys the CAS above and re-opens both resurrection of
+  // a released lock and TOCTOU stomping of a reconciler's replacement.
+  test("the loop lock itself is still never overwritten (structural, #198)", () => {
+    const src = readFileSync(LOCKS, "utf8");
+    expect(src).not.toMatch(/atomicWrite\(\s*loopLockPath/);
   });
 });
 

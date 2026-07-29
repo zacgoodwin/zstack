@@ -75,6 +75,21 @@ export function loopLockPath(locksDir: string): string {
   return join(locksDir, "loop.lock");
 }
 
+// The liveness heartbeat (issue #198), a SIDECAR beside the loop lock rather
+// than a field inside it. loop.lock is written with an exclusive create and must
+// stay that way -- that create IS the H11 mutual-exclusion guarantee -- so the
+// "is this loop still alive" signal cannot live in the same file. A separate
+// file also makes two hazards structurally impossible rather than merely
+// guarded: a straggler beat can never RESURRECT a released lock (writing the
+// beat never creates a lock), and a beat can never STOMP a reconciler's
+// replacement (the beat carries its session and a mismatch is ignored).
+//
+// Name safety: currentClaimGen prefix-matches `loop.lock.reconcile`, which this
+// does not match, and listLaneLocks filters /^ticket-\d+\.json$/.
+export function heartbeatPath(locksDir: string): string {
+  return join(locksDir, "loop.lock.beat");
+}
+
 // -- lane locks ---------------------------------------------------------------
 // Writes go through lib/cli.ts atomicWrite (tmp + rename, mode 0o600) so a
 // concurrent reader never observes a half-written or world-readable lock.
@@ -147,6 +162,55 @@ export function readLoopLock(locksDir: string): LoopLock | null {
     throw new ZError(`Loop lock ${path} must be {session, startedAt, pid?}.`);
   }
   return l as LoopLock;
+}
+
+// -- liveness heartbeat (issue #198) ------------------------------------------
+
+export interface Heartbeat {
+  session: string; // the loop that stamped it; a mismatch with the lock is ignored
+  lastSeenAt: number; // ms, injected clock
+}
+
+// Deliberately TOLERANT where readLoopLock is fail-loud: a misread lock risks
+// two loops on one board, whereas a misread beat can only make us judge the
+// loop MORE conservatively (fall back to startedAt, i.e. today's behavior). A
+// corrupt beat must never wedge an acquire.
+export function readHeartbeat(locksDir: string): Heartbeat | null {
+  const path = heartbeatPath(locksDir);
+  if (!existsSync(path)) return null;
+  try {
+    const b = JSON.parse(readFileSync(path, "utf8")) as any;
+    if (typeof b?.session !== "string" || typeof b?.lastSeenAt !== "number") return null;
+    return b as Heartbeat;
+  } catch {
+    return null;
+  }
+}
+
+// Stamp the beat -- read-verify-write, and NEVER create. Returns what it did so
+// the caller can surface "foreign" (our loop was reconciled out from under us),
+// which is alarming but must not abort a tick with lanes in flight.
+export function writeHeartbeat(
+  locksDir: string,
+  session: string,
+  nowMs: number
+): "stamped" | "not-held" | "foreign" {
+  const lock = readLoopLock(locksDir);
+  if (!lock) return "not-held";
+  if (lock.session !== session) return "foreign";
+  atomicWrite(heartbeatPath(locksDir), JSON.stringify({ session, lastSeenAt: nowMs }) + "\n");
+  return "stamped";
+}
+
+// The anchor liveness measures age against. A beat from a DIFFERENT session
+// means a reconciler replaced the lock while that beat was in flight; the new
+// holder's own startedAt is fresh and decides, so the stale beat is ignored.
+// Math.max defends against a beat older than startedAt (clock skew, or a beat
+// left by a prior run of the same session name).
+export function effectiveLastSeen(lock: LoopLock, beat: Heartbeat | null): number {
+  return beat && beat.session === lock.session
+    ? Math.max(lock.startedAt, beat.lastSeenAt)
+    : lock.startedAt;
 }
 
 // Is the process holding a loop lock alive on THIS host? signal 0 checks
@@ -243,7 +307,12 @@ export function loopLockLiveness(
   nowMs: number,
   stalenessMs: number,
   isAlive: (pid: number) => boolean = processAlive,
-  identify: (lock: LoopLock) => IdentityCheck = (l) => confirmIdentity(l)
+  identify: (lock: LoopLock) => IdentityCheck = (l) => confirmIdentity(l),
+  // issue #198: the anchor to measure age from. Callers holding a locksDir pass
+  // effectiveLastSeen(lock, readHeartbeat(dir)); omitting it falls back to
+  // startedAt, which is exactly the pre-#198 behavior -- so every existing
+  // positional call site keeps its meaning.
+  lastSeenAt?: number
 ): LockLiveness {
   if (lock.pid !== undefined) {
     if (!isAlive(lock.pid)) return "stale"; // dead pid: our loop is definitely gone
@@ -256,14 +325,21 @@ export function loopLockLiveness(
         break; // unconfirmable: fall through to the age heuristic
     }
   }
-  return nowMs - lock.startedAt > stalenessMs ? "stale" : "live";
+  // A pid, when present and confirmable, still outranks the heartbeat above.
+  // Production passes no pid (the SKILL step's $$ is the shell, not the loop --
+  // #164), so in practice this age branch is the only one reached, which is why
+  // an un-refreshed anchor made every long drain read stale (#198).
+  return nowMs - (lastSeenAt ?? lock.startedAt) > stalenessMs ? "stale" : "live";
 }
 
 export interface LoopLockState {
   state: "free" | "live" | "stale";
   lock?: LoopLock; // the existing lock, when state is live or stale
+  lastSeenAt?: number; // #198: the anchor age was judged against (beat, else startedAt)
 }
 
+// The one function that owns a locksDir, so the one place the lock and its
+// sidecar beat are merged (#198).
 export function inspectLoopLock(
   locksDir: string,
   nowMs: number,
@@ -272,7 +348,12 @@ export function inspectLoopLock(
 ): LoopLockState {
   const lock = readLoopLock(locksDir);
   if (!lock) return { state: "free" };
-  return { state: loopLockLiveness(lock, nowMs, stalenessMs, isAlive), lock };
+  const lastSeenAt = effectiveLastSeen(lock, readHeartbeat(locksDir));
+  return {
+    state: loopLockLiveness(lock, nowMs, stalenessMs, isAlive, undefined, lastSeenAt),
+    lock,
+    lastSeenAt,
+  };
 }
 
 export interface AcquireResult {
@@ -327,6 +408,7 @@ export function acquireLoopLock(
     const under = inspectLoopLock(locksDir, opts.nowMs, opts.stalenessMs, opts.isAlive);
     if (under.state === "live") return { acquired: false, held: under.lock, reason: "live" };
     rmSync(path, { force: true }); // clear the (still) stale lock
+    rmSync(heartbeatPath(locksDir), { force: true }); // and the dead loop's beat (#198)
     try {
       writeFileSync(path, body, { flag: "wx", mode: 0o600 });
       return { acquired: true };
@@ -433,8 +515,12 @@ function claimLiveness(
   return loopLockLiveness(claim, opts.nowMs, opts.stalenessMs, opts.isAlive);
 }
 
-function releaseLoopLock(locksDir: string): void {
+export function releaseLoopLock(locksDir: string): void {
   rmSync(loopLockPath(locksDir), { force: true });
+  // Not required for correctness -- a beat whose session no longer matches any
+  // lock is already ignored -- but a dangling file in the locks dir confuses a
+  // human reading it (#198).
+  rmSync(heartbeatPath(locksDir), { force: true });
 }
 
 // -- CLI ----------------------------------------------------------------------
@@ -445,6 +531,9 @@ const USAGE = `locks <command> [args]
                                        take the project loop lock, or refuse
                                        (exit 1) naming the live/stale session
   release  --slug S                    remove the project loop lock
+  beat     --slug S --session ID [--now MS]
+                                       re-stamp the liveness heartbeat; a no-op
+                                       unless the loop lock is held by ID
   inspect  --slug S [--staleness-minutes M] [--now MS]
                                        print the loop lock state as JSON
   lane-write  --slug S <ticket> <stage> --session ID [--now MS]
@@ -511,10 +600,29 @@ export function main(argv: string[]): number {
       }
       const h = res.held!;
       const since = new Date(h.startedAt).toISOString();
+      // #198: report the EVIDENCE, not a guess at the cause. The old stale
+      // message asserted "the previous loop likely crashed" and sent the
+      // operator straight to --reconcile -- which, against a loop that had
+      // merely outlived the staleness window, parked its tickets and deleted
+      // its worktrees. Liveness is now anchored on a heartbeat, so the reading
+      // is worth quoting; the consequence is still spelled out because a
+      // genuinely stale-looking lock can still belong to something running.
+      const beat = readHeartbeat(locksDir);
+      const seen = beat && beat.session === h.session ? beat.lastSeenAt : undefined;
+      const agoMin = (t: number) => Math.round((nowMs - t) / 60_000);
       if (res.reason === "live") {
-        console.error(`Refusing to start: a /z-loop is already running on this project in session "${h.session}" (since ${since}${h.pid ? `, pid ${h.pid}` : ""}). Stop that loop first.`);
+        const seenTxt = seen !== undefined ? `, last seen ${agoMin(seen)}m ago` : "";
+        console.error(
+          `Refusing to start: a /z-loop is already running on this project in session "${h.session}" (started ${since}${seenTxt}${h.pid ? `, pid ${h.pid}` : ""}). Stop that loop first.`
+        );
       } else {
-        console.error(`Refusing to start: a stale loop lock from session "${h.session}" (since ${since}) is present -- the previous loop likely crashed. Re-run /z-loop with --reconcile to clear it and recover orphans.`);
+        const evidence =
+          seen !== undefined
+            ? `no sign of life for ${agoMin(seen)}m (last heartbeat ${new Date(seen).toISOString()})`
+            : `no heartbeat was ever recorded (started ${since}, ${agoMin(h.startedAt)}m ago)`;
+        console.error(
+          `Refusing to start: the loop lock from session "${h.session}" is stale -- ${evidence}. The previous loop most likely crashed. If it is in fact still running, do NOT reconcile: --reconcile parks its tickets back to Ready and deletes its worktrees. Otherwise re-run /z-loop with --reconcile to clear it and recover orphans.`
+        );
       }
       return 1;
     }
@@ -523,6 +631,20 @@ export function main(argv: string[]): number {
       const { locksDir } = resolveDir(flags);
       releaseLoopLock(locksDir);
       console.log("released loop lock");
+      return 0;
+    }
+
+    // #198: re-stamp the liveness heartbeat. Called once per z-loop-tick, so it
+    // must be cheap and must never fail a drain: "not-held" and "foreign" are
+    // reported on stderr and still exit 0, because a lock that vanished or was
+    // reconciled away is not something a tick with lanes in flight can fix.
+    if (cmd === "beat") {
+      const { locksDir } = resolveDir(flags);
+      const session = requireFlag(flags, "session");
+      const res = writeHeartbeat(locksDir, session, nowMs);
+      if (res === "not-held") console.error(`beat: no loop lock held (session "${session}")`);
+      if (res === "foreign")
+        console.error(`beat: the loop lock is held by another session, not "${session}"`);
       return 0;
     }
 
