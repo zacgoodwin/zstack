@@ -2438,6 +2438,56 @@ describe("batch-scoped claiming + drain (#131)", () => {
     expect(nextRun.mergedThisRun).toEqual([]); // fresh batch resets the counters
     expect(nextAction(nextRun, 0)).toEqual({ kind: "claim", ticket: 3, stage: "builder" });
   });
+
+  // #168 (adversarial review of #150, unpinned gap 2): a ticket that a
+  // ticketLimit cap leaves in Ready -- excluded from batchTickets, the CLAIM
+  // allow-list -- is NOT excluded from initialBatchTickets, the
+  // humanNeededStatus SCOPE, once the next batch captures it. The two lists
+  // answer different questions (what may THIS run claim vs. what counts toward
+  // THIS run's safety-control numerator) and must not collapse into the same
+  // set. Reverting #150's isNewBatchTicket-based capture to the narrower
+  // flagged allow-list makes every assertion below fail.
+  test("#168: a ticket left out of a capped batchTickets by the ticket-limit still lands in the NEXT batch's initialBatchTickets, and counts toward humanNeededStatus if it parks", () => {
+    const nums = [1, 2, 3, 4, 5];
+    const bodies = Object.fromEntries(nums.map((n) => [String(n), "no deps"]));
+    const readyItems = nums.map((n) => ({ number: n, title: `t${n}`, fields: { Status: "Ready" } }));
+
+    // First capped batch: ticketLimit 2 over 5 Ready tickets flags [1, 2];
+    // #3/#4/#5 stay Ready, outside batchTickets -- the deliberately-excluded
+    // leftovers #150's context describes.
+    const first = ingestBoardItems(null, readyItems, bodies, { ticketLimit: 2 });
+    expect(first.batchTickets).toEqual([1, 2]);
+
+    // Drain it -- drainHappy claims/completes only the flagged pair (batch-scoped
+    // claiming, #131), leaving #3/#4/#5 untouched at Ready.
+    const drained = drainHappy(first).state;
+    expect(drained.tickets.filter((t) => t.status === "Done").map((t) => t.number)).toEqual([1, 2]);
+    expect(drained.tickets.filter((t) => t.status === "Ready").map((t) => t.number)).toEqual([3, 4, 5]);
+
+    // Re-invocation (Step 3, passes --ticket-limit again) against that drained
+    // state captures the NEXT batch: batchTickets caps at the lowest 2 of the 3
+    // leftovers ([3, 4]), but initialBatchTickets -- the same Ready-or-new rule
+    // initialReadyCount uses, not the capped allow-list -- picks up all 3,
+    // including leftover #5.
+    const drainedItems = [
+      { number: 1, title: "t1", fields: { Status: "Done" } },
+      { number: 2, title: "t2", fields: { Status: "Done" } },
+      ...[3, 4, 5].map((n) => ({ number: n, title: `t${n}`, fields: { Status: "Ready" } })),
+    ];
+    const next = ingestBoardItems(drained, drainedItems, bodies, { ticketLimit: 2, humanNeededPercent: 30 });
+    expect(next.batchTickets).toEqual([3, 4]); // the cap: #5 excluded from the claim allow-list
+    expect(next.initialBatchTickets).toEqual([3, 4, 5]); // the scope: #5 included anyway
+    expect(next.initialBatchTickets).not.toEqual(next.batchTickets);
+
+    // Park leftover #5 -- outside the cap, so nextAction's own claim/deadlock
+    // steps never reach it; this simulates whatever park path (human or a later
+    // run) eventually resolves it -- and confirm it counts toward THIS batch's
+    // human-needed numerator exactly like a flagged, in-cap ticket would.
+    const parked = applyAction(next, { kind: "park", ticket: 5, status: "Blocked", note: "test park" }, 0);
+    const hn = humanNeededStatus(parked);
+    expect(hn.blocked).toBe(1);
+    expect(hn.tickets.blocked).toEqual([5]);
+  });
 });
 
 describe("context ceiling gate (#131)", () => {
@@ -2530,6 +2580,7 @@ describe("ingestBoardItems: batch + context knobs (#131)", () => {
     const prev: LoopState = {
       ...state([ticket(1, "Done"), ticket(2, "Ready"), ticket(3, "Ready")]),
       batchTickets: [1, 2, 3],
+      initialBatchTickets: [1, 2, 3], // #150: this batch's own captured numerator scope
       contextTokens: 600000,
       contextTokenLimit: 550000,
       initialReadyCount: 3,
@@ -2547,6 +2598,12 @@ describe("ingestBoardItems: batch + context knobs (#131)", () => {
     // reading (the context-cleared orchestrator's first tick).
     const resumed = ingestBoardItems(prev, items, bodies, { contextTokens: 5000 });
     expect(resumed.batchTickets).toEqual([1, 2, 3]); // preserved verbatim (startingFreshBatch false)
+    // #168 (adversarial review of #150, unpinned gap 1): initialBatchTickets
+    // rides the SAME non-fresh carry-forward as batchTickets (both gated on
+    // startingFreshBatch false) -- pinned here so a future edit that drops it
+    // from that carry-forward fails loudly instead of silently re-scoping
+    // humanNeededStatus's numerator mid-run.
+    expect(resumed.initialBatchTickets).toEqual([1, 2, 3]);
     expect(resumed.contextTokens).toBe(5000);
     expect(resumed.contextTokenLimit).toBe(550000); // preserved
     // The gate is now open -> claiming resumes on the next flagged-but-unbuilt ticket.
