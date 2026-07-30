@@ -64,7 +64,54 @@ Three outcomes:
 
 Show the human the script's output verbatim in every case.
 
-## Step 2 — Report the result
+## Step 2 — Identity re-check (issue #66)
+
+Runs only when Step 1 succeeded (outcome 1: exit 0) — a refused or failed
+update (outcomes 2-3) skips this step; report the failure per Step 3 and stop.
+
+`/z-setup`'s identity step (its own SKILL.md Step 7) raises the loop's GitHub
+identity choice — a dedicated bot account, or continuing as the owner's own
+login (issue #66) — once per project, and states the issue #204 consequence
+("a standing human instruction left in a comment is invisible to the
+planning pass") before accepting "continue as human." This step exists for
+what that can't catch: a project's `config.json` written before issue #66
+shipped has no recorded choice at all, and a bot's token can be
+rotated/revoked later. It never re-asks a project that has already
+answered, either way (AC6).
+
+Walk every project this machine has configured — not just whichever repo
+`/z-update` happened to run from:
+
+```bash
+for SLUG in $(ls "$HOME/.zstack/projects" 2>/dev/null); do
+  STATE=$(bun "$PACK/lib/identity.ts" state --slug "$SLUG" 2>/dev/null | jq -r .state 2>/dev/null)
+  [ "$STATE" = "unset" ] || continue   # already answered (bot or human), or unreadable -- leave it alone
+  read -r OWNER REPO <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts'; const c = loadConfig('$SLUG'); console.log(c.owner, c.repo)")"
+
+  # Ask (decision-brief, condensed -- full rationale lives at z-setup/SKILL.md
+  # Step 7 and docs/user-guide/bot-identity.md, not repeated here):
+  #   "Should $OWNER/$REPO's loop run as its own bot GitHub account, or
+  #   continue as yours? This project predates issue #66 (or was never
+  #   asked). 'Continue as yours' is fully supported, but leaves issue #204
+  #   live: a standing human instruction left in a ticket comment is
+  #   invisible to the planning pass while the loop's login is your own. See
+  #   docs/user-guide/bot-identity.md for the bot-account walkthrough.
+  #   [A) Set up a bot account / B) Continue as my own account]"
+  # Then record EXACTLY ONE of the following -- never both -- matching
+  # whichever the owner answered:
+  if [ "$OWNER_ANSWER" = "bot" ]; then
+    bun "$PACK/lib/identity.ts" record --slug "$SLUG" --mode bot --token-location "<what the owner told you>"
+  else
+    bun "$PACK/lib/identity.ts" record --slug "$SLUG" --mode human
+  fi
+done
+```
+
+A machine with no configured projects at all (`~/.zstack/projects` empty or
+missing) has nothing to re-check — the loop body above simply never executes,
+and Step 3 runs next.
+
+## Step 3 — Report the result
 
 State plainly:
 
@@ -73,6 +120,9 @@ State plainly:
   (reinstall commands, or resolve the clone's git state).
 - That the GitHub board, milestones, and labels are remote data this skill
   never touches, and that gstack (a separate pack) is unaffected.
+- On success, which projects (if any) were raised by Step 2's identity
+  re-check and what was recorded for each; a run with nothing to re-check
+  states that plainly too.
 
 ## Done criteria
 
@@ -81,5 +131,8 @@ Report DONE only when:
 - `bin/z-update` ran and its output (including any error) was shown verbatim.
 - On success: the old → new VERSION was reported and `setup` re-ran to
   completion (its own "zstack setup complete." banner appeared).
+- On success: Step 2 ran — every configured project with `identity` state
+  `"unset"` was raised exactly once and its answer recorded; every project
+  that had already answered (bot or human) was left untouched, unprompted.
 - On failure: the human was told exactly which failure mode occurred and the
-  concrete next step to take.
+  concrete next step to take (Step 2 does not run on a failed update).

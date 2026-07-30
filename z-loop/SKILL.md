@@ -57,6 +57,11 @@ export ZSTACK_SLUG="$SLUG"   # H13: every z-board / lib call resolves the slug f
                              # --slug where already present -- explicit still wins.
 BASE=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
 BASE_SHA_START=$(git rev-parse "origin/$BASE" 2>/dev/null || git rev-parse "$BASE")  # C8: the e2e-detection diff base
+# issue #66: whoever `gh` is authed as -- a dedicated bot account is the
+# supported way to give the loop its own identity; see
+# docs/user-guide/bot-identity.md and z-setup/SKILL.md Step 7. No code here
+# prefers or hardcodes the owner -- this line is the single source of truth
+# for the session name, lane locks, and claims.
 ME=$(gh api user -q .login)
 SESSION="$ME-$(date +%s)"   # names this loop in the lock (second-invocation refusal)
 STATE_DIR="$HOME/.zstack/projects/$SLUG/loop"
@@ -687,7 +692,13 @@ Two lock kinds live under `$LOCKS` (`~/.zstack/projects/<slug>/locks/`):
 > cross-machine claim needs shared board-held state (a claim marker both loops
 > check), which is deliberately out of scope for this remediation (issue #14 C8).
 > Run one loop per (login, project) at a time; if you must parallelize, use
-> distinct logins or distinct projects.
+> distinct logins or distinct projects. A dedicated bot GitHub identity per
+> loop (issue #66; see docs/user-guide/bot-identity.md and z-setup/SKILL.md
+> Step 7) is the supported way to get that distinct login without creating a
+> second human account -- it does not add cross-machine coordination (a
+> second loop under a DIFFERENT bot login still needs a distinct project, or
+> the same race above), it just makes "distinct logins" cheap and
+> attributable instead of a spare personal account.
 
 **Startup, without `--reconcile`:** if `loop.lock` is live → refuse (name the
 session). If it is stale, or any orphans exist (lane locks with no running loop,

@@ -717,6 +717,40 @@ describe("SetupBoard.apply — pre-flight input validation (F9)", () => {
     expect(written.adversarialMode).toBe("always");
   });
 
+  // -- issue #66: a re-apply must never silently drop a recorded identity
+  // choice. Without this, any board-shape-drift re-apply of /z-setup after
+  // the owner answered the identity step (a separate SKILL.md step from this
+  // GraphQL-driven apply) would wipe it back to "unset" and force a
+  // re-prompt -- same hazard issue #97 already closed for the other four
+  // optional fields, same fix shape.
+  test("a re-apply over a drifted board preserves a hand-recorded identity choice (issue #66)", async () => {
+    const backend = setupBackend();
+    const setup = new SetupBoard(backend.exec);
+    const home = testHome();
+
+    const first = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
+    const withIdentity: BoardConfig = {
+      ...first.config,
+      identity: { mode: "bot", recordedAt: "2026-07-29T00:00:00.000Z", tokenLocation: "GH_TOKEN env var" },
+    };
+    writeConfig(withIdentity, home);
+
+    // Force board-shape drift so apply()'s mutation loop -- and therefore a
+    // real buildConfig/writeConfig, not the common no-op re-run -- executes.
+    backend.project!.fields.find((f) => f.name === "Model")!.options = ["haiku", "sonnet", "opus"];
+
+    const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
+    expect(second.actions.some((a) => a.kind === "set-field-options" && a.name === "Model")).toBe(true);
+    expect(second.config.identity).toEqual({
+      mode: "bot",
+      recordedAt: "2026-07-29T00:00:00.000Z",
+      tokenLocation: "GH_TOKEN env var",
+    });
+
+    const path = writeConfig(second.config, home);
+    expect(JSON.parse(readFileSync(path, "utf8")).identity).toEqual(second.config.identity);
+  });
+
   // -- issue #97 AC3: first-time setup, no prior config.json on disk at all --
   test("first-time setup with no prior config.json tolerates the absent file (no crash, unchanged default)", async () => {
     const backend = setupBackend();
@@ -728,6 +762,7 @@ describe("SetupBoard.apply — pre-flight input validation (F9)", () => {
     expect(result.config.stageModels).toEqual({ merge: "haiku" });
     expect(result.config.notifications).toBeUndefined();
     expect(result.config.adversarialMode).toBeUndefined();
+    expect(result.config.identity).toBeUndefined(); // issue #66: no choice recorded yet
     expect(() => writeConfig(result.config, home)).not.toThrow();
   });
 
@@ -1106,6 +1141,50 @@ describe("validateConfig", () => {
     });
   });
 
+  // -- issue #66: the owner's recorded bot-vs-human-account identity choice ---
+  describe("identity (issue #66)", () => {
+    test("rejects a bad identity.mode, naming the field and the valid set", () => {
+      const cfg = goodConfig() as any;
+      cfg.identity = { mode: "owner", recordedAt: "2026-07-29T00:00:00.000Z" };
+      expect(() => validateConfig(cfg)).toThrow(/identity\.mode.*"bot" or "human"/);
+    });
+
+    test("rejects a missing or empty recordedAt", () => {
+      const cfg = goodConfig() as any;
+      cfg.identity = { mode: "bot" };
+      expect(() => validateConfig(cfg)).toThrow(/identity\.recordedAt/);
+      cfg.identity.recordedAt = "";
+      expect(() => validateConfig(cfg)).toThrow(/identity\.recordedAt/);
+    });
+
+    test("rejects a non-string tokenLocation when present, but tokenLocation itself is optional", () => {
+      const cfg = goodConfig() as any;
+      cfg.identity = { mode: "bot", recordedAt: "2026-07-29T00:00:00.000Z", tokenLocation: 5 };
+      expect(() => validateConfig(cfg)).toThrow(/identity\.tokenLocation/);
+      delete cfg.identity.tokenLocation;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    test("accepts a valid identity for both modes and is optional (absent stays absent, never defaulted)", () => {
+      const cfg = goodConfig() as any;
+      for (const mode of ["bot", "human"]) {
+        cfg.identity = { mode, recordedAt: "2026-07-29T00:00:00.000Z" };
+        expect(() => validateConfig(cfg)).not.toThrow();
+      }
+      delete cfg.identity;
+      expect(() => validateConfig(cfg)).not.toThrow();
+      expect(cfg.identity).toBeUndefined(); // never defaulted, unlike e.g. quota/adversarialMode
+    });
+
+    test("a non-object identity (including a bare array) fails", () => {
+      const cfg = goodConfig() as any;
+      cfg.identity = "bot";
+      expect(() => validateConfig(cfg)).toThrow(/"identity" must be an object/);
+      cfg.identity = ["bot"];
+      expect(() => validateConfig(cfg)).toThrow(/"identity" must be an object/);
+    });
+  });
+
   // -- issue #58: the tick-throttle pacing knob --------------------------------
   describe("tickThrottleSeconds (issue #58)", () => {
     // AC3: 0 -- the required "off" value -- must NOT be rejected the way
@@ -1435,5 +1514,31 @@ describe("loadConfig deep validation", () => {
   test("AC2: tickThrottleSeconds 120 in config.json is honored through loadConfig, not overridden by the default", () => {
     const home = writeRaw("zstack", validRawConfig({ tickThrottleSeconds: 120 }));
     expect(loadConfig("zstack", home).tickThrottleSeconds).toBe(120);
+  });
+
+  // -- issue #66: identity absent -> loadConfig leaves it undefined (it is
+  // deliberately NEVER defaulted, unlike every knob above) -- this is the
+  // real end-to-end proof behind lib/identity.ts's identityState() reading
+  // "unset" for a project that predates this ticket.
+  test("#66: identity absent from config.json stays undefined through loadConfig (never defaulted)", () => {
+    const home = writeRaw("zstack", validRawConfig());
+    expect(loadConfig("zstack", home).identity).toBeUndefined();
+  });
+
+  test("#66: a recorded identity in config.json is honored verbatim through loadConfig", () => {
+    const home = writeRaw(
+      "zstack",
+      validRawConfig({ identity: { mode: "bot", recordedAt: "2026-07-29T00:00:00.000Z", tokenLocation: "GH_TOKEN" } })
+    );
+    expect(loadConfig("zstack", home).identity).toEqual({
+      mode: "bot",
+      recordedAt: "2026-07-29T00:00:00.000Z",
+      tokenLocation: "GH_TOKEN",
+    });
+  });
+
+  test("#66: an invalid recorded identity.mode fails loadConfig loudly, naming the field", () => {
+    const home = writeRaw("zstack", validRawConfig({ identity: { mode: "owner", recordedAt: "t" } }));
+    expect(() => loadConfig("zstack", home)).toThrow(/is invalid:.*identity\.mode/);
   });
 });

@@ -49,6 +49,15 @@ disk**.
 4. Re-run that clone's `setup --team`, which refreshes every host's
    registrations ($HOME/.claude/skills, plus Codex/Factory if installed) the
    same way a fresh install would.
+5. On success only, the skill's own Step 2 re-checks GitHub identity (issue
+   #66) for every project this machine has configured under
+   `~/.zstack/projects/`: a project whose `config.json` has no recorded
+   bot-vs-human choice yet — one written before this ticket shipped, or
+   never asked — is raised exactly once (same two options `/z-setup`'s
+   identity step offers; see [bot-identity](bot-identity.md)) and the answer
+   is recorded. A project that already answered, either way, is left alone
+   and never re-prompted. A failed or refused update (outcomes 2-3 above)
+   skips this step entirely.
 
 ## Self-replacement, handled
 
@@ -63,8 +72,12 @@ executes, and the function's own last statement replaces the process
 
 - `bin/z-update` (or `/z-update`) exited 0, the old → new VERSION was shown,
   and `setup`'s own "zstack setup complete." banner appeared.
+- On success, every configured project's GitHub identity (issue #66) was
+  re-checked: any with no recorded choice was raised exactly once and the
+  answer recorded; any that had already answered was left untouched.
 - Or it refused cleanly: either a reinstall message with nothing touched on
-  disk, or a surfaced `git pull` failure with registrations unchanged.
+  disk, or a surfaced `git pull` failure with registrations unchanged (and
+  the identity re-check did not run).
 
 ## Common snags
 

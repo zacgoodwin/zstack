@@ -10,6 +10,7 @@ import {
   ADVERSARIAL_MODES,
   BoardConfig,
   FieldDataType,
+  IDENTITY_MODES,
   ZError,
 } from "./config.ts";
 import { loadRates, resolveRate } from "./estimate.ts";
@@ -211,6 +212,13 @@ export function validateConfig(cfg: unknown): BoardConfig {
   // silently at spawn time.
   if (c.stageModels !== undefined) validateStageModels(c.stageModels);
 
+  // identity (issue #66): the owner's bot-vs-human-account choice for the
+  // loop's GitHub identity. Validated only when present -- absent means
+  // "never asked" and must stay absent (loadConfig deliberately never
+  // defaults it; see lib/config.ts). z-setup/z-update write through this via
+  // lib/identity.ts; loadConfig reads through it like every other field.
+  if (c.identity !== undefined) validateIdentity(c.identity);
+
   return c as BoardConfig;
 }
 
@@ -311,5 +319,28 @@ export function validateStageModels(stageModels: unknown): void {
           `Known: ${Object.keys(rates.rates).join(", ")}.`
       );
     }
+  }
+}
+
+// identity (issue #66): the owner's recorded bot-vs-human-account choice.
+// `mode` is the only field z-setup/z-update decide on; `recordedAt` is
+// written by lib/identity.ts's recordIdentityChoice, never hand-supplied;
+// `tokenLocation` is an optional human-facing note (never a login or a
+// secret) of where the bot's token/gh-auth profile lives.
+export function validateIdentity(identity: unknown): void {
+  if (typeof identity !== "object" || identity === null || Array.isArray(identity)) {
+    throw new ZError(`Config "identity" must be an object, not an array.`);
+  }
+  const i = identity as any;
+  if (!IDENTITY_MODES.includes(i.mode)) {
+    throw new ZError(
+      `Config "identity.mode" must be "bot" or "human", got ${JSON.stringify(i.mode)}.`
+    );
+  }
+  if (typeof i.recordedAt !== "string" || !i.recordedAt) {
+    throw new ZError(`Config "identity.recordedAt" must be a non-empty string.`);
+  }
+  if (i.tokenLocation !== undefined && (typeof i.tokenLocation !== "string" || !i.tokenLocation)) {
+    throw new ZError(`Config "identity.tokenLocation" must be a non-empty string when present.`);
   }
 }

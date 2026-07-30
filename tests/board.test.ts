@@ -1314,6 +1314,13 @@ describe("contract enforcement", () => {
       // Step 5 verification checklist: read-only project views for the human
       `gh project view <NUMBER> --owner <OWNER> --web`,
       `gh project list --owner "$OWNER"`,
+      // Step 7 identity check (issue #66): read-only login lookup, both the
+      // CURRENT_LOGIN= bash line and the prose explanation of z-loop's own
+      // ME= line (which already carries this exact call, z-loop/SKILL.md
+      // Step 0) -- same read, never a mutation.
+      `gh api user -q .login)`,
+      `gh api user`, // prose reference (Step 7 intro paragraph)
+      `gh api user -q .login`, // prose reference (Step 7 Answer A: confirming the bot is authed)
     ],
     "z-plan/SKILL.md": [
       // slug lookup: read-only (trailing shell comment is part of the line)
