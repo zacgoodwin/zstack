@@ -81,10 +81,15 @@ export function recordIdentityChoice(
 // -- CLI ----------------------------------------------------------------------
 const USAGE = `identity <command> [flags]
 
-  state  --slug S
+  state  --slug S [--raw]
          print {"state": "unset"|"bot"|"human"} for the project's recorded
          identity choice (issue #66). z-setup/SKILL.md (AC5/AC7) and
          z-update/SKILL.md (AC6) gate the AskUserQuestion prompt on this.
+         --raw prints just the bare word (unset|bot|human), no JSON --
+         what both SKILL.md call sites use so neither needs \`jq\` to read
+         a single field (review finding: jq is not a checked prerequisite
+         of this pack, so piping through it made a missing/failing jq
+         indistinguishable from a clean "unset" read).
   record --slug S --mode bot|human [--token-location TEXT]
          record the owner's choice into config.json (atomic, validated).
          TEXT is a human-facing note of where the bot's token/gh-auth
@@ -104,9 +109,10 @@ export async function main(argv: string[], home: string = homedir()): Promise<nu
   }
   try {
     if (cmd === "state") {
-      const { flags } = parseFlags(argv.slice(1));
+      const { flags } = parseFlags(argv.slice(1), ["raw"]);
       const cfg = loadConfig(requireFlag(flags, "slug"), home);
-      console.log(JSON.stringify({ state: identityState(cfg) }));
+      const state = identityState(cfg);
+      console.log(flags.raw ? state : JSON.stringify({ state }));
       return 0;
     }
     if (cmd === "record") {

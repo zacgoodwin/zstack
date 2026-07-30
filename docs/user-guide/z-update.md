@@ -56,8 +56,11 @@ disk**.
    never asked — is raised exactly once (same two options `/z-setup`'s
    identity step offers; see [bot-identity](bot-identity.md)) and the answer
    is recorded. A project that already answered, either way, is left alone
-   and never re-prompted. A failed or refused update (outcomes 2-3 above)
-   skips this step entirely.
+   and never re-prompted. A project whose state couldn't be read this run
+   (a corrupt `config.json`, or a `bun` error) is neither of those — it's
+   reported as a `WARN`, never silently treated as already answered, and
+   tried again on the next `/z-update`. A failed or refused update
+   (outcomes 2-3 above) skips this step entirely.
 
 ## Self-replacement, handled
 
@@ -74,7 +77,9 @@ executes, and the function's own last statement replaces the process
   and `setup`'s own "zstack setup complete." banner appeared.
 - On success, every configured project's GitHub identity (issue #66) was
   re-checked: any with no recorded choice was raised exactly once and the
-  answer recorded; any that had already answered was left untouched.
+  answer recorded; any that had already answered was left untouched; any
+  whose state couldn't be read was reported as a `WARN`, not silently
+  treated as answered.
 - Or it refused cleanly: either a reinstall message with nothing touched on
   disk, or a surfaced `git pull` failure with registrations unchanged (and
   the identity re-check did not run).

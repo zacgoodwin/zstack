@@ -85,16 +85,31 @@ half is pure enumeration, no decision, so it is safe to run as bash:
 
 ```bash
 for SLUG in $(ls "$HOME/.zstack/projects" 2>/dev/null); do
-  STATE=$(bun "$PACK/lib/identity.ts" state --slug "$SLUG" 2>/dev/null | jq -r .state 2>/dev/null)
-  # only "unset" needs re-checking -- "bot"/"human" (already answered) and
-  # an unreadable config are silently skipped, left alone
+  STATE=$(bun "$PACK/lib/identity.ts" state --slug "$SLUG" --raw 2>&1)
+  CODE=$?
+  if [ "$CODE" -ne 0 ]; then
+    # A real failure (corrupt/unreadable config.json, or bun itself
+    # erroring) -- NEVER treated the same as "unset" or as "already
+    # answered". Warn on stderr (never stdout, which is the slug list the
+    # prose below iterates) and leave the project for the next /z-update to
+    # retry. The bug this replaces piped the JSON form through `jq` with
+    # both halves' stderr suppressed by `2>/dev/null`: any failure (jq
+    # missing -- it is not a checked prerequisite of this pack -- bun
+    # erroring, an unreadable config) silently produced an empty $STATE,
+    # which never matched "unset" and was never echoed -- indistinguishable
+    # from "already answered", forever, with no error surfaced.
+    echo "WARN: could not read identity state for '$SLUG' (exit $CODE): $STATE" >&2
+    continue
+  fi
   [ "$STATE" = "unset" ] && echo "$SLUG"
 done
 ```
 
 A machine with no configured projects at all (`~/.zstack/projects` empty or
 missing), or none in state `"unset"`, prints nothing — Step 2 has nothing to
-re-check, and Step 3 runs next.
+re-check, and Step 3 runs next. A `WARN` line means one project's state
+couldn't be determined this run — name it in Step 3's report; it is neither
+raised nor recorded as answered, so the next `/z-update` run tries again.
 
 For EACH slug the enumeration above printed, ask the owner directly in your
 own reply — do not wrap the ask in a bash conditional or let a bash variable
@@ -150,6 +165,9 @@ State plainly:
 - On success, which projects (if any) were raised by Step 2's identity
   re-check and what was recorded for each; a run with nothing to re-check
   states that plainly too.
+- On success, name any project Step 2 could not read the identity state for
+  (a `WARN` line) — it was neither asked nor recorded, and stays eligible
+  for the next `/z-update` run.
 
 ## Done criteria
 
@@ -160,6 +178,8 @@ Report DONE only when:
   completion (its own "zstack setup complete." banner appeared).
 - On success: Step 2 ran — every configured project with `identity` state
   `"unset"` was raised exactly once and its answer recorded; every project
-  that had already answered (bot or human) was left untouched, unprompted.
+  that had already answered (bot or human) was left untouched, unprompted;
+  any project whose state could not be read (a `WARN` line, e.g. a corrupt
+  `config.json`) was surfaced rather than silently treated as answered.
 - On failure: the human was told exactly which failure mode occurred and the
   concrete next step to take (Step 2 does not run on a failed update).

@@ -209,6 +209,38 @@ Step 2, or you re-reading `config.json`) tells you about *where* to look if
 the bot's access ever needs rotating. The token itself is never written to
 `config.json`.
 
+## Org-owned repos: what re-verification can (and can't) do
+
+Every step above works identically whether the repo belongs to you
+personally or to an organization — creating the bot account, both
+collaborator grants, and generating the token don't depend on who owns the
+repo. What differs is what `/z-setup`'s re-verification (Step 7, on every
+re-run after the first) can tell you automatically.
+
+GitHub shares one login namespace between personal accounts and
+organizations, but no individual human ever authenticates AS an
+organization — you always authenticate as yourself. On a **personal** repo
+the owner IS a specific human's own login, so `/z-setup` can compare the
+active `gh` login against it and warn you if a recorded bot identity looks
+like it quietly fell back to a human login. On an **org-owned** repo, the
+repo's "owner" is the org's slug, which no individual login can ever equal
+— so that comparison can't distinguish a human login from a bot login
+there, for anyone. Rather than either falsely warning on every single
+re-run (what an org-owned "human" project used to get) or falsely staying
+silent about a real regression (what an org-owned "bot" project used to
+get), `/z-setup` reports the raw facts on an org repo — the recorded state
+and the currently active login — and asks you to eyeball it yourself.
+
+There's no extra setup step for this; it's a limit of what's automatically
+checkable. On an org-owned repo it's worth periodically running
+`gh api user -q .login` yourself and confirming it still prints the bot's
+login before trusting a long-unattended loop. To switch a recorded choice
+on an org repo (human → bot, or back), authenticate `gh` as the account you
+want and tell `/z-setup` directly that you've finished — the automatic
+"did something change" nudge described above is a personal-repo-only
+convenience, but recording the switch itself (`identity.ts record`) works
+identically everywhere.
+
 ## Verifying the permission set is actually minimal
 
 This is the one piece of this page that has to be proven against a real
@@ -245,10 +277,14 @@ actually works," and either is a legitimate answer depending on how hands-on
 you plan to stay.
 
 You can switch to a bot identity later at any time: come back to this page,
-work through Steps 1-4, then re-run `/z-setup` — it detects that `gh` no
-longer resolves to you, confirms with you that this is really the switch to
-the bot (never automatic — a different personal login on the machine could
-trigger the same detection), and only then re-records the choice.
+work through Steps 1-4, then re-run `/z-setup`. On a **personal** repo it
+detects that `gh` no longer resolves to you, confirms with you that this is
+really the switch to the bot (never automatic — a different personal login
+on the machine could trigger the same detection), and only then re-records
+the choice. On an **org-owned** repo that detection isn't available (see
+[Org-owned repos](#org-owned-repos-what-re-verification-can-and-cant-do)
+above) — tell `/z-setup` directly once you've finished the bot setup and it
+records the switch the same way.
 
 ## Verification checklist
 
@@ -262,6 +298,10 @@ trigger the same detection), and only then re-records the choice.
 - [ ] A test claim (`bin/z-board claim <N> <bot-login>`, or just watching the
       next real `/z-loop` run) shows the bot as the assignee on github.com.
 - [ ] A test PR is authored and merged by the bot, not you.
+- [ ] **Org-owned repo only:** since `/z-setup` can't auto-detect a login
+      drift here (see [Org-owned repos](#org-owned-repos-what-re-verification-can-and-cant-do)),
+      periodically re-check `gh api user -q .login` yourself rather than
+      trusting a long-unattended loop's "no changes" report.
 
 If any box doesn't check out, re-read Step 2 (the Projects grant is separate
 from the repo grant) and Step 3 (confirm `GH_TOKEN` is actually set in the

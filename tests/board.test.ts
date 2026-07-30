@@ -1321,6 +1321,11 @@ describe("contract enforcement", () => {
       `gh api user -q .login)`,
       `gh api user`, // prose reference (Step 7 intro paragraph)
       `gh api user -q .login`, // prose reference (Step 7 Answer A: confirming the bot is authed)
+      // Step 7 org-repo fix (issue #66 review finding 1): read-only check of
+      // whether $OWNER is a personal login or an org slug -- no individual
+      // human can ever authenticate AS an org, so the CURRENT_LOGIN/$OWNER
+      // comparison above only means something on a personal repo.
+      `gh repo view --json isInOrganization -q .isInOrganization)`,
     ],
     "z-update/SKILL.md": [
       // Step 2 identity re-check (issue #66), Answer A: same read-only login

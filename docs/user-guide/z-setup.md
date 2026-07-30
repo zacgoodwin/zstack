@@ -42,8 +42,12 @@ does not exist yet, you need `/z-setup`.
    supported, but the step states its cost first: issue #204's fold-in gate
    can never see the owner's own ticket comments as "someone else's" while
    the loop shares their login, so a standing instruction left in a comment
-   is invisible to the planning pass. Full walkthrough (account, permissions,
-   token, `gh` auth, verification): [bot-identity](bot-identity.md).
+   is invisible to the planning pass. On an **organization-owned** repo, the
+   re-verification that runs on every later re-run can't compare the active
+   `gh` login against a personal owner login (an org has no such login) —
+   it reports the raw facts and asks you to eyeball them instead of guessing.
+   Full walkthrough (account, permissions, token, `gh` auth, verification,
+   the org caveat): [bot-identity](bot-identity.md).
 8. **Auto-approvals (optional).** Offers to reduce Claude Code permission prompts
    so the loop runs unattended. **This edits `~/.claude/settings.json`, which is
    machine-wide.** Three choices:

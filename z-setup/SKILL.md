@@ -221,7 +221,7 @@ Check whether this project already answered (re-running /z-setup must never
 re-ask — AC7):
 
 ```bash
-STATE=$(bun "$PACK/lib/identity.ts" state --slug "$SLUG" | jq -r .state)
+STATE=$(bun "$PACK/lib/identity.ts" state --slug "$SLUG" --raw)
 ```
 
 **`$STATE` is `"bot"` or `"human"` already:** do not blindly re-ask — but do
@@ -234,9 +234,25 @@ longer the owner usually means the bot-account setup
 (docs/user-guide/bot-identity.md) just happened and the active `gh` login
 changed.
 
+That comparison only means something on a **personal** repo, where `$OWNER`
+IS the human owner's own login. GitHub shares one login namespace between
+users and orgs, but no individual human ever authenticates AS an
+organization — so on an **org-owned** repo, `$OWNER` is the org's slug and
+`$CURRENT_LOGIN` can never equal it, for anyone. Comparing against it
+anyway used to produce two different silent failures there: a human
+teammate who already recorded "human" got re-nagged on every single
+re-run (the comparison was permanently true for the wrong reason), while a
+"bot" project whose token had quietly fallen back to a human login got a
+false "No changes" (the comparison that would have warned about it could
+never fire either). Check `isInOrganization` first so an org repo gets an
+honest "can't verify this automatically" instead of either wrong answer:
+
 ```bash
 CURRENT_LOGIN=$(gh api user -q .login)
-if [ "$STATE" = "bot" ] && [ "$CURRENT_LOGIN" = "$OWNER" ]; then
+IS_ORG=$(gh repo view --json isInOrganization -q .isInOrganization)
+if [ "$IS_ORG" = "true" ]; then
+  echo "Org-owned repo ($OWNER): identity recorded as '$STATE'; currently authenticated as '$CURRENT_LOGIN'. No individual login ever equals an org slug, so this can't be verified automatically here -- confirm '$CURRENT_LOGIN' looks right yourself (the bot's login if '$STATE' is bot, a collaborator's own login if '$STATE' is human), or re-run this step to switch."
+elif [ "$STATE" = "bot" ] && [ "$CURRENT_LOGIN" = "$OWNER" ]; then
   echo "WARNING: config.json records a bot identity, but the active GitHub CLI login is the repo owner ($OWNER). Re-authenticate as the bot account, or re-run this step to deliberately record 'continue as human' instead."
 elif [ "$STATE" = "human" ] && [ "$CURRENT_LOGIN" != "$OWNER" ]; then
   echo "config.json records 'continue as human', but the active GitHub CLI login ('$CURRENT_LOGIN') is not the repo owner ('$OWNER') -- confirm below before switching."
@@ -245,22 +261,28 @@ else
 fi
 ```
 
-The first branch's warning is the full remediation — nothing further to run.
-The third branch (`"No changes"`) needs nothing further either — the common,
-stable case on every re-run.
+On a **personal** repo the branching is exactly as before: the bot/owner-login
+warning is the full remediation — nothing further to run; the `else` ("No
+changes") needs nothing further either — the common, stable case on every
+re-run. On an **org-owned** repo the new leading branch is purely
+informational — it never asks a question or changes anything (AC7 still
+holds), and it fires on every re-run rather than only on drift, because
+there is no login-based signal of drift available there.
 
-The second branch needs a human decision before recording anything, same
-discipline as the `"unset"` case below: never auto-switch on a login change
-alone, since `$CURRENT_LOGIN` could just as easily be a different personal
-account as the bot (e.g. a teammate briefly authenticated on a shared
-machine). Ask via AskUserQuestion: "config.json still records this project
-as continuing on your own account, but `gh` is now authenticated as
-`$CURRENT_LOGIN`, not the owner `$OWNER` — this looks like you finished the
-bot-account setup. Switch the recorded identity to bot?" Options:
-**A) Yes, record `$CURRENT_LOGIN` as the bot identity** / **B) No, this is a
-different personal login — leave it recorded as human.** On A, confirm the
-token/gh-auth location the same way as Answer A below, then run the same
-`identity.ts record --mode bot` command. On B, leave `config.json` untouched.
+The `$STATE = "human"` branch (only reachable on a personal repo — the org
+branch above always wins first on an org-owned one) needs a human decision
+before recording anything, same discipline as the `"unset"` case below:
+never auto-switch on a login change alone, since `$CURRENT_LOGIN` could just
+as easily be a different personal account as the bot (e.g. a teammate
+briefly authenticated on a shared machine). Ask via AskUserQuestion:
+"config.json still records this project as continuing on your own account,
+but `gh` is now authenticated as `$CURRENT_LOGIN`, not the owner `$OWNER` —
+this looks like you finished the bot-account setup. Switch the recorded
+identity to bot?" Options: **A) Yes, record `$CURRENT_LOGIN` as the bot
+identity** / **B) No, this is a different personal login — leave it
+recorded as human.** On A, confirm the token/gh-auth location the same way
+as Answer A below, then run the same `identity.ts record --mode bot`
+command. On B, leave `config.json` untouched.
 
 **`$STATE` is `"unset"`** (first-time setup, or a project that predates
 issue #66): ask the owner via AskUserQuestion, decision-brief format (D3):

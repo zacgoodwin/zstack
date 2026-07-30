@@ -10,7 +10,7 @@
 import { test, expect, describe, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   identityState,
   main,
@@ -18,6 +18,7 @@ import {
   type IdentityState,
 } from "../lib/identity.ts";
 import { configPath, type BoardConfig } from "../lib/config.ts";
+import { toPosixPath } from "./helpers/setup-harness.ts";
 
 // -- fixtures -----------------------------------------------------------------
 const homes: string[] = [];
@@ -202,6 +203,51 @@ describe('main("state"): three distinct states via the real CLI path (ticket #66
   });
 });
 
+// Issue #66 review finding 2: both SKILL.md call sites piped this command's
+// JSON output through `jq -r .state` to read one field, but `jq` isn't a
+// checked prerequisite of this pack (only gstack/bun/gh are) -- a missing or
+// failing jq made a real state indistinguishable from a silent read
+// failure. --raw removes the dependency entirely for this need: the bare
+// word, no JSON, nothing to parse.
+describe('main("state --raw"): plain-word output, no JSON, no jq needed', () => {
+  test("prints the bare word for each of the three states", async () => {
+    const unsetHome = makeHome("unset-proj");
+    const botHome = makeHome("bot-proj");
+    recordIdentityChoice("bot-proj", { mode: "bot" }, botHome);
+    const humanHome = makeHome("human-proj");
+    recordIdentityChoice("human-proj", { mode: "human" }, humanHome);
+
+    const logs: string[] = [];
+    const origLog = console.log;
+    console.log = (s: string) => logs.push(s);
+    try {
+      await main(["state", "--slug", "unset-proj", "--raw"], unsetHome);
+      await main(["state", "--slug", "bot-proj", "--raw"], botHome);
+      await main(["state", "--slug", "human-proj", "--raw"], humanHome);
+    } finally {
+      console.log = origLog;
+    }
+    // No JSON.parse anywhere -- the bare word IS the whole line.
+    expect(logs).toEqual(["unset", "bot", "human"]);
+  });
+
+  test("a failure (e.g. no config for the slug) still exits non-zero and prints to stderr, same as the JSON form", async () => {
+    const home = mkdtempSync(join(tmpdir(), "zstack-identity-home-"));
+    homes.push(home);
+    const errs: string[] = [];
+    const origErr = console.error;
+    console.error = (s: string) => errs.push(s);
+    let code: number;
+    try {
+      code = await main(["state", "--slug", "nope", "--raw"], home);
+    } finally {
+      console.error = origErr;
+    }
+    expect(code).toBe(1);
+    expect(errs.join("\n")).toMatch(/No zstack config for "nope"/);
+  });
+});
+
 describe('main("record"): CLI flag wiring', () => {
   test("records bot + token-location and prints the resulting state", async () => {
     const home = makeHome("demo");
@@ -273,27 +319,62 @@ describe("already-chosen states are stable across repeated reads (AC6/AC7)", () 
 });
 
 // ============================================================================
+// Shared SKILL.md / bash fixtures, module scope so both the static prose
+// checks below and the executable proofs further down (issue #66 review)
+// can use the same extraction. Same read-the-shipped-file style as
+// tests/board.test.ts's F5 gh-invocation scanner and
+// tests/plan-schema.test.ts's section() pins.
+// ============================================================================
+const REPO_ROOT = join(import.meta.dir, "..");
+function section(md: string, heading: string): string {
+  const start = md.indexOf(heading);
+  if (start < 0) return "";
+  const rest = md.slice(start + heading.length);
+  const next = rest.indexOf("\n## ");
+  return next < 0 ? rest : rest.slice(0, next);
+}
+function skillFile(rel: string): string {
+  return readFileSync(join(REPO_ROOT, rel), "utf8");
+}
+// Every fenced code block's inner text, in document order -- what actually
+// runs when an agent follows the skill (bare prose between fences never does).
+function fencedBlocksOf(md: string): string[] {
+  return [...md.matchAll(/```[^\n]*\n([\s\S]*?)```/g)].map((m) => m[1]);
+}
+
+// SKILL.md prose blocks are bash an AGENT runs, not a checked-in script, so
+// proving a fix is more than "the right string appears" means extracting the
+// exact shipped fence and executing it for real, with `gh`/`bun` stubbed as
+// shell functions (which shadow a PATH lookup in the same script -- no PATH
+// wiring needed for them). Only `ls` inside the loop needs a real PATH entry.
+const BASH = Bun.which("bash");
+if (!BASH) throw new Error("bash not found on PATH: required to execute extracted SKILL.md bash blocks");
+function binDir(name: string): string {
+  const resolved = Bun.which(name);
+  if (!resolved) throw new Error(`${name} not found on PATH: required to execute extracted SKILL.md bash blocks`);
+  return toPosixPath(dirname(resolved));
+}
+const CORE_DIR = binDir("uname"); // ls, etc.
+
+function runBash(script: string, env: Record<string, string> = {}): { stdout: string; stderr: string; code: number } {
+  const childEnv: Record<string, string> = { PATH: CORE_DIR, ...env };
+  for (const key of ["SYSTEMROOT", "windir", "TEMP", "TMP"]) {
+    const v = process.env[key];
+    if (v && !(key in childEnv)) childEnv[key] = v;
+  }
+  const proc = Bun.spawnSync([BASH!, "-c", script], { env: childEnv });
+  return { stdout: proc.stdout.toString(), stderr: proc.stderr.toString(), code: proc.exitCode ?? -1 };
+}
+
+// ============================================================================
 // SKILL.md prose regressions surfaced by QA on the #66 rebuild pass. These
 // are procedure-text bugs, not lib code -- the underlying primitives above
 // already proved switching works (recordIdentityChoice overwrites a prior
 // choice); what QA caught was the SKILL.md guided procedures never invoking
 // that support, or a decision recorded with no real human interaction at
-// all. Same read-the-shipped-file style as tests/board.test.ts's F5 gh-
-// invocation scanner and tests/plan-schema.test.ts's section() pins.
+// all.
 // ============================================================================
 describe("SKILL.md prose regressions (issue #66 QA bounce)", () => {
-  const REPO_ROOT = join(import.meta.dir, "..");
-  function section(md: string, heading: string): string {
-    const start = md.indexOf(heading);
-    if (start < 0) return "";
-    const rest = md.slice(start + heading.length);
-    const next = rest.indexOf("\n## ");
-    return next < 0 ? rest : rest.slice(0, next);
-  }
-  function skillFile(rel: string): string {
-    return readFileSync(join(REPO_ROOT, rel), "utf8");
-  }
-
   test("z-update/SKILL.md's Step 2 never stands a bash variable in for the owner's answer", () => {
     // The exact bug: `if [ "$OWNER_ANSWER" = "bot" ]` inside a FENCED bash
     // block, where $OWNER_ANSWER was assigned nowhere, so the else branch
@@ -328,5 +409,229 @@ describe("SKILL.md prose regressions (issue #66 QA bounce)", () => {
     for (const rel of ["README.md", "z-uninstall/SKILL.md", "docs/user-guide/z-uninstall.md"]) {
       expect(skillFile(rel)).not.toMatch(/Step 7\b/);
     }
+  });
+});
+
+// ============================================================================
+// Reviewer findings on issue #66 (confidence=0, skeptics=2/3) -- both BLOCKS.
+//
+// Finding 1 (AC3): z-setup/SKILL.md Step 7 compared $CURRENT_LOGIN to $OWNER
+// to detect identity drift on re-runs -- correct on a personal repo ($OWNER
+// IS the human owner's own login) but broken on an org-owned repo ($OWNER is
+// the org's slug, which no individual human can ever authenticate as): a
+// "human" project got re-nagged on every single re-run, and a "bot" project
+// whose token had fallen back to a human login got a false "No changes".
+//
+// Finding 2 (AC6): z-update/SKILL.md Step 2 piped identity.ts's JSON output
+// through `jq`, which is not a checked prerequisite of this pack (only
+// gstack/bun/gh are) -- a missing jq, a bun error, or a corrupt config.json
+// all suppressed to `2>/dev/null` left $STATE empty, which never matched
+// "unset" and was never echoed: a real failure was silently indistinguishable
+// from "already answered", forever, with nothing surfaced.
+//
+// The reviewer's own closing note is that this exact surface (SKILL.md bash
+// an agent runs, not lib/*.ts) "has no executable test coverage by
+// construction... which is why both a QA pass and two skeptics keep finding
+// defects there" -- so each fix below is proven two ways: a static
+// structural pin (fast, documents intent) AND an EXECUTABLE proof that
+// spawns real bash against the exact fenced block extracted from the shipped
+// file, with `gh`/`bun` stubbed out. A regex pin alone would repeat the gap
+// the reviewer named.
+// ============================================================================
+describe("issue #66 review finding 1: z-setup Step 7's org-repo identity check", () => {
+  function verifyBlock(): string {
+    const step7 = section(skillFile("z-setup/SKILL.md"), "## Step 7");
+    const block = fencedBlocksOf(step7).find((f) => f.includes("IS_ORG="));
+    if (!block) throw new Error("Step 7's CURRENT_LOGIN/IS_ORG verification fence not found");
+    return block;
+  }
+
+  test("isInOrganization is checked before the STATE=bot/human comparisons (static ordering pin)", () => {
+    const block = verifyBlock();
+    const orgIdx = block.indexOf('if [ "$IS_ORG" = "true" ]');
+    const botIdx = block.indexOf('[ "$STATE" = "bot" ] && [ "$CURRENT_LOGIN" = "$OWNER" ]');
+    const humanIdx = block.indexOf('[ "$STATE" = "human" ] && [ "$CURRENT_LOGIN" != "$OWNER" ]');
+    expect(orgIdx).toBeGreaterThan(-1);
+    expect(botIdx).toBeGreaterThan(-1);
+    expect(humanIdx).toBeGreaterThan(-1);
+    // Must be an `if` (not a later `elif`), and must precede both broken
+    // comparisons -- otherwise an org repo can still reach one of them.
+    expect(orgIdx).toBeLessThan(botIdx);
+    expect(orgIdx).toBeLessThan(humanIdx);
+  });
+
+  test("the org-repo branch is a plain echo, never a question (must not re-nag every re-run)", () => {
+    expect(verifyBlock()).not.toContain("AskUserQuestion");
+  });
+
+  test("docs/user-guide/bot-identity.md documents the org caveat (review: grep for org/organization previously returned nothing)", () => {
+    const doc = skillFile("docs/user-guide/bot-identity.md");
+    expect(doc).toMatch(/organization|org-owned/i);
+  });
+
+  test("EXECUTABLE: an org-repo 'bot' identity that fell back to a human login gets an honest notice, never the false \"No changes\"", () => {
+    const script = `
+gh() {
+  case "$*" in
+    "api user -q .login") echo "$FAKE_LOGIN" ;;
+    "repo view --json isInOrganization -q .isInOrganization") echo "$FAKE_IS_ORG" ;;
+    *) echo "unexpected gh call: $*" >&2; exit 99 ;;
+  esac
+}
+${verifyBlock()}
+`;
+    const out = runBash(script, { STATE: "bot", OWNER: "acme-corp", FAKE_LOGIN: "alice", FAKE_IS_ORG: "true" });
+    expect(out.code).toBe(0);
+    expect(out.stdout).toContain("Org-owned repo");
+    expect(out.stdout).not.toContain("No changes");
+    expect(out.stdout).not.toContain("WARNING: config.json records a bot identity");
+  });
+
+  test("EXECUTABLE: an org-repo already-answered 'human' project is never re-nagged", () => {
+    const script = `
+gh() {
+  case "$*" in
+    "api user -q .login") echo "$FAKE_LOGIN" ;;
+    "repo view --json isInOrganization -q .isInOrganization") echo "$FAKE_IS_ORG" ;;
+    *) echo "unexpected gh call: $*" >&2; exit 99 ;;
+  esac
+}
+${verifyBlock()}
+`;
+    // Two different active humans, neither of which is (or ever could be)
+    // the org slug -- both must land on the same honest org notice, never
+    // the old "confirm below before switching" nag.
+    for (const login of ["alice", "bob"]) {
+      const out = runBash(script, { STATE: "human", OWNER: "acme-corp", FAKE_LOGIN: login, FAKE_IS_ORG: "true" });
+      expect(out.code).toBe(0);
+      expect(out.stdout).toContain("Org-owned repo");
+      expect(out.stdout).not.toContain("confirm below before switching");
+    }
+  });
+
+  test("EXECUTABLE: personal-repo behavior is unchanged -- the bot-regression warning still fires", () => {
+    const script = `
+gh() {
+  case "$*" in
+    "api user -q .login") echo "$FAKE_LOGIN" ;;
+    "repo view --json isInOrganization -q .isInOrganization") echo "$FAKE_IS_ORG" ;;
+    *) echo "unexpected gh call: $*" >&2; exit 99 ;;
+  esac
+}
+${verifyBlock()}
+`;
+    const out = runBash(script, { STATE: "bot", OWNER: "zacgoodwin", FAKE_LOGIN: "zacgoodwin", FAKE_IS_ORG: "false" });
+    expect(out.code).toBe(0);
+    expect(out.stdout).toContain("WARNING: config.json records a bot identity");
+    expect(out.stdout).not.toContain("Org-owned repo");
+  });
+
+  test("EXECUTABLE: personal-repo behavior is unchanged -- the human-switch-offer still fires, and the stable case still says 'No changes'", () => {
+    const script = `
+gh() {
+  case "$*" in
+    "api user -q .login") echo "$FAKE_LOGIN" ;;
+    "repo view --json isInOrganization -q .isInOrganization") echo "$FAKE_IS_ORG" ;;
+    *) echo "unexpected gh call: $*" >&2; exit 99 ;;
+  esac
+}
+${verifyBlock()}
+`;
+    const switchOut = runBash(script, { STATE: "human", OWNER: "zacgoodwin", FAKE_LOGIN: "the-bot", FAKE_IS_ORG: "false" });
+    expect(switchOut.stdout).toContain("confirm below before switching");
+    expect(switchOut.stdout).not.toContain("Org-owned repo");
+
+    const stableOut = runBash(script, { STATE: "human", OWNER: "zacgoodwin", FAKE_LOGIN: "zacgoodwin", FAKE_IS_ORG: "false" });
+    expect(stableOut.stdout).toContain("No changes");
+  });
+});
+
+describe("issue #66 review finding 2: z-update Step 2 no longer silently swallows a state-read failure", () => {
+  function loopBlock(): string {
+    const step2 = section(skillFile("z-update/SKILL.md"), "## Step 2");
+    const block = fencedBlocksOf(step2).find((f) => f.includes("for SLUG in"));
+    if (!block) throw new Error("Step 2's enumeration fence not found");
+    return block;
+  }
+
+  test("the enumeration no longer invokes jq and reads --raw output (static pin: jq is not a checked prerequisite of this pack)", () => {
+    const block = loopBlock();
+    // "jq" may still appear in the explanatory comment (the historical bug);
+    // what must be gone is an actual pipe INTO the jq command.
+    expect(block).not.toMatch(/\|\s*jq\b/);
+    expect(block).toContain("--raw");
+  });
+
+  test("a non-zero exit from the state read is captured and warned about, not swallowed (static pin)", () => {
+    const block = loopBlock();
+    expect(block).toContain("CODE=$?");
+    expect(block).toMatch(/\$CODE"\s*-ne\s*0/);
+    expect(block).toContain("WARN:");
+    // The `ls ... 2>/dev/null` on the for-loop header is fine (an empty/
+    // missing projects dir is a normal, silent no-op); what must be gone is
+    // suppressing the STATE= read's own stderr the way the old
+    // `2>/dev/null | jq ... 2>/dev/null` pipeline did.
+    expect(block).not.toMatch(/--raw[^\n]*2>\/dev\/null/);
+  });
+
+  test("EXECUTABLE: a slug whose state can't be read is warned about on stderr, and is neither raised nor treated as already-answered", () => {
+    const home = mkdtempSync(join(tmpdir(), "zstack-identity-step2-home-"));
+    homes.push(home);
+    for (const slug of ["proj-unset", "proj-bot", "proj-human", "proj-broken"]) {
+      mkdirSync(join(home, ".zstack", "projects", slug), { recursive: true });
+    }
+    const script = `
+HOME="${toPosixPath(home)}"
+bun() {
+  case "$4" in
+    proj-unset) echo "unset" ;;
+    proj-bot) echo "bot" ;;
+    proj-human) echo "human" ;;
+    proj-broken) echo "Config at $HOME/.zstack/projects/proj-broken/config.json is not valid JSON: Unexpected token" >&2; return 1 ;;
+    *) echo "unexpected slug: $4" >&2; return 98 ;;
+  esac
+}
+${loopBlock()}
+`;
+    // Not asserting out.code here: the loop's last statement is
+    // `[ "$STATE" = "unset" ] && echo "$SLUG"`, so the SCRIPT's own exit
+    // status is just whichever slug `ls` happens to enumerate last matching
+    // or not -- a shell idiom artifact, not part of Step 2's contract (the
+    // agent reads stdout/stderr, never this loop's exit code). Pre-existing
+    // shape, unrelated to this fix.
+    const out = runBash(script);
+    const raised = out.stdout.split(/\r?\n/).filter(Boolean);
+    // Only the genuinely-unset project is raised -- not bot, not human, and
+    // NOT the broken one (the exact bug: a read failure used to look exactly
+    // like "already answered" and vanish from this list forever).
+    expect(raised).toEqual(["proj-unset"]);
+    expect(out.stderr).toMatch(/WARN.*proj-broken/);
+    expect(out.stdout).not.toContain("proj-broken");
+  });
+
+  test("EXECUTABLE: a clean run with every project already answered raises nothing and warns nothing", () => {
+    const home = mkdtempSync(join(tmpdir(), "zstack-identity-step2-home-"));
+    homes.push(home);
+    for (const slug of ["proj-bot", "proj-human"]) {
+      mkdirSync(join(home, ".zstack", "projects", slug), { recursive: true });
+    }
+    const script = `
+HOME="${toPosixPath(home)}"
+bun() {
+  case "$4" in
+    proj-bot) echo "bot" ;;
+    proj-human) echo "human" ;;
+    *) echo "unexpected slug: $4" >&2; return 98 ;;
+  esac
+}
+${loopBlock()}
+`;
+    // Not asserting out.code here either -- see the note in the previous
+    // test; with only "bot"/"human" slugs the last `[ ... ] && echo` is
+    // always false, so the script legitimately exits 1 even though nothing
+    // is wrong. stdout/stderr are the real assertions.
+    const out = runBash(script);
+    expect(out.stdout.trim()).toBe("");
+    expect(out.stderr.trim()).toBe("");
   });
 });
