@@ -245,8 +245,10 @@ actually works," and either is a legitimate answer depending on how hands-on
 you plan to stay.
 
 You can switch to a bot identity later at any time: come back to this page,
-work through Steps 1-4, then re-run `/z-setup` — it detects the change in
-what `gh` resolves to and re-records the choice.
+work through Steps 1-4, then re-run `/z-setup` — it detects that `gh` no
+longer resolves to you, confirms with you that this is really the switch to
+the bot (never automatic — a different personal login on the machine could
+trigger the same detection), and only then re-records the choice.
 
 ## Verification checklist
 

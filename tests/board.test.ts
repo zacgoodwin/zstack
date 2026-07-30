@@ -1322,6 +1322,11 @@ describe("contract enforcement", () => {
       `gh api user`, // prose reference (Step 7 intro paragraph)
       `gh api user -q .login`, // prose reference (Step 7 Answer A: confirming the bot is authed)
     ],
+    "z-update/SKILL.md": [
+      // Step 2 identity re-check (issue #66), Answer A: same read-only login
+      // confirmation as z-setup/SKILL.md Step 7 Answer A, prose reference only.
+      `gh api user -q .login`,
+    ],
     "z-plan/SKILL.md": [
       // slug lookup: read-only (trailing shell comment is part of the line)
       `gh repo view --json name -q .name) # one board per repo; matches /z-setup`,
@@ -1423,6 +1428,27 @@ describe("contract enforcement", () => {
       const allowed = new Set(SKILL_GH_ALLOWLIST[f] ?? []);
       for (const inv of ghInvocations(readFileSync(join(REPO_ROOT, f), "utf8"))) {
         if (!allowed.has(inv)) offenders.push(`${f}: ${inv}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  // Issue #66 QA bounce: z-update/SKILL.md's original Step 2 buried an
+  // AskUserQuestion decision INSIDE a bash fence, keyed on $OWNER_ANSWER -- a
+  // variable nothing in the file ever assigned. The `else` branch fired
+  // unconditionally, silently recording "human" with zero human interaction
+  // (violates PRINCIPLES.md's latent/deterministic split: a human decision is
+  // latent-space work and belongs in prose the agent reads, never simulated by
+  // an unset bash variable). Every legitimate AskUserQuestion call in every
+  // other skill file already lives in prose outside any fence; this keeps it
+  // that way everywhere, not just in the one file QA caught it in.
+  test("no SKILL.md embeds an AskUserQuestion decision inside a fenced code block", () => {
+    const skillFiles = trackedFiles().filter((f) => f.endsWith("/SKILL.md"));
+    const offenders: string[] = [];
+    for (const f of skillFiles) {
+      const content = readFileSync(join(REPO_ROOT, f), "utf8");
+      for (const m of content.matchAll(/```[^\n]*\n([\s\S]*?)```/g)) {
+        if (m[1].includes("AskUserQuestion")) offenders.push(f);
       }
     }
     expect(offenders).toEqual([]);

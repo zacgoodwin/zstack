@@ -79,37 +79,64 @@ shipped has no recorded choice at all, and a bot's token can be
 rotated/revoked later. It never re-asks a project that has already
 answered, either way (AC6).
 
-Walk every project this machine has configured — not just whichever repo
-`/z-update` happened to run from:
+First, find every project this machine has configured that has not yet
+answered — not just whichever repo `/z-update` happened to run from. This
+half is pure enumeration, no decision, so it is safe to run as bash:
 
 ```bash
 for SLUG in $(ls "$HOME/.zstack/projects" 2>/dev/null); do
   STATE=$(bun "$PACK/lib/identity.ts" state --slug "$SLUG" 2>/dev/null | jq -r .state 2>/dev/null)
-  [ "$STATE" = "unset" ] || continue   # already answered (bot or human), or unreadable -- leave it alone
-  read -r OWNER REPO <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts'; const c = loadConfig('$SLUG'); console.log(c.owner, c.repo)")"
-
-  # Ask (decision-brief, condensed -- full rationale lives at z-setup/SKILL.md
-  # Step 7 and docs/user-guide/bot-identity.md, not repeated here):
-  #   "Should $OWNER/$REPO's loop run as its own bot GitHub account, or
-  #   continue as yours? This project predates issue #66 (or was never
-  #   asked). 'Continue as yours' is fully supported, but leaves issue #204
-  #   live: a standing human instruction left in a ticket comment is
-  #   invisible to the planning pass while the loop's login is your own. See
-  #   docs/user-guide/bot-identity.md for the bot-account walkthrough.
-  #   [A) Set up a bot account / B) Continue as my own account]"
-  # Then record EXACTLY ONE of the following -- never both -- matching
-  # whichever the owner answered:
-  if [ "$OWNER_ANSWER" = "bot" ]; then
-    bun "$PACK/lib/identity.ts" record --slug "$SLUG" --mode bot --token-location "<what the owner told you>"
-  else
-    bun "$PACK/lib/identity.ts" record --slug "$SLUG" --mode human
-  fi
+  # only "unset" needs re-checking -- "bot"/"human" (already answered) and
+  # an unreadable config are silently skipped, left alone
+  [ "$STATE" = "unset" ] && echo "$SLUG"
 done
 ```
 
 A machine with no configured projects at all (`~/.zstack/projects` empty or
-missing) has nothing to re-check — the loop body above simply never executes,
-and Step 3 runs next.
+missing), or none in state `"unset"`, prints nothing — Step 2 has nothing to
+re-check, and Step 3 runs next.
+
+For EACH slug the enumeration above printed, ask the owner directly in your
+own reply — do not wrap the ask in a bash conditional or let a bash variable
+stand in for a human answer. (That is the exact bug this step used to have:
+an `if` branching on `$OWNER_ANSWER`, a variable nothing ever assigned, so
+the `else` fired unconditionally and recorded "human" with zero human
+interaction.) Load that project's owner/repo for the brief:
+
+```bash
+read -r OWNER REPO <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts'; const c = loadConfig('$SLUG'); console.log(c.owner, c.repo)")"
+```
+
+Then ask via AskUserQuestion, decision-brief, condensed (full rationale
+lives at z-setup/SKILL.md Step 7 and docs/user-guide/bot-identity.md, not
+repeated here):
+
+```
+Should $OWNER/$REPO's loop run as its own bot GitHub account, or continue as
+yours? This project predates issue #66 (or was never asked). "Continue as
+yours" is fully supported, but leaves issue #204 live: a standing human
+instruction left in a ticket comment is invisible to the planning pass
+while the loop's login is your own. See docs/user-guide/bot-identity.md for
+the bot-account walkthrough.
+[A) Set up a bot account / B) Continue as my own account]
+```
+
+Record EXACTLY the branch the owner answered — never both, never a default:
+
+- **Answer A (bot).** Confirm `gh` is authenticated as the bot
+  (`gh api user -q .login` prints the bot's login, not `$OWNER`), then:
+
+  ```bash
+  bun "$PACK/lib/identity.ts" record --slug "$SLUG" --mode bot --token-location "<what the owner told you>"
+  ```
+
+- **Answer B (human).**
+
+  ```bash
+  bun "$PACK/lib/identity.ts" record --slug "$SLUG" --mode human
+  ```
+
+Repeat for every slug the enumeration printed.
 
 ## Step 3 — Report the result
 

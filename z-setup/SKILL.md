@@ -224,19 +224,43 @@ re-ask — AC7):
 STATE=$(bun "$PACK/lib/identity.ts" state --slug "$SLUG" | jq -r .state)
 ```
 
-**`$STATE` is `"bot"` or `"human"` already:** do not re-ask. When it's
-`"bot"`, re-verify nothing has drifted (idempotent, changing nothing — AC7):
-a rotated/revoked bot token, or someone running `gh auth login` as
-themselves, can silently fall back to the owner's own login.
+**`$STATE` is `"bot"` or `"human"` already:** do not blindly re-ask — but do
+verify the live `gh` login still matches what's recorded (idempotent,
+changing nothing when it does — AC7), and flag it when it doesn't. A
+rotated/revoked bot token, or someone running `gh auth login` as themselves,
+can silently fall back to the owner's own login on a recorded `"bot"`
+project; conversely, a recorded `"human"` project whose active login is no
+longer the owner usually means the bot-account setup
+(docs/user-guide/bot-identity.md) just happened and the active `gh` login
+changed.
 
 ```bash
 CURRENT_LOGIN=$(gh api user -q .login)
 if [ "$STATE" = "bot" ] && [ "$CURRENT_LOGIN" = "$OWNER" ]; then
   echo "WARNING: config.json records a bot identity, but the active GitHub CLI login is the repo owner ($OWNER). Re-authenticate as the bot account, or re-run this step to deliberately record 'continue as human' instead."
+elif [ "$STATE" = "human" ] && [ "$CURRENT_LOGIN" != "$OWNER" ]; then
+  echo "config.json records 'continue as human', but the active GitHub CLI login ('$CURRENT_LOGIN') is not the repo owner ('$OWNER') -- confirm below before switching."
 else
   echo "Identity already recorded as '$STATE' (currently authenticated as '$CURRENT_LOGIN'). No changes."
 fi
 ```
+
+The first branch's warning is the full remediation — nothing further to run.
+The third branch (`"No changes"`) needs nothing further either — the common,
+stable case on every re-run.
+
+The second branch needs a human decision before recording anything, same
+discipline as the `"unset"` case below: never auto-switch on a login change
+alone, since `$CURRENT_LOGIN` could just as easily be a different personal
+account as the bot (e.g. a teammate briefly authenticated on a shared
+machine). Ask via AskUserQuestion: "config.json still records this project
+as continuing on your own account, but `gh` is now authenticated as
+`$CURRENT_LOGIN`, not the owner `$OWNER` — this looks like you finished the
+bot-account setup. Switch the recorded identity to bot?" Options:
+**A) Yes, record `$CURRENT_LOGIN` as the bot identity** / **B) No, this is a
+different personal login — leave it recorded as human.** On A, confirm the
+token/gh-auth location the same way as Answer A below, then run the same
+`identity.ts record --mode bot` command. On B, leave `config.json` untouched.
 
 **`$STATE` is `"unset"`** (first-time setup, or a project that predates
 issue #66): ask the owner via AskUserQuestion, decision-brief format (D3):
@@ -413,9 +437,16 @@ Report DONE only when all of these hold:
 - `/setup-deploy` ran.
 - Step 7 (GitHub identity, issue #66) has a recorded choice -- `"bot"` or
   `"human"` -- in `config.json`. First-time setup requires an explicit
-  answer (this DOES gate DONE, unlike Step 8 below); a re-run with an
-  already-recorded choice reports it and changes nothing.
+  answer (this DOES gate DONE, unlike Step 8 below); a re-run whose active
+  `gh` login still matches what's recorded reports it and changes nothing.
+  A re-run whose active login has drifted from what's recorded surfaces
+  that (Step 7's warning/confirm branches) and, for a recorded-human ->
+  now-authenticated-as-someone-else drift, may update the record, but only
+  after the owner explicitly confirms the switch.
 - Step 8 (auto-approvals) was offered via AskUserQuestion; its answer (A/B/C)
   does not gate DONE.
 
-A re-run of /z-setup on an already-set-up repo must make zero changes (idempotent).
+A re-run of /z-setup on an already-set-up repo whose `gh` login hasn't
+changed must make zero changes (idempotent); a re-run after the active `gh`
+login was deliberately switched is expected to surface that drift, per
+Step 7 above.

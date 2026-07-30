@@ -7,7 +7,7 @@ description: |
   same ownership rule setup uses: it never deletes a directory it cannot prove it
   created (a symlink pointing into the pack, or a copy carrying the
   .zstack-registered sentinel). Also
-  strips the Claude Code auto-approval entries /z-setup's Step 7 wrote, when they
+  strips the Claude Code auto-approval entries /z-setup's Step 8 wrote, when they
   are present. Destructive: confirms with you first. GitHub-side data (the board,
   milestones, labels) is remote and never touched.
   Use when asked to "uninstall zstack", "remove zstack", "z-uninstall", or to undo
@@ -17,7 +17,7 @@ description: |
 # /z-uninstall — Remove zstack from this machine
 
 You are removing the zstack install `./setup` created. This reverses `./setup`
-(and, optionally, the auto-approvals `/z-setup` Step 7 wrote). It is destructive,
+(and, optionally, the auto-approvals `/z-setup` Step 8 wrote). It is destructive,
 so **confirm with the human before doing anything**. It touches only local files:
 the GitHub board, its milestones, and its labels are remote data this skill never
 reaches — say so, and leave them to the human.
@@ -85,7 +85,7 @@ any printed `rm -rf` command for a clone or for `~/.zstack`.
 
 ## Step 3 — Remove the auto-approval settings (only if present)
 
-`/z-setup` Step 7 optionally wrote Claude Code permission entries into
+`/z-setup` Step 8 optionally wrote Claude Code permission entries into
 `~/.claude/settings.json` (an allow hook, `bypassPermissions` default mode + skip
 flags, and the git/gh/bun/bunx allow rules). Check whether any are present, and
 strip exactly those — leaving every other setting intact — only when they are.

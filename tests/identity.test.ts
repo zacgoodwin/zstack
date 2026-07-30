@@ -271,3 +271,62 @@ describe("already-chosen states are stable across repeated reads (AC6/AC7)", () 
     expect(identityState(readConfig(home, "demo"))).toBe("human");
   });
 });
+
+// ============================================================================
+// SKILL.md prose regressions surfaced by QA on the #66 rebuild pass. These
+// are procedure-text bugs, not lib code -- the underlying primitives above
+// already proved switching works (recordIdentityChoice overwrites a prior
+// choice); what QA caught was the SKILL.md guided procedures never invoking
+// that support, or a decision recorded with no real human interaction at
+// all. Same read-the-shipped-file style as tests/board.test.ts's F5 gh-
+// invocation scanner and tests/plan-schema.test.ts's section() pins.
+// ============================================================================
+describe("SKILL.md prose regressions (issue #66 QA bounce)", () => {
+  const REPO_ROOT = join(import.meta.dir, "..");
+  function section(md: string, heading: string): string {
+    const start = md.indexOf(heading);
+    if (start < 0) return "";
+    const rest = md.slice(start + heading.length);
+    const next = rest.indexOf("\n## ");
+    return next < 0 ? rest : rest.slice(0, next);
+  }
+  function skillFile(rel: string): string {
+    return readFileSync(join(REPO_ROOT, rel), "utf8");
+  }
+
+  test("z-update/SKILL.md's Step 2 never stands a bash variable in for the owner's answer", () => {
+    // The exact bug: `if [ "$OWNER_ANSWER" = "bot" ]` inside a FENCED bash
+    // block, where $OWNER_ANSWER was assigned nowhere, so the else branch
+    // fired unconditionally and recorded "human" with zero human
+    // interaction. Fenced code is what actually runs, so that's what this
+    // checks; the name is still allowed to appear in prose describing the
+    // historical bug (it does, deliberately, a few lines above Step 2's
+    // fences).
+    const content = skillFile("z-update/SKILL.md");
+    const fencedBlocks = [...content.matchAll(/```[^\n]*\n([\s\S]*?)```/g)].map((m) => m[1]);
+    expect(fencedBlocks.length).toBeGreaterThan(0); // canary: the scan must find Step 2's fences
+    for (const block of fencedBlocks) {
+      expect(block).not.toContain("OWNER_ANSWER");
+    }
+  });
+
+  test("z-setup/SKILL.md's Step 7 has a branch that offers to switch a recorded 'human' choice to 'bot' once the active gh login has moved off the owner", () => {
+    const step7 = section(skillFile("z-setup/SKILL.md"), "## Step 7");
+    expect(step7).toMatch(
+      /\[\s*"\$STATE"\s*=\s*"human"\s*\]\s*&&\s*\[\s*"\$CURRENT_LOGIN"\s*!=\s*"\$OWNER"\s*\]/
+    );
+    // The switch is confirmed, never silent -- distinguishes a real bot login
+    // from a different personal account temporarily authenticated.
+    expect(step7).toContain("AskUserQuestion");
+  });
+
+  test("no file still points 'Step 7' readers at the auto-approvals step (renumbered to Step 8 by this ticket)", () => {
+    // Each of these three files' only prior "Step 7" mention was the stale
+    // auto-approvals cross-reference (confirmed by a full-repo grep during
+    // the rebuild) -- so "contains no 'Step 7' at all" is a precise
+    // regression guard here, not an over-broad one.
+    for (const rel of ["README.md", "z-uninstall/SKILL.md", "docs/user-guide/z-uninstall.md"]) {
+      expect(skillFile(rel)).not.toMatch(/Step 7\b/);
+    }
+  });
+});

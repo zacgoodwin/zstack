@@ -57,7 +57,7 @@ command executes from IS the registration, and it cannot delete itself. Each run
    that repo needs `/z-setup` again — but the board and its ticket statuses live
    on GitHub and are unaffected.
 
-4. **Claude Code auto-approvals, only if present.** `/z-setup` Step 7 optionally
+4. **Claude Code auto-approvals, only if present.** `/z-setup` Step 8 optionally
    wrote permission entries into `~/.claude/settings.json` (an allow hook,
    `bypassPermissions` + skip flags, and the git/gh/bun/bunx allow rules).
    `bin/z-setup-permissions --remove` strips **exactly** those and nothing else —
