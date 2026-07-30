@@ -1359,6 +1359,13 @@ describe("contract enforcement", () => {
       `gh repo view --json name -q .name)`,
       `gh repo view --json defaultBranchRef -q .defaultBranchRef.name)`,
       `gh api user -q .login)`,
+      // issue #66: the numeric half of the loop's git commit author, so an
+      // authored commit can never disagree with the account gh is authed as.
+      // Same read-only endpoint as the .login lookup above, different field --
+      // deliberately a second plain call rather than one -q template emitting
+      // both, because the nested quoting that would require is exactly the
+      // kind of line a later edit breaks silently. One extra read per RUN.
+      `gh api user -q .id)`,
       `gh auth status`, // read-only auth probe (prereq checklist)
       // read-only body fetches (planning pass + board snapshot); z-board has no
       // body-read subcommand

@@ -544,6 +544,43 @@ ${verifyBlock()}
     const stableOut = runBash(script, { STATE: "human", OWNER: "zacgoodwin", FAKE_LOGIN: "zacgoodwin", FAKE_IS_ORG: "false" });
     expect(stableOut.stdout).toContain("No changes");
   });
+
+  // AC7's own scenario, and the one combination the four cases above leave
+  // out: a PERSONAL repo that recorded "bot", with `gh` genuinely authed AS
+  // the bot -- i.e. STATE="bot" and CURRENT_LOGIN != $OWNER. The only other
+  // STATE="bot" case sets the login EQUAL to $OWNER, which is the drift
+  // branch, not this stable one. Three review skeptics agreed the shipped
+  // if/elif chain reaches the right `else` here, but all three reached that
+  // by hand-tracing; AC7 asks for "verifies ... and reports so, changing
+  // nothing", so it gets executed like every sibling branch rather than
+  // trusted by symmetry.
+  test("EXECUTABLE (AC7): a personal repo recorded 'bot' and authed AS the bot reports 'No changes' and asks nothing", () => {
+    const script = `
+gh() {
+  case "$*" in
+    "api user -q .login") echo "$FAKE_LOGIN" ;;
+    "repo view --json isInOrganization -q .isInOrganization") echo "$FAKE_IS_ORG" ;;
+    *) echo "unexpected gh call: $*" >&2; exit 99 ;;
+  esac
+}
+${verifyBlock()}
+`;
+    const out = runBash(script, {
+      STATE: "bot",
+      OWNER: "zacgoodwin",
+      FAKE_LOGIN: "zstack-loop-bot",
+      FAKE_IS_ORG: "false",
+    });
+    expect(out.code).toBe(0);
+    expect(out.stdout).toContain("No changes");
+    // Idempotent: it reports, and does not take (or offer) any action.
+    expect(out.stdout).not.toContain("WARNING: config.json records a bot identity");
+    expect(out.stdout).not.toContain("confirm below before switching");
+    expect(out.stdout).not.toContain("Org-owned repo");
+    // And it names the login it actually verified, so the report is evidence
+    // rather than an unconditional reassurance.
+    expect(out.stdout).toContain("zstack-loop-bot");
+  });
 });
 
 describe("issue #66 review finding 2: z-update Step 2 no longer silently swallows a state-read failure", () => {
@@ -633,5 +670,144 @@ ${loopBlock()}
     const out = runBash(script);
     expect(out.stdout.trim()).toBe("");
     expect(out.stderr.trim()).toBe("");
+  });
+});
+
+// ============================================================================
+// AC5 requires more than "both branches are offered": choosing "continue as
+// the human's account" must STATE the #204 consequence (the fold-in gate
+// cannot fire) before the choice is accepted. z-setup/SKILL.md does say it,
+// but nothing pinned it -- `grep -rn "204" tests/` returned zero hits, so a
+// future edit tightening that decision brief could silently drop the one
+// sentence AC5 is about. This is a prose-content requirement, so a content
+// assertion is the right (and only) instrument.
+// ============================================================================
+describe("issue #66 AC5: the human-account branch states its #204 cost before being accepted", () => {
+  test("z-setup/SKILL.md Step 7's decision brief names #204 and what it costs", () => {
+    const step7 = section(skillFile("z-setup/SKILL.md"), "## Step 7");
+    expect(step7).toContain("#204");
+    // Not just the bare issue number: the brief has to say what goes wrong,
+    // in terms an owner can act on. The gate cannot see a human comment
+    // while the loop shares that human's login.
+    expect(step7).toMatch(/fold-in gate|standing instruction/i);
+    expect(step7).toMatch(/invisible to the planning pass/i);
+  });
+
+  test("the #204 cost sits in the SAME decision brief that offers the human branch, not in unrelated prose", () => {
+    // Guards the failure mode the assertion above can't see on its own: the
+    // sentence surviving somewhere in Step 7 while the actual choice text
+    // loses it. Both must live in one block.
+    const step7 = section(skillFile("z-setup/SKILL.md"), "## Step 7");
+    const brief = fencedBlocksOf(step7).find((f) => f.includes("D3 —"));
+    if (!brief) throw new Error("Step 7's D3 decision brief fence not found");
+    expect(brief).toContain("#204");
+    expect(brief).toMatch(/Continue as your own account|continue as human/i);
+  });
+
+  test("docs/user-guide/bot-identity.md states the same cost for readers who arrive there first", () => {
+    const page = skillFile("docs/user-guide/bot-identity.md");
+    expect(page).toContain("#204");
+    expect(page).toMatch(/invisible to the loop|fold-in gate/i);
+  });
+});
+
+// ============================================================================
+// Issue #66, owner directive 2026-07-30T17:53Z: "if the bot takes an action it
+// should show up as that GH user taking that action." `gh` auth alone does NOT
+// deliver that for commits -- it governs the API actor and the push credential,
+// while the author inside a commit object comes from git's user.name/user.email
+// (the human's, on a developer machine). z-loop/SKILL.md Step 0 therefore
+// derives ME_EMAIL from the same `gh api user` call as ME, and the claim row
+// stamps both onto the lane worktree.
+//
+// The subtle part -- and the reason this gets an executable test and not just a
+// grep -- is that worktrees SHARE the main repo's .git/config. The obvious
+// `git -C <worktree> config user.name` rewrites the HUMAN's identity in their
+// own checkout. Only `--worktree` (behind extensions.worktreeConfig) scopes it.
+// A future edit dropping that flag would look harmless and silently re-author
+// the owner's personal commits, so the behavior is proven against real git.
+// ============================================================================
+describe("issue #66: lane commits are authored by the account gh is authed as", () => {
+  function claimRow(): string {
+    const md = skillFile("z-loop/SKILL.md");
+    const row = md.split("\n").find((l) => l.includes("| `claim N` |"));
+    if (!row) throw new Error("z-loop/SKILL.md's `claim N` action row not found");
+    return row;
+  }
+
+  test("Step 0 derives ME and ME_EMAIL from one `gh api user` call, storing neither in config.json", () => {
+    const md = skillFile("z-loop/SKILL.md");
+    expect(md).toMatch(/^ME=\$\(gh api user -q \.login\)$/m);
+    expect(md).toMatch(/^ME_ID=\$\(gh api user -q \.id\)$/m);
+    expect(md).toMatch(/^ME_EMAIL="\$ME_ID\+\$ME@users\.noreply\.github\.com"$/m);
+    // GitHub's noreply form is what links a commit to the account when the
+    // account's email is private -- a bare login would not.
+    expect(md).toContain("users.noreply.github.com");
+    // The whole point of deriving it live: no second copy of the identity can
+    // drift from the real auth. Asserted on what actually reaches disk rather
+    // than by grepping the source (which legitimately mentions `.login` when
+    // describing where identity really comes from): the recorded block carries
+    // the CHOICE and nothing that could impersonate an identity.
+    const home = makeHome("demo");
+    const written = recordIdentityChoice(
+      "demo",
+      { mode: "bot", tokenLocation: "gh auth login (bot profile)", now: () => "2026-07-30T00:00:00.000Z" },
+      home
+    );
+    expect(Object.keys(written.identity!).sort()).toEqual(["mode", "recordedAt", "tokenLocation"]);
+    const onDisk = JSON.stringify(readConfig(home, "demo").identity);
+    expect(onDisk).not.toMatch(/users\.noreply\.github\.com/);
+    expect(onDisk).not.toMatch(/"(login|email|user)"\s*:/);
+  });
+
+  test("the claim row stamps the worktree with --worktree, never the shared-config form", () => {
+    const row = claimRow();
+    expect(row).toContain('config --worktree user.name "$ME"');
+    expect(row).toContain('config --worktree user.email "$ME_EMAIL"');
+    // extensions.worktreeConfig must be enabled first or --worktree hard-fails.
+    expect(row).toContain("git config extensions.worktreeConfig true");
+    // The regression this guards: the same ASSIGNMENT without --worktree,
+    // i.e. `config user.name "$ME"`. Matched with its argument so the row's
+    // own WARNING prose -- which quotes the bad form by name precisely so a
+    // future editor knows not to use it -- isn't mistaken for the bug.
+    expect(row).not.toMatch(/config user\.(name|email) "\$/);
+  });
+
+  test("EXECUTABLE: the shipped mechanism authors lane commits as the bot and leaves the human's own checkout alone", () => {
+    const home = mkdtempSync(join(tmpdir(), "zstack-identity-gitauthor-"));
+    homes.push(home);
+    const root = toPosixPath(home);
+    // Real git, real worktree, the exact three commands from the claim row.
+    const script = `
+set -e
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+cd "${root}"
+git init -q main && cd main
+git config user.name "HumanOwner"
+git config user.email "human@example.com"
+git config commit.gpgsign false
+echo a > a.txt && git add . && git commit -qm init
+ME="zstack-loop-bot"
+ME_EMAIL="4242+zstack-loop-bot@users.noreply.github.com"
+git worktree add -q ../wt -b lane HEAD
+# --- the claim row's step 4b, verbatim in shape ---
+git config extensions.worktreeConfig true
+git -C ../wt config --worktree user.name "$ME"
+git -C ../wt config --worktree user.email "$ME_EMAIL"
+# --- a lane commit, then a commit by the human in their own checkout ---
+cd ../wt && echo b > b.txt && git add . && git commit -qm "lane work"
+echo "LANE=$(git log -1 --format='%an <%ae>')"
+cd ../main && echo c > c.txt && git add . && git commit -qm "human work"
+echo "MAIN=$(git log -1 --format='%an <%ae>')"
+`;
+    const out = runBash(script, { PATH: `${binDir("git")}:${CORE_DIR}` });
+    expect(out.stderr).not.toContain("fatal:");
+    expect(out.code).toBe(0);
+    // The lane's commit is the bot's.
+    expect(out.stdout).toContain("LANE=zstack-loop-bot <4242+zstack-loop-bot@users.noreply.github.com>");
+    // ...and the human's own checkout is untouched. This is the assertion
+    // that fails if --worktree is ever dropped: without it, MAIN becomes the
+    // bot too, i.e. the loop silently re-authored the owner's commits.
+    expect(out.stdout).toContain("MAIN=HumanOwner <human@example.com>");
   });
 });

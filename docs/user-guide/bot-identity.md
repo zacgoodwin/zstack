@@ -50,14 +50,32 @@ Prior art: [savas.me — my coding agent needed its own GitHub identity](https:/
   name, lane locks, and board **claim** all derive from this one line.
 - `bin/z-board claim <N> <assignee>` takes the assignee as a parameter; it is
   never the repo owner's login by default.
-- Commits and PRs are authored by whatever `gh`/`git` are configured to use
-  at push/PR-create time.
+- Comments, PRs, merges, and pushes are performed by whichever account `gh`
+  is authenticated as — that account is the actor GitHub records.
+- **Commit authorship is separate, and the loop sets it explicitly.** `gh`
+  auth governs API calls and the HTTPS credential helper (who pushes); the
+  author stamped inside a commit object comes from git's own
+  `user.name`/`user.email`, which on your machine is *you*. So the loop
+  derives `ME_EMAIL` from the same `gh api user` call that resolves `ME`
+  (`<id>+<login>@users.noreply.github.com`, GitHub's noreply form) and
+  stamps both onto each lane worktree at claim time. Without that, a
+  bot-authed loop would still land commits authored by you.
 
-So making the loop run as a bot is entirely a matter of **which account `gh`
-is authenticated as when `/z-loop` runs** — no code changes, no config knob
-for "the loop's login" (deliberately: `gh api user` staying the single
-source of truth is what keeps this trustworthy). The steps below are all
-GitHub-account and `gh`-auth setup; none of them touch this repo's code.
+So making the loop run as a bot is a matter of **which account `gh` is
+authenticated as when `/z-loop` runs** — there is no config knob for "the
+loop's login" (deliberately: `gh api user` staying the single source of
+truth is what keeps this trustworthy, and a stored login could disagree with
+the live auth). The steps below are all GitHub-account and `gh`-auth setup;
+none of them ask you to configure git identity by hand, because the loop
+already derives it from the account you authenticate.
+
+> **Why the loop scopes that git identity per worktree.** Git worktrees share
+> the main repo's `.git/config`, so writing `user.name` from inside a lane
+> worktree the ordinary way would rewrite the identity of your own checkout
+> too, re-authoring your personal commits in that repo. The loop uses
+> `git config --worktree` (behind `extensions.worktreeConfig`) so the bot
+> identity applies only to the lane's worktree and your own checkout keeps
+> yours. You never have to set or unset anything.
 
 ## Step 1 — Create the bot's GitHub account
 
@@ -250,8 +268,15 @@ second account rather than just documented — do it once per install:
    from Step 2 in place, run a small end-to-end slice: claim a ticket, edit
    its body, open a PR, squash-merge it, push and delete the branch. Expect
    every step to succeed, `gh api user -q .login` to return the bot's login
-   throughout, the board claim to show the bot as assignee, and the merge
-   commit + PR to be authored by the bot.
+   throughout, and the board claim to show the bot as assignee. Check
+   authorship in **both** places, because they come from different
+   mechanisms: the PR and the squashed commit on the default branch follow
+   the account that opened/merged the PR (that's `gh` auth), while the
+   individual commits listed inside the PR carry the git author the lane
+   stamped (that's `ME_EMAIL`, set per worktree at claim time). Both should
+   read as the bot; if the branch commits show *you*, the lane's
+   `git config --worktree` step didn't run — see
+   [What stays true either way](#what-stays-true-either-way).
 2. **The missing-grant path.** Temporarily remove ONE grant (Projects Write
    is the easiest to toggle without touching repo access) and re-run a
    board-write step. Expect a clear GitHub permission error, not a silent
@@ -298,6 +323,9 @@ records the switch the same way.
 - [ ] A test claim (`bin/z-board claim <N> <bot-login>`, or just watching the
       next real `/z-loop` run) shows the bot as the assignee on github.com.
 - [ ] A test PR is authored and merged by the bot, not you.
+- [ ] The individual commits inside that PR also show the bot as author (a
+      separate mechanism from the line above — see step 1 of
+      [Verifying the permission set](#verifying-the-permission-set-is-actually-minimal)).
 - [ ] **Org-owned repo only:** since `/z-setup` can't auto-detect a login
       drift here (see [Org-owned repos](#org-owned-repos-what-re-verification-can-and-cant-do)),
       periodically re-check `gh api user -q .login` yourself rather than
