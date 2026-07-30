@@ -104,7 +104,7 @@ if [ "$HAS_ORPHANS" = "true" ] && [ -z "$RECONCILE" ]; then
   bun "$PACK/lib/locks.ts" release --slug "$SLUG"   # don't hold the lock while refusing
   exit 1
 fi
-[ -n "$RECONCILE" ] && bun "$PACK/lib/reconcile.ts" apply --slug "$SLUG"
+[ -n "$RECONCILE" ] && bun "$PACK/lib/reconcile.ts" apply --slug "$SLUG" --session "$SESSION"
 ```
 
 Set `RECONCILE=1` when the human invoked `/z-loop --reconcile`; leave it empty
@@ -211,7 +211,7 @@ and prints **only** the one-line Action JSON, so on a long drain's 100+ iteratio
 the repeated bash command text never re-enters your context (ticket #57, Leak 2):
 
 ```bash
-ACTION=$("$PACK/bin/z-loop-tick" --slug "$SLUG" --state "$STATE" --tmp "$TMP")
+ACTION=$("$PACK/bin/z-loop-tick" --slug "$SLUG" --state "$STATE" --tmp "$TMP" --session "$SESSION")
 ```
 
 `z-loop-tick` re-reads the board FIRST every iteration — refreshing each ticket's
@@ -616,7 +616,7 @@ session). If it is stale, or any orphans exist (lane locks with no running loop,
 worktrees with no lock, Building tickets with neither) → refuse and tell the
 human to re-run with `--reconcile`.
 
-**Startup, with `--reconcile`:** `bun "$PACK/lib/reconcile.ts" apply --slug "$SLUG"`
+**Startup, with `--reconcile`:** `bun "$PACK/lib/reconcile.ts" apply --slug "$SLUG" --session "$SESSION"`
 first clears the wedge, then the loop starts normally. Reconcile:
 
 - **releases claims** — `z-board release <N>` unassigns the ticket so it can be

@@ -26,17 +26,22 @@ PACK="$(cd "$HERE/.." && pwd -P)"
 # then the sibling in this bin dir. Never resolves to anything but a z-board.
 Z_BOARD="${Z_BOARD:-$(command -v z-board 2>/dev/null || echo "$HERE/z-board")}"
 
-SLUG=""; STATE=""; TMP=""
+SLUG=""; STATE=""; TMP=""; SESSION=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --slug) SLUG="$2"; shift 2 ;;
     --state) STATE="$2"; shift 2 ;;
     --tmp) TMP="$2"; shift 2 ;;
+    --session) SESSION="$2"; shift 2 ;;
     *) echo "z-loop-tick: unknown argument '$1'" >&2; exit 1 ;;
   esac
 done
-if [ -z "$SLUG" ] || [ -z "$STATE" ] || [ -z "$TMP" ]; then
-  echo "usage: z-loop-tick --slug <slug> --state <state.json> --tmp <dir>" >&2
+# --session is REQUIRED, not optional (issue #198). An optional session that is
+# simply absent would silently disable the liveness heartbeat and reintroduce
+# the "a live loop reads stale" bug invisibly; failing here means it can only
+# ever break loudly, on tick 1.
+if [ -z "$SLUG" ] || [ -z "$STATE" ] || [ -z "$TMP" ] || [ -z "$SESSION" ]; then
+  echo "usage: z-loop-tick --slug <slug> --state <state.json> --tmp <dir> --session <id>" >&2
   exit 1
 fi
 
@@ -48,6 +53,17 @@ mkdir -p "$TMP"
 #    reactive enforceQuota() backstop in lib/board.ts. No-op at the 0
 #    default -- today's behavior unchanged.
 bun "$PACK/lib/throttle.ts" wait --slug "$SLUG" >/dev/null
+# 0b. Liveness heartbeat (issue #198): re-stamp loop.lock.beat so the loop lock
+#     is judged by "last seen" rather than "started". Without it, any drain
+#     outliving lockStalenessMinutes (60) reads STALE WHILE LIVE and the acquire
+#     error tells the next operator to --reconcile over a running loop, which
+#     prunes its worktrees and parks its tickets.
+#     Placed BEFORE the snapshot deliberately: enforceQuota's sleep mode can park
+#     a board call until the rate-limit window resets, so beat first, then do the
+#     thing that might hang. Never aborts the tick (`|| true`) -- a locks-dir
+#     hiccup must not wedge a drain -- and stderr is deliberately NOT discarded,
+#     so a "foreign" beat (our lock was reconciled away) reaches the operator.
+bun "$PACK/lib/locks.ts" beat --slug "$SLUG" --session "$SESSION" >/dev/null || true
 # 1. Snapshot: all-status items + each ticket's body, one call, to files.
 "$Z_BOARD" snapshot --slug "$SLUG" --out-items "$TMP/items.json" --out-bodies "$TMP/bodies.json" >/dev/null
 # 1b. Live context reading (issue #131): how full the orchestrator's OWN
