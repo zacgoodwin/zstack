@@ -340,7 +340,36 @@ export function validateIdentity(identity: unknown): void {
   if (typeof i.recordedAt !== "string" || !i.recordedAt) {
     throw new ZError(`Config "identity.recordedAt" must be a non-empty string.`);
   }
-  if (i.tokenLocation !== undefined && (typeof i.tokenLocation !== "string" || !i.tokenLocation)) {
-    throw new ZError(`Config "identity.tokenLocation" must be a non-empty string when present.`);
+  if (i.tokenLocation !== undefined) {
+    if (typeof i.tokenLocation !== "string" || !i.tokenLocation) {
+      throw new ZError(`Config "identity.tokenLocation" must be a non-empty string when present.`);
+    }
+    assertNotACredential(i.tokenLocation);
+  }
+}
+
+// GitHub credential prefixes: `github_pat_` (fine-grained) and the
+// classic/OAuth/app family. Used ONLY to reject a credential pasted into the
+// tokenLocation POINTER field -- never to validate a token, which is GitHub's
+// job.
+const CREDENTIAL_PREFIXES = ["github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
+
+// tokenLocation is a human-facing NOTE of where the bot's token lives, so the
+// obvious wrong thing to put there is the token. This is not hypothetical: the
+// setup flow that writes this field hands the operator a token seconds earlier,
+// and this project has already burned two PATs by routing them through the
+// wrong channel (#66). config.json is plaintext on disk, so a credential landing
+// here is a durable leak, not a transient one.
+//
+// Like the discordWebhookUrl guard above, the error names the FIELD and the
+// matched prefix class ONLY and never echoes the value -- this message can end
+// up in a terminal, a log, or a pasted bug report, and echoing a live credential
+// into any of those is the very thing the guard exists to prevent.
+export function assertNotACredential(value: string): void {
+  const hit = CREDENTIAL_PREFIXES.find((p) => value.startsWith(p));
+  if (hit) {
+    throw new ZError(
+      `Config "identity.tokenLocation" must say WHERE the token lives (e.g. "GH_TOKEN env var in the loop's launch script"), not the token itself -- the value supplied starts with "${hit}", a GitHub credential prefix. Record the location and keep the credential in \`gh auth\` or an env var. If this credential was written to disk or shared, revoke it.`
+    );
   }
 }

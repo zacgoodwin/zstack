@@ -17,7 +17,8 @@ import {
   recordIdentityChoice,
   type IdentityState,
 } from "../lib/identity.ts";
-import { configPath, type BoardConfig } from "../lib/config.ts";
+import { assertNotACredential, validateIdentity } from "../lib/config-schema.ts";
+import { configPath, ZError, type BoardConfig } from "../lib/config.ts";
 import { toPosixPath } from "./helpers/setup-harness.ts";
 
 // -- fixtures -----------------------------------------------------------------
@@ -59,6 +60,81 @@ function makeHome(slug: string, extra: Partial<BoardConfig> = {}): string {
 function readConfig(home: string, slug: string): any {
   return JSON.parse(readFileSync(configPath(slug, home), "utf8"));
 }
+
+// ============================================================================
+// tokenLocation is a POINTER, never the credential itself
+// ============================================================================
+// The setup flow that writes this field hands the operator a token seconds
+// earlier, so pasting it here is the obvious wrong move -- and config.json is
+// plaintext on disk, making it a durable leak rather than a transient one.
+// This project has already burned two PATs by routing them through the wrong
+// channel (#66), which is why this is a hard guard and not a doc note.
+describe("identity.tokenLocation rejects a pasted credential (#66)", () => {
+  // The fake token BODY is built at runtime rather than written as a literal.
+  // A literal `ghp_<36 chars>` in this file is indistinguishable from a real
+  // leaked token to a secret scanner, and the repo's own pre-push guard blocks
+  // the push when one appears in the diff (it did, on the first attempt here).
+  // Concatenation keeps the test semantics identical while leaving no
+  // token-shaped string in the source.
+  const BODY = "d".repeat(36);
+  const PREFIXES = ["github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"] as const;
+
+  for (const prefix of PREFIXES) {
+    const cred = `${prefix}${BODY}`;
+    test(`assertNotACredential rejects a ${prefix} token`, () => {
+      expect(() => assertNotACredential(cred)).toThrow(ZError);
+    });
+
+    // The guard has to bite on the real write path, not just when called
+    // directly -- recordIdentityChoice routes through validateConfig, so this
+    // pins that the credential never reaches disk.
+    test(`recordIdentityChoice refuses to persist a ${prefix} token`, () => {
+      const home = makeHome("demo");
+      expect(() =>
+        recordIdentityChoice("demo", { mode: "bot", tokenLocation: cred, now: () => "2026-07-30T00:00:00.000Z" }, home)
+      ).toThrow(ZError);
+      // and nothing was written -- the config must not be left half-patched
+      expect("identity" in readConfig(home, "demo")).toBe(false);
+    });
+  }
+
+  // The message can land in a terminal, a log, or a pasted bug report. Echoing
+  // a live credential into any of those is the exact harm the guard prevents.
+  test("the rejection never echoes the credential value", () => {
+    const secret = "s".repeat(36);
+    const cred = `github_pat_${secret}`;
+    let msg = "";
+    try {
+      assertNotACredential(cred);
+    } catch (e) {
+      msg = (e as Error).message;
+    }
+    expect(msg).not.toContain(cred);
+    expect(msg).not.toContain(secret);
+    expect(msg).toContain("github_pat_"); // the prefix CLASS is named, not the value
+    expect(msg).toContain("identity.tokenLocation");
+  });
+
+  // A hand-edited config.json must be caught on read too, not only on write.
+  test("a credential already on disk is rejected at config load", () => {
+    expect(() =>
+      validateIdentity({ mode: "bot", recordedAt: "2026-07-30T00:00:00.000Z", tokenLocation: `ghp_${"d".repeat(36)}` })
+    ).toThrow(ZError);
+  });
+
+  test("real location notes still pass unchanged", () => {
+    for (const ok of [
+      "GH_TOKEN env var in the loop's launch script",
+      "gh auth login (bot profile)",
+      "1Password: zstack bot token",
+    ]) {
+      expect(() => assertNotACredential(ok)).not.toThrow();
+      expect(() =>
+        validateIdentity({ mode: "bot", recordedAt: "2026-07-30T00:00:00.000Z", tokenLocation: ok })
+      ).not.toThrow();
+    }
+  });
+});
 
 // ============================================================================
 // identityState: pure, three distinct states
