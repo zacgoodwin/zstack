@@ -462,6 +462,28 @@ describe("builder prompt", () => {
     expect(pr).toContain("`reviewNotes`");
     expect(pr).not.toContain("1) AC weakened");
   });
+
+  // #177: the commit re-spawn's whole value is telling the fresh builder that the
+  // work may already exist, uncommitted, in the worktree -- a rebuild from scratch
+  // is the wrong move -- and that BUILT is verified, so the same slip loops.
+  test("the commit re-spawn points at commitNotes and says commit, do not rebuild", () => {
+    const p = builderPrompt({ ...BUILDER_INPUT, commitNotes: "uncommitted work: 3 uncommitted path(s)" }, INPUT_PATH);
+    expect(p).toContain("`commitNotes`");
+    expect(p).toContain(INPUT_PATH);
+    expect(p).not.toContain("3 uncommitted path(s)"); // payload lives in the input file
+    expect(p).toContain("COMMIT whatever is already there");
+    expect(p).toContain("git status");
+    // Absent on every other spawn, so a first-pass builder prompt is unchanged.
+    expect(builderPrompt(BUILDER_INPUT, INPUT_PATH)).not.toContain("commitNotes");
+  });
+
+  // The exit contract itself has to state what BUILT is checked against, or the
+  // guard is a surprise the builder learns by being re-spawned.
+  test("the BUILT marker states the clean-tree + moved-HEAD requirement", () => {
+    const p = builderPrompt(BUILDER_INPUT, INPUT_PATH);
+    expect(p).toContain("git status --porcelain` empty");
+    expect(p).toContain(`HEAD off ${BUILDER_INPUT.baseBranch}`);
+  });
 });
 
 // -- QA prompt ----------------------------------------------------------------

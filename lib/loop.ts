@@ -173,6 +173,13 @@ export interface LaneState {
   // #191 load unchanged (absent reads as 0). Deliberately NOT folded into
   // reviewBounces -- see quorumAction for why one budget cannot serve both.
   quorumRetries?: number;
+  // #177: builder->BUILDER re-spawns this lane has spent on a BUILT that shipped
+  // nothing (dirty tree / HEAD still at base), capped by MAX_COMMIT_RETRIES.
+  // Optional so pre-#177 state files load unchanged (absent reads as 0), and its
+  // own budget for the same reason quorumRetries is: "you forgot to commit" is
+  // not a QA bug or a reviewer finding, so it must not consume a rebuild those
+  // caps are holding, nor park the ticket under their notes.
+  commitRetries?: number;
   workerDead?: boolean; // set by the orchestrator after an aliveness probe
   outcome?: StageOutcome; // set when the stage agent's final message is parsed
   // #125: the board status the loop itself last wrote for this lane (set by
@@ -256,7 +263,11 @@ export interface LoopState {
 // -- stage outcomes -----------------------------------------------------------
 
 export type StageOutcome =
-  | { kind: "built" }
+  // #177: `unverified` carries the reason a BUILT shipped nothing (see
+  // builtGuardFailure). Set by recordOutcome from the lane worktree's own git
+  // facts, never by the marker parser -- a BUILT recorded without those facts is
+  // a plain `built`, exactly as before.
+  | { kind: "built"; unverified?: string }
   | { kind: "needs-input"; note: string }
   | { kind: "qa-pass" }
   | { kind: "qa-bugs"; note: string }
@@ -302,6 +313,113 @@ export function parseSkepticQuorum(note: string): { received: number; of: number
   const of = Number(m[2]);
   if (of < 1 || received > of) return null;
   return { received, of };
+}
+
+// The three git facts a BUILT claim is checked against (#177), read from the
+// lane's OWN worktree by the orchestrator (z-loop/SKILL.md collects them).
+// Passed in as data so the guard below stays pure and gate-testable with no real
+// repository.
+export interface BuilderCommitFacts {
+  // `git status --porcelain --branch`. `--branch` is load-bearing, not decoration:
+  // git ALWAYS emits a leading `## <branch>` line, so a payload without one means
+  // `git status` never produced output (a `> file` redirect creates the file
+  // BEFORE git runs, so a failed status leaves an empty file). Judging the bare
+  // porcelain string would read that empty file as "clean tree" -- the dirtiness
+  // half failing open, while the SHA half already fails closed.
+  porcelain: string;
+  headSha: string; // `git rev-parse HEAD`
+  // `git merge-base <baseBranch> HEAD` -- NOT `git rev-parse <baseBranch>`. The
+  // question is "does HEAD carry a commit the base branch does not", and the base
+  // TIP only answers it while the tip has not moved since the worktree was made.
+  // A leftover worktree re-claimed by a later loop (the claim row reuses one that
+  // exists) sits under a base that Step 7 has since pulled forward, so a lane
+  // that committed NOTHING reads as moved -- the guard failing open on the exact
+  // build it exists to catch. The merge-base equals HEAD precisely when HEAD is
+  // an ancestor of the base, i.e. when the branch has no commit of its own,
+  // whatever the tip did in the meantime.
+  baseSha: string;
+}
+
+// The shortest prefix that may be read as naming a commit. git's own default
+// abbreviation is 7, and anything shorter is treated as "no SHA reported" rather
+// than as a match against every commit that happens to start with it.
+const MIN_SHA_LENGTH = 7;
+
+// Do two SHAs name the same commit? Both sides come from git (full 40-char
+// OIDs), but an abbreviated one still names the same commit, and reading an
+// abbreviation as "different" would fail OPEN -- the guard would report a moved
+// HEAD for a branch still sitting on base, which is the exact bug #177 exists to
+// catch. Prefix compare, case-folded, so length mismatch cannot slip a no-commit
+// build past.
+function sameCommit(a: string, b: string): boolean {
+  const x = a.toLowerCase();
+  const y = b.toLowerCase();
+  return x.startsWith(y) || y.startsWith(x);
+}
+
+// Did a builder that reported BUILT actually ship anything? Returns null when it
+// did (clean tree AND at least one commit of its own), else the reason, phrased
+// for the human who reads it on the board and for the builder that is re-prompted
+// with it.
+//
+// Run 9's #155 builder emitted BUILT with everything still uncommitted; QA then
+// reviewed the BASE tree and passed, because a lane with no commit ships no diff.
+// Both halves are load-bearing: a dirty tree means work is still sitting in the
+// worktree, and a HEAD that is still an ancestor of the base means nothing was
+// committed at all. Either alone still holds the lane (a builder that commits half
+// its work and leaves the rest unstaged has shipped an incomplete diff).
+//
+// The status payload is judged by its DIRTY lines, untracked files included: a
+// brand-new test or docs file the builder never `git add`ed is precisely the work
+// that would go missing, so `??` lines count. Files matched by .gitignore never
+// appear (no --ignored), so real scratch output -- graphify-out/ under this repo's
+// mandatory hook, for one -- does not trip this.
+//
+// Every unreadable input fails CLOSED, on both halves: a status payload with no
+// `## <branch>` header cannot prove a clean tree, and an absent/short SHA cannot
+// prove a commit exists. A git call that returned nothing must never be the reason
+// a no-commit build walks to QA.
+export function builtGuardFailure(facts: BuilderCommitFacts): string | null {
+  const lines = facts.porcelain.split(/\r?\n/).filter((l) => l.trim() !== "");
+  const statusRan = lines.some((l) => l.startsWith("## ")); // see BuilderCommitFacts.porcelain
+  const dirty = lines.filter((l) => !l.startsWith("## "));
+  const head = facts.headSha.trim();
+  const base = facts.baseSha.trim();
+  const readable = head.length >= MIN_SHA_LENGTH && base.length >= MIN_SHA_LENGTH;
+  const moved = readable && !sameCommit(head, base);
+  if (statusRan && dirty.length === 0 && moved) return null;
+  const parts: string[] = [];
+  if (dirty.length > 0) {
+    parts.push(`${dirty.length} uncommitted path(s) in its worktree (${dirty.slice(0, 5).map((l) => l.trim()).join(", ")}${dirty.length > 5 ? ", ..." : ""})`);
+  }
+  if (!statusRan) {
+    parts.push(
+      `no readable \`git status --porcelain --branch\` output (its \`## <branch>\` header is missing), so a clean tree cannot be proven`
+    );
+  }
+  if (!moved) {
+    parts.push(
+      readable
+        ? `HEAD (${head.slice(0, MIN_SHA_LENGTH)}) still an ancestor of the base branch, so the branch carries no commit of its own`
+        : `no readable HEAD/base SHA, so no commit can be proven either way`
+    );
+  }
+  // The fix line has to be true in EVERY shape: a dirty tree means the work exists
+  // and only needs committing; a clean tree with no commit means the lane holds
+  // nothing at all, and telling that builder to "commit its work" would send it
+  // looking for files nobody wrote; an unreadable fact means the lane's state is
+  // unknown, so the only honest instruction is "look first".
+  const fix =
+    dirty.length > 0
+      ? `Commit what is already in the worktree onto this lane's branch -- nothing is lost, the files are still there -- then report BUILT again.`
+      : statusRan && readable
+        ? `Nothing at all is on this branch: build the ticket and COMMIT it, then report BUILT again.`
+        : `The worktree's state could not be read at all, so look before you build (\`git status\`, \`git log\`): commit whatever is already there, build the rest, then report BUILT again.`;
+  return (
+    `uncommitted work: the builder reported BUILT but left ${parts.join(" and ")}. ` +
+    `QA and the reviewer read the branch's committed diff, so they would review the base tree and pass a diff that does not exist. ` +
+    fix
+  );
 }
 
 // The machine-parsed exit contract every stage prompt ends with
@@ -407,6 +525,54 @@ interface ReviewerGate {
 // knob for the same reason N=3 skeptics has none (lib/stage-prompts.ts).
 export const MAX_QUORUM_RETRIES = 1;
 
+// #177: how many times ONE lane may re-spawn its BUILDER over a BUILT that
+// shipped nothing before the ticket parks Blocked. Fixed at 1 for the same reason
+// MAX_QUORUM_RETRIES is: committing is a single command, so one honest retry is
+// the whole value of retrying -- a second builder that also reports BUILT with
+// nothing committed is not going to be fixed by a third paid pass.
+export const MAX_COMMIT_RETRIES = 1;
+
+// #177's guard failure, resolved: re-spawn THIS lane's builder to commit its work
+// (a self-advance -- the lane is already at builder, the board already shows
+// Building, so the move is a no-op), and once the retry is spent, park Blocked
+// with the same "uncommitted work" note a human needs to see.
+//
+// The re-spawn targets the builder rather than parking straight away because the
+// observed failure (run 9's #155) was fixed by one instruction to commit; parking
+// would spend a human trip on a one-command fix. The note travels to that builder
+// as `commitNotes` (lib/stage-prompts.ts) so the fresh agent is told what its
+// predecessor left behind instead of guessing.
+//
+// The park note must not promise a worktree the loop itself deletes. Parking
+// removes the lane lock, and a LOCKLESS worktree is an orphan to the next run's
+// reconcile scan (lib/reconcile.ts) whatever the board says: its plan prunes it
+// with `git worktree remove --force`, and Step 0(b) refuses to start until that
+// prune has run. Every other park's work is already committed on a branch, and
+// branches are never deleted (issue #2) -- this is the ONE park whose only copy of
+// real work is uncommitted, so the note names the salvage patch the orchestrator
+// dumps first (z-loop/SKILL.md `park N Blocked`) and says plainly that the
+// worktree does not survive the next run.
+function commitRetryAction(lane: LaneState, detail: string): Action {
+  const spent = lane.commitRetries ?? 0;
+  if (spent >= MAX_COMMIT_RETRIES) {
+    return {
+      kind: "park",
+      ticket: lane.ticket,
+      status: "Blocked",
+      note:
+        `${detail}\n\nA re-prompted builder reported BUILT with nothing committed again ` +
+        `(${spent + 1} attempt(s)), so this is not a slip. The work was dumped to ` +
+        `\`~/.zstack/projects/<slug>/reports/uncommitted-${lane.ticket}.patch\` ` +
+        `(re-apply it in a fresh worktree with \`git apply\`) because the lane worktree does NOT survive: ` +
+        `parking released its lane lock, so the next run's reconcile scan force-removes it ` +
+        `(\`git worktree remove --force\` -- uncommitted work discarded) before the loop will start. ` +
+        `Salvage it BEFORE the next /z-loop run: commit it onto this lane's branch (branches are never deleted) ` +
+        `or stash it, then return the ticket to Ready.`,
+    };
+  }
+  return { kind: "advance", ticket: lane.ticket, to: "builder", note: detail };
+}
+
 // Reviewer->builder bounce cap (issue #76): both routes that send a ticket
 // back to the builder from Review -- a REVIEW-FINDINGS, and a below-floor
 // confidence retry -- draw on the SAME lane.reviewBounces budget, capped by
@@ -487,6 +653,12 @@ function resolveOutcome(lane: LaneState, qaLimits: QaBounceLimits, reviewerGate:
   const ticket = lane.ticket;
   switch (o.kind) {
     case "built":
+      // #177: a BUILT whose lane worktree proved to have shipped nothing never
+      // advances -- not to QA and not to Review either, since the skip-QA walk
+      // would hand the reviewer the same empty diff. Absent (a BUILT recorded
+      // with no git facts, e.g. a pre-#177 state file mid-drain) is byte-identical
+      // to the old behavior.
+      if (o.unverified) return commitRetryAction(lane, o.unverified);
       // #130: a `skip-qa`-labeled ticket walks straight to Review (Building ->
       // Review, made legal above). Every other outcome is unchanged, so the
       // qa-pass/qa-bugs/investigate/reviewer paths are identical for non-skip.
@@ -916,12 +1088,14 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
       if (!lane) throw new ZError(`No lane holds #${action.ticket} to advance.`);
       if (action.to === "builder" && lane.stage === "qa") lane.qaBounces += 1;
       if (action.to === "builder" && lane.stage === "reviewer") lane.reviewBounces += 1;
-      // #191: reviewer -> reviewer is the ONLY self-advance in the machine, and
-      // it MUST consume a counter here. Without this line quorumAction's `spent`
-      // never grows, so a project whose sub-agent delivery is broken re-spawns
-      // the same reviewer forever -- a paid infinite loop, the exact thing the
-      // no-token-burn rule forbids.
+      // The two self-advances in the machine (#191's reviewer -> reviewer, #177's
+      // builder -> builder) MUST each consume their counter here. Without these
+      // lines quorumAction/commitRetryAction's `spent` never grows, so a project
+      // whose sub-agent delivery is broken -- or a builder that keeps reporting
+      // BUILT with nothing committed -- re-spawns the same stage forever: a paid
+      // infinite loop, the exact thing the no-token-burn rule forbids.
       if (action.to === "reviewer" && lane.stage === "reviewer") lane.quorumRetries = (lane.quorumRetries ?? 0) + 1;
+      if (action.to === "builder" && lane.stage === "builder") lane.commitRetries = (lane.commitRetries ?? 0) + 1;
       lane.stage = action.to;
       lane.lastActivityMs = nowMs;
       delete lane.outcome;
@@ -979,11 +1153,30 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
 }
 
 // Records a finished stage agent's final message on its lane (pure).
-export function recordOutcome(state: LoopState, ticket: number, finalMessage: string, nowMs: number): LoopState {
+//
+// #177: `git` is the lane worktree's own git facts, and a BUILT is checked against
+// them right here -- where the marker becomes state -- so every builder is held to
+// the same clean-tree + moved-HEAD contract instead of relying on the
+// orchestrator to notice. Optional because only the builder stage has facts to
+// check (the other three markers ignore it) and because a state file recorded
+// before #177 must keep loading; the CLI below is what makes it non-optional for
+// a real builder lane. resolveOutcome turns a failure into the retry/park.
+export function recordOutcome(
+  state: LoopState,
+  ticket: number,
+  finalMessage: string,
+  nowMs: number,
+  git?: BuilderCommitFacts
+): LoopState {
   const next = structuredClone(state);
   const lane = next.lanes.find((l) => l.ticket === ticket);
   if (!lane) throw new ZError(`No lane holds #${ticket} to record an outcome on.`);
-  lane.outcome = parseStageResult(lane.stage, finalMessage);
+  const outcome = parseStageResult(lane.stage, finalMessage);
+  if (outcome.kind === "built" && git) {
+    const unverified = builtGuardFailure(git);
+    if (unverified) outcome.unverified = unverified;
+  }
+  lane.outcome = outcome;
   lane.lastActivityMs = nowMs;
   return next;
 }
@@ -1228,6 +1421,10 @@ const USAGE = `loop <command> [args]
   next <state.json> [--now <ms>]                     print the next Action as JSON (no writes)
   apply <state.json> <action.json> [--now <ms>]      apply an Action, rewrite the state file
   outcome <state.json> <ticket> <msg.txt> [--now <ms>]  parse a stage's final message onto its lane
+          a BUILDER lane also REQUIRES its worktree's git facts (#177), which a
+          BUILT is verified against: --porcelain <file> (git status --porcelain
+          --branch) --head-sha <sha> (git rev-parse HEAD) --base-sha <sha>
+          (git merge-base <baseBranch> HEAD)
   probe <state.json> <ticket> <alive|dead> [--now <ms>] record an aliveness probe
   claim-lost <state.json> <ticket>                   mark a ticket claimed by another session
   human-needed <state.json>                          print the breakdown + tripped/alreadyNotified (no writes)
@@ -1297,6 +1494,48 @@ const INGEST_NUMBERS = [
 // kebab-case CLI flag -> the camelCase key ingestBoardItems takes.
 const camel = (flag: string): string => flag.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 
+// readJson's contract for plain text: a missing/unreadable file at the CLI edge is
+// an actionable usage failure (exit 1 with the path), not a rethrown stack.
+function readText(path: string): string {
+  try {
+    return readFileSync(path, "utf8");
+  } catch (e) {
+    throw new ZError(`Cannot read ${path}: ${(e as Error).message}`);
+  }
+}
+
+// #177's fail-closed edge. A BUILDER lane may not record an outcome without its
+// worktree's git facts: an optional check the orchestrator can simply omit is a
+// check that silently is not there, which is the failure mode #177 filed (a BUILT
+// with nothing committed walked to QA, and QA passed the base tree). Same
+// reasoning as z-loop-tick's required --session (#198) -- it can only ever break
+// loudly, on the first builder outcome of the run, with the commands to run.
+// Every other stage has nothing to verify, so the flags are ignored there;
+// `undefined` keeps recordOutcome's guard off for them.
+function builderFactsFromFlags(
+  state: LoopState,
+  ticket: number,
+  flags: ReturnType<typeof parseFlags>["flags"]
+): BuilderCommitFacts | undefined {
+  const lane = state.lanes?.find((l) => l.ticket === ticket);
+  if (lane?.stage !== "builder") return undefined;
+  const porcelain = str(flags, "porcelain");
+  const headSha = str(flags, "head-sha");
+  const baseSha = str(flags, "base-sha");
+  if (porcelain === undefined || headSha === undefined || baseSha === undefined) {
+    throw new ZError(
+      `Recording a BUILDER outcome for #${ticket} requires the lane worktree's git facts (#177):\n` +
+        `  git -C <worktree> status --porcelain --branch > "$TMP/porcelain-${ticket}.txt"\n` +
+        `  loop outcome <state.json> ${ticket} <msg.txt> --porcelain "$TMP/porcelain-${ticket}.txt" \\\n` +
+        `    --head-sha "$(git -C <worktree> rev-parse HEAD)" --base-sha "$(git -C <worktree> merge-base <baseBranch> HEAD)"\n` +
+        `A BUILT is verified against them (clean tree + a commit of its own) before the lane may advance to QA.\n` +
+        `--branch and merge-base are both required: without --branch a git status that FAILED reads as a clean tree, ` +
+        `and against the base TIP a lane that committed nothing under an advanced base reads as moved.`
+    );
+  }
+  return { porcelain: readText(porcelain), headSha, baseSha };
+}
+
 export function main(argv: string[]): number {
   const cmd = argv[0];
   if (!cmd || cmd === "--help" || cmd === "-h") {
@@ -1349,8 +1588,8 @@ export function main(argv: string[]): number {
       const ticket = Number(positionals[1]);
       if (!Number.isInteger(ticket) || !positionals[2]) throw new ZError("Usage: loop outcome <state.json> <ticket> <msg.txt> [--now <ms>]");
       const state = readJson(statePath) as LoopState;
-      const message = readFileSync(positionals[2], "utf8");
-      const next = recordOutcome(state, ticket, message, nowMs);
+      const message = readText(positionals[2]);
+      const next = recordOutcome(state, ticket, message, nowMs, builderFactsFromFlags(state, ticket, flags));
       atomicWrite(statePath, JSON.stringify(next, null, 2));
       console.log(JSON.stringify(next.lanes.find((l) => l.ticket === ticket)!.outcome));
       return 0;
