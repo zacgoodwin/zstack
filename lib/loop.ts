@@ -1106,6 +1106,91 @@ export function ingestBoardItems(
   };
 }
 
+// -- merge gate (#178) --------------------------------------------------------
+
+// Why this exists: run 9's merge worker for #132 read a suite that reported
+// 9 failing tests, decided in prose that it was green, and merged -- main went
+// red and had to be reverted (PR #158). "Is the suite green?" is deterministic
+// space, so the loop owns it: the gate runs the gauntlet itself and judges by
+// the summary fail-count + the process exit code. The merge agent never gets a
+// vote; it runs `gh pr merge` only after this returns green.
+
+// One gauntlet attempt in a merge worktree: `bun test` then `bun run typecheck`.
+export interface SuiteRun {
+  exitCode: number; // the first nonzero of the two commands (0 = both clean)
+  output: string; // their combined stdout+stderr
+}
+
+export interface MergeGateVerdict {
+  green: boolean;
+  attempts: number; // 1 or 2 -- exactly one retry is allowed, for contention
+  failCount: number | null; // summary fail-count of the deciding run (null = no summary line)
+  note: string; // one line; goes verbatim into the lane's BLOCKED note
+}
+
+// The one contention retry's wait. Long enough for another lane's suite/tsc to
+// release a file lock (the only nonzero-with-no-failures case seen on Windows),
+// short enough that a genuinely broken branch is refused within ~30s.
+export const MERGE_GATE_RETRY_WAIT_MS = 15_000;
+
+// The fail-count off a `bun test` run, read ONLY from its summary line
+// (`^ N fail`), never from per-test `(fail) name` lines or a literal like
+// tests/e2e-check.test.ts's intentional `FAIL merge-order` self-test output
+// (#128) -- those are prose about a nested run, not this run's verdict.
+// MAX across summary lines, not last: a test that spawns a nested `bun test`
+// can print a second (green) summary into the same stream, and the fail-closed
+// reading is "any summary reporting failures is a failure".
+export function parseSuiteFailCount(output: string): number | null {
+  const counts = [...output.matchAll(/^[ \t]*(\d+)[ \t]+fail\b/gm)].map((m) => Number(m[1]));
+  return counts.length ? Math.max(...counts) : null;
+}
+
+// One attempt's verdict. Green demands all three: a summary line, zero fails in
+// it, and exit 0 -- exit 0 with NO summary means the suite may not have run at
+// all (the #132 shape), so it is not green.
+function judgeSuiteRun(run: SuiteRun, attempt: number): MergeGateVerdict {
+  const failCount = parseSuiteFailCount(run.output);
+  const red = (why: string): MergeGateVerdict => ({ green: false, attempts: attempt, failCount, note: `${why} -- refusing the merge` });
+  if (failCount !== null && failCount > 0) {
+    return red(`merge gate RED on attempt ${attempt}: suite summary reports ${failCount} fail (exit ${run.exitCode})`);
+  }
+  if (run.exitCode !== 0) {
+    return red(`merge gate RED on attempt ${attempt}: gauntlet exited ${run.exitCode}${failCount === null ? " with no test-summary line" : " with 0 fail (typecheck or a crashed run)"}`);
+  }
+  if (failCount === null) {
+    return red(`merge gate RED on attempt ${attempt}: exit 0 but no "N fail" summary line -- the suite did not run`);
+  }
+  return { green: true, attempts: attempt, failCount: 0, note: `merge gate GREEN on attempt ${attempt}: 0 fail, exit 0` };
+}
+
+// The gate. `runAttempt` runs the gauntlet once in the merge worktree;
+// `sleep` blocks between the two attempts (both injected so the unit test feeds
+// synthetic outputs and never waits). Retry policy: EXACTLY one, and only for
+// the contention shape (nonzero exit / missing summary with no reported test
+// failures). A summary reporting failures is never retried and never merges.
+export function mergeGate(
+  runAttempt: (attempt: number) => SuiteRun,
+  sleep: (ms: number) => void,
+  retryWaitMs: number = MERGE_GATE_RETRY_WAIT_MS
+): MergeGateVerdict {
+  const first = judgeSuiteRun(runAttempt(1), 1);
+  if (first.green || (first.failCount !== null && first.failCount > 0)) return first;
+  sleep(retryWaitMs);
+  return judgeSuiteRun(runAttempt(2), 2);
+}
+
+// The real attempt: `bun test` then, only if that is clean, `bun run typecheck`
+// -- both in the merge worktree. process.execPath is this bun binary (no PATH
+// lookup, which is what breaks the spawn on Windows).
+function runGauntlet(cwd: string): SuiteRun {
+  const dec = (b: unknown): string => (b instanceof Uint8Array ? new TextDecoder().decode(b) : "");
+  const test = Bun.spawnSync([process.execPath, "test"], { cwd, stdout: "pipe", stderr: "pipe" });
+  const testOut = dec(test.stdout) + dec(test.stderr);
+  if (test.exitCode !== 0) return { exitCode: test.exitCode, output: testOut };
+  const tc = Bun.spawnSync([process.execPath, "run", "typecheck"], { cwd, stdout: "pipe", stderr: "pipe" });
+  return { exitCode: tc.exitCode, output: testOut + dec(tc.stdout) + dec(tc.stderr) };
+}
+
 // -- CLI ---------------------------------------------------------------------
 
 const USAGE = `loop <command> [args]
@@ -1113,6 +1198,9 @@ const USAGE = `loop <command> [args]
   stage-model <builder|qa|reviewer|merge> <ticketModel> --slug <s>
                                                      print the resolved model name for that stage
                                                      (config stageModels override, else ticketModel)
+  merge-gate <worktreePath> [--retry-wait-ms N]      run the pre-merge gauntlet (bun test + typecheck) in
+                                                     that worktree and print the verdict JSON; exit 0 ONLY
+                                                     when green (#178) -- nothing merges on a nonzero exit
   next <state.json> [--now <ms>]                     print the next Action as JSON (no writes)
   apply <state.json> <action.json> [--now <ms>]      apply an Action, rewrite the state file
   outcome <state.json> <ticket> <msg.txt> [--now <ms>]  parse a stage's final message onto its lane
@@ -1210,6 +1298,25 @@ export function main(argv: string[]): number {
       // configured project, and throws its own ZError when neither resolves.
       console.log(resolveStageModel(stage, ticketModel, loadConfig(str(flags, "slug")).stageModels));
       return 0;
+    }
+
+    // merge-gate takes a worktree path, not a state.json, so it is handled
+    // before the statePath guard too. Its EXIT CODE is the contract: 0 green,
+    // 1 red (and 1 on a usage/IO error via handleCliError) -- every nonzero
+    // means "do not merge", so the fail-closed reading needs no parsing.
+    if (cmd === "merge-gate") {
+      const worktree = positionals[0];
+      if (!worktree) throw new ZError("Usage: loop merge-gate <worktreePath> [--retry-wait-ms N]");
+      if (!existsSync(worktree)) throw new ZError(`Merge gate: worktree ${worktree} does not exist.`);
+      const rawWait = str(flags, "retry-wait-ms");
+      const retryWaitMs = rawWait === undefined ? MERGE_GATE_RETRY_WAIT_MS : Number(rawWait);
+      if (!Number.isFinite(retryWaitMs) || retryWaitMs < 0) {
+        throw new ZError(`--retry-wait-ms must be a non-negative number, got ${JSON.stringify(rawWait)}.`);
+      }
+      const verdict = mergeGate(() => runGauntlet(worktree), (ms) => Bun.sleepSync(ms), retryWaitMs);
+      console.log(JSON.stringify(verdict));
+      if (!verdict.green) console.error(verdict.note);
+      return verdict.green ? 0 : 1;
     }
 
     // The only Date.now() in this file: the CLI boundary. Pure functions above

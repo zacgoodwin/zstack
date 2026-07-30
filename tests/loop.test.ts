@@ -18,7 +18,10 @@ import {
   ingestBoardItems,
   markClaimLost,
   markHumanNeededNotified,
+  mergeGate,
+  MERGE_GATE_RETRY_WAIT_MS,
   nextAction,
+  parseSuiteFailCount,
   parseReviewerConfidence,
   parseStageResult,
   recordOutcome,
@@ -28,6 +31,7 @@ import {
   type LaneState,
   type LoopState,
   type Stage,
+  type SuiteRun,
   type TicketSnapshot,
 } from "../lib/loop.ts";
 import { ZError } from "../lib/config.ts";
@@ -2388,5 +2392,198 @@ describe("validateConfig: ticketLimit / contextTokenLimit (#131 AC10)", () => {
 
   test("ticketLimit 0 and contextTokenLimit 0 both pass (disabled is legal)", () => {
     expect(() => validateConfig({ ...baseConfig(), ticketLimit: 0, contextTokenLimit: 0 })).not.toThrow();
+  });
+});
+
+// -- merge gate (#178) --------------------------------------------------------
+//
+// The gate the loop owns instead of the merge agent's prose judgment: run 9's
+// worker for #132 read a suite reporting 9 failures, called it green, merged,
+// and broke main (reverted in PR #158). These feed SYNTHETIC suite outputs to
+// mergeGate -- no spawns, no waiting -- and assert block / retry-then-pass /
+// pass, plus the two real-CLI ends.
+
+// A bun test tail, exactly as bun prints it (the summary line is the only thing
+// the gate is allowed to read).
+const suiteTail = (pass: number, fail: number) =>
+  ` ${pass} pass\n ${fail} fail\n ${pass + fail} expect() calls\nRan ${pass + fail} tests across 3 files. [900.00ms]\n`;
+
+// Drives mergeGate over a scripted list of attempts. An attempt beyond the
+// script THROWS -- that is how "no retry happened" is proven, not by a count an
+// assertion could forget to check.
+function driveGate(runs: SuiteRun[]) {
+  const attempts: number[] = [];
+  const waits: number[] = [];
+  const verdict = mergeGate(
+    (n) => {
+      attempts.push(n);
+      const r = runs[n - 1];
+      if (!r) throw new Error(`gate ran attempt ${n}, only ${runs.length} scripted`);
+      return r;
+    },
+    (ms) => waits.push(ms)
+  );
+  return { verdict, attempts, waits };
+}
+
+describe("merge gate: the loop decides green/red, never the agent (#178)", () => {
+  // AC1 -- 9 fail, exit 1: RED, no retry, fail count in the note.
+  test("a suite reporting 9 fail (exit 1) is RED, is never retried, and names the fail count", () => {
+    const { verdict, attempts, waits } = driveGate([
+      { exitCode: 1, output: `(fail) claims a lane\n${suiteTail(1252, 9)}` },
+    ]);
+    expect(verdict.green).toBe(false);
+    expect(verdict.failCount).toBe(9);
+    expect(verdict.attempts).toBe(1);
+    expect(verdict.note).toContain("9 fail");
+    expect(verdict.note).toContain("refusing the merge");
+    expect(attempts).toEqual([1]); // real test failures are never a contention retry
+    expect(waits).toEqual([]);
+  });
+
+  // AC2 -- contention on the first run, green on the retry: exactly one retry
+  // after the 15s wait, then the merge proceeds.
+  test("a nonzero first exit with no reported failures retries ONCE after 15s, then passes on green", () => {
+    const { verdict, attempts, waits } = driveGate([
+      { exitCode: 1, output: "error: EBUSY: resource busy or locked, open 'tsconfig.tsbuildinfo'\n" },
+      { exitCode: 0, output: suiteTail(1261, 0) },
+    ]);
+    expect(verdict.green).toBe(true);
+    expect(verdict.attempts).toBe(2);
+    expect(verdict.failCount).toBe(0);
+    expect(attempts).toEqual([1, 2]);
+    expect(waits).toEqual([MERGE_GATE_RETRY_WAIT_MS]);
+    expect(MERGE_GATE_RETRY_WAIT_MS).toBe(15_000);
+  });
+
+  // AC3 -- the intentional "FAIL merge-order" self-test line (#128) must not
+  // block a suite whose summary says 0 fail at exit 0.
+  test("a green run whose output contains the literal FAIL merge-order self-test line passes", () => {
+    const output =
+      "FAIL  merge-order  expected [1,2,3], got [2,1,3]\n" +
+      "(fail) out-of-order merge (mergedThisRun [2,1,3]) fails merge-order\n" +
+      suiteTail(1261, 0);
+    const { verdict, attempts, waits } = driveGate([{ exitCode: 0, output }]);
+    expect(verdict.green).toBe(true);
+    expect(verdict.attempts).toBe(1);
+    expect(waits).toEqual([]);
+    expect(attempts).toEqual([1]);
+  });
+
+  test("a second nonzero exit is RED -- the retry budget is exactly one", () => {
+    const { verdict, attempts } = driveGate([
+      { exitCode: 1, output: "error: EBUSY\n" },
+      { exitCode: 1, output: "error: EBUSY\n" },
+      { exitCode: 0, output: suiteTail(1261, 0) }, // a third attempt would wrongly reach this
+    ]);
+    expect(verdict.green).toBe(false);
+    expect(verdict.attempts).toBe(2);
+    expect(attempts).toEqual([1, 2]);
+    expect(verdict.note).toContain("exited 1");
+  });
+
+  test("contention then real failures is RED with the retry's fail count", () => {
+    const { verdict } = driveGate([
+      { exitCode: 1, output: "error: EBUSY\n" },
+      { exitCode: 1, output: suiteTail(1252, 9) },
+    ]);
+    expect(verdict.green).toBe(false);
+    expect(verdict.failCount).toBe(9);
+    expect(verdict.note).toContain("9 fail");
+  });
+
+  test("exit 0 with NO summary line is not green -- a suite that did not run never merges", () => {
+    const { verdict, attempts } = driveGate([
+      { exitCode: 0, output: "bun test v1.3.14\n" },
+      { exitCode: 0, output: "bun test v1.3.14\n" },
+    ]);
+    expect(verdict.green).toBe(false);
+    expect(verdict.failCount).toBeNull();
+    expect(attempts).toEqual([1, 2]); // treated as contention: one retry, then refuse
+    expect(verdict.note).toContain("did not run");
+  });
+
+  test("a typecheck-only failure (0 fail, nonzero exit) never merges", () => {
+    const tsErr = "lib/loop.ts(12,3): error TS2322: Type 'string' is not assignable to type 'number'.\n";
+    const { verdict } = driveGate([
+      { exitCode: 2, output: suiteTail(1261, 0) + tsErr },
+      { exitCode: 2, output: suiteTail(1261, 0) + tsErr },
+    ]);
+    expect(verdict.green).toBe(false);
+    expect(verdict.attempts).toBe(2);
+  });
+
+  describe("parseSuiteFailCount reads the summary line only", () => {
+    test("no summary line -> null", () => {
+      expect(parseSuiteFailCount("error: EBUSY\nFAIL  merge-order\n(fail) something\n")).toBeNull();
+    });
+    test("0 fail -> 0; 9 fail -> 9", () => {
+      expect(parseSuiteFailCount(suiteTail(10, 0))).toBe(0);
+      expect(parseSuiteFailCount(suiteTail(1, 9))).toBe(9);
+    });
+    test("two summaries (a test that spawns a nested bun test) -> the MAX, fail-closed", () => {
+      expect(parseSuiteFailCount(suiteTail(3, 0) + suiteTail(1, 2))).toBe(2);
+      expect(parseSuiteFailCount(suiteTail(1, 2) + suiteTail(3, 0))).toBe(2);
+    });
+  });
+
+  // -- the real CLI end: it actually runs the gauntlet and exits on its verdict
+  describe("loop merge-gate CLI", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zstack-merge-gate-"));
+    afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+    // A throwaway "worktree": one test file plus a typecheck script that is a
+    // no-op, so the gate's two real spawns stay well inside the gate budget.
+    function project(name: string, body: string): string {
+      const p = join(dir, name);
+      mkdirSync(p, { recursive: true });
+      writeFileSync(join(p, "package.json"), JSON.stringify({ name, scripts: { typecheck: "bun --version" } }));
+      writeFileSync(join(p, "x.test.ts"), body);
+      return p;
+    }
+
+    const runGate = (cwd: string) =>
+      Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "merge-gate", cwd], { stdout: "pipe", stderr: "pipe" });
+
+    const PASSING = 'import {test,expect} from "bun:test";\ntest("a",()=>{expect(1).toBe(1)});\n';
+    const FAILING = 'import {test,expect} from "bun:test";\ntest("a",()=>{expect(1).toBe(2)});\n';
+
+    test("green worktree -> exit 0 and a green verdict JSON", () => {
+      const proc = runGate(project("green", PASSING));
+      expect(proc.exitCode).toBe(0);
+      expect(JSON.parse(proc.stdout.toString())).toMatchObject({ green: true, attempts: 1, failCount: 0 });
+    });
+
+    test("red worktree -> exit 1, fail count in the verdict, and no 15s retry", () => {
+      const started = Date.now();
+      const proc = runGate(project("red", FAILING));
+      expect(proc.exitCode).toBe(1);
+      expect(JSON.parse(proc.stdout.toString())).toMatchObject({ green: false, attempts: 1, failCount: 1 });
+      expect(Date.now() - started).toBeLessThan(MERGE_GATE_RETRY_WAIT_MS); // real failures short-circuit
+    });
+
+    test("a missing worktree is a loud refusal, not a silent green", () => {
+      const proc = runGate(join(dir, "does-not-exist"));
+      expect(proc.exitCode).not.toBe(0);
+      expect(proc.stderr.toString()).toContain("does not exist");
+    });
+  });
+
+  // -- doc canary: the SKILL is what the orchestrator actually executes -------
+  describe("z-loop/SKILL.md wires the gate ahead of the merge spawn", () => {
+    const skill = () => readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
+
+    test("the merge spawn runs loop.ts merge-gate BEFORE spawning the agent", () => {
+      const md = skill();
+      expect(md).toContain('bun "$PACK/lib/loop.ts" merge-gate ".worktrees/ticket-<N>"');
+      expect(md.indexOf("merge-gate")).toBeLessThan(md.indexOf("3. Spawn a FRESH harness Agent"));
+    });
+
+    test("a nonzero gate parks the lane Blocked and spawns no merge agent", () => {
+      const md = skill();
+      expect(md).toMatch(/Any nonzero exit[\s\S]*do NOT spawn the merge agent/);
+      expect(md).toContain("BLOCKED: %s");
+      expect(md).toContain('"$PACK/lib/loop.ts" outcome "$STATE"');
+    });
   });
 });

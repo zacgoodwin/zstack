@@ -311,6 +311,30 @@ the input file, never through your context; ticket #57, Leak 1):
    hand-write the prompt. The `reviewer` stage is the one exception that takes two
    extra flags (`--adversarial-mode`, `--labels`) — see its row below; they decide
    the super-truth fan-out and NEVER become input keys.
+2b. **`merge` stage ONLY — the loop-owned green gate (#178), BEFORE the spawn.**
+   Never let the merge agent decide green vs red: run the gate and obey its exit
+   code. Run 9's merge worker read a suite reporting 9 failures, called it green
+   in prose, merged, and broke `$BASE` (reverted in PR #158).
+
+   ```bash
+   bun "$PACK/lib/loop.ts" merge-gate ".worktrees/ticket-<N>" > "$TMP/gate-<N>.json"
+   ```
+
+   Exit **0** — green — is the ONLY state in which you spawn the merge agent;
+   continue to step 3. **Any nonzero exit** (red suite, red typecheck, or the
+   gate itself failing to run) → do NOT spawn the merge agent, and park the lane
+   with the gate's own note (which carries the fail count):
+
+   ```bash
+   printf 'BLOCKED: %s\n' "$(jq -r '.note // empty' "$TMP/gate-<N>.json" 2>/dev/null || true)" > "$TMP/msg-<N>.txt"
+   bun "$PACK/lib/loop.ts" outcome "$STATE" <N> "$TMP/msg-<N>.txt"
+   ```
+
+   (Empty note — the gate errored before printing a verdict — is still a refusal:
+   write `BLOCKED: merge gate did not return a verdict` instead.) The next `next`
+   returns `park N Blocked`; execute that row as written. The gate already retried
+   once for process contention, so a red verdict is never "try again": nothing
+   merges until a human or a rebuild makes the suite green.
 3. Spawn a FRESH harness Agent (Agent tool), `run_in_background: true`, with
    that prompt and `model` resolved through the per-stage router (issue #82:
    the merge stage is mechanical — a PR create, a conflict check, a PR merge —
@@ -334,7 +358,7 @@ the input file, never through your context; ticket #57, Leak 1):
 | `builder` | `ticketNumber`, `ticketTitle`, `ticketBody` (fresh `gh issue view` → `"$TMP/body-<N>.md"`, injected `--rawfile`), `worktreePath` (`.worktrees/ticket-<N>`), `branch`, `baseBranch`; on a bounce also `qaNotes`/`investigateFirst` or `reviewNotes` per the advance row above. |
 | `qa` | `ticketNumber`, `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `worktreePath`, `branch`, `qaPass` (the lane's `qaBounces` in the state file + 1), `webTarget` (true when the ticket changes a web-served surface — your judgment; QA then drives gstack /qa). |
 | `reviewer` | **BLINDED — exactly** `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `acceptanceCriteria` (the `### Acceptance Criteria` section to a file: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$TMP/body-<N>.md" > "$TMP/ac-<N>.md"`, injected `--rawfile`), `diff` (exclude lockfiles to avoid flooding the reviewer with generated code: `git -C .worktrees/ticket-<N> diff "$BASE"...HEAD -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)pnpm-lock.yaml' ':(exclude)yarn.lock' > "$TMP/diff-<N>.txt"`; if the filtered diff is empty — a lockfile-only change — fall back to the unfiltered diff: `[ ! -s "$TMP/diff-<N>.txt" ] && git -C .worktrees/ticket-<N> diff "$BASE"...HEAD > "$TMP/diff-<N>.txt"`. Injected `--rawfile` so it never enters your context), `worktreePath` = a THROWAWAY worktree of the head commit, placed under the repo's own `.worktrees/` — NEVER under `$TMP` / `~/.zstack` (issue #118: the reviewer runs the full `bun test` suite in this worktree, and several tests write to/delete real `~/.zstack` subtrees via `homedir()`; a throwaway worktree rooted there lets that suite's cleanup destroy the loop's own live state.json/locks/transcripts mid-run) — `git worktree add ".worktrees/review-<N>" <head-sha>`; remove it after the stage (`git worktree remove ".worktrees/review-<N>" --force`). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. **Adversarial control (#59):** build this stage's prompt with two extra flags — `MODE=$("$Z_BOARD" ... )` the project's `adversarialMode` (read it from `~/.zstack/projects/$SLUG/config.json`; `loadConfig` defaults it to `non-trivial`) and `LABELS=$(gh issue view <N> --json labels -q '[.labels[].name]')` (a JSON array — labels live on the GitHub issue, NOT on the board item, so `board.list` never fetched them; get them here). Then `bun "$PACK/lib/stage-prompts.ts" prompt reviewer "$TMP/input-<N>.json" --adversarial-mode "$MODE" --labels "$LABELS" > "$TMP/prompt-<N>.txt"`. The predicate (`adversarialActive`) reads the diff's own changed-line count from the blinded input — `always`/`non-trivial`-on-a-big-or-labeled diff spawns the skeptic fan-out (and stamps a `confidence=` token onto `REVIEW-FINDINGS` too); `off`/small-unlabeled is the single pass. Either way `REVIEW-APPROVE` always carries a `confidence=` token (issue #62's safety gate reads it regardless) — see `/z-loop`'s reviewer-confidence-gate section for what a sub-floor score does. Mode + labels ride as FLAGS; the four-key input JSON is untouched. |
-| `merge` | `ticketNumber`, `prTitle` (the ticket title), `branch`, `baseBranch`, `worktreePath`, `stackedOn` (from the advance action — parents whose branches this PR stacks on; the prompt carries the PROCESS.md step 18 chain rules: parents first, no branch deletion mid-batch, retarget, delete last). |
+| `merge` | `ticketNumber`, `prTitle` (the ticket title), `branch`, `baseBranch`, `worktreePath`, `stackedOn` (from the advance action — parents whose branches this PR stacks on; the prompt carries the PROCESS.md step 18 chain rules: parents first, no branch deletion mid-batch, retarget, delete last). **The green gate in step 2b runs BEFORE this spawn and its exit code is the merge permission** — a red gate parks the lane Blocked and no merge agent is ever spawned. |
 
 **Per-stage Actual (every stage, no exceptions):** when a stage agent finishes,
 copy its transcript jsonl into

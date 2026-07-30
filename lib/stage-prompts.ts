@@ -18,7 +18,7 @@
 // parameter, NOT a key of the input object, so the reviewer's exact-four-key
 // blindness gate is untouched.
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { handleCliError, parseFlags, str } from "./cli.ts";
 import { ADVERSARIAL_MODES, DEFAULT_ADVERSARIAL_MODE, ZError, type AdversarialMode } from "./config.ts";
 
@@ -253,6 +253,11 @@ export function shSingleQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
+// The loop-owned merge gate's CLI, by absolute path off THIS pack (#178). The
+// merge agent is told to shell it, never to read test output and judge green
+// itself -- the whole point of the gate is that no latent step decides it.
+const MERGE_GATE_CLI = join(import.meta.dir, "loop.ts");
+
 export interface MergePromptInput {
   ticketNumber: number;
   prTitle: string;
@@ -273,10 +278,17 @@ This branch stacks on ticket(s) #${i.stackedOn.join(", #")}. Their PRs merge FIR
 - Worktree: ${i.worktreePath}, branch ${i.branch}, base ${i.baseBranch}.
 - Full stage input (numbers, PR title, branch, base, worktree, stacked chain) is in ${inputPath} if you need to re-read any field.
 ${stacked}
+## The green gate is NOT yours to judge (#178)
+The loop already ran the mechanical pre-merge gate (bun test + bun run typecheck in this worktree, judged by the summary fail-count and the process exit code) and it returned GREEN -- that is the only reason you were spawned. You never decide green vs red by reading test output: a merge agent that did exactly that landed a branch with 9 failing tests and broke ${i.baseBranch}. If ANY step below changes the branch's code (a conflict resolution), re-run the gate yourself and obey its exit code:
+
+bun ${shSingleQuote(MERGE_GATE_CLI)} merge-gate ${shSingleQuote(i.worktreePath)}
+
+Exit 0 = green, the only state in which gh pr merge may run. ANY nonzero exit = BLOCKED, no matter what the output looks like to you.
+
 ## Steps
 1. Open the PR: gh pr create --base ${i.baseBranch} --head ${i.branch} --title ${shSingleQuote(i.prTitle)} with a body that links the ticket and summarizes what shipped.
-2. If ${i.branch} conflicts with ${i.baseBranch}: resolve ON the branch, then rerun the full gauntlet (typecheck + full test suite) before merging. Never resolve in the merge commit blind.
-3. Merge with gh pr merge only when everything is green. Never pass --delete-branch: branch cleanup happens once at batch end, after every dependent PR has landed.
+2. If ${i.branch} conflicts with ${i.baseBranch}: resolve ON the branch, then re-run the full gauntlet through the gate command above before merging (never in prose, never resolve in the merge commit blind). Gate nonzero -> exit BLOCKED with its note.
+3. Merge with gh pr merge only when the gate exited 0. Never pass --delete-branch: branch cleanup happens once at batch end, after every dependent PR has landed.
 4. Do not close the ticket issue and do not comment on it -- the orchestrator posts the completion note.
 
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):

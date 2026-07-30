@@ -390,6 +390,18 @@ describe("merge prompt", () => {
     expect(p).not.toContain("Stacked chain");
   });
 
+  // #178: the merge agent must never judge green vs red -- the loop's own gate
+  // does, and its exit code is the merge permission.
+  test("the green gate is the loop's: the prompt hands the agent a command and an exit code, not a judgment", () => {
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    expect(p).toMatch(/never decide green vs red/i);
+    expect(p).toContain("merge-gate"); // the loop-owned CLI, by absolute pack path
+    expect(p).toContain(MERGE_INPUT.worktreePath);
+    expect(p).toContain("Exit 0 = green");
+    expect(p).toMatch(/ANY nonzero exit = BLOCKED/);
+    expect(p).toContain("only when the gate exited 0"); // step 3 no longer says "when everything is green"
+  });
+
   test("stacked chain: parent first, no deletion, retarget, delete last", () => {
     const p = mergePrompt({ ...MERGE_INPUT, stackedOn: [40, 41] }, INPUT_PATH);
     expect(p).toContain("Stacked chain");

@@ -61,6 +61,11 @@ records the result. It never re-derives a scheduling decision in prose.
   (`retry`), or is ignored entirely (`off`). A `REVIEW-APPROVE` with no
   parseable confidence is treated the same as a sub-floor score — fail-closed,
   never a silent merge — whenever the gate is on.
+- **A red suite does not merge, and the agent has no say.** Before a merge agent
+  is spawned, the loop itself runs the gauntlet in the lane's worktree and
+  judges it by the summary fail-count and the process exit code, never by an
+  agent's reading of the output. Green is the only state in which a merge agent
+  is spawned at all. See [The merge green gate](#the-merge-green-gate).
 - **Reviewer->builder bounces are capped.** A `REVIEW-FINDINGS` and a
   `reviewerBelowThresholdAction: "retry"` both send the ticket back to the
   builder from Review, and both draw on the same per-lane budget: at config
@@ -114,6 +119,40 @@ the decision is a one-click human classification, not the builder's own call.
 The reviewer still runs: `skip-qa` skips QA, never the last correctness gate.
 Every ticket without the label runs the full builder → QA → reviewer → merge
 pipeline, and the QA bounce/investigate machinery is unchanged.
+
+## The merge green gate
+
+The last thing between a branch and `main` is mechanical, and the loop owns it —
+not the merge agent. A merge agent once read a suite that reported 9 failing
+tests, decided in prose that it was green, merged, and broke `main` (reverted in
+PR #158). "Is the suite green?" is deterministic space, so it is code now:
+
+```bash
+bun "$PACK/lib/loop.ts" merge-gate .worktrees/ticket-<N>
+```
+
+What it does, in the lane's own worktree:
+
+1. Runs `bun test`, then `bun run typecheck` if the tests were clean.
+2. Judges the result by two machine-readable facts only — the `N fail` count on
+   the suite's **summary line** and the process **exit code**. Per-test `(fail)`
+   lines and prose like `tests/e2e-check.test.ts`'s intentional
+   `FAIL merge-order` self-test output are never read as a verdict; a summary
+   saying `0 fail` at exit 0 is green even when such a line is present. When two
+   summaries appear (a test that spawns a nested `bun test`), the higher fail
+   count wins.
+3. Allows **exactly one** retry, after a 15s wait, and only for the contention
+   shape: a nonzero exit (or a missing summary) with no reported test failures.
+   A summary reporting failures is never retried.
+4. Prints the verdict as JSON (`{green, attempts, failCount, note}`) and **exits
+   0 only when green**.
+
+The orchestrator runs it *before* the merge stage spawns. Nonzero exit → no
+merge agent is spawned at all, and the lane parks Blocked carrying the gate's
+note (fail count included) for a human. Green → the merge agent is spawned, and
+its prompt hands it the same command rather than a judgment call: if it resolves
+a conflict on the branch it must re-run the gate and obey the exit code, and
+`gh pr merge` may run only on a 0. Under no circumstance does a red suite merge.
 
 ## Ticket and context limits
 
