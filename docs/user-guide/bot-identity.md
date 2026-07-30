@@ -183,12 +183,46 @@ Generate a **classic** personal access token for the bot account
 (`github.com` → bot account's own **Settings → Developer settings →
 Personal access tokens → Tokens (classic)**) with scopes **`repo`** and
 **`project`** (add `workflow` too only if your loop is expected to edit
-`.github/workflows/*.yml` files — most projects don't need it). Classic
-scopes are what this pack's own scope probe (`gh auth status` /
-`gh auth refresh -s project`) understands; a fine-grained PAT's "Projects"
-account permission covers the same access but doesn't show up as a `project`
-OAuth scope, so it hasn't been exercised against this pack's preflight
-check — prefer classic unless you've verified otherwise.
+`.github/workflows/*.yml` files — most projects don't need it).
+
+**Classic is required, not merely preferred. A fine-grained PAT cannot drive
+this loop at all.** This was measured against a real bot account holding repo
+**Write** as a collaborator (2026-07-30, recorded on #66), and it fails on two
+independent walls:
+
+1. **A fine-grained PAT's permissions are scoped to its *resource owner*,** and
+   the only resource owner a bot account can select is itself (unless it belongs
+   to an organization). Your repo is owned by *you*, so a token the bot mints
+   holds **no grants on it whatsoever**, no matter what was ticked at creation.
+   It will still read a public repo, because that needs no grant — which makes
+   the token look fine right up until the first write.
+2. **GitHub does not support fine-grained PATs for user-owned Projects.** Their
+   own docs list it verbatim as a known gap: *"Using fine-grained personal
+   access token to access Projects owned by a user account."* The board is a
+   ProjectV2, so board access fails even once the repo side is sorted.
+
+What that looks like on the wire, same account, same repo:
+
+| Operation | Fine-grained PAT | Classic (`repo` + `project`) |
+| --- | --- | --- |
+| Read the repo / an issue | works (public, no grant) | works |
+| Resolve the board's ProjectV2 id | `NOT_FOUND` | works |
+| Create a branch | `403 Resource not accessible by personal access token` | works |
+| Comment on / edit an issue | `403` | works |
+| Open a PR | `403` | works |
+
+If you are looking at `Resource not accessible by personal access token` on a
+token whose permissions appear correct, this is why. **The exception:** if the
+repo and board are owned by an **organization** the bot belongs to, fine-grained
+PATs do work, because the org can be the resource owner and org-owned Projects
+are supported.
+
+Tick only `repo`, `project`, and (if needed) `workflow`. The classic token page
+starts with everything unchecked and it is easy to grab far more; nothing in
+this pack uses `admin:org`, `delete_repo`, or the rest of the `admin:*` family,
+and a token carrying them turns a leak into an account-level incident instead of
+a repo-level one. Scopes cannot be edited after creation — to narrow one, revoke
+it and mint a new one.
 
 Then, instead of touching your own `gh auth login` session at all, export
 the token only in the environment that launches the loop:
@@ -286,6 +320,25 @@ second account rather than just documented — do it once per install:
 
 Record what you found — confirming or correcting the table above — on issue
 #66 or wherever this project tracks that kind of note.
+
+### Result of the first run (2026-07-30, recorded on #66)
+
+Both paths were run against a real non-owner bot account. The happy path
+passed end to end with a classic token: identity resolved to the bot, the
+board read returned the Model / Model Effort / Estimate / Actual fields, the
+claim assigned the bot and released cleanly, and the branch commit, the PR,
+and the squash merge were all authored by the bot. (The merge commit's
+*committer* reads `web-flow`, which is GitHub's own identity for any
+API- or UI-driven merge; the *author* is the bot. That is expected, not a
+misconfiguration.)
+
+The missing-grant path was exercised with a token carrying **no** Projects
+access at all: every board read and write failed with `NOT_FOUND` on the
+ProjectV2 id, while the same account with `project` succeeded. That proves the
+`project` grant in the table above is *necessary*, not merely sufficient. Note
+the failure mode — a missing Projects grant surfaces as `NOT_FOUND` on the
+board, which reads like "the board doesn't exist" rather than like a permission
+error. Check the grant before you go looking for a bad project id.
 
 ## Continuing as your own account instead
 
