@@ -167,6 +167,17 @@ change them.
   `truth-check failed (confidence X/100)`; `retry` bounces it back to the
   builder; `off` disables the gate entirely (a low-confidence or unparseable
   approval merges, the pre-#62 behavior).
+- `minSkepticQuorum` (default 2, values 0–3) — how many of the 3 skeptic
+  verdicts an **adversarial** `REVIEW-APPROVE` must actually have received for
+  its aggregated confidence to merge (issue #191). One skeptic reporting "cannot
+  refute" is `confidence=100`, which clears `minReviewerConfidence` and merges as
+  though three reviews agreed; this is the denominator that stops it. A short
+  quorum re-spawns the reviewer once, then parks Blocked. `0` disables the gate;
+  `1` accepts a single opinion as an adversarial pass, which is the hole this
+  closes — lower it only deliberately. Must be an integer 0–3: a floor above the
+  fan-out could never be met, so it is a loud config error rather than a drain
+  where every adversarial review parks Blocked. Projects with `adversarialMode:
+  "off"` are unaffected (no fan-out, no token, nothing to judge).
 - `maxReviewBounces` (default 2) — reviewer->builder bounces (a
   `REVIEW-FINDINGS`, or a `reviewerBelowThresholdAction: "retry"`) on a ticket
   before it parks Blocked with `review bounce cap reached (N/N)` instead of

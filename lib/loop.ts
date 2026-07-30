@@ -15,6 +15,7 @@ import {
   DEFAULT_MAX_LANES,
   DEFAULT_MAX_QA_PASSES,
   DEFAULT_MAX_REVIEW_BOUNCES,
+  DEFAULT_MIN_SKEPTIC_QUORUM,
   DEFAULT_MIN_REVIEWER_CONFIDENCE,
   DEFAULT_QA_INVESTIGATE_AFTER,
   DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
@@ -167,6 +168,11 @@ export interface LaneState {
   lastActivityMs: number; // last observed worker output (watchdog baseline)
   qaBounces: number; // completed QA passes that found bugs
   reviewBounces: number; // completed reviewer->builder bounces (issue #76)
+  // #191: reviewer->REVIEWER re-spawns this lane has spent on a short skeptic
+  // quorum, capped by MAX_QUORUM_RETRIES. Optional so state files written before
+  // #191 load unchanged (absent reads as 0). Deliberately NOT folded into
+  // reviewBounces -- see quorumAction for why one budget cannot serve both.
+  quorumRetries?: number;
   workerDead?: boolean; // set by the orchestrator after an aliveness probe
   outcome?: StageOutcome; // set when the stage agent's final message is parsed
   // #125: the board status the loop itself last wrote for this lane (set by
@@ -200,6 +206,10 @@ export interface LoopState {
   // treatment as the gate knobs above (cfg -> preserved-from-prev ->
   // DEFAULT_MAX_REVIEW_BOUNCES).
   maxReviewBounces?: number;
+  // Skeptic quorum floor (issue #191), same optional-with-fallback treatment: the
+  // number of skeptic verdicts an ADVERSARIAL review must actually have received
+  // for its aggregated confidence to be allowed to merge. 0 disables the gate.
+  minSkepticQuorum?: number;
   // Tickets whose PRs landed during THIS run. Their branches still exist
   // (stacked-chain rule: branches are deleted only after the whole batch), so a
   // dependent's merge stage must know to retarget onto the base branch.
@@ -250,7 +260,7 @@ export type StageOutcome =
   | { kind: "needs-input"; note: string }
   | { kind: "qa-pass" }
   | { kind: "qa-bugs"; note: string }
-  | { kind: "review-approve"; confidence: number | null }
+  | { kind: "review-approve"; confidence: number | null; skeptics: { received: number; of: number } | null }
   | { kind: "review-findings"; note: string }
   | { kind: "human-question"; note: string }
   | { kind: "stage-blocked"; note: string }
@@ -269,6 +279,29 @@ export function parseReviewerConfidence(note: string): number | null {
   if (!m) return null;
   const n = Number(m[1]);
   return n >= 0 && n <= 100 ? n : null;
+}
+
+// Skeptic-delivery denominator off a reviewer marker note: `skeptics=<k>/<of>`
+// (issue #191), the number of skeptic verdicts the reviewer actually held out of
+// the 3 it spawned. The confidence token alone cannot express this and hides the
+// exact case that made #62's gate unsafe: ONE skeptic reporting "cannot refute"
+// aggregates to confidence=100, clears the default floor of 70, and merges as
+// though three independent reviews agreed. The denominator is the missing fact.
+//
+// Absent token -> null, which the gate reads as "this review had no fan-out" and
+// never blocks on (a single-pass prompt emits no `skeptics=`, by design). Same
+// no-throw contract as parseReviewerConfidence: these are model-authored prose,
+// so an unparseable value is a decision for the gate, not a crash. `of` is
+// carried rather than assumed 3 so a future skeptic count needs no reparse; a
+// received count above `of` is incoherent (nobody delivered 4 of 3) and reads as
+// null rather than being clamped into a pass.
+export function parseSkepticQuorum(note: string): { received: number; of: number } | null {
+  const m = note.match(/\bskeptics=(\d{1,2})\/(\d{1,2})(?!\d)/i);
+  if (!m) return null;
+  const received = Number(m[1]);
+  const of = Number(m[2]);
+  if (of < 1 || received > of) return null;
+  return { received, of };
 }
 
 // The machine-parsed exit contract every stage prompt ends with
@@ -290,7 +323,11 @@ const MARKERS: Record<Stage, Record<string, (note: string) => StageOutcome>> = {
     "CONFUSED": (note) => ({ kind: "confused", note }),
   },
   reviewer: {
-    "REVIEW-APPROVE": (note) => ({ kind: "review-approve", confidence: parseReviewerConfidence(note) }),
+    "REVIEW-APPROVE": (note) => ({
+      kind: "review-approve",
+      confidence: parseReviewerConfidence(note),
+      skeptics: parseSkepticQuorum(note),
+    }),
     "REVIEW-FINDINGS": (note) => ({ kind: "review-findings", note }),
     "NEEDS-HUMAN": (note) => ({ kind: "human-question", note }),
     "BLOCKED": (note) => ({ kind: "stage-blocked", note }),
@@ -359,7 +396,16 @@ interface ReviewerGate {
   minConfidence: number;
   belowAction: "block" | "retry" | "off";
   maxReviewBounces: number;
+  minSkepticQuorum: number; // #191: skeptic verdicts an adversarial approve needs
 }
+
+// #191: how many times ONE lane may re-spawn its reviewer over a short skeptic
+// quorum before the ticket parks Blocked. Fixed at 1, deliberately: a starved
+// quorum is a delivery race, and one retry is the whole value of retrying -- if a
+// second independent reviewer also cannot get verdicts from 2 of 3 sub-agents,
+// the cause is environmental and another paid pass will not fix it. No config
+// knob for the same reason N=3 skeptics has none (lib/stage-prompts.ts).
+export const MAX_QUORUM_RETRIES = 1;
 
 // Reviewer->builder bounce cap (issue #76): both routes that send a ticket
 // back to the builder from Review -- a REVIEW-FINDINGS, and a below-floor
@@ -379,6 +425,56 @@ function reviewerBounceAction(lane: LaneState, reviewerGate: ReviewerGate, note:
     };
   }
   return { kind: "advance", ticket, to: "builder", note };
+}
+
+// #191's quorum gate, applied only to an approve that already cleared the
+// confidence floor. Returns null (merge) when the review carried enough skeptic
+// verdicts, a reviewer RE-SPAWN when it did not, and Blocked once this lane has
+// spent its one retry.
+//
+// The re-spawn targets the REVIEWER, not the builder: a short quorum says the
+// review was thin, not that the diff is wrong, and rebuilding a diff nobody
+// found fault with fixes nothing while paying a builder and a QA pass for it.
+// canTransition("Review","Review") is already legal and STATUS_FOR_STAGE matches,
+// so the board move is a no-op.
+//
+// The retry budget is SEPARATE from lane.reviewBounces on purpose. Sharing it
+// would let a delivery race consume a rebuild that a genuine finding needs, and
+// would park the ticket under "review bounce cap reached" -- telling the human a
+// reviewer rejected this diff twice when one of the two was a starved sub-agent.
+// Two different failures, two different budgets, two different notes.
+function quorumAction(
+  lane: LaneState,
+  reviewerGate: ReviewerGate,
+  skeptics: { received: number; of: number } | null
+): Action | null {
+  if (reviewerGate.minSkepticQuorum <= 0) return null; // quorum gate disabled
+  // `== null` catches undefined as well as null, deliberately: a lane's outcome
+  // is PERSISTED in state.json, so a loop upgraded onto #191 mid-drain reads
+  // review-approve outcomes recorded by the old code, which carry no `skeptics`
+  // key at all. A strict `=== null` would dereference undefined and crash the
+  // tick. Either way the reading is the same -- no denominator reported, so this
+  // gate has nothing to judge and #62's floor already ruled.
+  if (skeptics == null) return null; // single pass, unparseable, or pre-#191 state
+  if (skeptics.received >= reviewerGate.minSkepticQuorum) return null; // enough looked -> merge gate
+  const spent = lane.quorumRetries ?? 0;
+  const detail =
+    `skeptic quorum not met (${skeptics.received}/${skeptics.of} verdicts delivered, ` +
+    `${reviewerGate.minSkepticQuorum} required). The confidence score aggregated over ` +
+    `${skeptics.received === 0 ? "no verdicts at all" : `only ${skeptics.received}`}, so it is not the ` +
+    `independent agreement the adversarial pass is supposed to produce.`;
+  if (spent >= MAX_QUORUM_RETRIES) {
+    return {
+      kind: "park",
+      ticket: lane.ticket,
+      status: "Blocked",
+      note:
+        `${detail}\n\nA second reviewer could not reach quorum either (${spent + 1} attempt(s)), so this is ` +
+        `environmental, not luck. Re-run the review by hand, or lower minSkepticQuorum for this project if a ` +
+        `thinner adversarial pass is acceptable. The diff itself was never faulted.`,
+    };
+  }
+  return { kind: "advance", ticket: lane.ticket, to: "reviewer", note: detail };
 }
 
 // What one lane's finished stage means for that lane. A PASSING review-approve
@@ -419,12 +515,19 @@ function resolveOutcome(lane: LaneState, qaLimits: QaBounceLimits, reviewerGate:
     case "review-approve": {
       if (reviewerGate.belowAction === "off") return null; // gate disabled -> merge gate lands it
       const conf = o.confidence; // number | null
-      if (conf !== null && conf >= reviewerGate.minConfidence) return null; // passes -> merge gate
-      const note = conf === null
-        ? `truth-check failed (reviewer approved with no parseable confidence score)`
-        : `truth-check failed (confidence ${conf}/100)`;
-      if (reviewerGate.belowAction === "retry") return reviewerBounceAction(lane, reviewerGate, note);
-      return { kind: "park", ticket, status: "Blocked", note };
+      if (conf === null || conf < reviewerGate.minConfidence) {
+        const note = conf === null
+          ? `truth-check failed (reviewer approved with no parseable confidence score)`
+          : `truth-check failed (confidence ${conf}/100)`;
+        if (reviewerGate.belowAction === "retry") return reviewerBounceAction(lane, reviewerGate, note);
+        return { kind: "park", ticket, status: "Blocked", note };
+      }
+      // #191: the confidence cleared the floor -- but WHAT cleared it? An
+      // aggregate over ONE skeptic that could not refute is confidence=100, and
+      // before this gate that merged as though three independent reviews agreed.
+      // Only an adversarial review reports the denominator, so an absent token is
+      // a single pass and never blocks here (that case is #62's floor's job).
+      return quorumAction(lane, reviewerGate, o.skeptics);
     }
     case "merged":
       return { kind: "complete", ticket, note: o.note };
@@ -479,6 +582,7 @@ export function nextAction(state: LoopState, nowMs: number): Action {
     minConfidence: state.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE,
     belowAction: state.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
     maxReviewBounces: state.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES,
+    minSkepticQuorum: state.minSkepticQuorum ?? DEFAULT_MIN_SKEPTIC_QUORUM,
   };
   const byNumber = new Map(tickets.map((t) => [t.number, t]));
   // Tickets this tick's desync guard judged as a lagged (not genuine) board
@@ -812,6 +916,12 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
       if (!lane) throw new ZError(`No lane holds #${action.ticket} to advance.`);
       if (action.to === "builder" && lane.stage === "qa") lane.qaBounces += 1;
       if (action.to === "builder" && lane.stage === "reviewer") lane.reviewBounces += 1;
+      // #191: reviewer -> reviewer is the ONLY self-advance in the machine, and
+      // it MUST consume a counter here. Without this line quorumAction's `spent`
+      // never grows, so a project whose sub-agent delivery is broken re-spawns
+      // the same reviewer forever -- a paid infinite loop, the exact thing the
+      // no-token-burn rule forbids.
+      if (action.to === "reviewer" && lane.stage === "reviewer") lane.quorumRetries = (lane.quorumRetries ?? 0) + 1;
       lane.stage = action.to;
       lane.lastActivityMs = nowMs;
       delete lane.outcome;
@@ -936,6 +1046,7 @@ export function ingestBoardItems(
     minReviewerConfidence?: number;
     reviewerBelowThresholdAction?: "block" | "retry" | "off";
     maxReviewBounces?: number;
+    minSkepticQuorum?: number;
     humanNeededPercent?: number;
     ticketLimit?: number; // #131: cap used to compute batchTickets on a fresh batch
     contextTokens?: number; // #131: live orchestrator context reading, stored fresh
@@ -1086,6 +1197,7 @@ export function ingestBoardItems(
     reviewerBelowThresholdAction:
       cfg?.reviewerBelowThresholdAction ?? prev?.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
     maxReviewBounces: cfg?.maxReviewBounces ?? prev?.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES,
+    minSkepticQuorum: cfg?.minSkepticQuorum ?? prev?.minSkepticQuorum ?? DEFAULT_MIN_SKEPTIC_QUORUM,
     humanNeededPercent: cfg?.humanNeededPercent ?? prev?.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT,
     mergedThisRun: startingFreshBatch ? [] : [...(prev?.mergedThisRun ?? [])],
     initialReadyCount: startingFreshBatch ? readyCount : (prev!.initialReadyCount ?? 0),
@@ -1123,7 +1235,8 @@ const USAGE = `loop <command> [args]
   ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M]
                       [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N]
                       [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off]
-                      [--max-review-bounces N] [--ticket-limit N] [--context-token-limit N] [--context-tokens N]
+                      [--max-review-bounces N] [--min-skeptic-quorum N] [--ticket-limit N]
+                      [--context-token-limit N] [--context-tokens N]
                                                      build/refresh the snapshot (creates state.json)
 
   --now defaults to the wall clock; tests pass it explicitly.`;
@@ -1175,6 +1288,7 @@ const INGEST_NUMBERS = [
   "human-needed-percent",
   "min-reviewer-confidence",
   "max-review-bounces",
+  "min-skeptic-quorum", // #191: skeptic-delivery floor for an adversarial approve (0 disables)
   "ticket-limit", // #131: per-loop ticket cap (0 = no cap); selects batchTickets on a fresh batch
   "context-token-limit", // #131: context ceiling (0 = disabled), captured once
   "context-tokens", // #131: live orchestrator context reading, threaded per tick by z-loop-tick
@@ -1272,7 +1386,7 @@ export function main(argv: string[]): number {
       return 0;
     }
     if (cmd === "ingest") {
-      if (!positionals[1] || !positionals[2]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off] [--max-review-bounces N] [--ticket-limit N] [--context-token-limit N] [--context-tokens N]");
+      if (!positionals[1] || !positionals[2]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off] [--max-review-bounces N] [--min-skeptic-quorum N] [--ticket-limit N] [--context-token-limit N] [--context-tokens N]");
       const prev = readPrevState(statePath);
       const items = readJson(positionals[1]) as BoardItemLike[];
       const bodies = readJson(positionals[2]) as Record<string, string>;

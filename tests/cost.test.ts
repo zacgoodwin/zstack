@@ -808,6 +808,26 @@ describe("sumByStage", () => {
     expect(stages.map((s) => s.stage).sort()).toEqual(["builder", "merge", "reviewer"]);
   });
 
+  // #190: lib/transcripts.ts also writes `<stage>-<attempt>-sub-<agentId>.jsonl`
+  // for every sub-agent a stage spawned -- the adversarial reviewer's 3 skeptics
+  // are the case that matters, since their tokens ARE reviewer spend and used to
+  // be collected by nobody. Splitting on the FIRST "-" already buckets them under
+  // the spawning stage, so #190 needed no change here; this pins that, because a
+  // regression would move the majority of every adversarial review's dollars into
+  // the "other" row instead of "reviewer".
+  test("#190: a stage's sub-agent transcripts bucket under that stage, not 'other'", () => {
+    const byFile = [
+      fileSpend("/state/transcripts/ticket-12/reviewer-2.jsonl", 1),
+      fileSpend("/state/transcripts/ticket-12/reviewer-2-sub-a8c4119bcf720c8ad.jsonl", 2),
+      fileSpend("/state/transcripts/ticket-12/reviewer-2-sub-aada05782427029df.jsonl", 3),
+      fileSpend("/state/transcripts/ticket-12/qa-1-sub-a26d46782f2c4f5ee.jsonl", 4),
+    ];
+    const stages = sumByStage(byFile);
+    expect(stages.find((s) => s.stage === "reviewer")!.dollars).toBe(6);
+    expect(stages.find((s) => s.stage === "qa")!.dollars).toBe(4);
+    expect(stages.find((s) => s.stage === "other")).toBeUndefined();
+  });
+
   test("a Windows-style path (backslashes) still resolves to the basename's stage", () => {
     const byFile = [fileSpend("C:\\state\\transcripts\\ticket-9\\qa-1.jsonl", 0.5)];
     expect(sumByStage(byFile)).toEqual([{ stage: "qa", dollars: 0.5 }]);

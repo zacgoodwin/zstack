@@ -76,12 +76,13 @@ mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports" 
 4. Read the loop knobs from config (defaults 3 lanes / 10 minutes / audits
    every 5th loop / 3 QA passes before Blocked / investigate from QA bounce 2 /
    human-needed at 30% parked / reviewer-confidence floor 70, block a
-   sub-floor approve / 2 reviewer->builder bounces before Blocked / no per-loop
+   sub-floor approve / 2 reviewer->builder bounces before Blocked / 2 of 3
+   skeptic verdicts required for an adversarial approve to merge / no per-loop
    ticket cap / context ceiling 550000 tokens):
 
 ```bash
-read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMAN_NEEDED_PERCENT MIN_REVIEWER_CONFIDENCE REVIEWER_BELOW_ACTION MAX_REVIEW_BOUNCES TICKET_LIMIT CONTEXT_TOKEN_LIMIT <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
-  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.humanNeededPercent, c.minReviewerConfidence, c.reviewerBelowThresholdAction, c.maxReviewBounces, c.ticketLimit, c.contextTokenLimit)")"
+read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMAN_NEEDED_PERCENT MIN_REVIEWER_CONFIDENCE REVIEWER_BELOW_ACTION MAX_REVIEW_BOUNCES MIN_SKEPTIC_QUORUM TICKET_LIMIT CONTEXT_TOKEN_LIMIT <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
+  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.humanNeededPercent, c.minReviewerConfidence, c.reviewerBelowThresholdAction, c.maxReviewBounces, c.minSkepticQuorum, c.ticketLimit, c.contextTokenLimit)")"
 ```
 
 5. **Startup orphan scan (C7).** A crashed prior loop leaves lane locks in
@@ -177,7 +178,7 @@ bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" \
   --max-qa-passes "$MAX_QA_PASSES" --qa-investigate-after "$QA_INVESTIGATE_AFTER" \
   --human-needed-percent "$HUMAN_NEEDED_PERCENT" \
   --min-reviewer-confidence "$MIN_REVIEWER_CONFIDENCE" --reviewer-below-threshold-action "$REVIEWER_BELOW_ACTION" \
-  --max-review-bounces "$MAX_REVIEW_BOUNCES" \
+  --max-review-bounces "$MAX_REVIEW_BOUNCES" --min-skeptic-quorum "$MIN_SKEPTIC_QUORUM" \
   --ticket-limit "$TICKET_LIMIT" --context-token-limit "$CONTEXT_TOKEN_LIMIT"
 ```
 
@@ -302,15 +303,35 @@ the input file, never through your context; ticket #57, Leak 1):
    `input-<N>.json` stays EXACTLY the four blinded keys `{ticketBody,
    acceptanceCriteria, diff, worktreePath}` — `input-<N>.json`'s path is a
    constructor argument, not a key, so blindness is untouched.
-2. `bun "$PACK/lib/stage-prompts.ts" prompt <stage> "$TMP/input-<N>.json" > "$TMP/prompt-<N>.txt"`
-   (1b) — the constructor prints a POINTER prompt: small/fixed fields inline plus
-   an instruction to read `ticketBody`/`diff`/`acceptanceCriteria` from the
+2. **Stamp the spawn, then build the prompt (1b).** `<attempt>` is that lane's
+   1-based spawn count for this stage, computed from the SAME state-file bounce
+   counters used elsewhere in this step: `qa` and `reviewer` are
+   `qaBounces`/`reviewBounces` + 1 (the `qa` row below already computes this as
+   `qaPass` — reuse it), `builder` is `qaBounces + reviewBounces + 1` (either
+   bounce type re-spawns the builder), `merge` is always `1`.
+
+   ```bash
+   TAG=$(bun "$PACK/lib/transcripts.ts" tag --slug "$SLUG" --ticket <N> --stage <stage> --attempt <attempt>)
+   bun "$PACK/lib/stage-prompts.ts" prompt <stage> "$TMP/input-<N>.json" --spawn-tag "$TAG" > "$TMP/prompt-<N>.txt"
+   ```
+
+   The tag is an opaque digest of those four facts and nothing else, so it is
+   **recomputable** — the per-stage Actual step below re-runs the identical `tag`
+   command instead of depending on `$TAG` surviving between calls. It is what lets
+   that step find this spawn's transcript deterministically (#190); skip it and
+   the stage's dollars go uncounted. Never invent a tag by hand.
+
+   The constructor prints a POINTER prompt: small/fixed fields inline plus an
+   instruction to read `ticketBody`/`diff`/`acceptanceCriteria` from the
    ABSOLUTE path of `input-<N>.json`. `prompt-<N>.txt` stays small (payload-
    independent), so reading it to spawn the Agent is cheap. The constructor is the
    contract; if it exits non-zero the input is wrong, fix the input, never
-   hand-write the prompt. The `reviewer` stage is the one exception that takes two
-   extra flags (`--adversarial-mode`, `--labels`) — see its row below; they decide
-   the super-truth fan-out and NEVER become input keys.
+   hand-write the prompt. The `reviewer` stage additionally takes two flags
+   (`--adversarial-mode`, `--labels`) — see its row below. All three ride as
+   FLAGS and NEVER become input keys, so the reviewer's four-key blindness gate is
+   untouched (the tag is a digest for that reason too: a readable
+   `<slug>/t<n>/<stage>/<attempt>` would tell the reviewer which review attempt
+   this is).
 3. Spawn a FRESH harness Agent (Agent tool), `run_in_background: true`, with
    that prompt and `model` resolved through the per-stage router (issue #82:
    the merge stage is mechanical — a PR create, a conflict check, a PR merge —
@@ -333,26 +354,45 @@ the input file, never through your context; ticket #57, Leak 1):
 |---|---|
 | `builder` | `ticketNumber`, `ticketTitle`, `ticketBody` (fresh `gh issue view` → `"$TMP/body-<N>.md"`, injected `--rawfile`), `worktreePath` (`.worktrees/ticket-<N>`), `branch`, `baseBranch`; on a bounce also `qaNotes`/`investigateFirst` or `reviewNotes` per the advance row above. |
 | `qa` | `ticketNumber`, `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `worktreePath`, `branch`, `qaPass` (the lane's `qaBounces` in the state file + 1), `webTarget` (true when the ticket changes a web-served surface — your judgment; QA then drives gstack /qa). |
-| `reviewer` | **BLINDED — exactly** `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `acceptanceCriteria` (the `### Acceptance Criteria` section to a file: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$TMP/body-<N>.md" > "$TMP/ac-<N>.md"`, injected `--rawfile`), `diff` (exclude lockfiles to avoid flooding the reviewer with generated code: `git -C .worktrees/ticket-<N> diff "$BASE"...HEAD -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)pnpm-lock.yaml' ':(exclude)yarn.lock' > "$TMP/diff-<N>.txt"`; if the filtered diff is empty — a lockfile-only change — fall back to the unfiltered diff: `[ ! -s "$TMP/diff-<N>.txt" ] && git -C .worktrees/ticket-<N> diff "$BASE"...HEAD > "$TMP/diff-<N>.txt"`. Injected `--rawfile` so it never enters your context), `worktreePath` = a THROWAWAY worktree of the head commit, placed under the repo's own `.worktrees/` — NEVER under `$TMP` / `~/.zstack` (issue #118: the reviewer runs the full `bun test` suite in this worktree, and several tests write to/delete real `~/.zstack` subtrees via `homedir()`; a throwaway worktree rooted there lets that suite's cleanup destroy the loop's own live state.json/locks/transcripts mid-run) — `git worktree add ".worktrees/review-<N>" <head-sha>`; remove it after the stage (`git worktree remove ".worktrees/review-<N>" --force`). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. **Adversarial control (#59):** build this stage's prompt with two extra flags — `MODE=$("$Z_BOARD" ... )` the project's `adversarialMode` (read it from `~/.zstack/projects/$SLUG/config.json`; `loadConfig` defaults it to `non-trivial`) and `LABELS=$(gh issue view <N> --json labels -q '[.labels[].name]')` (a JSON array — labels live on the GitHub issue, NOT on the board item, so `board.list` never fetched them; get them here). Then `bun "$PACK/lib/stage-prompts.ts" prompt reviewer "$TMP/input-<N>.json" --adversarial-mode "$MODE" --labels "$LABELS" > "$TMP/prompt-<N>.txt"`. The predicate (`adversarialActive`) reads the diff's own changed-line count from the blinded input — `always`/`non-trivial`-on-a-big-or-labeled diff spawns the skeptic fan-out (and stamps a `confidence=` token onto `REVIEW-FINDINGS` too); `off`/small-unlabeled is the single pass. Either way `REVIEW-APPROVE` always carries a `confidence=` token (issue #62's safety gate reads it regardless) — see `/z-loop`'s reviewer-confidence-gate section for what a sub-floor score does. Mode + labels ride as FLAGS; the four-key input JSON is untouched. |
+| `reviewer` | **BLINDED — exactly** `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `acceptanceCriteria` (the `### Acceptance Criteria` section to a file: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$TMP/body-<N>.md" > "$TMP/ac-<N>.md"`, injected `--rawfile`), `diff` (exclude lockfiles to avoid flooding the reviewer with generated code: `git -C .worktrees/ticket-<N> diff "$BASE"...HEAD -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)pnpm-lock.yaml' ':(exclude)yarn.lock' > "$TMP/diff-<N>.txt"`; if the filtered diff is empty — a lockfile-only change — fall back to the unfiltered diff: `[ ! -s "$TMP/diff-<N>.txt" ] && git -C .worktrees/ticket-<N> diff "$BASE"...HEAD > "$TMP/diff-<N>.txt"`. Injected `--rawfile` so it never enters your context), `worktreePath` = a THROWAWAY worktree of the head commit, placed under the repo's own `.worktrees/` — NEVER under `$TMP` / `~/.zstack` (issue #118: the reviewer runs the full `bun test` suite in this worktree, and several tests write to/delete real `~/.zstack` subtrees via `homedir()`; a throwaway worktree rooted there lets that suite's cleanup destroy the loop's own live state.json/locks/transcripts mid-run) — `git worktree add ".worktrees/review-<N>" <head-sha>`; remove it after the stage (`git worktree remove ".worktrees/review-<N>" --force`). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. **Adversarial control (#59):** build this stage's prompt with two extra flags — `MODE=$("$Z_BOARD" ... )` the project's `adversarialMode` (read it from `~/.zstack/projects/$SLUG/config.json`; `loadConfig` defaults it to `non-trivial`) and `LABELS=$(gh issue view <N> --json labels -q '[.labels[].name]')` (a JSON array — labels live on the GitHub issue, NOT on the board item, so `board.list` never fetched them; get them here). Then `bun "$PACK/lib/stage-prompts.ts" prompt reviewer "$TMP/input-<N>.json" --adversarial-mode "$MODE" --labels "$LABELS" --spawn-tag "$TAG" > "$TMP/prompt-<N>.txt"` (`--spawn-tag` per step 1b — required here like every other stage, and #190's skeptic transcripts are the reason it exists at all). The predicate (`adversarialActive`) reads the diff's own changed-line count from the blinded input — `always`/`non-trivial`-on-a-big-or-labeled diff spawns the skeptic fan-out (and stamps a `confidence=` token onto `REVIEW-FINDINGS` too); `off`/small-unlabeled is the single pass. Either way `REVIEW-APPROVE` always carries a `confidence=` token (issue #62's safety gate reads it regardless) — see `/z-loop`'s reviewer-confidence-gate section for what a sub-floor score does. Mode + labels ride as FLAGS; the four-key input JSON is untouched. |
 | `merge` | `ticketNumber`, `prTitle` (the ticket title), `branch`, `baseBranch`, `worktreePath`, `stackedOn` (from the advance action — parents whose branches this PR stacks on; the prompt carries the PROCESS.md step 18 chain rules: parents first, no branch deletion mid-batch, retarget, delete last). |
 
 **Per-stage Actual (every stage, no exceptions):** when a stage agent finishes,
-copy its transcript jsonl into
-`"$STATE_DIR/transcripts/ticket-<N>/<stage>-<attempt>.jsonl"` (the harness
-writes session transcripts under `~/.claude/projects/`; take the file for that
-spawn) — never an unnamed/default filename. `<stage>` is one of
-`builder`/`qa`/`reviewer`/`merge`; `<attempt>` is that lane's 1-based spawn
-count for the stage, taken from the SAME state-file bounce counters this step
-already reads elsewhere: `qa` and `reviewer` are `qaBounces`/`reviewBounces` + 1
-(the `qa` row above already computes this as `qaPass` — reuse it, don't
-recompute), `builder` is `qaBounces + reviewBounces + 1` (either bounce type
-re-spawns builder, so its attempt count is the sum + the initial spawn), and
-`merge` is always `1` (it never bounces back to builder). This deterministic
-naming is what lets the end-of-loop spend-by-stage table (Step 7a item 5)
-attribute dollars per stage instead of only per ticket. Then price the
-ticket's whole directory — the glob accumulates every stage so far, and z-cost
-dedupes by requestId, so its total IS the cumulative and you never add dollars
-in prose:
+collect its transcripts with `lib/transcripts.ts` — never by picking files
+yourself. Recompute the same tag the spawn was stamped with (step 1b above; same
+four facts, same digest), then collect:
+
+```bash
+TAG=$(bun "$PACK/lib/transcripts.ts" tag --slug "$SLUG" --ticket <N> --stage <stage> --attempt <attempt>)
+bun "$PACK/lib/transcripts.ts" collect --tag "$TAG" \
+  --dest "$STATE_DIR/transcripts/ticket-<N>" --name "<stage>-<attempt>" >/dev/null
+```
+
+`collect` finds the stage agent by its stamped tag and copies **it plus every
+sub-agent it spawned, transitively** — `<stage>-<attempt>.jsonl` for the stage
+itself and `<stage>-<attempt>-sub-<agentId>.jsonl` for each descendant. `<stage>`
+is one of `builder`/`qa`/`reviewer`/`merge` (the `tag` verb rejects anything else,
+since only those four have a spend-by-stage row); `<attempt>` is the same 1-based
+spawn count step 1b computed. Sub-agents are the
+whole point (#190): the adversarial reviewer spawns 3 skeptics whose tokens ARE
+reviewer spend, and the old prose here said "take the file for that spawn" — a
+latent step, so they were collected by nobody and every adversarial review's
+Actual undercounted by most of what it spent. Do NOT sweep by modification time:
+three lanes run concurrently, so sibling reviewers' skeptics interleave in one
+flat directory, and that sweep gave a reviewer with 3 skeptics 8 transcripts.
+
+It exits non-zero rather than writing a partial set — a missing stage transcript
+is exactly the silent undercount #190 filed. If it fails, the tag never reached
+the agent (step 1b was skipped, or `<attempt>` disagrees between the two calls):
+say so in the completion note instead of guessing a number, price whatever the
+directory does hold, and keep the drain moving.
+
+Then price the ticket's whole directory — the glob accumulates every stage so far,
+and z-cost dedupes by requestId, so its total IS the cumulative and you never add
+dollars in prose. This deterministic naming is also what lets the end-of-loop
+spend-by-stage table (Step 7a item 5) attribute dollars per stage instead of only
+per ticket (`stageOfFile` splits on the first `-`, so a `-sub-` file buckets under
+the stage that spawned it):
 
 ```bash
 ACTUAL=$("$Z_COST" --json "$STATE_DIR/transcripts/ticket-<N>/*.jsonl" | jq -r .total)

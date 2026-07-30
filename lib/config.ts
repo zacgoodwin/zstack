@@ -129,6 +129,18 @@ export interface BoardConfig {
   // builder->QA->review forever. Same optional-with-fallback treatment as the
   // gate knobs above.
   maxReviewBounces?: number;
+  // Skeptic quorum floor (issue #191): how many of the 3 skeptic verdicts an
+  // ADVERSARIAL review must actually have received for its aggregated confidence
+  // to merge. The confidence token alone cannot express this, and the gap is not
+  // theoretical: one skeptic reporting "cannot refute" aggregates to
+  // confidence=100, clears the default floor of 70, and merges as though three
+  // independent reviews agreed. Default 2 -- a majority of the fan-out had to
+  // look. 0 disables the gate; 1 accepts a single opinion as an adversarial pass,
+  // which is the hole this closes, so lower it only deliberately. A short quorum
+  // re-spawns the REVIEWER once (a thin review is not a bad diff), then parks
+  // Blocked. Only ever consulted when the reviewer emitted a `skeptics=` token,
+  // so a project with adversarialMode "off" is entirely unaffected.
+  minSkepticQuorum?: number;
   // Safety control (issue #63): mid-run breakdown notification when parked
   // tickets (Blocked + Skipped + Questions) exceed this percent of the
   // batch's initial committed-to-Building count. 0 disables the control.
@@ -178,6 +190,7 @@ export const DEFAULT_TICK_THROTTLE_SECONDS = 0;
 export const DEFAULT_MIN_REVIEWER_CONFIDENCE = 70;
 export const DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION = "block" as const;
 export const DEFAULT_MAX_REVIEW_BOUNCES = 2;
+export const DEFAULT_MIN_SKEPTIC_QUORUM = 2;
 export const DEFAULT_HUMAN_NEEDED_PERCENT = 30;
 export const DEFAULT_TICKET_LIMIT = 0;
 export const DEFAULT_CONTEXT_TOKEN_LIMIT = 550000;
@@ -285,6 +298,7 @@ export function loadConfig(slug?: string, home = homedir()): BoardConfig {
   cfg.minReviewerConfidence = cfg.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE;
   cfg.reviewerBelowThresholdAction = cfg.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION;
   cfg.maxReviewBounces = cfg.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES;
+  cfg.minSkepticQuorum = cfg.minSkepticQuorum ?? DEFAULT_MIN_SKEPTIC_QUORUM;
   cfg.humanNeededPercent = cfg.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT;
   cfg.ticketLimit = cfg.ticketLimit ?? DEFAULT_TICKET_LIMIT;
   cfg.contextTokenLimit = cfg.contextTokenLimit ?? DEFAULT_CONTEXT_TOKEN_LIMIT;
