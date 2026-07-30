@@ -661,44 +661,119 @@ describe("skeptic quorum gate (issue #191)", () => {
 describe("built guard: clean tree + moved HEAD (#177)", () => {
   const BASE = "1111111111111111111111111111111111111111";
   const HEAD = "2222222222222222222222222222222222222222";
+  // What `git status --porcelain --branch` prints for a clean lane worktree: the
+  // `## <branch>` header and nothing else. The header is REQUIRED (an empty
+  // payload is a git status that never ran), so no fixture may omit it.
+  const CLEAN = "## z/ticket-1-thing...origin/main [ahead 1]\n";
   // The AC's setup: staged (`M `) + unstaged (` M`) edits and an unadded new
   // file, no commit, HEAD still at the base SHA.
   const DIRTY_NO_COMMIT = {
-    porcelain: "M  lib/loop.ts\n M tests/loop.test.ts\n?? docs/new.md\n",
+    porcelain: `${CLEAN}M  lib/loop.ts\n M tests/loop.test.ts\n?? docs/new.md\n`,
     headSha: BASE,
     baseSha: BASE,
   };
-  const CLEAN_MOVED = { porcelain: "", headSha: HEAD, baseSha: BASE };
+  const CLEAN_MOVED = { porcelain: CLEAN, headSha: HEAD, baseSha: BASE };
 
   test("the guard passes a clean tree with a commit off base, and fails on either half alone", () => {
     expect(builtGuardFailure(CLEAN_MOVED)).toBeNull();
     // Trailing/blank lines are not dirt -- git's porcelain output ends in \n.
-    expect(builtGuardFailure({ porcelain: "\n   \n", headSha: HEAD, baseSha: BASE })).toBeNull();
+    expect(builtGuardFailure({ porcelain: `${CLEAN}\n   \n`, headSha: HEAD, baseSha: BASE })).toBeNull();
     expect(builtGuardFailure(DIRTY_NO_COMMIT)).toContain("uncommitted work");
     // Committed SOMETHING but left the rest behind: still an incomplete diff.
-    const half = builtGuardFailure({ porcelain: "?? tests/new.test.ts\n", headSha: HEAD, baseSha: BASE })!;
+    const half = builtGuardFailure({ porcelain: `${CLEAN}?? tests/new.test.ts\n`, headSha: HEAD, baseSha: BASE })!;
     expect(half).toContain("1 uncommitted path(s)");
     expect(half).toContain("Commit what is already in the worktree");
     // Clean tree, no commit: the lane holds nothing at all, so the fix line must
     // NOT tell that builder to commit files nobody wrote.
-    const nothing = builtGuardFailure({ porcelain: "", headSha: BASE, baseSha: BASE })!;
-    expect(nothing).toContain("HEAD still at the base commit");
+    const nothing = builtGuardFailure({ porcelain: CLEAN, headSha: BASE, baseSha: BASE })!;
+    expect(nothing).toContain("still an ancestor of the base branch");
     expect(nothing).toContain("Nothing at all is on this branch");
+  });
+
+  // The porcelain half needs the SAME fail-closed twin the SHA half has. The
+  // orchestrator collects status with `> file`, and a redirect creates the file
+  // BEFORE git runs -- so a `git status` that failed leaves an EMPTY file, which a
+  // bare porcelain payload cannot tell apart from a clean tree. With a moved HEAD
+  // that read a half-committed build straight into QA. `--branch` closes it: git
+  // always emits the `## <branch>` header, so its absence means "no status".
+  test("a status payload with no `## ` header fails closed instead of reading as clean", () => {
+    const empty = builtGuardFailure({ porcelain: "", headSha: HEAD, baseSha: BASE })!;
+    expect(empty).toContain("uncommitted work");
+    expect(empty).toContain("`## <branch>` header is missing");
+    // ...and the fix line cannot claim the branch is empty or that files are
+    // waiting -- neither is known.
+    expect(empty).toContain("look before you build");
+    expect(empty).not.toContain("Nothing at all is on this branch");
+    // Whitespace-only and dirt-without-a-header are the same unproven state.
+    expect(builtGuardFailure({ porcelain: "\n \n", headSha: HEAD, baseSha: BASE })).toContain("header is missing");
+    expect(builtGuardFailure({ porcelain: " M lib/loop.ts\n", headSha: HEAD, baseSha: BASE })).toContain("header is missing");
+    // A `##` inside a path is not the header (git's own header is `## ` + branch).
+    expect(builtGuardFailure({ porcelain: "?? docs/##notes.md\n", headSha: HEAD, baseSha: BASE })).toContain("header is missing");
   });
 
   // Reading a 7-char abbreviation as "different from" its own full OID would fail
   // OPEN: the guard would report a moved HEAD for a branch still on base -- the
   // exact build this ticket exists to stop.
   test("an abbreviated or upper-case SHA still reads as the same commit", () => {
-    expect(builtGuardFailure({ porcelain: "", headSha: BASE, baseSha: BASE.slice(0, 7) })).toContain("uncommitted work");
-    expect(builtGuardFailure({ porcelain: "", headSha: BASE.toUpperCase(), baseSha: BASE })).toContain("uncommitted work");
+    expect(builtGuardFailure({ porcelain: CLEAN, headSha: BASE, baseSha: BASE.slice(0, 7) })).toContain("uncommitted work");
+    expect(builtGuardFailure({ porcelain: CLEAN, headSha: BASE.toUpperCase(), baseSha: BASE })).toContain("uncommitted work");
     // A genuinely different commit, abbreviated, still reads as moved.
-    expect(builtGuardFailure({ porcelain: "", headSha: HEAD.slice(0, 7), baseSha: BASE })).toBeNull();
+    expect(builtGuardFailure({ porcelain: CLEAN, headSha: HEAD.slice(0, 7), baseSha: BASE })).toBeNull();
   });
 
   test("an unreadable SHA fails closed instead of reading as a moved HEAD", () => {
-    expect(builtGuardFailure({ porcelain: "", headSha: "", baseSha: BASE })).toContain("no readable HEAD/base SHA");
-    expect(builtGuardFailure({ porcelain: "", headSha: HEAD, baseSha: "  " })).toContain("no readable HEAD/base SHA");
+    expect(builtGuardFailure({ porcelain: CLEAN, headSha: "", baseSha: BASE })).toContain("no readable HEAD/base SHA");
+    expect(builtGuardFailure({ porcelain: CLEAN, headSha: HEAD, baseSha: "  " })).toContain("no readable HEAD/base SHA");
+  });
+
+  // `baseSha` is the MERGE-BASE of the base branch and HEAD, not the base tip, and
+  // the difference is the whole guard on a re-claimed worktree: the tip moves when
+  // step 7 pulls the base forward between loops, so a lane that committed NOTHING
+  // has a HEAD that differs from the tip. Only the merge-base answers "does HEAD
+  // carry a commit of its own" -- it EQUALS HEAD exactly when HEAD is an ancestor
+  // of the base. Real git, so the identity is git's, not a fixture's.
+  test("the merge-base -- not the base tip -- is what proves a commit of its own", () => {
+    const repo = mkdtempSync(join(tmpdir(), "zstack-builtguard-git-"));
+    const git = (...args: string[]) => {
+      const p = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
+      if (p.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${p.stderr.toString()}`);
+      return p.stdout.toString().trim();
+    };
+    try {
+      git("init", "-q", "-b", "main");
+      git("config", "user.email", "t@t.t");
+      git("config", "user.name", "t");
+      writeFileSync(join(repo, "a.txt"), "1");
+      git("add", "-A");
+      git("commit", "-qm", "base");
+      // A lane branch cut from base that commits NOTHING, then a base branch that
+      // advances underneath it (what the next loop's `git pull` does).
+      git("branch", "z/ticket-1");
+      writeFileSync(join(repo, "a.txt"), "2");
+      git("commit", "-qam", "base moved on");
+      const headSha = git("rev-parse", "z/ticket-1");
+      const baseTip = git("rev-parse", "main");
+      const mergeBase = git("merge-base", "main", "z/ticket-1");
+      const facts = (baseSha: string) => ({ porcelain: `## z/ticket-1\n`, headSha, baseSha });
+      // Ground truth: the lane branch has no commit of its own.
+      expect(git("rev-list", "--count", "main..z/ticket-1")).toBe("0");
+      // The base TIP differs from HEAD, so a tip-based check reads "moved" and
+      // fails OPEN -- this is the bug the merge-base closes, pinned as a fact.
+      expect(baseTip).not.toBe(headSha);
+      expect(builtGuardFailure(facts(baseTip))).toBeNull();
+      // The merge-base equals HEAD, so the guard holds the lane.
+      expect(mergeBase).toBe(headSha);
+      expect(builtGuardFailure(facts(mergeBase))).toContain("no commit of its own");
+      // And a lane that DID commit passes on the same merge-base input.
+      git("checkout", "-q", "z/ticket-1");
+      writeFileSync(join(repo, "b.txt"), "own work");
+      git("add", "-A");
+      git("commit", "-qm", "the lane's own commit");
+      const ownHead = git("rev-parse", "HEAD");
+      expect(builtGuardFailure({ porcelain: `## z/ticket-1\n`, headSha: ownHead, baseSha: git("merge-base", "main", "HEAD") })).toBeNull();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 
   // AC1: dirty tree + no commit + BUILT -> held, flagged, builder asked to commit.
@@ -766,6 +841,35 @@ describe("built guard: clean tree + moved HEAD (#177)", () => {
     expect(s.lanes).toEqual([]);
   });
 
+  // This park is the only one in the machine whose work is NOT already committed
+  // on a branch, and parking removes the lane lock -- which makes the worktree an
+  // orphan the next run's reconcile plan prunes with `git worktree remove --force`
+  // (lib/reconcile.ts), gated by Step 0(b) BEFORE the loop will start. A note that
+  // said "the worktree is left in place -- commit or discard what is there" was
+  // pointing the human at a directory the loop deletes first. So the note must name
+  // the salvage patch and warn, and the SKILL must actually dump it.
+  test("the park note points at a durable salvage patch, not the doomed worktree", () => {
+    let s = state([ticket(7, "Building")], [lane(7, "builder", { commitRetries: MAX_COMMIT_RETRIES })]);
+    s = recordOutcome(s, 7, HAPPY.builder, 0, DIRTY_NO_COMMIT);
+    const note = (nextAction(s, 0) as { note: string }).note;
+    // The SKILL keys the salvage dump on this PREFIX (the same way the park row
+    // keys Notify on `Dependency deadlock:`), so the prefix is part of the contract.
+    expect(note.startsWith("uncommitted work:")).toBe(true);
+    expect(note).toContain("reports/uncommitted-7.patch"); // the ticket's own patch
+    expect(note).toContain("git apply");
+    expect(note).toContain("force-removes it");
+    expect(note).toContain("BEFORE the next /z-loop run");
+    expect(note).not.toContain("it is left in place");
+    // The park path has to write that patch, or the note lies. Keyed on the note's
+    // `uncommitted work:` prefix, the same way the row keys Notify on
+    // `Dependency deadlock:`.
+    const skill = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
+    const has = (s: string) => skill.includes(s); // see the canary below re: file dumps
+    expect(has("uncommitted work:")).toBe(true);
+    expect(has(`diff --cached --binary HEAD > "$HOME/.zstack/projects/$SLUG/reports/uncommitted-<N>.patch"`)).toBe(true);
+    expect(has(`git -C ".worktrees/ticket-<N>" add -A`)).toBe(true);
+  });
+
   // Three failures, three budgets: "you forgot to commit" must not consume the
   // rebuild a QA bug or a reviewer finding needs, nor park under their notes.
   test("a commit re-spawn spends commitRetries and leaves qaBounces/reviewBounces alone", () => {
@@ -807,7 +911,6 @@ describe("built guard: clean tree + moved HEAD (#177)", () => {
   // limitation in tests/safety.test.ts).
   test("the SKILL documents the git-fact flags, the commitNotes route, and the attempt count", () => {
     const skill = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
-    expect(skill).toContain("status --porcelain");
     expect(skill).toContain("--porcelain");
     expect(skill).toContain("--head-sha");
     expect(skill).toContain("--base-sha");
@@ -816,8 +919,37 @@ describe("built guard: clean tree + moved HEAD (#177)", () => {
     // transcript overwrites its predecessor's -- a silent Actual undercount.
     expect(skill).toContain("qaBounces + reviewBounces + commitRetries + 1");
     const docs = readFileSync(join(REPO_ROOT, "docs", "user-guide", "z-loop.md"), "utf8");
-    expect(docs).toMatch(/`git status --porcelain` must be empty/);
+    expect(docs).toMatch(/`git status --porcelain --branch` must report a clean tree/);
     expect(docs).toMatch(/`HEAD` must have moved off the base branch/);
+    expect(docs).toContain("git merge-base");
+    expect(docs).toContain("uncommitted-<N>.patch");
+  });
+
+  // The two collection flags carry the guard's fail-closed halves, and BOTH have a
+  // shorter form that reads as working while failing open. The verdict is in code,
+  // but the INPUTS are the SKILL's, so the exact commands are pinned here -- this
+  // canary is what catches a future edit "simplifying" either one.
+  test("the SKILL collects status --branch and the merge-base, never the bare forms", () => {
+    const skill = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
+    // Booleans, not toContain: a miss on a 60KB SKILL.md dumps the entire file
+    // into the failure output, and the test name already says what is missing.
+    const has = (s: string) => skill.includes(s);
+    expect(has(`git -C "$WT" status --porcelain --branch > "$TMP/porcelain-<N>.txt"`)).toBe(true);
+    expect(has(`--base-sha "$(git -C "$WT" merge-base "$BASE" HEAD)"`)).toBe(true);
+    // The base TIP cannot answer "does HEAD carry a commit of its own" once the
+    // base has moved under a re-claimed worktree (see the real-git test above).
+    expect(has(`--base-sha "$(git -C "$WT" rev-parse "$BASE")"`)).toBe(false);
+    // A bare `status --porcelain >` redirect leaves an empty file when git fails.
+    expect(has(`status --porcelain > "$TMP/porcelain-<N>.txt"`)).toBe(false);
+  });
+
+  // #177's untracked-file strictness is right (an un-added test file is exactly the
+  // work that goes missing) but it makes .gitignore part of the guard: scratch
+  // output every agent in this repo produces would hold an honest, fully committed
+  // BUILT as "uncommitted work" and then tell the builder to commit scratch.
+  test("this repo's own mandatory graphify scratch output is gitignored", () => {
+    const p = Bun.spawnSync(["git", "check-ignore", "-q", "graphify-out/graph.json"], { cwd: REPO_ROOT, stdout: "pipe", stderr: "pipe" });
+    expect(p.exitCode).toBe(0); // 0 = ignored, 1 = would show up as `??` in the guard
   });
 });
 
@@ -2338,7 +2470,7 @@ describe("loop CLI", () => {
       const statePath = join(dir, "outcome-dirty.json");
       writeFileSync(statePath, JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder")])));
       const dirty = runOutcome(statePath, "BUILT: done\n", [
-        "--porcelain", porcelainFile("porcelain-dirty.txt", " M lib/loop.ts\n?? tests/new.test.ts\n"),
+        "--porcelain", porcelainFile("porcelain-dirty.txt", "## z/ticket-1\n M lib/loop.ts\n?? tests/new.test.ts\n"),
         "--head-sha", BASE, "--base-sha", BASE,
       ]);
       expect(dirty.exitCode).toBe(0);
@@ -2349,11 +2481,27 @@ describe("loop CLI", () => {
       const cleanPath = join(dir, "outcome-clean.json");
       writeFileSync(cleanPath, JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder")])));
       const clean = runOutcome(cleanPath, "BUILT: done\n", [
-        "--porcelain", porcelainFile("porcelain-clean.txt", ""),
+        "--porcelain", porcelainFile("porcelain-clean.txt", "## z/ticket-1...origin/main\n"),
         "--head-sha", HEAD, "--base-sha", BASE,
       ]);
       expect(clean.exitCode).toBe(0);
       expect(JSON.parse(clean.stdout)).toEqual({ kind: "built" });
+    });
+
+    // The redirect that collects the facts creates the file BEFORE git runs, so a
+    // `git status` that FAILED hands the CLI an existing, empty file -- the one
+    // shape a missing-file check (ENOENT -> exit 1) cannot catch. With a moved HEAD
+    // it used to read as a clean tree and walk to QA.
+    test("an empty porcelain file (a git status that failed) is held, not read as clean", () => {
+      const statePath = join(dir, "outcome-emptyporcelain.json");
+      writeFileSync(statePath, JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder")])));
+      const r = runOutcome(statePath, "BUILT: done\n", [
+        "--porcelain", porcelainFile("porcelain-empty.txt", ""),
+        "--head-sha", HEAD, "--base-sha", BASE,
+      ]);
+      expect(r.exitCode).toBe(0);
+      const outcome = JSON.parse(r.stdout) as { kind: string; unverified?: string };
+      expect(outcome.unverified).toContain("header is missing");
     });
 
     test("a non-builder lane still records with no facts (the dead-merge PR-state path)", () => {

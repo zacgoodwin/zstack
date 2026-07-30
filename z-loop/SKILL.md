@@ -240,19 +240,33 @@ outcome therefore REQUIRES that lane worktree's own git facts, and
 
 ```bash
 WT=".worktrees/ticket-<N>"
-git -C "$WT" status --porcelain > "$TMP/porcelain-<N>.txt"
+git -C "$WT" status --porcelain --branch > "$TMP/porcelain-<N>.txt"
 bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt \
   --porcelain "$TMP/porcelain-<N>.txt" \
   --head-sha "$(git -C "$WT" rev-parse HEAD)" \
-  --base-sha "$(git -C "$WT" rev-parse "$BASE")"
+  --base-sha "$(git -C "$WT" merge-base "$BASE" HEAD)"
 ```
+
+Both flags in that command are load-bearing, and neither is interchangeable with
+the obvious shorter form:
+
+- `--branch` — git always emits a `## <branch>` header with it, and the guard
+  REQUIRES that header. A `> file` redirect creates the file before git runs, so
+  a `git status` that failed leaves an EMPTY file, which a bare `--porcelain`
+  payload cannot tell apart from a clean tree.
+- `merge-base "$BASE" HEAD`, not `rev-parse "$BASE"` — the check is "does HEAD
+  carry a commit `$BASE` does not". The base TIP only answers that while it has
+  not moved since the worktree was created; a leftover worktree re-claimed in a
+  later loop sits under a `$BASE` that step 7 already pulled forward, so a lane
+  that committed NOTHING would read as moved.
 
 The three facts are all it takes; the verdict is the state machine's
 (`builtGuardFailure`), never yours. A `BUILT` with a dirty tree OR a HEAD still
-at `$BASE` does not advance to QA (nor to Review under `skip-qa`): the lane
-re-spawns its own builder ONCE with an `uncommitted work` note asking it to
-commit, and a second such `BUILT` parks the ticket Blocked with that note. Every
-other stage has nothing to verify, so its `outcome` call is unchanged.
+an ancestor of `$BASE` does not advance to QA (nor to Review under `skip-qa`): the
+lane re-spawns its own builder ONCE with an `uncommitted work` note asking it to
+commit, and a second such `BUILT` parks the ticket Blocked with that note (see the
+`park N Blocked` row for the salvage dump that park REQUIRES first). Every other
+stage has nothing to verify, so its `outcome` call is unchanged.
 
 **Human-needed safety control (issue #63).** `z-loop-tick` also recomputes the
 parked-tickets breakdown every iteration and fires a ONE-TIME mid-run Discord
@@ -273,7 +287,7 @@ Perform exactly that action, then record it. Action → side effects:
 | `claim N` | 1. `"$Z_BOARD" claim <N> "$ME"` **before anything else**. Claim lost → `bun "$PACK/lib/loop.ts" claim-lost "$STATE" <N>` and re-run `next` (next ticket). 2. **Deferred commit (#133) — move the ticket to its claimed stage's status, ONLY after the claim succeeds** (a claim loser must never move a ticket, same C7 reason as the lock below): `"$Z_BOARD" move <N> <status> --slug "$SLUG"` where `<status>` mirrors the reducer's `STATUS_FOR_STAGE[stage]` — `builder`→`Building`, `qa`→`QA`, `reviewer`→`Review`. A fresh `builder` claim moves Ready→Building (the old Step 2 up-front move, now deferred to here); a resume claim at `qa`/`reviewer` is already at its stage's status, so the move is a no-op. 3. **Write the lane lock** (C7 — a claim loser never leaves a lock): `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <stage> --session "$SESSION"`. 4. Worktree (skip if it exists — a resume claim at stage qa/reviewer reuses it): `TSLUG=$(bun -e "import {slugifyTitle} from '$PACK/lib/ticket-schema.ts'; console.log(slugifyTitle(process.argv[1]))" "<title>")` then `git worktree add ".worktrees/ticket-<N>" -b "z/ticket-<N>-$TSLUG" "$BASE"`. 5. Apply: write the action JSON to a file, `bun "$PACK/lib/loop.ts" apply "$STATE" action.json` (its `claim` reducer sets the state-file status to `STATUS_FOR_STAGE[stage]`, matching the board move above). 6. Spawn the action's stage (table below). |
 | `advance N to S` | **Re-stamp the lane lock** to the new stage: `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <S> --session "$SESSION"`. Apply, then spawn stage S fresh. Before applying, read the lane's CURRENT stage from the state file: an advance to `builder` from `qa` passes the action's `note` as `qaNotes` (+ `investigateFirst`); from `reviewer`, as `reviewNotes`; from `builder` (the #177 commit re-spawn), as `commitNotes`. |
 | `park N Questions` | Comment the note as `## Needs input --` + the question, `"$Z_BOARD" move <N> Questions`, apply, then **remove the lane lock** (`bun "$PACK/lib/locks.ts" lane-remove --slug "$SLUG" <N>`). Tell the human in the comment which status to return the ticket to. Keep the worktree. **Notify** `human-pause` (`{ticket,title,note}`; see the Notify block below). |
-| `park N Blocked` | Comment the note (what was wrong + recommended next steps), `move <N> Blocked`, apply, remove the lane lock. **Notify** `token-burn` (`{ticket,detail:note}`) when the note begins `Dependency deadlock:` (the step-6 deadlock break); otherwise `ticket-parked` (`{ticket,title,status:"Blocked",note}`). |
+| `park N Blocked` | **First**, when the note begins `uncommitted work:` (#177's exhausted commit retry): salvage the lane worktree's uncommitted state BEFORE anything else — `git -C ".worktrees/ticket-<N>" add -A && git -C ".worktrees/ticket-<N>" diff --cached --binary HEAD > "$HOME/.zstack/projects/$SLUG/reports/uncommitted-<N>.patch"` (`add -A` so untracked files land in the patch too; the worktree is doomed, so mutating its index costs nothing). This is the ONE park whose only copy of real work is uncommitted — every other park's work is already committed on a branch, and branches are never deleted (issue #2) — and removing the lane lock below turns the worktree into an orphan the next run's reconcile scan force-removes. The note already names that patch path, so this dump is what makes the note true. Then: comment the note (what was wrong + recommended next steps), `move <N> Blocked`, apply, remove the lane lock. **Notify** `token-burn` (`{ticket,detail:note}`) when the note begins `Dependency deadlock:` (the step-6 deadlock break); otherwise `ticket-parked` (`{ticket,title,status:"Blocked",note}`). |
 | `skip N` | Comment the note (the confusion or the dead-worker evidence), `move <N> Skipped`, apply, remove the lane lock. (PROCESS.md global rule.) **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:note}`) when the note begins `Worker died mid-` (a watchdog dead-worker skip); otherwise `ticket-parked` (`{ticket,title,status:"Skipped",note}`). |
 | `stop-lane N` | A human moved #N to a stop status (Blocked/Questions/Skipped/Done) mid-run; the board already reflects it — do NOT move or comment it. Tear down the lane's background agent, remove the lane lock (`lane-remove`), keep the worktree for inspection, and apply (drops the lane, leaves the human's status). Other lanes are unaffected. |
 | `check-worker N` | Is the lane's background agent still running (harness task list)? Alive → `bun "$PACK/lib/loop.ts" probe "$STATE" <N> alive`. Dead with no final message: **if the lane's stage is `merge`, do NOT probe-dead/skip** — verify PR state first (H9): `gh pr view <branch> --json state,url -q '.state'`. If `MERGED`, the PR landed before the worker died, so record it as merged (`printf 'MERGED: %s\n' "$prUrl" > msg.txt; bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`) → the reducer completes it and counts it in `mergedThisRun` (so a stacked child still retargets and the batch-end branch delete can't close its PR). If NOT merged, record `printf 'BLOCKED: merge worker died with the PR unmerged (%s)\n' "$state" > msg.txt; outcome ...` → parks it Blocked for a human, and **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:"merge worker died with the PR unmerged"}`). For any OTHER stage, dead with no final message → `probe "$STATE" <N> dead` (the next `next` returns the skip). |

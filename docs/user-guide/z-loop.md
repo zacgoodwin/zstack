@@ -45,20 +45,30 @@ records the result. It never re-derives a scheduling decision in prose.
   batch drains in one session without tripping auto-compaction.
 - **A `BUILT` that shipped nothing does not reach QA.** `BUILT` is a claim, and
   the loop verifies it against the lane worktree's own git facts before the lane
-  advances: `git status --porcelain` must be empty (a clean tree, untracked files
-  included — a new test file the builder never `git add`ed is exactly the work
-  that would go missing) **and** `HEAD` must have moved off the base branch's SHA
-  (at least one commit of its own). Run 9 produced the failure this closes: a
-  builder reported `BUILT` with everything still uncommitted, so QA reviewed the
-  BASE tree and passed a diff that did not exist. On a failure the ticket does not
-  advance to QA — nor to Review under `skip-qa`, which would hand the reviewer the
-  same empty diff. The lane re-spawns its **own builder** once with an
-  `uncommitted work` note naming what it left behind (dirty paths, HEAD still at
-  base) and telling it to commit what is already in the worktree rather than
-  rebuild it; a second `BUILT` with nothing committed parks the ticket Blocked
-  with that note and leaves the worktree in place for inspection. That retry has
-  its own budget — "you forgot to commit" is neither a QA bug nor a reviewer
-  finding, so it never consumes a rebuild those caps are holding.
+  advances: `git status --porcelain --branch` must report a clean tree, untracked
+  files included — a new test file the builder never `git add`ed is exactly the
+  work that would go missing — **and** `HEAD` must have moved off the base branch
+  (at least one commit of its own). Both halves fail closed. The status payload is
+  read `--branch`, so git's own `## <branch>` header is required and a `git status`
+  that failed (an empty file) can never read as "clean"; the commit half compares
+  `HEAD` against `git merge-base <base> HEAD`, not the base tip, so a leftover
+  worktree re-claimed under a base branch that has since been pulled forward
+  cannot read as having committed something it never did. Run 9 produced the
+  failure this closes: a builder reported `BUILT` with everything still
+  uncommitted, so QA reviewed the BASE tree and passed a diff that did not exist.
+  On a failure the ticket does not advance to QA — nor to Review under `skip-qa`,
+  which would hand the reviewer the same empty diff. The lane re-spawns its **own
+  builder** once with an `uncommitted work` note naming what it left behind (dirty
+  paths, a HEAD with no commit of its own) and telling it to commit what is already
+  in the worktree rather than rebuild it. A second `BUILT` with nothing committed
+  parks the ticket Blocked with that note, and because parking releases the lane
+  lock — which makes the worktree an orphan the next run's reconcile scan
+  force-removes — the park first dumps the worktree's uncommitted state to
+  `~/.zstack/projects/<slug>/reports/uncommitted-<N>.patch`. Re-apply it with
+  `git apply` in a fresh worktree, or commit/stash the worktree yourself **before**
+  the next `/z-loop` run. That retry has its own budget — "you forgot to commit" is
+  neither a QA bug nor a reviewer finding, so it never consumes a rebuild those
+  caps are holding.
 - **Adversarial review, when the card earns it.** When `adversarialMode` is
   active for a card, the Review stage runs a super-truth pass: it fans out
   independent skeptic sub-agents that each try to REFUTE the diff against the

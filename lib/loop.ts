@@ -316,12 +316,27 @@ export function parseSkepticQuorum(note: string): { received: number; of: number
 }
 
 // The three git facts a BUILT claim is checked against (#177), read from the
-// lane's OWN worktree by the orchestrator: `git status --porcelain`,
-// `git rev-parse HEAD`, and `git rev-parse <baseBranch>`. Passed in as data so
-// the guard below stays pure and gate-testable with no real repository.
+// lane's OWN worktree by the orchestrator (z-loop/SKILL.md collects them).
+// Passed in as data so the guard below stays pure and gate-testable with no real
+// repository.
 export interface BuilderCommitFacts {
+  // `git status --porcelain --branch`. `--branch` is load-bearing, not decoration:
+  // git ALWAYS emits a leading `## <branch>` line, so a payload without one means
+  // `git status` never produced output (a `> file` redirect creates the file
+  // BEFORE git runs, so a failed status leaves an empty file). Judging the bare
+  // porcelain string would read that empty file as "clean tree" -- the dirtiness
+  // half failing open, while the SHA half already fails closed.
   porcelain: string;
-  headSha: string;
+  headSha: string; // `git rev-parse HEAD`
+  // `git merge-base <baseBranch> HEAD` -- NOT `git rev-parse <baseBranch>`. The
+  // question is "does HEAD carry a commit the base branch does not", and the base
+  // TIP only answers it while the tip has not moved since the worktree was made.
+  // A leftover worktree re-claimed by a later loop (the claim row reuses one that
+  // exists) sits under a base that Step 7 has since pulled forward, so a lane
+  // that committed NOTHING reads as moved -- the guard failing open on the exact
+  // build it exists to catch. The merge-base equals HEAD precisely when HEAD is
+  // an ancestor of the base, i.e. when the branch has no commit of its own,
+  // whatever the tip did in the meantime.
   baseSha: string;
 }
 
@@ -330,12 +345,12 @@ export interface BuilderCommitFacts {
 // than as a match against every commit that happens to start with it.
 const MIN_SHA_LENGTH = 7;
 
-// Do two SHAs name the same commit? Both sides come from `git rev-parse` (full
-// 40-char OIDs), but an abbreviated one still names the same commit, and reading
-// an abbreviation as "different" would fail OPEN -- the guard would report a
-// moved HEAD for a branch still sitting on base, which is the exact bug #177
-// exists to catch. Prefix compare, case-folded, so length mismatch cannot slip a
-// no-commit build past.
+// Do two SHAs name the same commit? Both sides come from git (full 40-char
+// OIDs), but an abbreviated one still names the same commit, and reading an
+// abbreviation as "different" would fail OPEN -- the guard would report a moved
+// HEAD for a branch still sitting on base, which is the exact bug #177 exists to
+// catch. Prefix compare, case-folded, so length mismatch cannot slip a no-commit
+// build past.
 function sameCommit(a: string, b: string): boolean {
   const x = a.toLowerCase();
   const y = b.toLowerCase();
@@ -343,51 +358,63 @@ function sameCommit(a: string, b: string): boolean {
 }
 
 // Did a builder that reported BUILT actually ship anything? Returns null when it
-// did (clean tree AND at least one commit off the base), else the reason, phrased
+// did (clean tree AND at least one commit of its own), else the reason, phrased
 // for the human who reads it on the board and for the builder that is re-prompted
 // with it.
 //
 // Run 9's #155 builder emitted BUILT with everything still uncommitted; QA then
 // reviewed the BASE tree and passed, because a lane with no commit ships no diff.
 // Both halves are load-bearing: a dirty tree means work is still sitting in the
-// worktree, and an unmoved HEAD means nothing was committed at all. Either alone
-// still holds the lane (a builder that commits half its work and leaves the rest
-// unstaged has shipped an incomplete diff).
+// worktree, and a HEAD that is still an ancestor of the base means nothing was
+// committed at all. Either alone still holds the lane (a builder that commits half
+// its work and leaves the rest unstaged has shipped an incomplete diff).
 //
-// `git status --porcelain` is judged EMPTY-or-not, untracked files included: a
+// The status payload is judged by its DIRTY lines, untracked files included: a
 // brand-new test or docs file the builder never `git add`ed is precisely the work
 // that would go missing, so `??` lines count. Files matched by .gitignore never
-// appear (no --ignored), so real scratch output does not trip this.
+// appear (no --ignored), so real scratch output -- graphify-out/ under this repo's
+// mandatory hook, for one -- does not trip this.
 //
-// An unreadable/absent SHA reads as "cannot prove a commit exists" -> unmoved,
-// fail-closed: a git call that returned nothing must never be the reason a
-// no-commit build walks to QA.
+// Every unreadable input fails CLOSED, on both halves: a status payload with no
+// `## <branch>` header cannot prove a clean tree, and an absent/short SHA cannot
+// prove a commit exists. A git call that returned nothing must never be the reason
+// a no-commit build walks to QA.
 export function builtGuardFailure(facts: BuilderCommitFacts): string | null {
-  const dirty = facts.porcelain.split(/\r?\n/).filter((l) => l.trim() !== "");
+  const lines = facts.porcelain.split(/\r?\n/).filter((l) => l.trim() !== "");
+  const statusRan = lines.some((l) => l.startsWith("## ")); // see BuilderCommitFacts.porcelain
+  const dirty = lines.filter((l) => !l.startsWith("## "));
   const head = facts.headSha.trim();
   const base = facts.baseSha.trim();
   const readable = head.length >= MIN_SHA_LENGTH && base.length >= MIN_SHA_LENGTH;
   const moved = readable && !sameCommit(head, base);
-  if (dirty.length === 0 && moved) return null;
+  if (statusRan && dirty.length === 0 && moved) return null;
   const parts: string[] = [];
   if (dirty.length > 0) {
     parts.push(`${dirty.length} uncommitted path(s) in its worktree (${dirty.slice(0, 5).map((l) => l.trim()).join(", ")}${dirty.length > 5 ? ", ..." : ""})`);
   }
+  if (!statusRan) {
+    parts.push(
+      `no readable \`git status --porcelain --branch\` output (its \`## <branch>\` header is missing), so a clean tree cannot be proven`
+    );
+  }
   if (!moved) {
     parts.push(
       readable
-        ? `HEAD still at the base commit (${head.slice(0, MIN_SHA_LENGTH)}), so the branch carries no commit of its own`
+        ? `HEAD (${head.slice(0, MIN_SHA_LENGTH)}) still an ancestor of the base branch, so the branch carries no commit of its own`
         : `no readable HEAD/base SHA, so no commit can be proven either way`
     );
   }
-  // The fix line has to be true in BOTH shapes: a dirty tree means the work
-  // exists and only needs committing, while a clean tree at base means the lane
-  // holds nothing at all and telling that builder to "commit its work" would send
-  // it looking for files that were never written.
+  // The fix line has to be true in EVERY shape: a dirty tree means the work exists
+  // and only needs committing; a clean tree with no commit means the lane holds
+  // nothing at all, and telling that builder to "commit its work" would send it
+  // looking for files nobody wrote; an unreadable fact means the lane's state is
+  // unknown, so the only honest instruction is "look first".
   const fix =
     dirty.length > 0
       ? `Commit what is already in the worktree onto this lane's branch -- nothing is lost, the files are still there -- then report BUILT again.`
-      : `Nothing at all is on this branch: build the ticket and COMMIT it, then report BUILT again.`;
+      : statusRan && readable
+        ? `Nothing at all is on this branch: build the ticket and COMMIT it, then report BUILT again.`
+        : `The worktree's state could not be read at all, so look before you build (\`git status\`, \`git log\`): commit whatever is already there, build the rest, then report BUILT again.`;
   return (
     `uncommitted work: the builder reported BUILT but left ${parts.join(" and ")}. ` +
     `QA and the reviewer read the branch's committed diff, so they would review the base tree and pass a diff that does not exist. ` +
@@ -515,6 +542,16 @@ export const MAX_COMMIT_RETRIES = 1;
 // would spend a human trip on a one-command fix. The note travels to that builder
 // as `commitNotes` (lib/stage-prompts.ts) so the fresh agent is told what its
 // predecessor left behind instead of guessing.
+//
+// The park note must not promise a worktree the loop itself deletes. Parking
+// removes the lane lock, and a LOCKLESS worktree is an orphan to the next run's
+// reconcile scan (lib/reconcile.ts) whatever the board says: its plan prunes it
+// with `git worktree remove --force`, and Step 0(b) refuses to start until that
+// prune has run. Every other park's work is already committed on a branch, and
+// branches are never deleted (issue #2) -- this is the ONE park whose only copy of
+// real work is uncommitted, so the note names the salvage patch the orchestrator
+// dumps first (z-loop/SKILL.md `park N Blocked`) and says plainly that the
+// worktree does not survive the next run.
 function commitRetryAction(lane: LaneState, detail: string): Action {
   const spent = lane.commitRetries ?? 0;
   if (spent >= MAX_COMMIT_RETRIES) {
@@ -524,8 +561,13 @@ function commitRetryAction(lane: LaneState, detail: string): Action {
       status: "Blocked",
       note:
         `${detail}\n\nA re-prompted builder reported BUILT with nothing committed again ` +
-        `(${spent + 1} attempt(s)), so this is not a slip. Inspect the lane's worktree by hand -- it is left in place -- ` +
-        `commit or discard what is there, and return the ticket to Ready.`,
+        `(${spent + 1} attempt(s)), so this is not a slip. The work was dumped to ` +
+        `\`~/.zstack/projects/<slug>/reports/uncommitted-${lane.ticket}.patch\` ` +
+        `(re-apply it in a fresh worktree with \`git apply\`) because the lane worktree does NOT survive: ` +
+        `parking released its lane lock, so the next run's reconcile scan force-removes it ` +
+        `(\`git worktree remove --force\` -- uncommitted work discarded) before the loop will start. ` +
+        `Salvage it BEFORE the next /z-loop run: commit it onto this lane's branch (branches are never deleted) ` +
+        `or stash it, then return the ticket to Ready.`,
     };
   }
   return { kind: "advance", ticket: lane.ticket, to: "builder", note: detail };
@@ -1380,9 +1422,9 @@ const USAGE = `loop <command> [args]
   apply <state.json> <action.json> [--now <ms>]      apply an Action, rewrite the state file
   outcome <state.json> <ticket> <msg.txt> [--now <ms>]  parse a stage's final message onto its lane
           a BUILDER lane also REQUIRES its worktree's git facts (#177), which a
-          BUILT is verified against: --porcelain <file> (git status --porcelain,
-          may be empty) --head-sha <sha> (git rev-parse HEAD) --base-sha <sha>
-          (git rev-parse <baseBranch>)
+          BUILT is verified against: --porcelain <file> (git status --porcelain
+          --branch) --head-sha <sha> (git rev-parse HEAD) --base-sha <sha>
+          (git merge-base <baseBranch> HEAD)
   probe <state.json> <ticket> <alive|dead> [--now <ms>] record an aliveness probe
   claim-lost <state.json> <ticket>                   mark a ticket claimed by another session
   human-needed <state.json>                          print the breakdown + tripped/alreadyNotified (no writes)
@@ -1483,10 +1525,12 @@ function builderFactsFromFlags(
   if (porcelain === undefined || headSha === undefined || baseSha === undefined) {
     throw new ZError(
       `Recording a BUILDER outcome for #${ticket} requires the lane worktree's git facts (#177):\n` +
-        `  git -C <worktree> status --porcelain > "$TMP/porcelain-${ticket}.txt"\n` +
+        `  git -C <worktree> status --porcelain --branch > "$TMP/porcelain-${ticket}.txt"\n` +
         `  loop outcome <state.json> ${ticket} <msg.txt> --porcelain "$TMP/porcelain-${ticket}.txt" \\\n` +
-        `    --head-sha "$(git -C <worktree> rev-parse HEAD)" --base-sha "$(git -C <worktree> rev-parse <baseBranch>)"\n` +
-        `A BUILT is verified against them (clean tree + a commit off the base) before the lane may advance to QA.`
+        `    --head-sha "$(git -C <worktree> rev-parse HEAD)" --base-sha "$(git -C <worktree> merge-base <baseBranch> HEAD)"\n` +
+        `A BUILT is verified against them (clean tree + a commit of its own) before the lane may advance to QA.\n` +
+        `--branch and merge-base are both required: without --branch a git status that FAILED reads as a clean tree, ` +
+        `and against the base TIP a lane that committed nothing under an advanced base reads as moved.`
     );
   }
   return { porcelain: readText(porcelain), headSha, baseSha };
