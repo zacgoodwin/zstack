@@ -1314,6 +1314,23 @@ describe("contract enforcement", () => {
       // Step 5 verification checklist: read-only project views for the human
       `gh project view <NUMBER> --owner <OWNER> --web`,
       `gh project list --owner "$OWNER"`,
+      // Step 7 identity check (issue #66): read-only login lookup, both the
+      // CURRENT_LOGIN= bash line and the prose explanation of z-loop's own
+      // ME= line (which already carries this exact call, z-loop/SKILL.md
+      // Step 0) -- same read, never a mutation.
+      `gh api user -q .login)`,
+      `gh api user`, // prose reference (Step 7 intro paragraph)
+      `gh api user -q .login`, // prose reference (Step 7 Answer A: confirming the bot is authed)
+      // Step 7 org-repo fix (issue #66 review finding 1): read-only check of
+      // whether $OWNER is a personal login or an org slug -- no individual
+      // human can ever authenticate AS an org, so the CURRENT_LOGIN/$OWNER
+      // comparison above only means something on a personal repo.
+      `gh repo view --json isInOrganization -q .isInOrganization)`,
+    ],
+    "z-update/SKILL.md": [
+      // Step 2 identity re-check (issue #66), Answer A: same read-only login
+      // confirmation as z-setup/SKILL.md Step 7 Answer A, prose reference only.
+      `gh api user -q .login`,
     ],
     "z-plan/SKILL.md": [
       // slug lookup: read-only (trailing shell comment is part of the line)
@@ -1342,6 +1359,13 @@ describe("contract enforcement", () => {
       `gh repo view --json name -q .name)`,
       `gh repo view --json defaultBranchRef -q .defaultBranchRef.name)`,
       `gh api user -q .login)`,
+      // issue #66: the numeric half of the loop's git commit author, so an
+      // authored commit can never disagree with the account gh is authed as.
+      // Same read-only endpoint as the .login lookup above, different field --
+      // deliberately a second plain call rather than one -q template emitting
+      // both, because the nested quoting that would require is exactly the
+      // kind of line a later edit breaks silently. One extra read per RUN.
+      `gh api user -q .id)`,
       `gh auth status`, // read-only auth probe (prereq checklist)
       // read-only body fetches (planning pass + board snapshot); z-board has no
       // body-read subcommand
@@ -1416,6 +1440,27 @@ describe("contract enforcement", () => {
       const allowed = new Set(SKILL_GH_ALLOWLIST[f] ?? []);
       for (const inv of ghInvocations(readFileSync(join(REPO_ROOT, f), "utf8"))) {
         if (!allowed.has(inv)) offenders.push(`${f}: ${inv}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  // Issue #66 QA bounce: z-update/SKILL.md's original Step 2 buried an
+  // AskUserQuestion decision INSIDE a bash fence, keyed on $OWNER_ANSWER -- a
+  // variable nothing in the file ever assigned. The `else` branch fired
+  // unconditionally, silently recording "human" with zero human interaction
+  // (violates PRINCIPLES.md's latent/deterministic split: a human decision is
+  // latent-space work and belongs in prose the agent reads, never simulated by
+  // an unset bash variable). Every legitimate AskUserQuestion call in every
+  // other skill file already lives in prose outside any fence; this keeps it
+  // that way everywhere, not just in the one file QA caught it in.
+  test("no SKILL.md embeds an AskUserQuestion decision inside a fenced code block", () => {
+    const skillFiles = trackedFiles().filter((f) => f.endsWith("/SKILL.md"));
+    const offenders: string[] = [];
+    for (const f of skillFiles) {
+      const content = readFileSync(join(REPO_ROOT, f), "utf8");
+      for (const m of content.matchAll(/```[^\n]*\n([\s\S]*?)```/g)) {
+        if (m[1].includes("AskUserQuestion")) offenders.push(f);
       }
     }
     expect(offenders).toEqual([]);

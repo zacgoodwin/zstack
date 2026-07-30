@@ -57,7 +57,25 @@ export ZSTACK_SLUG="$SLUG"   # H13: every z-board / lib call resolves the slug f
                              # --slug where already present -- explicit still wins.
 BASE=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
 BASE_SHA_START=$(git rev-parse "origin/$BASE" 2>/dev/null || git rev-parse "$BASE")  # C8: the e2e-detection diff base
+# issue #66: whoever `gh` is authed as -- a dedicated bot account is the
+# supported way to give the loop its own identity; see
+# docs/user-guide/bot-identity.md and z-setup/SKILL.md Step 7. No code here
+# prefers or hardcodes the owner -- this line is the single source of truth
+# for the session name, lane locks, claims, AND the git commit author.
+#
+# ME_EMAIL is the git AUTHOR half. `gh` auth decides who calls the API and who
+# pushes; it does NOT decide the author stamped into a commit object -- that is
+# git's own user.name/user.email, which on a developer machine is the human. So
+# a bot-authed loop with no ME_EMAIL still lands commits authored by the owner,
+# breaking "if the bot takes an action it shows up as that GH user". Both come
+# out of the SAME single `gh api user` request, so they can never disagree with
+# the live auth and neither is stored in config.json. The <id>+<login> form is
+# GitHub's noreply address, which links the commit to the account even when its
+# email is private. Applied PER-WORKTREE at claim time (Step 4's `claim` row),
+# never repo-wide -- see the WARNING there for why that distinction matters.
 ME=$(gh api user -q .login)
+ME_ID=$(gh api user -q .id)
+ME_EMAIL="$ME_ID+$ME@users.noreply.github.com"
 SESSION="$ME-$(date +%s)"   # names this loop in the lock (second-invocation refusal)
 STATE_DIR="$HOME/.zstack/projects/$SLUG/loop"
 STATE="$STATE_DIR/state.json"; TMP="$STATE_DIR/tmp"
@@ -284,7 +302,7 @@ Perform exactly that action, then record it. Action → side effects:
 
 | Action | What you do |
 |---|---|
-| `claim N` | 1. `"$Z_BOARD" claim <N> "$ME"` **before anything else**. Claim lost → `bun "$PACK/lib/loop.ts" claim-lost "$STATE" <N>` and re-run `next` (next ticket). 2. **Deferred commit (#133) — move the ticket to its claimed stage's status, ONLY after the claim succeeds** (a claim loser must never move a ticket, same C7 reason as the lock below): `"$Z_BOARD" move <N> <status> --slug "$SLUG"` where `<status>` mirrors the reducer's `STATUS_FOR_STAGE[stage]` — `builder`→`Building`, `qa`→`QA`, `reviewer`→`Review`. A fresh `builder` claim moves Ready→Building (the old Step 2 up-front move, now deferred to here); a resume claim at `qa`/`reviewer` is already at its stage's status, so the move is a no-op. 3. **Write the lane lock** (C7 — a claim loser never leaves a lock): `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <stage> --session "$SESSION"`. 4. Worktree (skip if it exists — a resume claim at stage qa/reviewer reuses it): `TSLUG=$(bun -e "import {slugifyTitle} from '$PACK/lib/ticket-schema.ts'; console.log(slugifyTitle(process.argv[1]))" "<title>")` then `git worktree add ".worktrees/ticket-<N>" -b "z/ticket-<N>-$TSLUG" "$BASE"`. 5. Apply: write the action JSON to a file, `bun "$PACK/lib/loop.ts" apply "$STATE" action.json` (its `claim` reducer sets the state-file status to `STATUS_FOR_STAGE[stage]`, matching the board move above). 6. Spawn the action's stage (table below). |
+| `claim N` | 1. `"$Z_BOARD" claim <N> "$ME"` **before anything else**. Claim lost → `bun "$PACK/lib/loop.ts" claim-lost "$STATE" <N>` and re-run `next` (next ticket). 2. **Deferred commit (#133) — move the ticket to its claimed stage's status, ONLY after the claim succeeds** (a claim loser must never move a ticket, same C7 reason as the lock below): `"$Z_BOARD" move <N> <status> --slug "$SLUG"` where `<status>` mirrors the reducer's `STATUS_FOR_STAGE[stage]` — `builder`→`Building`, `qa`→`QA`, `reviewer`→`Review`. A fresh `builder` claim moves Ready→Building (the old Step 2 up-front move, now deferred to here); a resume claim at `qa`/`reviewer` is already at its stage's status, so the move is a no-op. 3. **Write the lane lock** (C7 — a claim loser never leaves a lock): `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <stage> --session "$SESSION"`. 4. Worktree (skip if it exists — a resume claim at stage qa/reviewer reuses it): `TSLUG=$(bun -e "import {slugifyTitle} from '$PACK/lib/ticket-schema.ts'; console.log(slugifyTitle(process.argv[1]))" "<title>")` then `git worktree add ".worktrees/ticket-<N>" -b "z/ticket-<N>-$TSLUG" "$BASE"`. 4b. **Stamp the lane's git author (#66) — every commit this lane makes must be authored by the account `gh` is authed as, not by this machine's global git identity:** `git config extensions.worktreeConfig true` then `git -C ".worktrees/ticket-<N>" config --worktree user.name "$ME"` and `git -C ".worktrees/ticket-<N>" config --worktree user.email "$ME_EMAIL"`. **WARNING — `--worktree` is load-bearing, do not drop it.** Git worktrees SHARE the main repo's `.git/config`, so the plain `git -C <worktree> config user.name` form silently rewrites the identity of the human's OWN checkout too, re-authoring their personal commits in this repo. `--worktree` scopes the write to `.git/worktrees/<name>/config.worktree`, leaving the main checkout untouched; it hard-fails unless `extensions.worktreeConfig` is on, which is why that line comes first (idempotent, additive, and safe at repo format version 0 — verified on git 2.55). Re-running on an existing worktree (a resume claim) just rewrites the same two values. 5. Apply: write the action JSON to a file, `bun "$PACK/lib/loop.ts" apply "$STATE" action.json` (its `claim` reducer sets the state-file status to `STATUS_FOR_STAGE[stage]`, matching the board move above). 6. Spawn the action's stage (table below). |
 | `advance N to S` | **Re-stamp the lane lock** to the new stage: `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <S> --session "$SESSION"`. Apply, then spawn stage S fresh. Before applying, read the lane's CURRENT stage from the state file: an advance to `builder` from `qa` passes the action's `note` as `qaNotes` (+ `investigateFirst`); from `reviewer`, as `reviewNotes`; from `builder` (the #177 commit re-spawn), as `commitNotes`. |
 | `park N Questions` | Comment the note as `## Needs input --` + the question, `"$Z_BOARD" move <N> Questions`, apply, then **remove the lane lock** (`bun "$PACK/lib/locks.ts" lane-remove --slug "$SLUG" <N>`). Tell the human in the comment which status to return the ticket to. Keep the worktree. **Notify** `human-pause` (`{ticket,title,note}`; see the Notify block below). |
 | `park N Blocked` | **First**, when the note begins `uncommitted work:` (#177's exhausted commit retry): salvage the lane worktree's uncommitted state BEFORE anything else — `git -C ".worktrees/ticket-<N>" add -A && git -C ".worktrees/ticket-<N>" diff --cached --binary HEAD > "$HOME/.zstack/projects/$SLUG/reports/uncommitted-<N>.patch"` (`add -A` so untracked files land in the patch too; the worktree is doomed, so mutating its index costs nothing). This is the ONE park whose only copy of real work is uncommitted — every other park's work is already committed on a branch, and branches are never deleted (issue #2) — and removing the lane lock below turns the worktree into an orphan the next run's reconcile scan force-removes. The note already names that patch path, so this dump is what makes the note true. Then: comment the note (what was wrong + recommended next steps), `move <N> Blocked`, apply, remove the lane lock. **Notify** `token-burn` (`{ticket,detail:note}`) when the note begins `Dependency deadlock:` (the step-6 deadlock break); otherwise `ticket-parked` (`{ticket,title,status:"Blocked",note}`). |
@@ -687,7 +705,13 @@ Two lock kinds live under `$LOCKS` (`~/.zstack/projects/<slug>/locks/`):
 > cross-machine claim needs shared board-held state (a claim marker both loops
 > check), which is deliberately out of scope for this remediation (issue #14 C8).
 > Run one loop per (login, project) at a time; if you must parallelize, use
-> distinct logins or distinct projects.
+> distinct logins or distinct projects. A dedicated bot GitHub identity per
+> loop (issue #66; see docs/user-guide/bot-identity.md and z-setup/SKILL.md
+> Step 7) is the supported way to get that distinct login without creating a
+> second human account -- it does not add cross-machine coordination (a
+> second loop under a DIFFERENT bot login still needs a distinct project, or
+> the same race above), it just makes "distinct logins" cheap and
+> attributable instead of a spare personal account.
 
 **Startup, without `--reconcile`:** if `loop.lock` is live → refuse (name the
 session). If it is stale, or any orphans exist (lane locks with no running loop,

@@ -6,6 +6,7 @@ contracts live next to each skill (`z-setup/SKILL.md` etc.) and each has a
 shorter reference page here: [z-setup](z-setup.md) · [z-plan](z-plan.md) ·
 [z-loop](z-loop.md) · [z-status](z-status.md) · [z-uninstall](z-uninstall.md) ·
 [z-update](z-update.md) ·
+[bot-identity](bot-identity.md) ·
 [troubleshooting](troubleshooting.md).
 
 ## The mental model
@@ -198,7 +199,18 @@ idempotent: re-running on a configured repo plans and executes zero changes.
 6. **Wire deploy.** Invokes gstack's `/setup-deploy` for this repo, so the
    end-of-loop green path (`/land-and-deploy` → `/canary` →
    `/document-release`) works.
-7. **Auto-approvals (the second question).** Optional, offered every time.
+7. **GitHub identity (the first question — not optional).** Should the loop
+   run as its own dedicated bot GitHub account, or continue under yours? A
+   bot account scopes the loop's permissions independently of your own and
+   fixes issue #204 (a standing instruction left in a ticket comment is
+   invisible to the planning pass while the loop shares your login);
+   continuing as yours is fully supported but keeps #204 live. Unlike
+   auto-approvals below, this one requires an explicit answer before setup
+   reports done — see [bot-identity](bot-identity.md) for the full
+   walkthrough (account, permissions, token, verification), and
+   [z-update](z-update.md) for how an older install catches up on this
+   choice.
+8. **Auto-approvals (the second question).** Optional, offered every time.
 
 ### The auto-approvals question, in full
 
@@ -238,8 +250,10 @@ Two things worth knowing after choosing A:
 ### Done when
 
 The scoped probe passed, verify exited 0, you confirmed both workflows off,
-`config.json` loads, `/setup-deploy` ran, and the auto-approvals offer was made
-(its answer doesn't gate completion).
+`config.json` loads, `/setup-deploy` ran, you answered the GitHub identity
+question (bot or continue-as-human — this DOES gate completion, unlike
+auto-approvals), and the auto-approvals offer was made (its answer doesn't
+gate completion).
 
 ## 3. Plan work: `/z-plan`
 
@@ -387,7 +401,9 @@ ticket with a live lane.
 **One loop per (GitHub login, project) at a time.** The loop lock is per
 machine, but board claims are keyed on your GitHub login — two loops as the
 same login on different machines will both think every ticket is theirs and
-race. Use distinct logins or distinct projects to parallelize.
+race. Use distinct logins or distinct projects to parallelize — a dedicated
+[bot identity](bot-identity.md) per loop is the supported way to get a
+distinct login without a spare personal GitHub account.
 
 ## 5. Watch the board: `/z-status`
 

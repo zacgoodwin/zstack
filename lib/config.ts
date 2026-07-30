@@ -63,6 +63,25 @@ export type EpicStyle = "milestones" | "issue-type";
 export type AdversarialMode = "off" | "non-trivial" | "always";
 export const ADVERSARIAL_MODES: AdversarialMode[] = ["off", "non-trivial", "always"];
 
+// The owner's bot-vs-human-account choice for the loop's GitHub identity
+// (issue #66): whether /z-loop runs as a dedicated bot collaborator or
+// continues under the human owner's own `gh` login. This is never a second
+// copy of a login -- ME is always `gh api user -q .login` (z-loop/SKILL.md
+// Step 0) and stays the single source of truth -- only the human's recorded
+// DECISION, so /z-setup and /z-update know whether to raise the choice
+// (absent) or leave it alone (already answered, either way).
+export type IdentityChoice = "bot" | "human";
+export const IDENTITY_MODES: IdentityChoice[] = ["bot", "human"];
+
+export interface IdentityRecord {
+  mode: IdentityChoice;
+  recordedAt: string; // ISO 8601, when the choice was (re)recorded
+  // Human-facing note of where the bot's token/gh-auth profile lives (e.g.
+  // "gh auth login (bot profile)" or "GH_TOKEN env var in the loop's launch
+  // script"). "bot" mode only; never a login or the token itself.
+  tokenLocation?: string;
+}
+
 // Per-stage model routing (issue #82): overrides the ticket's board Model
 // field for one or more of the loop's four stage spawns. Not a Stage-keyed
 // import from lib/loop.ts (that would cycle back through this file) -- the
@@ -175,6 +194,13 @@ export interface BoardConfig {
   // (including {}) -> used exactly as written, no default layered on. See the
   // StageModels comment above for why loadConfig must never fill this in.
   stageModels?: StageModels;
+  // Issue #66: the owner's recorded bot-vs-human-account choice. Absent means
+  // "never asked" (a project that predates this ticket) -- deliberately NOT
+  // defaulted by loadConfig below (unlike every numeric knob above), because
+  // "absent" and "chose human" must stay distinguishable: that distinction is
+  // what lets z-update's re-check (SKILL.md) prompt an old project exactly
+  // once and never re-prompt one that already answered either way.
+  identity?: IdentityRecord;
 }
 
 export const DEFAULT_QUOTA: QuotaConfig = { threshold: 100, mode: "sleep" };

@@ -285,7 +285,7 @@ the clone (it may be your only copy) and prints the exact `rm -rf` command.
 `--purge` additionally removes `~/.zstack` (per-project config, loop counter,
 locks, reports); without it, that path and the purge command are printed. The
 skill also runs `bin/z-setup-permissions --remove` to strip the auto-approval
-settings `/z-setup` Step 7 wrote, when present. The GitHub board, milestones, and
+settings `/z-setup` Step 8 wrote, when present. The GitHub board, milestones, and
 labels are remote data — never touched; delete them yourself if you want them
 gone. See [z-uninstall](docs/user-guide/z-uninstall.md). Board statuses are the
 recoverable state; worktrees are disposable; locks clear via `/z-loop --reconcile`.

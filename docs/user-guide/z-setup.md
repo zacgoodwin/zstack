@@ -33,7 +33,22 @@ does not exist yet, you need `/z-setup`.
    non-zero on any drift — no eyeballing.
 6. **Wire deploy.** Invokes gstack `/setup-deploy` so `/land-and-deploy` works at
    end of loop.
-7. **Auto-approvals (optional).** Offers to reduce Claude Code permission prompts
+7. **GitHub identity (issue #66, not optional).** Should `/z-loop` run as its
+   own dedicated bot GitHub account, or continue under the owner's own login?
+   A fresh project (or one that predates this step) must leave with an
+   explicit answer recorded in `config.json` — this DOES gate Done, unlike
+   Step 8 below. A project that already answered is left untouched and the
+   step reports so (idempotent). Continuing as the owner's account is fully
+   supported, but the step states its cost first: issue #204's fold-in gate
+   can never see the owner's own ticket comments as "someone else's" while
+   the loop shares their login, so a standing instruction left in a comment
+   is invisible to the planning pass. On an **organization-owned** repo, the
+   re-verification that runs on every later re-run can't compare the active
+   `gh` login against a personal owner login (an org has no such login) —
+   it reports the raw facts and asks you to eyeball them instead of guessing.
+   Full walkthrough (account, permissions, token, `gh` auth, verification,
+   the org caveat): [bot-identity](bot-identity.md).
+8. **Auto-approvals (optional).** Offers to reduce Claude Code permission prompts
    so the loop runs unattended. **This edits `~/.claude/settings.json`, which is
    machine-wide.** Three choices:
    - **A) Full auto-approvals** — a permission-allow hook + `bypassPermissions`
@@ -87,14 +102,19 @@ Beyond the board IDs, `config.json` carries optional per-project tuning knobs,
 each defaulted by `loadConfig` when absent:
 
 **A re-apply preserves your hand-edits (issue #97).** `z-setup-board apply`
-assembles the rest of the config fresh from the live board every run, but four
+assembles the rest of the config fresh from the live board every run, but five
 fields are instead carried forward from the prior config.json on disk:
-`stageModels`, `quota`, `notifications`, `adversarialMode`. Whatever value one
-of these carries wins over the freshly-assembled default the next time `apply`
-genuinely rewrites the file (a board-shape change forced a real `writeConfig`,
-not the common no-op re-run). Of the four, `stageModels`/`notifications`/
-`adversarialMode` have no CLI flag and are absent unless you hand-edit them in
-— a field you never added stays exactly as it would today. `quota` is
+`stageModels`, `quota`, `notifications`, `adversarialMode`, `identity`.
+Whatever value one of these carries wins over the freshly-assembled default
+the next time `apply` genuinely rewrites the file (a board-shape change forced
+a real `writeConfig`, not the common no-op re-run). Of these, `stageModels`/
+`notifications`/`adversarialMode` have no CLI flag and are absent unless you
+hand-edit them in — a field you never added stays exactly as it would today.
+`identity` (issue #66) likewise has no CLI flag, but isn't meant to be
+hand-edited either — it's written by Step 7's identity step
+(`bun lib/identity.ts record`) and preserved here for the same reason: a
+later board-shape-drift re-apply must not silently erase a recorded
+bot/human choice and force a re-prompt. `quota` is
 different: `buildConfig` writes `{...DEFAULT_QUOTA}` into every config.json
 unconditionally, hand-edited or not, so it is carried forward on every
 re-apply from day one — including a *future* release changing `DEFAULT_QUOTA`,
@@ -210,9 +230,10 @@ change them.
 ## Done when
 
 - The scoped GraphQL probe passed, `verify` exited 0, the two workflows are OFF,
-  `config.json` exists and loads, `/setup-deploy` ran, and the auto-approvals
-  offer was made (its A/B/C answer does not gate Done). A re-run makes zero
-  changes.
+  `config.json` exists and loads, `/setup-deploy` ran, the GitHub identity
+  question was answered and recorded (Step 7, issue #66 — this DOES gate
+  Done), and the auto-approvals offer was made (Step 8; its A/B/C answer does
+  not gate Done). A re-run makes zero changes.
 
 ## Common snags
 
