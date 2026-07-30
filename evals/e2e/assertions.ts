@@ -85,7 +85,10 @@ export function happyOutcome(stage: Stage, ticket: number): string {
 // carried conversation. `lastWroteStatus` (issue #125) is the resync origin
 // marker (the board status the loop last wrote for this lane) -- a scheduling
 // field the loop itself sets/clears, never anything the stage agent carried.
-const ALLOWED_LANE_KEYS = new Set(["ticket", "stage", "lastActivityMs", "qaBounces", "reviewBounces", "workerDead", "outcome", "lastWroteStatus"]);
+// `quorumRetries` (#191) and `commitRetries` (#177) are two more retry counters of
+// the same kind -- a happy run never spends either, but this set claims to be the
+// FULL key set, so an unhappy oracle must not read a scheduling counter as a leak.
+const ALLOWED_LANE_KEYS = new Set(["ticket", "stage", "lastActivityMs", "qaBounces", "reviewBounces", "quorumRetries", "commitRetries", "workerDead", "outcome", "lastWroteStatus"]);
 const FORBIDDEN_LANE_KEY = /conversation|session|context|thread|agent.?id|history|transcript/i;
 
 export interface SimTrace {

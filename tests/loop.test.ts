@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   applyAction,
+  builtGuardFailure,
   canTransition,
   drainComplete,
   humanNeededStatus,
@@ -22,6 +23,7 @@ import {
   parseReviewerConfidence,
   parseSkepticQuorum,
   parseStageResult,
+  MAX_COMMIT_RETRIES,
   MAX_QUORUM_RETRIES,
   recordOutcome,
   recordProbe,
@@ -651,6 +653,174 @@ describe("skeptic quorum gate (issue #191)", () => {
 
 });
 
+// A `built` marker used to advance a lane to QA on the marker ALONE. Run 9's
+// #155 builder emitted BUILT with everything still uncommitted, so QA reviewed
+// the BASE tree and passed a diff that did not exist. These drive the guard that
+// closes it (issue #177) -- the facts are passed as data, so no real git is
+// needed and the whole block stays a free gate test.
+describe("built guard: clean tree + moved HEAD (#177)", () => {
+  const BASE = "1111111111111111111111111111111111111111";
+  const HEAD = "2222222222222222222222222222222222222222";
+  // The AC's setup: staged (`M `) + unstaged (` M`) edits and an unadded new
+  // file, no commit, HEAD still at the base SHA.
+  const DIRTY_NO_COMMIT = {
+    porcelain: "M  lib/loop.ts\n M tests/loop.test.ts\n?? docs/new.md\n",
+    headSha: BASE,
+    baseSha: BASE,
+  };
+  const CLEAN_MOVED = { porcelain: "", headSha: HEAD, baseSha: BASE };
+
+  test("the guard passes a clean tree with a commit off base, and fails on either half alone", () => {
+    expect(builtGuardFailure(CLEAN_MOVED)).toBeNull();
+    // Trailing/blank lines are not dirt -- git's porcelain output ends in \n.
+    expect(builtGuardFailure({ porcelain: "\n   \n", headSha: HEAD, baseSha: BASE })).toBeNull();
+    expect(builtGuardFailure(DIRTY_NO_COMMIT)).toContain("uncommitted work");
+    // Committed SOMETHING but left the rest behind: still an incomplete diff.
+    const half = builtGuardFailure({ porcelain: "?? tests/new.test.ts\n", headSha: HEAD, baseSha: BASE })!;
+    expect(half).toContain("1 uncommitted path(s)");
+    expect(half).toContain("Commit what is already in the worktree");
+    // Clean tree, no commit: the lane holds nothing at all, so the fix line must
+    // NOT tell that builder to commit files nobody wrote.
+    const nothing = builtGuardFailure({ porcelain: "", headSha: BASE, baseSha: BASE })!;
+    expect(nothing).toContain("HEAD still at the base commit");
+    expect(nothing).toContain("Nothing at all is on this branch");
+  });
+
+  // Reading a 7-char abbreviation as "different from" its own full OID would fail
+  // OPEN: the guard would report a moved HEAD for a branch still on base -- the
+  // exact build this ticket exists to stop.
+  test("an abbreviated or upper-case SHA still reads as the same commit", () => {
+    expect(builtGuardFailure({ porcelain: "", headSha: BASE, baseSha: BASE.slice(0, 7) })).toContain("uncommitted work");
+    expect(builtGuardFailure({ porcelain: "", headSha: BASE.toUpperCase(), baseSha: BASE })).toContain("uncommitted work");
+    // A genuinely different commit, abbreviated, still reads as moved.
+    expect(builtGuardFailure({ porcelain: "", headSha: HEAD.slice(0, 7), baseSha: BASE })).toBeNull();
+  });
+
+  test("an unreadable SHA fails closed instead of reading as a moved HEAD", () => {
+    expect(builtGuardFailure({ porcelain: "", headSha: "", baseSha: BASE })).toContain("no readable HEAD/base SHA");
+    expect(builtGuardFailure({ porcelain: "", headSha: HEAD, baseSha: "  " })).toContain("no readable HEAD/base SHA");
+  });
+
+  // AC1: dirty tree + no commit + BUILT -> held, flagged, builder asked to commit.
+  test("AC1: a dirty, no-commit BUILT does NOT advance to QA -- the builder is asked to commit", () => {
+    let s = state([ticket(1, "Building")], [lane(1, "builder")]);
+    s = recordOutcome(s, 1, HAPPY.builder, 0, DIRTY_NO_COMMIT);
+    // Asserted field-by-field, not via toMatchObject + expect.stringContaining:
+    // bun 1.3.14's toMatchObject REPLACES a matched value with the asymmetric
+    // matcher object in the received value, which would corrupt the very state
+    // this test goes on to drive through nextAction.
+    expect(s.lanes[0].outcome!.kind).toBe("built");
+    expect((s.lanes[0].outcome as { unverified?: string }).unverified).toContain("uncommitted work");
+    const a = nextAction(s, 0);
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "builder" });
+    expect(a).not.toMatchObject({ to: "qa" });
+    expect((a as { note: string }).note).toContain("uncommitted work");
+    s = applyAction(s, a, 0);
+    expect(s.tickets[0].status).toBe("Building"); // never reached QA
+    expect(s.lanes[0].stage).toBe("builder");
+    expect(s.lanes[0].commitRetries).toBe(1);
+    expect(s.lanes[0].outcome).toBeUndefined(); // fresh spawn, same lane
+  });
+
+  // AC2: clean tree + one commit ahead + BUILT -> the normal walk to QA.
+  test("AC2: a clean tree one commit ahead of base advances to QA normally", () => {
+    let s = state([ticket(1, "Building")], [lane(1, "builder")]);
+    s = recordOutcome(s, 1, HAPPY.builder, 0, CLEAN_MOVED);
+    expect(s.lanes[0].outcome).toEqual({ kind: "built" }); // no `unverified` key at all
+    const a = nextAction(s, 0);
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "qa" });
+    s = applyAction(s, a, 0);
+    expect(s.tickets[0].status).toBe("QA");
+    expect(s.lanes[0].commitRetries ?? 0).toBe(0);
+  });
+
+  // #130's shortcut would otherwise hand the reviewer the same empty diff.
+  test("a skip-qa ticket does not walk to Review on an unverified BUILT either", () => {
+    let s = state([ticket(1, "Building", [], { skipQa: true })], [lane(1, "builder")]);
+    s = recordOutcome(s, 1, HAPPY.builder, 0, DIRTY_NO_COMMIT);
+    expect(nextAction(s, 0)).toMatchObject({ kind: "advance", to: "builder" });
+    // The same label with a VERIFIED build still takes the shortcut, unchanged.
+    let t = state([ticket(1, "Building", [], { skipQa: true })], [lane(1, "builder")]);
+    t = recordOutcome(t, 1, HAPPY.builder, 0, CLEAN_MOVED);
+    expect(nextAction(t, 0)).toMatchObject({ kind: "advance", to: "reviewer" });
+  });
+
+  // Without applyAction's builder->builder increment, `spent` never grows and a
+  // builder that keeps reporting BUILT with nothing committed is re-spawned
+  // forever -- a paid infinite loop. This drives the real sequence to prove it
+  // converges.
+  test("the retry is spent once, then the ticket parks Blocked with the uncommitted-work note", () => {
+    let s = state([ticket(1, "Building")], [lane(1, "builder")]);
+    s = recordOutcome(s, 1, HAPPY.builder, 0, DIRTY_NO_COMMIT);
+    s = applyAction(s, nextAction(s, 0), 0);
+    expect(s.lanes[0].commitRetries).toBe(MAX_COMMIT_RETRIES);
+    s = recordOutcome(s, 1, HAPPY.builder, 0, DIRTY_NO_COMMIT); // does it again
+    const a = nextAction(s, 0);
+    expect(a).toMatchObject({ kind: "park", ticket: 1, status: "Blocked" });
+    const note = (a as { note: string }).note;
+    expect(note).toContain("uncommitted work");
+    expect(note).toContain("not a slip");
+    expect(note).toContain("worktree"); // the human is told where to look
+    s = applyAction(s, a, 0);
+    expect(s.tickets[0].status).toBe("Blocked");
+    expect(s.lanes).toEqual([]);
+  });
+
+  // Three failures, three budgets: "you forgot to commit" must not consume the
+  // rebuild a QA bug or a reviewer finding needs, nor park under their notes.
+  test("a commit re-spawn spends commitRetries and leaves qaBounces/reviewBounces alone", () => {
+    let s = state([ticket(1, "Building")], [lane(1, "builder")]);
+    s = recordOutcome(s, 1, HAPPY.builder, 0, DIRTY_NO_COMMIT);
+    s = applyAction(s, nextAction(s, 0), 0);
+    expect(s.lanes[0].commitRetries).toBe(1);
+    expect(s.lanes[0].qaBounces).toBe(0);
+    expect(s.lanes[0].reviewBounces).toBe(0);
+    // And the converse: a QA bounce back to the builder leaves commitRetries at 0.
+    let t = state([ticket(2, "QA")], [lane(2, "qa", { outcome: { kind: "qa-bugs", note: "1) boom" } })]);
+    t.maxQaPasses = 3;
+    t = applyAction(t, nextAction(t, 0), 0);
+    expect(t.lanes[0].qaBounces).toBe(1);
+    expect(t.lanes[0].commitRetries ?? 0).toBe(0);
+  });
+
+  // The pure reducer keeps its old contract: no facts -> no verdict, byte-identical
+  // to pre-#177. That is what a state file recorded by an older loop mid-drain
+  // looks like, and what the e2e/orchestrator-context eval harnesses pass. The CLI
+  // is where the facts are made non-optional for a real builder lane (below).
+  test("a BUILT recorded with no git facts stays a plain built and advances", () => {
+    let s = state([ticket(1, "Building")], [lane(1, "builder")]);
+    s = recordOutcome(s, 1, HAPPY.builder, 0);
+    expect(s.lanes[0].outcome).toEqual({ kind: "built" });
+    expect(nextAction(s, 0)).toMatchObject({ kind: "advance", to: "qa" });
+  });
+
+  test("the facts are ignored on every non-builder stage", () => {
+    let s = state([ticket(1, "QA")], [lane(1, "qa")]);
+    s = recordOutcome(s, 1, HAPPY.qa, 0, DIRTY_NO_COMMIT);
+    expect(s.lanes[0].outcome).toEqual({ kind: "qa-pass" });
+    expect(nextAction(s, 0)).toMatchObject({ kind: "advance", to: "reviewer" });
+  });
+
+  // The guard only fires if the orchestrator collects the facts, and the retry is
+  // only useful if the note reaches the re-spawned builder -- both live in the
+  // SKILL, so both are pinned here (same doc-canary discipline as the C8 claim
+  // limitation in tests/safety.test.ts).
+  test("the SKILL documents the git-fact flags, the commitNotes route, and the attempt count", () => {
+    const skill = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
+    expect(skill).toContain("status --porcelain");
+    expect(skill).toContain("--porcelain");
+    expect(skill).toContain("--head-sha");
+    expect(skill).toContain("--base-sha");
+    expect(skill).toMatch(/from `builder`[^|]*`commitNotes`/);
+    // Without commitRetries in the attempt count, the re-spawned builder's
+    // transcript overwrites its predecessor's -- a silent Actual undercount.
+    expect(skill).toContain("qaBounces + reviewBounces + commitRetries + 1");
+    const docs = readFileSync(join(REPO_ROOT, "docs", "user-guide", "z-loop.md"), "utf8");
+    expect(docs).toMatch(/`git status --porcelain` must be empty/);
+    expect(docs).toMatch(/`HEAD` must have moved off the base branch/);
+  });
+});
+
 // #62 shipped reviewerBelowThresholdAction: "retry" with no cap on the
 // reviewer->builder bounce -- this closes it, mirroring the maxQaPasses gate
 // tests' fixture-then-nextAction shape above.
@@ -1145,25 +1315,26 @@ describe("ingest preserves state on a transient empty snapshot (#127)", () => {
 // -- fresh-stage guarantee (AC4): lane state carries no conversation id -------
 
 describe("fresh-stage lane state", () => {
-  test("LaneState carries exactly its nine scheduling fields and no session/conversation id", () => {
+  test("LaneState carries exactly its ten scheduling fields and no session/conversation id", () => {
     // Compile-time half: this constant stops typechecking if LaneState's key
-    // set ever drifts from the nine named here (issue #76 added reviewBounces,
+    // set ever drifts from the ten named here (issue #76 added reviewBounces,
     // mirroring qaBounces; #125 added lastWroteStatus, the resync origin marker;
     // #191 added quorumRetries, a budget deliberately separate from
-    // reviewBounces). Every addition must be a deliberate edit here -- this gate
+    // reviewBounces; #177 added commitRetries, separate for the same reason).
+    // Every addition must be a deliberate edit here -- this gate
     // is what keeps a conversation/session id from ever riding between stages.
     type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
     const _laneKeysExact: Exact<
       keyof LaneState,
-      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "quorumRetries" | "workerDead" | "outcome" | "lastWroteStatus"
+      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "quorumRetries" | "commitRetries" | "workerDead" | "outcome" | "lastWroteStatus"
     > = true;
     void _laneKeysExact;
     // Runtime half: a fully-populated lane exposes exactly those keys, and none
     // of them smells like a carried conversation.
     const full: Required<LaneState> = {
-      ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, quorumRetries: 0, workerDead: false, outcome: { kind: "built" }, lastWroteStatus: "Building",
+      ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, quorumRetries: 0, commitRetries: 0, workerDead: false, outcome: { kind: "built" }, lastWroteStatus: "Building",
     };
-    expect(Object.keys(full).sort()).toEqual(["lastActivityMs", "lastWroteStatus", "outcome", "qaBounces", "quorumRetries", "reviewBounces", "stage", "ticket", "workerDead"]);
+    expect(Object.keys(full).sort()).toEqual(["commitRetries", "lastActivityMs", "lastWroteStatus", "outcome", "qaBounces", "quorumRetries", "reviewBounces", "stage", "ticket", "workerDead"]);
     for (const k of Object.keys(full)) {
       expect(k).not.toMatch(/conversation|session|context|transcript|agent/i);
     }
@@ -2118,6 +2289,80 @@ describe("loop CLI", () => {
     const proc2 = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "human-needed", statePath], { stdout: "pipe", stderr: "pipe" });
     expect(proc2.exitCode).toBe(0);
     expect(JSON.parse(proc2.stdout.toString())).toMatchObject({ tripped: true, alreadyNotified: true });
+  });
+
+  // -- #177: a BUILDER outcome may not be recorded without its git facts ------
+  // The pure recordOutcome treats them as optional (a pre-#177 state file must
+  // still load); this CLI edge is what makes the guard impossible to omit, the
+  // same fail-loud-on-tick-1 reasoning as z-loop-tick's required --session (#198).
+  describe("outcome (#177 builder verification)", () => {
+    const BASE = "1111111111111111111111111111111111111111";
+    const HEAD = "2222222222222222222222222222222222222222";
+
+    function runOutcome(statePath: string, message: string, extra: string[]) {
+      const msgPath = join(dir, "outcome-msg.txt");
+      writeFileSync(msgPath, message);
+      const proc = Bun.spawnSync(
+        ["bun", join(REPO_ROOT, "lib", "loop.ts"), "outcome", statePath, "1", msgPath, "--now", "0", ...extra],
+        { stdout: "pipe", stderr: "pipe" }
+      );
+      return { exitCode: proc.exitCode, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
+    }
+
+    function porcelainFile(name: string, content: string): string {
+      const p = join(dir, name);
+      writeFileSync(p, content);
+      return p;
+    }
+
+    test("a builder lane with no git facts exits 1 and leaves the state untouched", () => {
+      const statePath = join(dir, "outcome-nofacts.json");
+      const before = JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder")]));
+      writeFileSync(statePath, before);
+      const r = runOutcome(statePath, "BUILT: all criteria pass\n", []);
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain("git facts");
+      expect(r.stderr).toContain("--porcelain");
+      expect(readFileSync(statePath, "utf8")).toBe(before); // no outcome recorded
+    });
+
+    test("a partial set of facts is refused too (all three or none)", () => {
+      const statePath = join(dir, "outcome-partial.json");
+      writeFileSync(statePath, JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder")])));
+      const r = runOutcome(statePath, "BUILT: x\n", ["--head-sha", HEAD, "--base-sha", BASE]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain("git facts");
+    });
+
+    test("dirty + no commit records the unverified reason; clean + moved records a plain built", () => {
+      const statePath = join(dir, "outcome-dirty.json");
+      writeFileSync(statePath, JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder")])));
+      const dirty = runOutcome(statePath, "BUILT: done\n", [
+        "--porcelain", porcelainFile("porcelain-dirty.txt", " M lib/loop.ts\n?? tests/new.test.ts\n"),
+        "--head-sha", BASE, "--base-sha", BASE,
+      ]);
+      expect(dirty.exitCode).toBe(0);
+      const outcome = JSON.parse(dirty.stdout) as { kind: string; unverified?: string };
+      expect(outcome.kind).toBe("built");
+      expect(outcome.unverified).toContain("uncommitted work");
+      // And the same command on a clean, moved worktree records no reason at all.
+      const cleanPath = join(dir, "outcome-clean.json");
+      writeFileSync(cleanPath, JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder")])));
+      const clean = runOutcome(cleanPath, "BUILT: done\n", [
+        "--porcelain", porcelainFile("porcelain-clean.txt", ""),
+        "--head-sha", HEAD, "--base-sha", BASE,
+      ]);
+      expect(clean.exitCode).toBe(0);
+      expect(JSON.parse(clean.stdout)).toEqual({ kind: "built" });
+    });
+
+    test("a non-builder lane still records with no facts (the dead-merge PR-state path)", () => {
+      const statePath = join(dir, "outcome-merge.json");
+      writeFileSync(statePath, JSON.stringify(state([ticket(1, "Review")], [lane(1, "merge")])));
+      const r = runOutcome(statePath, "MERGED: https://github.com/x/y/pull/1\n", []);
+      expect(r.exitCode).toBe(0);
+      expect(JSON.parse(r.stdout)).toEqual({ kind: "merged", note: "https://github.com/x/y/pull/1" });
+    });
   });
 
   // -- stage-model (issue #82): the real CLI wiring the SKILL shells out to --

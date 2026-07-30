@@ -43,6 +43,22 @@ records the result. It never re-derives a scheduling decision in prose.
   single `bin/z-loop-tick` call (snapshot → ingest → `next`) that prints only the
   one-line next Action, so the repeated bash never re-enters context. A long
   batch drains in one session without tripping auto-compaction.
+- **A `BUILT` that shipped nothing does not reach QA.** `BUILT` is a claim, and
+  the loop verifies it against the lane worktree's own git facts before the lane
+  advances: `git status --porcelain` must be empty (a clean tree, untracked files
+  included — a new test file the builder never `git add`ed is exactly the work
+  that would go missing) **and** `HEAD` must have moved off the base branch's SHA
+  (at least one commit of its own). Run 9 produced the failure this closes: a
+  builder reported `BUILT` with everything still uncommitted, so QA reviewed the
+  BASE tree and passed a diff that did not exist. On a failure the ticket does not
+  advance to QA — nor to Review under `skip-qa`, which would hand the reviewer the
+  same empty diff. The lane re-spawns its **own builder** once with an
+  `uncommitted work` note naming what it left behind (dirty paths, HEAD still at
+  base) and telling it to commit what is already in the worktree rather than
+  rebuild it; a second `BUILT` with nothing committed parks the ticket Blocked
+  with that note and leaves the worktree in place for inspection. That retry has
+  its own budget — "you forgot to commit" is neither a QA bug nor a reviewer
+  finding, so it never consumes a rebuild those caps are holding.
 - **Adversarial review, when the card earns it.** When `adversarialMode` is
   active for a card, the Review stage runs a super-truth pass: it fans out
   independent skeptic sub-agents that each try to REFUTE the diff against the
@@ -106,10 +122,11 @@ records the result. It never re-derives a scheduling decision in prose.
 - **Per-stage transcript layout.** Each stage's copy lands at
   `~/.zstack/projects/<slug>/state/transcripts/ticket-<N>/<stage>-<attempt>.jsonl`
   — `<stage>` is `builder`/`qa`/`reviewer`/`merge`, `<attempt>` is that lane's
-  1-based spawn count for the stage (a QA bounce or a reviewer bounce, either
-  one, re-spawns builder — so `builder-3.jsonl` might follow one bounce of
-  each kind, not necessarily three QA passes). This naming is what lets the
-  end-of-loop report break spend down by stage instead of only by ticket.
+  1-based spawn count for the stage (a QA bounce, a reviewer bounce, and an
+  uncommitted-work re-spawn each re-spawn builder — so `builder-3.jsonl` might
+  follow two bounces of different kinds, not necessarily three QA passes). This
+  naming is what lets the end-of-loop report break spend down by stage instead
+  of only by ticket.
 - **Sub-agent transcripts count too.** A stage that spawns its own sub-agents —
   the adversarial reviewer's 3 skeptics are the case that matters — lands each
   one beside its parent as `<stage>-<attempt>-sub-<agentId>.jsonl`, and those

@@ -62,6 +62,7 @@ export interface BuilderPromptInput {
   baseBranch: string;
   qaNotes?: string; // present on a QA bounce-back
   reviewNotes?: string; // present on a reviewer bounce-back
+  commitNotes?: string; // #177: present on a builder->builder re-spawn (BUILT shipped nothing)
   investigateFirst?: boolean; // second QA bounce: root-cause before touching code
 }
 
@@ -75,6 +76,13 @@ export function builderPrompt(i: BuilderPromptInput, inputPath: string, tag?: st
   const review = i.reviewNotes
     ? `\n## Reviewer findings to address\n\nRead them from \`reviewNotes\` in ${inputPath}.\n`
     : "";
+  // #177: this lane's previous builder reported BUILT with nothing on the branch.
+  // Stated up front, before the ticket body, because the work may already be done
+  // and sitting uncommitted in the worktree -- rebuilding it from scratch would be
+  // the wrong move.
+  const commit = i.commitNotes
+    ? `\n## Your predecessor on this lane shipped nothing\n\nRead what the pre-advance guard found from \`commitNotes\` in ${inputPath}. Start by inspecting the worktree (\`git status\`, \`git log ${i.baseBranch}..HEAD\`): finish and COMMIT whatever is already there rather than rebuilding it, and only build from scratch if the worktree is genuinely empty. A BUILT is not accepted until the tree is clean and the branch carries at least one commit.\n`
+    : "";
   return `${spawnStamp(tag)}You are the BUILDER for ticket #${i.ticketNumber}: "${i.ticketTitle}", running UNATTENDED inside the zstack dev loop. No user is available -- never ask a question, never wait for input; decide or exit via the contract below.
 
 ## Workspace
@@ -83,7 +91,7 @@ export function builderPrompt(i: BuilderPromptInput, inputPath: string, tag?: st
 
 ## Ticket
 Read your full ticket body (Context, Plan, Acceptance Criteria, Tests + evals, Docs pages touched, Out of scope) from ${inputPath} -- field \`ticketBody\` -- before doing anything else. That body is the contract for this build.
-${bounce}${review}
+${bounce}${review}${commit}
 ## Discipline
 - Ponytail ladder before writing any code: does it need to exist at all; does this codebase already have it; does the stdlib/platform/an installed dep cover it; can it be one line -- only then write the minimum that works. Smallest correct diff, full scope.
 - If the ticket has a \`## Files\` section, it is the map -- start from those paths instead of searching.
@@ -94,7 +102,7 @@ ${bounce}${review}
 - Do not edit the issue body, comment on issues, close issues, or expand scope beyond the ticket.
 
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
-BUILT: <one-line summary>            all acceptance criteria pass, tests green in the worktree, work committed on ${i.branch}
+BUILT: <one-line summary>            all acceptance criteria pass, tests green in the worktree, work committed on ${i.branch} -- VERIFIED before the lane advances: \`git status --porcelain\` empty AND HEAD off ${i.baseBranch}. A BUILT with work still uncommitted sends this lane straight back to you.
 NEEDS-INPUT: <the exact question>    a human decision is required; stop immediately, commit nothing half-wired
 BLOCKED: <reason>                    cannot proceed (broken dependency, failing environment) after a real attempt
 CONFUSED: <what makes no sense>      the ticket cannot be understood as written`;
