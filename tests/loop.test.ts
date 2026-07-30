@@ -19,11 +19,13 @@ import {
   markClaimLost,
   markHumanNeededNotified,
   mergeGate,
+  MERGE_GATE_MAX_RUNS,
   MERGE_GATE_RETRY_WAIT_MS,
   nextAction,
   parseSuiteFailCount,
   parseReviewerConfidence,
   parseStageResult,
+  recordMergeGate,
   recordOutcome,
   recordProbe,
   resolveStageModel,
@@ -83,6 +85,9 @@ const HAPPY: Record<Stage, string> = {
   merge: "MERGED: https://github.com/x/y/pull/1",
 };
 
+// A green merge-gate verdict, the shape `loop merge-gate --state` stamps (#178).
+const GREEN_GATE = { green: true, attempts: 1, failCount: 0, note: "merge gate GREEN on attempt 1: 0 fail, exit 0" };
+
 // Drives the state machine to drain, feeding every stage a happy-path outcome.
 // Returns the action log and the peak concurrent-lane count.
 function drainHappy(s: LoopState): { state: LoopState; log: Action[]; maxConcurrent: number } {
@@ -99,6 +104,12 @@ function drainHappy(s: LoopState): { state: LoopState; log: Action[]; maxConcurr
       continue;
     }
     if (a.kind === "check-worker") throw new Error("unexpected watchdog in happy path");
+    // #178: the loop gates every merge itself. On the happy path the gauntlet
+    // is green, which is what unlocks the advance to merge.
+    if (a.kind === "merge-gate") {
+      s = recordMergeGate(s, a.ticket, GREEN_GATE, 0);
+      continue;
+    }
     s = applyAction(s, a, 0);
     maxConcurrent = Math.max(maxConcurrent, s.lanes.length);
   }
@@ -260,7 +271,12 @@ describe("stage transitions", () => {
     expect(s.tickets[0].status).toBe("QA");
     expect(step(HAPPY.qa)).toMatchObject({ kind: "advance", to: "reviewer" });
     expect(s.tickets[0].status).toBe("Review");
-    expect(step(HAPPY.reviewer)).toMatchObject({ kind: "advance", to: "merge", stackedOn: [] });
+    // #178: the loop's own green gate stands between review-approve and merge.
+    expect(step(HAPPY.reviewer)).toMatchObject({ kind: "merge-gate", ticket: 1 });
+    s = recordMergeGate(s, 1, GREEN_GATE, 0);
+    const toMerge = nextAction(s, 0);
+    expect(toMerge).toMatchObject({ kind: "advance", to: "merge", stackedOn: [] });
+    s = applyAction(s, toMerge, 0);
     expect(s.tickets[0].status).toBe("Review"); // merge runs under Review
     expect(step(HAPPY.merge)).toMatchObject({ kind: "complete", note: "https://github.com/x/y/pull/1" });
     expect(s.tickets[0].status).toBe("Done");
@@ -411,8 +427,12 @@ describe("reviewer confidence gate", () => {
   // One lane, ticket in Review with no deps, stage reviewer, a review-approve
   // outcome carrying `confidence`. Drives nextAction with the gate knobs under
   // test -- mirrors the maxQaPasses gate tests' fixture-then-nextAction shape.
+  // The lane carries a green merge-gate stamp (#178) because this fixture is
+  // about the CONFIDENCE floor: with the suite gate already satisfied, a
+  // passing score is visibly the advance to merge and a failing one is visibly
+  // the park, exactly as before #178. The unstamped case is its own suite below.
   function reviewGate(confidence: number | null, minConfidence: number, belowAction: "block" | "retry" | "off"): Action {
-    const s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: { kind: "review-approve", confidence } })]);
+    const s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: { kind: "review-approve", confidence }, mergeGate: GREEN_GATE })]);
     s.minReviewerConfidence = minConfidence;
     s.reviewerBelowThresholdAction = belowAction;
     return nextAction(s, 0);
@@ -528,8 +548,11 @@ describe("reviewer bounce cap (issue #76)", () => {
     expect(s.lanes[0].reviewBounces).toBe(1);
 
     // An at-threshold approve merges normally -- the one prior bounce does
-    // not block it.
+    // not block it. (#178: the rebuilt code is gated afresh -- the bounce
+    // cleared any earlier verdict -- and green lets the merge proceed.)
     s = recordOutcome(s, 1, "REVIEW-APPROVE: confidence=70 now satisfied", 0);
+    expect(nextAction(s, 0)).toMatchObject({ kind: "merge-gate", ticket: 1 });
+    s = recordMergeGate(s, 1, GREEN_GATE, 0);
     expect(nextAction(s, 0)).toMatchObject({ kind: "advance", ticket: 1, to: "merge" });
 
     // A second ticket claimed fresh starts its own lane at reviewBounces: 0 --
@@ -636,11 +659,12 @@ describe("merge ordering", () => {
   });
 
   test("one merge at a time, in dependency order across approved lanes", () => {
+    // Both lanes are already gated green (#178) so this test stays about ORDER.
     let s = state(
       [ticket(20, "Review"), ticket(21, "Review", [20])],
       [
-        lane(21, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
-        lane(20, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+        lane(21, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, mergeGate: GREEN_GATE }),
+        lane(20, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, mergeGate: GREEN_GATE }),
       ]
     );
     // The parent merges first even though the child's lane comes first in the array.
@@ -690,7 +714,7 @@ describe("merge-gate cycle parks instead of throwing (#146)", () => {
       [
         lane(10, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
         lane(11, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
-        lane(30, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+        lane(30, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, mergeGate: GREEN_GATE }),
       ]
     );
     // The cycle doesn't block the independent lane: #30 merges this very tick.
@@ -960,22 +984,24 @@ describe("ingest preserves state on a transient empty snapshot (#127)", () => {
 // -- fresh-stage guarantee (AC4): lane state carries no conversation id -------
 
 describe("fresh-stage lane state", () => {
-  test("LaneState carries exactly its eight scheduling fields and no session/conversation id", () => {
+  test("LaneState carries exactly its ten scheduling fields and no session/conversation id", () => {
     // Compile-time half: this constant stops typechecking if LaneState's key
-    // set ever drifts from the eight named here (issue #76 added reviewBounces,
-    // mirroring qaBounces; #125 added lastWroteStatus, the resync origin marker).
+    // set ever drifts from the ten named here (issue #76 added reviewBounces,
+    // mirroring qaBounces; #125 added lastWroteStatus, the resync origin marker;
+    // #178 added the mechanical merge-gate verdict + its attempt count).
     type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
     const _laneKeysExact: Exact<
       keyof LaneState,
-      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "workerDead" | "outcome" | "lastWroteStatus"
+      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "workerDead" | "outcome" | "lastWroteStatus" | "mergeGate" | "mergeGateRuns"
     > = true;
     void _laneKeysExact;
     // Runtime half: a fully-populated lane exposes exactly those keys, and none
     // of them smells like a carried conversation.
     const full: Required<LaneState> = {
       ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, workerDead: false, outcome: { kind: "built" }, lastWroteStatus: "Building",
+      mergeGate: { green: true, attempts: 1, failCount: 0, note: "green" }, mergeGateRuns: 1,
     };
-    expect(Object.keys(full).sort()).toEqual(["lastActivityMs", "lastWroteStatus", "outcome", "qaBounces", "reviewBounces", "stage", "ticket", "workerDead"]);
+    expect(Object.keys(full).sort()).toEqual(["lastActivityMs", "lastWroteStatus", "mergeGate", "mergeGateRuns", "outcome", "qaBounces", "reviewBounces", "stage", "ticket", "workerDead"]);
     for (const k of Object.keys(full)) {
       expect(k).not.toMatch(/conversation|session|context|transcript|agent/i);
     }
@@ -1176,8 +1202,11 @@ describe("resync-on-lag vs genuine move-back (#116)", () => {
 // stage status. A human move the loop never wrote leaves it cleared -> safe
 // stop-lane, even at one hop.
 describe("one-hop resync: lagged write vs genuine move-back by origin (#125)", () => {
+  // Already gated green (#178) so these stay about the resync discriminator:
+  // the merge-gate action is not resync-carrying, and the advance that follows
+  // it is the one under test here.
   const reviewerLane = (over: Partial<LaneState> = {}) =>
-    lane(1, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, ...over });
+    lane(1, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, mergeGate: GREEN_GATE, ...over });
 
   test("AC1: a reviewer lane one hop behind (board QA) with the loop's Review write still in flight resyncs to Review and advances to merge", () => {
     const s = state([ticket(1, "QA")], [reviewerLane({ lastWroteStatus: "Review" })]);
@@ -2542,8 +2571,8 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
       return p;
     }
 
-    const runGate = (cwd: string) =>
-      Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "merge-gate", cwd], { stdout: "pipe", stderr: "pipe" });
+    const runGate = (cwd: string, ...extra: string[]) =>
+      Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "merge-gate", cwd, ...extra], { stdout: "pipe", stderr: "pipe" });
 
     const PASSING = 'import {test,expect} from "bun:test";\ntest("a",()=>{expect(1).toBe(1)});\n';
     const FAILING = 'import {test,expect} from "bun:test";\ntest("a",()=>{expect(1).toBe(2)});\n';
@@ -2567,23 +2596,167 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
       expect(proc.exitCode).not.toBe(0);
       expect(proc.stderr.toString()).toContain("does not exist");
     });
+
+    // -- the stamping form: the verdict lands on the lane, which is what makes
+    // the gate enforceable instead of advisory (QA finding 2).
+    // A state.json holding one review-approved lane, ungated.
+    function stateFile(name: string): string {
+      const p = join(dir, `${name}-state.json`);
+      writeFileSync(p, JSON.stringify(state([ticket(7, "Review")], [lane(7, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } })])));
+      return p;
+    }
+    const readState = (p: string): LoopState => JSON.parse(readFileSync(p, "utf8"));
+
+    test("--state/--ticket stamps a GREEN verdict on the lane and the scheduler then advances it to merge", () => {
+      const sp = stateFile("stamp-green");
+      const proc = runGate(project("stamp-green", PASSING), "--state", sp, "--ticket", "7");
+      expect(proc.exitCode).toBe(0);
+      const laneAfter = readState(sp).lanes[0];
+      expect(laneAfter.mergeGate).toMatchObject({ green: true, failCount: 0 });
+      expect(laneAfter.mergeGateRuns).toBe(1); // the attempt marker written BEFORE the gauntlet
+      expect(nextAction(readState(sp), 0)).toMatchObject({ kind: "advance", ticket: 7, to: "merge" });
+    });
+
+    test("--state/--ticket stamps a RED verdict and the scheduler parks the lane Blocked with the gate's note", () => {
+      const sp = stateFile("stamp-red");
+      const proc = runGate(project("stamp-red", FAILING), "--state", sp, "--ticket", "7");
+      expect(proc.exitCode).toBe(1);
+      const laneAfter = readState(sp).lanes[0];
+      expect(laneAfter.mergeGate).toMatchObject({ green: false, failCount: 1 });
+      const a = nextAction(readState(sp), 0);
+      expect(a).toMatchObject({ kind: "park", ticket: 7, status: "Blocked" });
+      expect((a as { note: string }).note).toContain("1 fail");
+    });
+
+    // A gate that cannot RUN is a red gate, not a crashed tick: stamping it red
+    // parks the lane instead of leaving `next` to re-issue a command that will
+    // fail identically forever.
+    test("a missing worktree in the stamping form stamps RED (and parks) instead of erroring out of the tick", () => {
+      const sp = stateFile("stamp-missing");
+      const proc = runGate(join(dir, "does-not-exist"), "--state", sp, "--ticket", "7");
+      expect(proc.exitCode).toBe(1);
+      expect(readState(sp).lanes[0].mergeGate).toMatchObject({ green: false });
+      expect(readState(sp).lanes[0].mergeGate!.note).toContain("could not run");
+      expect(nextAction(readState(sp), 0)).toMatchObject({ kind: "park", ticket: 7, status: "Blocked" });
+    });
+
+    test("--state without --ticket (or the reverse) is a usage error, never a half-stamped lane", () => {
+      const sp = stateFile("stamp-usage");
+      expect(runGate(project("stamp-usage", PASSING), "--state", sp).exitCode).toBe(1);
+      expect(runGate(project("stamp-usage2", PASSING), "--ticket", "7").exitCode).toBe(1);
+      expect(readState(sp).lanes[0].mergeGate).toBeUndefined();
+      expect(readState(sp).lanes[0].mergeGateRuns).toBeUndefined();
+    });
+  });
+
+  // -- the enforcement itself: no advance to merge without a green stamp ------
+  //
+  // QA finding 2 on the first pass: the gate ran only because the SKILL's prose
+  // said to, and the merge prompt then ASSERTED it had returned green. An
+  // orchestrator that skipped the step -- the exact prose-compliance failure
+  // that produced #132 -- spawned a merge agent carrying a false assurance.
+  // These pin the scheduler-side answer: the gate is the only door.
+  describe("nextAction refuses the merge stage without a green gate", () => {
+    const approved = (over: Partial<LaneState> = {}) =>
+      state([ticket(7, "Review")], [lane(7, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, ...over })]);
+
+    test("a review-approved lane with NO verdict gets merge-gate, never an advance to merge", () => {
+      expect(nextAction(approved(), 0)).toEqual({ kind: "merge-gate", ticket: 7 });
+    });
+
+    test("the merge-gate action repeats until a verdict lands -- applying it changes nothing", () => {
+      const s = approved();
+      const after = applyAction(s, { kind: "merge-gate", ticket: 7 }, 999);
+      expect(after).toEqual(s); // pure no-op: the CLI does the work, like check-worker/probe
+      expect(nextAction(after, 0)).toEqual({ kind: "merge-gate", ticket: 7 });
+    });
+
+    test("a GREEN verdict unlocks the advance to merge, stacked parents intact", () => {
+      const s = state(
+        [ticket(7, "Review"), ticket(8, "Review", [7])],
+        [
+          lane(7, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, mergeGate: GREEN_GATE }),
+          lane(8, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, mergeGate: GREEN_GATE }),
+        ]
+      );
+      expect(nextAction(s, 0)).toEqual({ kind: "advance", ticket: 7, to: "merge", stackedOn: [] });
+    });
+
+    test("a RED verdict parks the lane Blocked carrying the gate's own note verbatim -- it merges under NO circumstance", () => {
+      const red = { green: false, attempts: 1, failCount: 9, note: "merge gate RED on attempt 1: suite summary reports 9 fail (exit 1) -- refusing the merge" };
+      expect(nextAction(approved({ mergeGate: red }), 0)).toEqual({ kind: "park", ticket: 7, status: "Blocked", note: red.note });
+    });
+
+    // QA finding 1's consequence, handled in code: a gauntlet killed mid-run
+    // (a command timeout shorter than the suite) stamps no verdict, so the
+    // action simply repeats -- but it must not repeat forever.
+    test("gate runs that never return a verdict park the lane after MERGE_GATE_MAX_RUNS, never spin", () => {
+      let s = approved();
+      for (let i = 1; i <= MERGE_GATE_MAX_RUNS; i++) {
+        expect(nextAction(s, 0)).toEqual({ kind: "merge-gate", ticket: 7 });
+        s = recordMergeGate(s, 7, null, 0); // an attempt started, then its process died
+        expect(s.lanes[0].mergeGateRuns).toBe(i);
+      }
+      const a = nextAction(s, 0);
+      expect(a).toMatchObject({ kind: "park", ticket: 7, status: "Blocked" });
+      expect((a as { note: string }).note).toMatch(/never returned a verdict/);
+      expect((a as { note: string }).note).toMatch(/timeout/); // names the usual cause
+    });
+
+    test("a verdict that DOES land on the second attempt still merges -- only silent runs consume the budget", () => {
+      let s = recordMergeGate(approved(), 7, null, 0); // attempt 1 killed
+      s = recordMergeGate(s, 7, null, 0); // attempt 2 starts
+      s = recordMergeGate(s, 7, GREEN_GATE, 0); // and answers
+      expect(nextAction(s, 0)).toMatchObject({ kind: "advance", ticket: 7, to: "merge" });
+    });
+
+    test("a bounce back to the builder clears the verdict -- rebuilt code is gated again", () => {
+      const s = state([ticket(7, "Review")], [lane(7, "reviewer", { mergeGate: GREEN_GATE, mergeGateRuns: 1 })]);
+      const bounced = applyAction(s, { kind: "advance", ticket: 7, to: "builder" }, 0);
+      expect(bounced.lanes[0].mergeGate).toBeUndefined();
+      expect(bounced.lanes[0].mergeGateRuns).toBeUndefined();
+      // ...while the advance INTO merge keeps it as the audit trail of the permission.
+      const merging = applyAction(s, { kind: "advance", ticket: 7, to: "merge" }, 0);
+      expect(merging.lanes[0].mergeGate).toEqual(GREEN_GATE);
+    });
+
+    test("recordMergeGate refuses a ticket with no lane instead of silently doing nothing", () => {
+      expect(() => recordMergeGate(approved(), 999, GREEN_GATE, 0)).toThrow(ZError);
+    });
+
+    test("an ingest preserves a stamped verdict across ticks (the gate is not re-run every tick)", () => {
+      const s = recordMergeGate(approved(), 7, GREEN_GATE, 0);
+      const after = ingestBoardItems(s, [{ number: 7, title: "Ticket 7", fields: { Status: "Review" } }], { "7": "" });
+      expect(after.lanes[0].mergeGate).toEqual(GREEN_GATE);
+    });
   });
 
   // -- doc canary: the SKILL is what the orchestrator actually executes -------
-  describe("z-loop/SKILL.md wires the gate ahead of the merge spawn", () => {
+  describe("z-loop/SKILL.md wires the gate as the merge-gate action", () => {
     const skill = () => readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
 
-    test("the merge spawn runs loop.ts merge-gate BEFORE spawning the agent", () => {
+    test("the merge-gate action row runs the STAMPING form of the CLI", () => {
       const md = skill();
-      expect(md).toContain('bun "$PACK/lib/loop.ts" merge-gate ".worktrees/ticket-<N>"');
-      expect(md.indexOf("merge-gate")).toBeLessThan(md.indexOf("3. Spawn a FRESH harness Agent"));
+      expect(md).toContain('bun "$PACK/lib/loop.ts" merge-gate ".worktrees/ticket-<N>" --state "$STATE" --ticket <N>');
+      expect(md).toMatch(/\|\s*`merge-gate N`\s*\|/); // it is an action row, not a step buried in the spawn sequence
     });
 
-    test("a nonzero gate parks the lane Blocked and spawns no merge agent", () => {
-      const md = skill();
-      expect(md).toMatch(/Any nonzero exit[\s\S]*do NOT spawn the merge agent/);
-      expect(md).toContain("BLOCKED: %s");
-      expect(md).toContain('"$PACK/lib/loop.ts" outcome "$STATE"');
+    // QA finding 1 (#178): step 2b handed the orchestrator a blocking foreground
+    // command with no timeout guidance, so the harness's 120s default killed the
+    // very contention retry the gate exists to survive and the lane false-parked.
+    test("the row states an explicit generous Bash timeout, well past a full gauntlet", () => {
+      const row = skill().split("\n").find((l) => l.startsWith("| `merge-gate N` |"))!;
+      expect(row).toMatch(/timeout/i);
+      const ms = [...row.matchAll(/`(\d{6,})`/g)].map((m) => Number(m[1]));
+      expect(Math.max(...ms)).toBeGreaterThanOrEqual(600_000); // >= 10 min: two full gauntlets + the 15s wait, with room to grow
+      expect(row).toContain("120000"); // and names the default it must not inherit
+    });
+
+    test("a red verdict parks the lane Blocked and no merge agent is ever spawned from this row", () => {
+      const row = skill().split("\n").find((l) => l.startsWith("| `merge-gate N` |"))!;
+      expect(row).toContain("park N Blocked");
+      expect(row).toMatch(/do NOT spawn a merge agent/i);
+      expect(row).toMatch(/nonzero exit is EXPECTED/i); // exit 1 on red is the contract, not a tick failure
     });
   });
 });

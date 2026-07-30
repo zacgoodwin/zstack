@@ -177,6 +177,19 @@ export interface LaneState {
   // points at the lane's own stage status (a genuine human move-back, which the
   // loop never wrote, leaves it cleared -> safe stop-lane). See the guard below.
   lastWroteStatus?: BoardStatus;
+  // #178: the loop-owned merge gate's verdict for this lane, stamped by
+  // `loop merge-gate --state <state.json> --ticket <N>`. nextAction will not
+  // emit an advance to the merge stage until this reads green, so a merge agent
+  // is never spawned on a suite nobody mechanically verified -- the enforcement
+  // is here, in the reducer, not in the orchestrator's compliance with prose.
+  // Cleared by any advance OFF the merge path (a lane bounced back to the
+  // builder must re-gate the code it comes back with).
+  mergeGate?: MergeGateVerdict;
+  // Gate attempts STARTED (stamped before the gauntlet runs, so a run killed
+  // mid-gauntlet -- a command timeout shorter than the suite -- still leaves a
+  // trace). Bounds the retry so a gate that never returns parks the lane
+  // instead of spinning the drain forever (PROCESS.md: park, never stall).
+  mergeGateRuns?: number;
 }
 
 export interface LoopState {
@@ -338,6 +351,12 @@ export type Action =
   | { kind: "skip"; ticket: number; note: string }
   | { kind: "stop-lane"; ticket: number; note: string }
   | { kind: "check-worker"; ticket: number }
+  // #178: run the loop-owned merge gate for this lane and stamp its verdict
+  // (`loop merge-gate <worktree> --state <state.json> --ticket <N>`), exactly
+  // as check-worker asks for a probe. The ONLY door to the merge stage: this
+  // action repeats until a verdict lands, and nothing advances to merge
+  // without a green one.
+  | { kind: "merge-gate"; ticket: number }
   | { kind: "complete"; ticket: number; note: string }
   | { kind: "wait" }
   | { kind: "context-clear" }
@@ -588,10 +607,36 @@ export function nextAction(state: LoopState, nowMs: number): Action {
       // into `order` above instead and merges normally this same tick.
       return { kind: "park", ticket: stuck[0], status: "Blocked", note: `Dependency cycle among review-approved lanes: #${stuck.join(", #")}. Parking to keep the rest of the drain moving.` };
     }
+    // #178: the green gate, enforced HERE rather than in orchestrator prose.
+    // Run 9's merge worker read a suite reporting 9 failures, called it green,
+    // merged, and broke main (reverted in PR #158) -- so "is the suite green?"
+    // is not the agent's call, and neither is "did anyone check?". A lane at
+    // the front of the merge order with no verdict on it gets a merge-gate
+    // action (repeated until a verdict lands, the same way check-worker repeats
+    // until a probe lands); a red verdict parks it Blocked with the gate's own
+    // note; only a green one reaches the advance below. There is no other edge
+    // into the merge stage.
+    const first = order[0];
+    const firstLane = mergeReady.find((l) => l.ticket === first.ticket)!;
+    const gate = firstLane.mergeGate;
+    if (!gate) {
+      // A gate that keeps starting and never finishing (its process killed
+      // mid-gauntlet) must not spin the drain: refuse after MERGE_GATE_MAX_RUNS
+      // silent attempts, fail-closed, with the cause named.
+      if ((firstLane.mergeGateRuns ?? 0) >= MERGE_GATE_MAX_RUNS) {
+        return {
+          kind: "park",
+          ticket: first.ticket,
+          status: "Blocked",
+          note: `merge gate started ${firstLane.mergeGateRuns} times and never returned a verdict (the gauntlet process was killed each time -- most often a command timeout shorter than the suite). Refusing the merge.`,
+        };
+      }
+      return { kind: "merge-gate", ticket: first.ticket };
+    }
+    if (!gate.green) return { kind: "park", ticket: first.ticket, status: "Blocked", note: gate.note };
     // A stacked parent is one merging concurrently OR already merged this run
     // (its branch survives until batch-end cleanup, so the child's PR still
     // needs the step-18 retarget).
-    const first = order[0];
     const mergedThisRun = new Set(state.mergedThisRun ?? []);
     const runParents = (byNumber.get(first.ticket)?.dependsOn ?? []).filter((d) => mergedThisRun.has(d));
     const stackedOn = [...new Set([...first.stackedOn, ...runParents])].sort((a, b) => a - b);
@@ -816,6 +861,15 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
       lane.lastActivityMs = nowMs;
       delete lane.outcome;
       delete lane.workerDead;
+      // #178: a green gate vouches for ONE commit. Advancing anywhere but into
+      // the merge stage (a QA/review bounce back to the builder) means the code
+      // is about to change, so the verdict and its attempt count are dropped and
+      // the lane must be gated again before it can merge. The advance INTO merge
+      // keeps its verdict as the audit trail of why the merge was allowed.
+      if (action.to !== "merge") {
+        delete lane.mergeGate;
+        delete lane.mergeGateRuns;
+      }
       // #125: this advance writes STATUS_FOR_STAGE[to] below; record it as the
       // lane's origin marker so a lagged board write can be told from a human
       // move-back on the next tick (ingest clears it once the board shows it land).
@@ -856,6 +910,12 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
       return next;
     }
     case "check-worker":
+    // #178: like check-worker, the state change is the side effect the
+    // orchestrator's command performs (recordMergeGate via `loop merge-gate
+    // --state`), not something the reducer can synthesize -- running a test
+    // suite is not pure. Applying it is a no-op; the next `next` reads the
+    // stamped verdict.
+    case "merge-gate":
     case "wait":
     // #131: context-clear is a mid-batch PAUSE, not a state transition -- the
     // orchestrator releases the loop lock, keeps worktrees/branches and the
@@ -889,6 +949,25 @@ export function recordProbe(state: LoopState, ticket: number, alive: boolean, no
     delete lane.workerDead;
   } else {
     lane.workerDead = true;
+  }
+  return next;
+}
+
+// Records the loop-owned merge gate on a lane (#178, pure). `verdict === null`
+// means an attempt is STARTING: bump the attempt count and drop any earlier
+// verdict, so a gauntlet killed mid-run still leaves the evidence nextAction
+// needs to stop retrying. A verdict object is the finished attempt's answer,
+// green or red, and it is what unlocks (or refuses) the advance to merge.
+export function recordMergeGate(state: LoopState, ticket: number, verdict: MergeGateVerdict | null, nowMs: number): LoopState {
+  const next = structuredClone(state);
+  const lane = next.lanes.find((l) => l.ticket === ticket);
+  if (!lane) throw new ZError(`No lane holds #${ticket} to record a merge gate on.`);
+  lane.lastActivityMs = nowMs;
+  if (verdict === null) {
+    lane.mergeGateRuns = (lane.mergeGateRuns ?? 0) + 1;
+    delete lane.mergeGate;
+  } else {
+    lane.mergeGate = verdict;
   }
   return next;
 }
@@ -1114,6 +1193,11 @@ export function ingestBoardItems(
 // space, so the loop owns it: the gate runs the gauntlet itself and judges by
 // the summary fail-count + the process exit code. The merge agent never gets a
 // vote; it runs `gh pr merge` only after this returns green.
+//
+// The verdict is STAMPED on the lane (LaneState.mergeGate) and nextAction's
+// merge step reads it, so "did anyone actually run the gate?" is not a prose
+// question either: with no green stamp there is no advance to the merge stage,
+// hence no merge agent, hence no `gh pr merge`.
 
 // One gauntlet attempt in a merge worktree: `bun test` then `bun run typecheck`.
 export interface SuiteRun {
@@ -1132,6 +1216,13 @@ export interface MergeGateVerdict {
 // release a file lock (the only nonzero-with-no-failures case seen on Windows),
 // short enough that a genuinely broken branch is refused within ~30s.
 export const MERGE_GATE_RETRY_WAIT_MS = 15_000;
+
+// How many times the loop starts the gate for one lane before refusing the
+// merge outright. Only a run that dies WITHOUT stamping a verdict (its process
+// killed mid-gauntlet) consumes an attempt -- a run that answers, green or red,
+// ends the sequence -- so two covers "the first call was killed, the second had
+// a long enough timeout" and nothing more.
+export const MERGE_GATE_MAX_RUNS = 2;
 
 // The fail-count off a `bun test` run, read ONLY from its summary line
 // (`^ N fail`), never from per-test `(fail) name` lines or a literal like
@@ -1198,9 +1289,12 @@ const USAGE = `loop <command> [args]
   stage-model <builder|qa|reviewer|merge> <ticketModel> --slug <s>
                                                      print the resolved model name for that stage
                                                      (config stageModels override, else ticketModel)
-  merge-gate <worktreePath> [--retry-wait-ms N]      run the pre-merge gauntlet (bun test + typecheck) in
+  merge-gate <worktreePath> [--state <state.json> --ticket <N>] [--retry-wait-ms N]
+                                                     run the pre-merge gauntlet (bun test + typecheck) in
                                                      that worktree and print the verdict JSON; exit 0 ONLY
-                                                     when green (#178) -- nothing merges on a nonzero exit
+                                                     when green (#178) -- nothing merges on a nonzero exit.
+                                                     With --state/--ticket, stamps the verdict on that lane:
+                                                     "next" will not advance a lane to merge without a green one
   next <state.json> [--now <ms>]                     print the next Action as JSON (no writes)
   apply <state.json> <action.json> [--now <ms>]      apply an Action, rewrite the state file
   outcome <state.json> <ticket> <msg.txt> [--now <ms>]  parse a stage's final message onto its lane
@@ -1304,16 +1398,47 @@ export function main(argv: string[]): number {
     // before the statePath guard too. Its EXIT CODE is the contract: 0 green,
     // 1 red (and 1 on a usage/IO error via handleCliError) -- every nonzero
     // means "do not merge", so the fail-closed reading needs no parsing.
+    //
+    // With --state/--ticket it also STAMPS the verdict onto that lane, which is
+    // what makes the gate enforceable rather than advisory: nextAction refuses
+    // to advance a lane to the merge stage until a green stamp is there. The
+    // stamping form writes twice -- an attempt marker before the gauntlet, the
+    // verdict after -- so a run killed mid-gauntlet is still visible.
     if (cmd === "merge-gate") {
       const worktree = positionals[0];
-      if (!worktree) throw new ZError("Usage: loop merge-gate <worktreePath> [--retry-wait-ms N]");
-      if (!existsSync(worktree)) throw new ZError(`Merge gate: worktree ${worktree} does not exist.`);
+      const gateState = str(flags, "state");
+      const gateTicketRaw = str(flags, "ticket");
+      if (!worktree || (gateState === undefined) !== (gateTicketRaw === undefined)) {
+        throw new ZError("Usage: loop merge-gate <worktreePath> [--state <state.json> --ticket <N>] [--retry-wait-ms N]");
+      }
+      const gateTicket = gateTicketRaw === undefined ? undefined : Number(gateTicketRaw);
+      if (gateTicket !== undefined && !Number.isInteger(gateTicket)) {
+        throw new ZError(`--ticket must be an issue number, got ${JSON.stringify(gateTicketRaw)}.`);
+      }
       const rawWait = str(flags, "retry-wait-ms");
       const retryWaitMs = rawWait === undefined ? MERGE_GATE_RETRY_WAIT_MS : Number(rawWait);
       if (!Number.isFinite(retryWaitMs) || retryWaitMs < 0) {
         throw new ZError(`--retry-wait-ms must be a non-negative number, got ${JSON.stringify(rawWait)}.`);
       }
-      const verdict = mergeGate(() => runGauntlet(worktree), (ms) => Bun.sleepSync(ms), retryWaitMs);
+      const now = Number(str(flags, "now") ?? Date.now());
+      const stamp = (v: MergeGateVerdict | null): void => {
+        if (gateState === undefined) return;
+        atomicWrite(gateState, JSON.stringify(recordMergeGate(readJson(gateState) as LoopState, gateTicket!, v, now), null, 2));
+      };
+      stamp(null); // an attempt is starting -- survives a killed gauntlet
+      let verdict: MergeGateVerdict;
+      try {
+        if (!existsSync(worktree)) throw new ZError(`Merge gate: worktree ${worktree} does not exist.`);
+        verdict = mergeGate(() => runGauntlet(worktree), (ms) => Bun.sleepSync(ms), retryWaitMs);
+      } catch (e) {
+        // Standalone (a merge agent's own run): keep the loud CLI error. Stamping
+        // (the loop's own run): a gate that cannot RUN is a red gate, not a
+        // crashed tick -- the lane parks Blocked with the reason instead of
+        // re-running a command that will fail the same way.
+        if (gateState === undefined) throw e;
+        verdict = { green: false, attempts: 0, failCount: null, note: `merge gate could not run: ${(e as Error).message} -- refusing the merge` };
+      }
+      stamp(verdict);
       console.log(JSON.stringify(verdict));
       if (!verdict.green) console.error(verdict.note);
       return verdict.green ? 0 : 1;

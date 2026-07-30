@@ -87,7 +87,13 @@ export function atomicWrite(
   // Test-only seam for simulating transient rename failures; callers never pass it.
   rename: (from: string, to: string) => void = renameSync,
 ): void {
-  mkdirSync(dirname(path), { recursive: true });
+  // dirname("state.json") is "." -- a directory that exists by definition, and
+  // one Bun's mkdirSync rejects with EEXIST on Windows even under recursive.
+  // So a bare relative filename (`loop merge-gate . --state state.json`) used
+  // to die with a raw stack before writing anything; only paths with a parent
+  // component need creating.
+  const dir = dirname(path);
+  if (dir && dir !== ".") mkdirSync(dir, { recursive: true });
   let tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
   try {
     writeFileSync(tmp, content, { encoding: "utf8", mode: 0o600, flag: "wx" });

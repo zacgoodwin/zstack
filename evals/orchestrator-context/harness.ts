@@ -15,6 +15,7 @@
 import {
   applyAction,
   nextAction,
+  recordMergeGate,
   recordOutcome,
   type LoopState,
   type Stage,
@@ -149,6 +150,13 @@ export function simulateDrain(nTickets: number): DrainStats {
       continue;
     }
     if (a.kind === "check-worker") throw new Error("simulateDrain: unexpected watchdog on the happy path");
+    // #178: the loop runs its own merge gate before a lane may advance to the
+    // merge stage. It is a bash command, not a spawn, so it costs no
+    // orchestrator context beyond the one-line tick this loop already counts.
+    if (a.kind === "merge-gate") {
+      s = recordMergeGate(s, a.ticket, { green: true, attempts: 1, failCount: 0, note: "merge gate GREEN on attempt 1: 0 fail, exit 0" }, 0);
+      continue;
+    }
     // A claim spawns builder; an advance spawns its target stage. complete (after
     // a merge) and any park/skip just mutate state -- no spawn, but still applied.
     if (a.kind === "claim") spawns.push({ ticket: a.ticket, stage: a.stage });

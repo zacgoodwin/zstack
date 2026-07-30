@@ -64,8 +64,10 @@ records the result. It never re-derives a scheduling decision in prose.
 - **A red suite does not merge, and the agent has no say.** Before a merge agent
   is spawned, the loop itself runs the gauntlet in the lane's worktree and
   judges it by the summary fail-count and the process exit code, never by an
-  agent's reading of the output. Green is the only state in which a merge agent
-  is spawned at all. See [The merge green gate](#the-merge-green-gate).
+  agent's reading of the output. The verdict is stamped on the lane and the
+  scheduler refuses to advance a ticket into the merge stage without a green
+  one, so "was the gate even run?" is decided in code too. See
+  [The merge green gate](#the-merge-green-gate).
 - **Reviewer->builder bounces are capped.** A `REVIEW-FINDINGS` and a
   `reviewerBelowThresholdAction: "retry"` both send the ticket back to the
   builder from Review, and both draw on the same per-lane budget: at config
@@ -128,7 +130,7 @@ tests, decided in prose that it was green, merged, and broke `main` (reverted in
 PR #158). "Is the suite green?" is deterministic space, so it is code now:
 
 ```bash
-bun "$PACK/lib/loop.ts" merge-gate .worktrees/ticket-<N>
+bun "$PACK/lib/loop.ts" merge-gate .worktrees/ticket-<N> --state "$STATE" --ticket <N>
 ```
 
 What it does, in the lane's own worktree:
@@ -144,15 +146,41 @@ What it does, in the lane's own worktree:
 3. Allows **exactly one** retry, after a 15s wait, and only for the contention
    shape: a nonzero exit (or a missing summary) with no reported test failures.
    A summary reporting failures is never retried.
-4. Prints the verdict as JSON (`{green, attempts, failCount, note}`) and **exits
-   0 only when green**.
+4. Prints the verdict as JSON (`{green, attempts, failCount, note}`), **exits
+   0 only when green**, and — with `--state`/`--ticket` — stamps the verdict
+   onto that lane.
 
-The orchestrator runs it *before* the merge stage spawns. Nonzero exit → no
-merge agent is spawned at all, and the lane parks Blocked carrying the gate's
-note (fail count included) for a human. Green → the merge agent is spawned, and
-its prompt hands it the same command rather than a judgment call: if it resolves
-a conflict on the branch it must re-run the gate and obey the exit code, and
-`gh pr merge` may run only on a 0. Under no circumstance does a red suite merge.
+### Who runs it, and why it cannot be skipped
+
+The stamp is the enforcement. A review-approved lane at the front of the merge
+order gets its own scheduler action, `merge-gate N`, and `next` will not emit
+the `advance N to merge` that spawns a merge agent until the lane carries a
+**green** verdict:
+
+| Lane state | What `next` returns |
+|---|---|
+| No verdict stamped | `merge-gate N` — run the gate (again) |
+| Verdict green | `advance N to merge` — the merge agent spawns |
+| Verdict red | `park N Blocked`, carrying the gate's own note (fail count included) |
+| Two gate runs started, neither finished | `park N Blocked` — a gate that never returns refuses the merge rather than spinning the drain |
+
+So an orchestrator that "forgets" the gate does not merge anything; it just gets
+`merge-gate N` back on the next tick. A gate that cannot even run (a missing
+worktree, say) stamps *red* rather than erroring out, so the lane parks for a
+human instead of retrying a command that will fail the same way.
+
+Run the command with a generous timeout — the SKILL specifies `600000` ms (the
+Bash tool's maximum) on the orchestrator's call, and the merge prompt asks the
+agent for the same. It is a full test suite plus a typecheck (~1 minute on this
+repo, and it grows), and the contention path adds a 15s wait and a second full
+run; the harness's 120s default would kill it mid-gauntlet — turning the exact
+branches the retry exists to rescue into false Blocked lanes.
+
+The merge agent runs the same command as its own **Step 0**, unconditionally,
+before any `gh pr merge` — and again after any conflict resolution, since the
+loop's run vouches for the commit it gated, not for code the agent changed
+afterwards. Its prompt never asserts that an earlier gate passed; it hands over
+a command and an exit code. Under no circumstance does a red suite merge.
 
 ## Ticket and context limits
 

@@ -256,6 +256,12 @@ export function shSingleQuote(s: string): string {
 // The loop-owned merge gate's CLI, by absolute path off THIS pack (#178). The
 // merge agent is told to shell it, never to read test output and judge green
 // itself -- the whole point of the gate is that no latent step decides it.
+// The prompt must never ASSERT that the gate already ran green: the loop does
+// gate this lane before the spawn (nextAction refuses to advance to merge
+// without a stamped green verdict), but a prompt that states it as fact would
+// be an unverifiable claim inside the agent's own context, and a claim is
+// exactly what this ticket replaces with a command. So the gate is Step 0,
+// unconditional, and the agent's own exit code is its permission to merge.
 const MERGE_GATE_CLI = join(import.meta.dir, "loop.ts");
 
 export interface MergePromptInput {
@@ -278,16 +284,20 @@ This branch stacks on ticket(s) #${i.stackedOn.join(", #")}. Their PRs merge FIR
 - Worktree: ${i.worktreePath}, branch ${i.branch}, base ${i.baseBranch}.
 - Full stage input (numbers, PR title, branch, base, worktree, stacked chain) is in ${inputPath} if you need to re-read any field.
 ${stacked}
-## The green gate is NOT yours to judge (#178)
-The loop already ran the mechanical pre-merge gate (bun test + bun run typecheck in this worktree, judged by the summary fail-count and the process exit code) and it returned GREEN -- that is the only reason you were spawned. You never decide green vs red by reading test output: a merge agent that did exactly that landed a branch with 9 failing tests and broke ${i.baseBranch}. If ANY step below changes the branch's code (a conflict resolution), re-run the gate yourself and obey its exit code:
+## Step 0 -- run the green gate. It is NOT yours to judge (#178)
+Run this yourself, in THIS session, before any gh pr merge -- unconditionally, whatever you were told about earlier runs:
 
 bun ${shSingleQuote(MERGE_GATE_CLI)} merge-gate ${shSingleQuote(i.worktreePath)}
 
-Exit 0 = green, the only state in which gh pr merge may run. ANY nonzero exit = BLOCKED, no matter what the output looks like to you.
+Exit 0 = green, the only state in which gh pr merge may run. ANY nonzero exit = stop and exit BLOCKED with the gate's note, no matter what the output looks like to you. You never decide green vs red by reading test output: a merge agent that did exactly that landed a branch with 9 failing tests and broke ${i.baseBranch}.
+
+Give the command the largest timeout your shell tool allows (600000 ms), never a 120s default: it runs the full test suite plus a typecheck, and its one contention retry adds a 15s wait and a second full run. A killed command is not a verdict; re-run it.
+
+Run it AGAIN after any change you make to the branch (a conflict resolution) -- the run before your change does not vouch for the code after it.
 
 ## Steps
 1. Open the PR: gh pr create --base ${i.baseBranch} --head ${i.branch} --title ${shSingleQuote(i.prTitle)} with a body that links the ticket and summarizes what shipped.
-2. If ${i.branch} conflicts with ${i.baseBranch}: resolve ON the branch, then re-run the full gauntlet through the gate command above before merging (never in prose, never resolve in the merge commit blind). Gate nonzero -> exit BLOCKED with its note.
+2. If ${i.branch} conflicts with ${i.baseBranch}: resolve ON the branch, then re-run the full gauntlet through Step 0's gate command before merging (never in prose, never resolve in the merge commit blind). Gate nonzero -> exit BLOCKED with its note.
 3. Merge with gh pr merge only when the gate exited 0. Never pass --delete-branch: branch cleanup happens once at batch end, after every dependent PR has landed.
 4. Do not close the ticket issue and do not comment on it -- the orchestrator posts the completion note.
 

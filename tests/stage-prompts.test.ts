@@ -398,8 +398,31 @@ describe("merge prompt", () => {
     expect(p).toContain("merge-gate"); // the loop-owned CLI, by absolute pack path
     expect(p).toContain(MERGE_INPUT.worktreePath);
     expect(p).toContain("Exit 0 = green");
-    expect(p).toMatch(/ANY nonzero exit = BLOCKED/);
+    expect(p).toMatch(/ANY nonzero exit = stop and exit BLOCKED/);
     expect(p).toContain("only when the gate exited 0"); // step 3 no longer says "when everything is green"
+  });
+
+  // QA finding 2 on the first #178 pass: the prompt ASSERTED "the loop already
+  // ran the gate and it returned GREEN", and the only instruction to run it was
+  // conditional on a conflict resolution -- so on the clean-merge path the agent
+  // ran nothing and merged on an unverifiable claim. The gate command is now an
+  // unconditional Step 0 and the prompt states no verdict as fact.
+  test("the gate is an UNCONDITIONAL step 0, ahead of the numbered steps, with no claim that it already passed", () => {
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const gateIdx = p.indexOf("merge-gate");
+    expect(gateIdx).toBeGreaterThan(-1);
+    expect(gateIdx).toBeLessThan(p.indexOf("## Steps")); // before every numbered step, including the merge
+    expect(p).toMatch(/Step 0/);
+    expect(p).toMatch(/Run this yourself, in THIS session, before any gh pr merge -- unconditionally/);
+    // No unverifiable assurance about a run the agent cannot see.
+    expect(p).not.toMatch(/returned GREEN/i);
+    expect(p).not.toMatch(/already ran the mechanical pre-merge gate/i);
+    // The command inherits the same timeout lesson as the orchestrator's row:
+    // a full suite + typecheck plus a 15s contention retry blows a 120s default.
+    expect(p).toMatch(/timeout/i);
+    expect(p).toContain("600000");
+    // ...and a change to the branch invalidates the earlier run.
+    expect(p).toMatch(/Run it AGAIN after any change you make to the branch/);
   });
 
   test("stacked chain: parent first, no deletion, retarget, delete last", () => {

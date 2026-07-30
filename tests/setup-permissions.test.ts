@@ -487,6 +487,22 @@ function errnoErr(code: string): Error {
 }
 
 describe("atomicWrite failure handling", () => {
+  // A bare relative filename has dirname "." -- Bun's mkdirSync rejects that
+  // with EEXIST on Windows even under `recursive`, so every CLI that takes a
+  // state/lock path (`loop merge-gate . --state state.json`) used to die with a
+  // raw stack instead of writing.
+  test("a bare relative filename writes instead of blowing up on its \".\" parent", () => {
+    const dir = makeDir();
+    const cwd = process.cwd();
+    try {
+      process.chdir(dir);
+      atomicWrite("state.json", "{}");
+      expect(readFileSync(join(dir, "state.json"), "utf8")).toBe("{}");
+    } finally {
+      process.chdir(cwd);
+    }
+  });
+
   test("rename failure unlinks the tmp file and propagates the error", () => {
     const dir = makeDir();
     const target = join(dir, "target");
