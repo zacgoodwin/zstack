@@ -33,7 +33,22 @@ does not exist yet, you need `/z-setup`.
    non-zero on any drift — no eyeballing.
 6. **Wire deploy.** Invokes gstack `/setup-deploy` so `/land-and-deploy` works at
    end of loop.
-7. **Auto-approvals (optional).** Offers to reduce Claude Code permission prompts
+7. **GitHub identity (issue #66, not optional).** Should `/z-loop` run as its
+   own dedicated bot GitHub account, or continue under the owner's own login?
+   A fresh project (or one that predates this step) must leave with an
+   explicit answer recorded in `config.json` — this DOES gate Done, unlike
+   Step 8 below. A project that already answered is left untouched and the
+   step reports so (idempotent). Continuing as the owner's account is fully
+   supported, but the step states its cost first: issue #204's fold-in gate
+   can never see the owner's own ticket comments as "someone else's" while
+   the loop shares their login, so a standing instruction left in a comment
+   is invisible to the planning pass. On an **organization-owned** repo, the
+   re-verification that runs on every later re-run can't compare the active
+   `gh` login against a personal owner login (an org has no such login) —
+   it reports the raw facts and asks you to eyeball them instead of guessing.
+   Full walkthrough (account, permissions, token, `gh` auth, verification,
+   the org caveat): [bot-identity](bot-identity.md).
+8. **Auto-approvals (optional).** Offers to reduce Claude Code permission prompts
    so the loop runs unattended. **This edits `~/.claude/settings.json`, which is
    machine-wide.** Three choices:
    - **A) Full auto-approvals** — a permission-allow hook + `bypassPermissions`
@@ -87,14 +102,19 @@ Beyond the board IDs, `config.json` carries optional per-project tuning knobs,
 each defaulted by `loadConfig` when absent:
 
 **A re-apply preserves your hand-edits (issue #97).** `z-setup-board apply`
-assembles the rest of the config fresh from the live board every run, but four
+assembles the rest of the config fresh from the live board every run, but five
 fields are instead carried forward from the prior config.json on disk:
-`stageModels`, `quota`, `notifications`, `adversarialMode`. Whatever value one
-of these carries wins over the freshly-assembled default the next time `apply`
-genuinely rewrites the file (a board-shape change forced a real `writeConfig`,
-not the common no-op re-run). Of the four, `stageModels`/`notifications`/
-`adversarialMode` have no CLI flag and are absent unless you hand-edit them in
-— a field you never added stays exactly as it would today. `quota` is
+`stageModels`, `quota`, `notifications`, `adversarialMode`, `identity`.
+Whatever value one of these carries wins over the freshly-assembled default
+the next time `apply` genuinely rewrites the file (a board-shape change forced
+a real `writeConfig`, not the common no-op re-run). Of these, `stageModels`/
+`notifications`/`adversarialMode` have no CLI flag and are absent unless you
+hand-edit them in — a field you never added stays exactly as it would today.
+`identity` (issue #66) likewise has no CLI flag, but isn't meant to be
+hand-edited either — it's written by Step 7's identity step
+(`bun lib/identity.ts record`) and preserved here for the same reason: a
+later board-shape-drift re-apply must not silently erase a recorded
+bot/human choice and force a re-prompt. `quota` is
 different: `buildConfig` writes `{...DEFAULT_QUOTA}` into every config.json
 unconditionally, hand-edited or not, so it is carried forward on every
 re-apply from day one — including a *future* release changing `DEFAULT_QUOTA`,
@@ -143,8 +163,10 @@ change them.
 - `quota.threshold` (default 100) — the GitHub GraphQL rate-limit guard trips
   when remaining points fall below this before any board call.
 - `quota.mode` (default `"sleep"`) — `"sleep"` waits until the rate-limit window
-  resets (`resetAt`) and then proceeds; `"abort"` fails the call immediately
-  instead of waiting.
+  resets, re-probes the quota, and retries up to 3 bounded rounds. If the quota
+  is still below threshold after 3 rounds, it aborts the run loudly with both
+  readings (first and final) rather than proceeding on an unverified quota;
+  `"abort"` fails the call immediately instead of waiting.
 - `adversarialMode` (default `"non-trivial"`, values `off` | `non-trivial` |
   `always`) — when the Review stage fans out independent skeptic sub-agents
   (super-truth) instead of a single pass. `non-trivial` activates on a diff of
@@ -165,22 +187,32 @@ change them.
   `truth-check failed (confidence X/100)`; `retry` bounces it back to the
   builder; `off` disables the gate entirely (a low-confidence or unparseable
   approval merges, the pre-#62 behavior).
+- `minSkepticQuorum` (default 2, values 0–3) — how many of the 3 skeptic
+  verdicts an **adversarial** `REVIEW-APPROVE` must actually have received for
+  its aggregated confidence to merge (issue #191). One skeptic reporting "cannot
+  refute" is `confidence=100`, which clears `minReviewerConfidence` and merges as
+  though three reviews agreed; this is the denominator that stops it. A short
+  quorum re-spawns the reviewer once, then parks Blocked. `0` disables the gate;
+  `1` accepts a single opinion as an adversarial pass, which is the hole this
+  closes — lower it only deliberately. Must be an integer 0–3: a floor above the
+  fan-out could never be met, so it is a loud config error rather than a drain
+  where every adversarial review parks Blocked. Projects with `adversarialMode:
+  "off"` are unaffected (no fan-out, no token, nothing to judge).
 - `maxReviewBounces` (default 2) — reviewer->builder bounces (a
   `REVIEW-FINDINGS`, or a `reviewerBelowThresholdAction: "retry"`) on a ticket
   before it parks Blocked with `review bounce cap reached (N/N)` instead of
   bouncing again (issue #76). Both routes share one budget on the lane. Must
   be a positive integer — a fraction, zero, or a negative is a loud config
   error, never a silent fallback.
-- `stageModels` (default `{"merge": "haiku"}` on a brand-new project's
-  config; omitted entirely on an adopted/pre-existing one) — per-stage model
-  overrides for the loop's four stage spawns (builder/qa/reviewer/merge). Key
-  absent -> the default above applies; key present, even as `{}` -> used
-  exactly as written, no default layered on. Each value must be a model
-  rate key in `references/rates.json` (the same lookup `z-cost`/`z-estimate`
-  use), checked by `validateConfig`. An already-set-up project that predates
-  this knob (or was adopted) never gets it auto-added — add it to
-  `config.json` by hand to opt in, and it survives every later `z-setup`
-  re-apply (issue #97 — see the note above). Full semantics:
+- `stageModels` (default `{"merge": "haiku"}`, written into `config.json` on
+  both a brand-new project and an adopted/pre-existing one — issue #156)
+  — per-stage model overrides for the loop's four stage spawns
+  (builder/qa/reviewer/merge). Key absent -> the default above applies; key
+  present, even as `{}` -> used exactly as written, no default layered on.
+  Each value must be a model rate key in `references/rates.json` (the same
+  lookup `z-cost`/`z-estimate` use), checked by `validateConfig`. Want a
+  different default? Hand-edit `config.json`; it survives every later
+  `z-setup` re-apply (issue #97 — see the note above). Full semantics:
   [z-loop.md → Per-stage model routing](z-loop.md#per-stage-model-routing).
 - `notifications` (absent = off) — Discord notifications for the seven loop/plan
   events (including `human-needed` — issue #63). Shape: `{ "enabled": true, "discordWebhookUrl": "https://…",
@@ -198,9 +230,10 @@ change them.
 ## Done when
 
 - The scoped GraphQL probe passed, `verify` exited 0, the two workflows are OFF,
-  `config.json` exists and loads, `/setup-deploy` ran, and the auto-approvals
-  offer was made (its A/B/C answer does not gate Done). A re-run makes zero
-  changes.
+  `config.json` exists and loads, `/setup-deploy` ran, the GitHub identity
+  question was answered and recorded (Step 7, issue #66 — this DOES gate
+  Done), and the auto-approvals offer was made (Step 8; its A/B/C answer does
+  not gate Done). A re-run makes zero changes.
 
 ## Common snags
 

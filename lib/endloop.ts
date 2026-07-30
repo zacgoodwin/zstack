@@ -38,7 +38,12 @@ export interface RegressionResult {
   // What ran and what it found: typecheck/full suite/build/e2e (where web
   // changed) + gstack /qa-only, always present regardless of verdict.
   evidence: string;
-  findings: Finding[]; // non-empty iff verdict === "red"
+  // Normally non-empty iff verdict === "red" -- but the orchestrator's
+  // regression step can produce "red" with an empty array (a gate-wiring
+  // anomaly, not a real "nothing to file"). synthesizeFindings() below is the
+  // single place that degrades that case into one generic finding instead of
+  // letting it crash or silently vanish (issue #151).
+  findings: Finding[];
 }
 
 // -- the plan -------------------------------------------------------------------
@@ -74,15 +79,46 @@ export function endLoopPlan(
     throw new ZError(`auditEveryNLoops must be a positive integer (>= 1), got ${auditEveryNLoops}.`);
   }
   if (regression.verdict === "red") {
-    if (regression.findings.length === 0) {
-      throw new ZError("Red regression verdict carries zero findings -- nothing to file. Check the regression gate wiring before trusting this result.");
-    }
+    // Zero findings on red used to throw here, crashing the whole stage (no
+    // report, no notification, no bookkeeping). It degrades instead now:
+    // synthesizeFindings() supplies one generic finding for "file-bugs" to
+    // file, and buildEndLoopReport names the anomaly explicitly -- the plan
+    // shape itself (red never deploys) is identical either way (issue #151).
     return ["file-bugs", "report"];
   }
   const plan: EndLoopActionKind[] = ["land-and-deploy", "canary", "document-release"];
   if (loopCount % auditEveryNLoops === 0) plan.push("cso", "health");
   plan.push("report");
   return plan;
+}
+
+// The one generic bug filed when a red verdict carries zero findings (issue
+// #151): the regression gates failed, but nothing structured explains why --
+// filing this keeps the anomaly from being silently swallowed while pointing
+// straight at the transcript instead of guessing at a root cause it doesn't have.
+const EMPTY_FINDINGS_TITLE = "regression red with no structured findings -- investigate the regression transcript";
+
+// Anomaly note appended to the report's deploy line ONLY for this exact case
+// (see buildEndLoopReport) -- red-with-findings and green stay byte-identical.
+export const EMPTY_FINDINGS_ANOMALY_NOTE =
+  " Anomaly: findings[] was empty on a RED verdict -- one generic bug was filed in its place; check the regression gate wiring.";
+
+// The single place that degrades "red + zero findings" into something
+// file-bugs can act on. Every caller (the CLI's `bug`/`findings` commands,
+// the SKILL's step 3a) MUST go through this instead of reading
+// regression.findings directly, so the fallback is applied exactly once. Green
+// and red-with-findings pass their findings through unchanged.
+export function synthesizeFindings(regression: RegressionResult): Finding[] {
+  if (regression.verdict === "red" && regression.findings.length === 0) {
+    return [
+      {
+        title: EMPTY_FINDINGS_TITLE,
+        repro: `Regression verdict was RED but findings[] was empty. Evidence: ${regression.evidence}. Re-run the regression stage and inspect its transcript/logs directly -- the gate(s) reported failure without emitting a structured finding.`,
+        firstSuspectFile: "z-loop/SKILL.md", // Step 7a: where regression.json gets assembled
+      },
+    ];
+  }
+  return regression.findings;
 }
 
 // -- loop counter: read/increment/persist, atomic write, missing file = 0 -------
@@ -187,7 +223,9 @@ export interface EndLoopReportInput {
 // Fixed row order for the "## Spend by stage" table (ticket #83 plan item 3):
 // every row renders, including $0.00 ones, so a run with no reviewer bounces
 // still shows the shape rather than a shrinking table. "other" catches any
-// transcript file whose name doesn't match `<stage>-<attempt>.jsonl`.
+// transcript file whose name doesn't match `<stage>-<attempt>.jsonl` or
+// `<stage>-<attempt>-sub-<agentId>.jsonl` (lib/transcripts.ts, #190 -- a
+// stage's sub-agents bucket under the stage that spawned them).
 const SPEND_STAGE_ORDER = ["builder", "qa", "reviewer", "merge", "other"] as const;
 
 // Pure markdown render of the whole loop's outcome (issue #9 AC4): verdict with
@@ -214,7 +252,7 @@ export function buildEndLoopReport(input: EndLoopReportInput): string {
 
   const deployLine =
     regression.verdict === "red"
-      ? "NO deploy -- regression is red. Every finding below is filed to Backlog with repro + first-suspect file; fix and re-run before shipping."
+      ? `NO deploy -- regression is red. Every finding below is filed to Backlog with repro + first-suspect file; fix and re-run before shipping.${regression.findings.length === 0 ? EMPTY_FINDINGS_ANOMALY_NOTE : ""}`
       : `land-and-deploy -> canary -> document-release completed, in that order.${auditsRan ? " audits (cso + health) also ran this loop; findings below." : ""}`;
 
   const statusCounts = TERMINAL_STATUSES.map((s) => `- ${s}: ${tickets.filter((t) => t.status === s).length}`).join("\n");
@@ -265,6 +303,10 @@ const USAGE = `endloop <command> [args]
   counter read <path>                             print the current loop counter (0 if missing)
   counter peek <path>                             print the prospective next count (read+1), NO write
   counter bump <path>                             increment + persist atomically, print the new value
+  findings <regression.json>                      print synthesizeFindings(regression) as JSON --
+                                                    Finding[], with the zero-findings-on-red fallback
+                                                    already applied (issue #151); iterate THIS, never
+                                                    regression.json's raw .findings, when filing bugs
   bug <finding.json> <regression|cso|health> <loopCount>   print a BugTicketDraft {title, body} as JSON
   spend-by-stage <cost-result.json>               print sumByStage(costResult.by_file) as JSON --
                                                     feeds "z-cost --json --by-file"'s output into
@@ -299,6 +341,13 @@ export function main(argv: string[]): number {
       if (!path || (sub !== "read" && sub !== "peek" && sub !== "bump")) throw new ZError(`Usage: endloop counter <read|peek|bump> <path>`);
       const value = sub === "read" ? readLoopCounter(path) : sub === "peek" ? peekLoopCounter(path) : bumpLoopCounter(path);
       console.log(String(value));
+      return 0;
+    }
+    if (cmd === "findings") {
+      const path = argv[1];
+      if (!path) throw new ZError(`Usage: endloop findings <regression.json>`);
+      const regression = readJson(path) as RegressionResult;
+      console.log(JSON.stringify(synthesizeFindings(regression)));
       return 0;
     }
     if (cmd === "bug") {

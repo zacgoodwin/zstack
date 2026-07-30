@@ -49,11 +49,37 @@ This is the **second-invocation guard**: two loops on one project would fight ov
 the same tickets and worktrees. Options:
 
 - It really is running elsewhere → let it finish, or stop that session.
-- It crashed and the lock is stale (dead pid, or older than
-  `lockStalenessMinutes`) → the message says so; start with `/z-loop --reconcile`.
+- It crashed and the lock is stale → the message says so, and names the evidence
+  ("no sign of life for N minutes", or "no heartbeat was ever recorded"); start
+  with `/z-loop --reconcile`.
 
 A **live** lock never clears via reconcile — you cannot reconcile over a running
-loop, by design.
+loop, by design. Since #198 that is enforced in code as well: `reconcile apply`
+itself refuses while the lock is live, rather than trusting the caller to have
+checked. The loop passes its own `--session` so its Step 0 recovery pass still
+works; a bare human invocation has no session and is refused.
+
+### The liveness heartbeat (`locks/loop.lock.beat`)
+
+Liveness is judged against a **heartbeat**, not against the lock's creation time.
+`bin/z-loop-tick` re-stamps `locks/loop.lock.beat` every iteration, so the
+question the lock answers is "was this loop seen recently" rather than "did it
+start recently".
+
+That distinction matters because `loop.lock` is written once and never
+re-stamped. Before #198 a loop that simply ran longer than `lockStalenessMinutes`
+(default 60) read as **stale while it was still running**, and the refusal
+message told the next operator the loop "likely crashed. Re-run /z-loop with
+--reconcile" — which parks the live run's tickets back to Ready and deletes its
+worktrees. Real drains run for hours, so this was the ordinary case, not an edge:
+it was reproduced against a live run at `age_minutes: 198` with a 60-minute
+window.
+
+**Do not delete `loop.lock.beat` while a loop is running** — you would make a
+live loop look crashed. It is removed automatically on release and by
+`--reconcile`. A beat naming a session that does not match the lock is ignored,
+so a leftover file from an earlier run is harmless, and a corrupt one degrades to
+the old creation-time behaviour rather than failing the run.
 
 `--reconcile` serializes its clear-and-replace through a one-shot claim file,
 `locks/loop.lock.reconcile`. If a run is killed mid-reconcile the claim can be left
@@ -138,3 +164,34 @@ One special case: when the pack **is** the git clone at `~/.claude/skills/zstack
 (you cloned straight into the skills dir), `/z-uninstall` leaves the clone — it may
 be your only copy — and prints the exact `rm -rf` command for you to run by hand.
 Run it only if you have another copy or don't need the source.
+
+## "OVER-CEILING: #N … exceeded a per-item pagination ceiling" / "exceeds its single query page and would be silently truncated"
+
+`z-board` reads each item's labels, custom-field values, and (per issue) assignees
+in one GraphQL page each — 20 labels, 20 field values, 10 assignees. Those ceilings
+never move (raising them isn't the fix), but what happens when a ticket blows past
+one depends on where it happens:
+
+- **`z-board snapshot`** (the drain loop's per-tick board read): an item over its
+  labels or field-values ceiling is **skipped from that snapshot only** — every
+  other item still comes back, and the offending ticket number is printed on
+  stderr as `OVER-CEILING: #N …`. The tick is never wedged over one runaway
+  ticket. Fix the named ticket (see below) and it rejoins the next snapshot.
+- **`claim` / `move` / `comment` / `field-get` / `field-set` / `link` / `release`**
+  (anything that looks up a single issue): an assignees list over 10 throws loud —
+  `assignees for issue #N (ceiling: 10 assignees per issue) exceeds its single
+  query page and would be silently truncated` — and refuses to act. This guards
+  `claim()`'s "sole assignee is me" ownership check: a silently truncated
+  10-assignee page could otherwise misjudge a ticket it should have refused.
+
+Either way, the fix is the same: reduce what's on the issue.
+
+```bash
+gh issue edit <N> --remove-label <one-of-the-labels>
+gh issue edit <N> --remove-assignee <one-of-the-logins>
+```
+
+Trim labels to 20 or fewer, custom field values to 20 or fewer, and assignees to
+10 or fewer, then re-run the failing command. Full cursor pagination of these
+per-item connections is out of scope — the ceilings are a deliberate bound on a
+per-ticket query shape, not a bug to paginate away.

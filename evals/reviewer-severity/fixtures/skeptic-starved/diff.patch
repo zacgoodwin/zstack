@@ -1,0 +1,45 @@
+diff --git a/src/chunk.ts b/src/chunk.ts
+new file mode 100644
+--- /dev/null
++++ b/src/chunk.ts
+@@ -0,0 +1,12 @@
++// Split `items` into consecutive sub-arrays of at most `size`. The final chunk
++// is short rather than padded, and an empty input yields no chunks at all.
++export function chunk<T>(items: T[], size: number): T[][] {
++  if (!Number.isInteger(size) || size <= 0) {
++    throw new RangeError(`chunk size must be a positive integer, got ${size}`);
++  }
++  const out: T[][] = [];
++  for (let i = 0; i < items.length; i += size) {
++    out.push(items.slice(i, i + size));
++  }
++  return out;
++}
+diff --git a/src/chunk.test.ts b/src/chunk.test.ts
+new file mode 100644
+--- /dev/null
++++ b/src/chunk.test.ts
+@@ -0,0 +1,22 @@
++import { test, expect } from "bun:test";
++import { chunk } from "./chunk.ts";
++
++test("an exact multiple splits evenly", () => {
++  expect(chunk([1, 2, 3, 4], 2)).toEqual([[1, 2], [3, 4]]);
++});
++
++test("the final chunk is short, not padded", () => {
++  expect(chunk([1, 2, 3], 2)).toEqual([[1, 2], [3]]);
++});
++
++test("an empty list yields no chunks", () => {
++  expect(chunk([], 2)).toEqual([]);
++});
++
++test("a non-positive size throws RangeError", () => {
++  expect(() => chunk([1, 2], 0)).toThrow(RangeError);
++  expect(() => chunk([1, 2], -1)).toThrow(RangeError);
++});
++
++test("a fractional size throws RangeError", () => {
++  expect(() => chunk([1, 2], 1.5)).toThrow(RangeError);
++});

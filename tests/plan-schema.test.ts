@@ -14,12 +14,17 @@ import {
   shouldSplitForCost,
   slugifyTitle,
   validateTicketBody,
+  validateTicketTitle,
+  GENERIC_TITLE_STOPLIST,
+  MIN_TITLE_LENGTH,
   SPLIT_MAX_FILES,
   SPLIT_MAX_STEPS,
   TIER_ESTIMATES,
   type TicketError,
 } from "../lib/ticket-schema.ts";
 import { estimate, loadRates, type Buckets } from "../lib/estimate.ts";
+import { QUOTA_REPROBE_ROUNDS } from "../lib/board.ts";
+import { BOARD_STATUSES } from "../lib/config.ts";
 
 const TICKETS = join(import.meta.dir, "fixtures", "tickets");
 const read = (name: string) => readFileSync(join(TICKETS, name), "utf8");
@@ -286,6 +291,165 @@ describe("slugifyTitle", () => {
   test("punctuation-only or empty input slugs to the empty string", () => {
     expect(slugifyTitle("!!!")).toBe("");
     expect(slugifyTitle("")).toBe("");
+  });
+});
+
+// -- validateTicketTitle: the deterministic title gate (issue #155) ---------
+describe("validateTicketTitle: rejects empty/whitespace-only titles", () => {
+  test("empty string fails with 'empty', no other checks run", () => {
+    const r = validateTicketTitle("");
+    expect(r.ok).toBe(false);
+    expect(r.errors).toEqual([{ code: "empty", message: expect.any(String) }]);
+  });
+
+  test("whitespace-only fails with 'empty'", () => {
+    const r = validateTicketTitle("   \t  ");
+    expect(r.ok).toBe(false);
+    expect(r.errors).toHaveLength(1);
+    expect(r.errors[0].code).toBe("empty");
+  });
+});
+
+describe("validateTicketTitle: minimum length", () => {
+  test("a title under the minimum length fails with 'too-short', naming the length", () => {
+    const r = validateTicketTitle("Fix it");
+    expect(r.ok).toBe(false);
+    const e = r.errors.find((e) => e.code === "too-short");
+    expect(e).toBeDefined();
+    expect(e?.message).toContain(`${MIN_TITLE_LENGTH}`);
+  });
+
+  test("a title at exactly the minimum length passes the length check", () => {
+    const title = "x".repeat(MIN_TITLE_LENGTH);
+    expect(validateTicketTitle(title).errors.find((e) => e.code === "too-short")).toBeUndefined();
+  });
+
+  test("a title one char under the minimum fails the length check", () => {
+    const title = "x".repeat(MIN_TITLE_LENGTH - 1);
+    const r = validateTicketTitle(title);
+    expect(r.errors.find((e) => e.code === "too-short")).toBeDefined();
+  });
+});
+
+describe('validateTicketTitle: the #133 case -- "CHANGE IN BEHAVIOR" (issue #155 setup)', () => {
+  test('"CHANGE IN BEHAVIOR" fails, naming BOTH the all-caps and generic rule', () => {
+    const r = validateTicketTitle("CHANGE IN BEHAVIOR");
+    expect(r.ok).toBe(false);
+    const codes = r.errors.map((e) => e.code).sort();
+    expect(codes).toEqual(["all-caps", "generic"]);
+  });
+});
+
+describe("validateTicketTitle: ALL-CAPS titles", () => {
+  test("a fully uppercase title fails with 'all-caps'", () => {
+    const r = validateTicketTitle("REWRITE THE WHOLE SERVICE");
+    expect(r.errors.some((e) => e.code === "all-caps")).toBe(true);
+  });
+
+  test("a title with any lowercase letter does not trigger all-caps", () => {
+    const r = validateTicketTitle("Add a z-stop command");
+    expect(r.errors.some((e) => e.code === "all-caps")).toBe(false);
+  });
+
+  test("a bare acronym (e.g. 'API') has no lowercase letters to compare against, so it also trips all-caps -- but too-short fires alongside it, so it fails either way", () => {
+    const r = validateTicketTitle("API");
+    expect(r.errors.some((e) => e.code === "all-caps")).toBe(true);
+    expect(r.errors.some((e) => e.code === "too-short")).toBe(true);
+  });
+
+  test("a title mixing an uppercase acronym with lowercase prose does not trigger all-caps", () => {
+    const r = validateTicketTitle("API rate limits: fix 429 responses on /v1/users");
+    expect(r.errors.some((e) => e.code === "all-caps")).toBe(false);
+  });
+
+  test("a title with no letters at all (numbers/punctuation only) never triggers all-caps", () => {
+    const r = validateTicketTitle("#134 / #132 -- 2026-07-29");
+    expect(r.errors.some((e) => e.code === "all-caps")).toBe(false);
+  });
+});
+
+describe("validateTicketTitle: generic stoplist", () => {
+  test.each(GENERIC_TITLE_STOPLIST)("the bare stoplisted phrase %s fails with 'generic'", (phrase) => {
+    const r = validateTicketTitle(phrase);
+    expect(r.errors.some((e) => e.code === "generic")).toBe(true);
+  });
+
+  test("stoplist match is case- and punctuation-insensitive on the WHOLE title", () => {
+    expect(validateTicketTitle("Fix Bug.").errors.some((e) => e.code === "generic")).toBe(true);
+    expect(validateTicketTitle("  misc  ").errors.some((e) => e.code === "generic")).toBe(true);
+    expect(validateTicketTitle("Update   Code!!!").errors.some((e) => e.code === "generic")).toBe(true);
+  });
+
+  test("a specific title that merely MENTIONS a stoplisted phrase (not equal to it) does not fail generic -- substring is not enough", () => {
+    // This ticket's own title quotes "CHANGE IN BEHAVIOR" as its motivating
+    // example; the gate must not flag titles that reference the phrase
+    // inside a real, specific sentence.
+    const r = validateTicketTitle(
+      'z-ticket-lint gains a deterministic title gate -- reject generic titles like "CHANGE IN BEHAVIOR"'
+    );
+    expect(r.errors.some((e) => e.code === "generic")).toBe(false);
+  });
+
+  test('"fix bug" as a substring of a specific title (e.g. "Fix bug in login causing crash") does not fail generic', () => {
+    const r = validateTicketTitle("Fix bug in login causing crash on empty password");
+    expect(r.errors.some((e) => e.code === "generic")).toBe(false);
+  });
+});
+
+describe("validateTicketTitle: pass cases -- the board's current well-formed titles (issue #155 AC2)", () => {
+  test.each([
+    "Add -reestimate flag to /z-plan", // #134
+    "Add a z-stop command", // #132
+    "[loop][safety] empty-snapshot guard misses truncated-but-nonzero reads; short snapshot still drops live lanes", // #138
+  ])("%s passes with zero errors", (title) => {
+    const r = validateTicketTitle(title);
+    expect(r.ok).toBe(true);
+    expect(r.errors).toEqual([]);
+  });
+});
+
+describe("z-ticket-lint CLI: --title (issue #155)", () => {
+  let logs: ReturnType<typeof spyOn>;
+  let errs: ReturnType<typeof spyOn>;
+  beforeEach(() => {
+    logs = spyOn(console, "log").mockImplementation(() => {});
+    errs = spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    logs.mockRestore();
+    errs.mockRestore();
+  });
+
+  test('--title "CHANGE IN BEHAVIOR" exits 1, naming the all-caps/generic rule (AC1)', () => {
+    const code = main([join(TICKETS, "good.md"), "--title", "CHANGE IN BEHAVIOR"]);
+    expect(code).toBe(1);
+    const printed = errs.mock.calls.flat().join("\n");
+    expect(printed).toMatch(/all-caps/);
+    expect(printed).toMatch(/generic/);
+  });
+
+  test("--title with a well-formed board title passes alongside a valid body (AC2)", () => {
+    expect(main([join(TICKETS, "good.md"), "--title", "Add a z-stop command"])).toBe(0);
+  });
+
+  test("omitting --title entirely is unchanged: only the body schema gates", () => {
+    expect(main([join(TICKETS, "good.md")])).toBe(0);
+  });
+
+  test("--title accepted before the body path too (flag order is not fixed)", () => {
+    expect(main(["--title", "Add a z-stop command", join(TICKETS, "good.md")])).toBe(0);
+  });
+
+  test("--title with no value errors loud and exits 1", () => {
+    expect(main([join(TICKETS, "good.md"), "--title"])).toBe(1);
+  });
+
+  test("a bad title AND a bad body both get reported, not just the first found", () => {
+    const code = main([join(TICKETS, "missing-ac.md"), "--title", "misc"]);
+    expect(code).toBe(1);
+    const printed = errs.mock.calls.flat().join("\n");
+    expect(printed).toMatch(/generic/);
+    expect(printed).toMatch(/Acceptance Criteria/);
   });
 });
 
@@ -912,6 +1076,23 @@ describe("z-plan/SKILL.md: --reestimate re-estimates Backlog + Ready (issue #134
     return next < 0 ? rest : rest.slice(0, next);
   }
 
+  // "## Dry-run / eval mode" bundles three sibling paragraphs (--backlog,
+  // --ticket, --reestimate), each opening with an inline bold marker rather
+  // than its own "##" heading. Slice from one marker to the next so a
+  // per-flag assertion binds to only its own paragraph -- issue #160: the
+  // AC10 canary previously ran against the WHOLE section, so it was also
+  // satisfied by the pre-existing --backlog paragraph's identical "No board
+  // writes, no GitHub writes" sentence, and stayed green if that guarantee
+  // was deleted from the --reestimate paragraph alone.
+  function paragraph(sectionText: string, marker: string): string {
+    const start = sectionText.indexOf(marker);
+    if (start < 0) return "";
+    const rest = sectionText.slice(start + marker.length);
+    const next = rest.search(/\n\*\*`/);
+    const end = next < 0 ? sectionText.length : start + marker.length + next;
+    return sectionText.slice(start, end);
+  }
+
   test("--reestimate is parsed as its own flag alongside --backlog/--ticket/--dry-run", () => {
     const step1 = section(zPlan(), "## Step 1 —");
     expect(step1).toContain("--reestimate) REESTIMATE_ONLY=1");
@@ -950,8 +1131,23 @@ describe("z-plan/SKILL.md: --reestimate re-estimates Backlog + Ready (issue #134
     // must NOT satisfy this -- the excluded statuses have to be named right
     // next to "left ... untouched" (review finding 3: the old
     // /left\s*\n?\s*untouched/ regex alone was too generic).
+    //
+    // Derived from lib/config.ts (issue #160), not a hand-written string: the
+    // scan only reads/writes Backlog + Ready, so "every other status" is
+    // BOARD_STATUSES minus those two, in the config's own order. Pinning this
+    // literally in the test meant a correct future docs fix (e.g. adding a
+    // status this enumeration had omitted) would fail the gate for getting
+    // MORE accurate; deriving it means the expectation moves with the config
+    // instead of needing a hand-edit in lockstep.
+    const excludedStatuses = BOARD_STATUSES.filter(
+      (s) => s !== "Backlog" && s !== "Ready"
+    );
+    expect(excludedStatuses.length).toBeGreaterThan(0);
+    const excludedPattern = excludedStatuses
+      .map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join("\\/");
     expect(step12).toMatch(
-      /\(Building\/QA\/Review\/Blocked\/Skipped\/Done\)\s+is\s+left\s*\n?\s*untouched/
+      new RegExp(`\\(${excludedPattern}\\)\\s+is\\s+left\\s*\\n?\\s*untouched`)
     );
   });
 
@@ -1065,10 +1261,45 @@ describe("z-plan/SKILL.md: --reestimate re-estimates Backlog + Ready (issue #134
   });
 
   test("--dry-run --reestimate emits changes to stdout with no board writes (AC10)", () => {
-    const dryRun = section(zPlan(), "## Dry-run / eval mode");
-    expect(dryRun).toContain("--dry-run --reestimate");
-    expect(dryRun).toMatch(/composes like `--dry-run --backlog`/);
-    expect(dryRun).toMatch(/No board writes, no\s*\n?\s*GitHub writes/);
+    // Scoped to the --reestimate paragraph only (issue #160). The whole
+    // "## Dry-run / eval mode" section also carries the --backlog paragraph's
+    // identical "No board writes, no GitHub writes" sentence, so asserting
+    // against the full section was satisfied by that unrelated paragraph and
+    // stayed green even if the --reestimate paragraph's own guarantee was
+    // deleted.
+    const dryRunSection = section(zPlan(), "## Dry-run / eval mode");
+    const reestimateParagraph = paragraph(
+      dryRunSection,
+      "**`--dry-run --reestimate`**"
+    );
+    expect(reestimateParagraph).not.toBe("");
+    expect(reestimateParagraph).toContain("--dry-run --reestimate");
+    expect(reestimateParagraph).toMatch(/composes like `--dry-run --backlog`/);
+    expect(reestimateParagraph).toMatch(/No board writes, no\s*\n?\s*GitHub writes/);
+  });
+
+  test("scoped AC10 slice still fails when the WHOLE --dry-run --reestimate paragraph is removed", () => {
+    // Proves the scoping itself, not just the assertion: if a future edit
+    // deletes the entire --reestimate paragraph (not just the guarantee
+    // sentence inside it), the scoped slice must come back empty rather than
+    // silently falling through to a sibling paragraph -- otherwise the AC10
+    // test above could still pass against leftover text it was never meant
+    // to see.
+    const dryRunSection = section(zPlan(), "## Dry-run / eval mode");
+    const marker = "**`--dry-run --reestimate`**";
+    const markerStart = dryRunSection.indexOf(marker);
+    expect(markerStart).toBeGreaterThan(-1);
+    // Everything up to the marker, i.e. the section with the whole
+    // --reestimate paragraph (marker through end of section) cut off.
+    const withoutParagraph = dryRunSection.slice(0, markerStart);
+
+    // The scoped slice comes back empty -- the marker itself is gone --
+    // rather than silently matching a leftover sibling paragraph.
+    const reestimateParagraph = paragraph(withoutParagraph, marker);
+    expect(reestimateParagraph).toBe("");
+    // So the real AC10 assertions, run against this mutated text, fail loud:
+    expect(reestimateParagraph).not.toContain("--dry-run --reestimate");
+    expect(reestimateParagraph).not.toMatch(/No board writes, no\s*\n?\s*GitHub writes/);
   });
 
   test("Done criteria names --reestimate", () => {
@@ -1089,5 +1320,30 @@ describe("z-plan/SKILL.md: --reestimate re-estimates Backlog + Ready (issue #134
     expect(docs).toMatch(/even one\s*\n?\s*that already has an Estimate/);
     expect(docs).toContain("Estimate $OLD → $NEW");
     expect(docs).toMatch(/never\s*\n?\s*promotes a ticket to Ready and never edits a body/);
+  });
+});
+
+// -- z-setup.md sleep quota mode doc canary (issue #166) -----
+// After #147 merged bounded quota abort, z-setup.md's sleep quota mode
+// description needed to reflect the new behavior: wait, re-probe, retry up to
+// a bound, then abort loudly. This canary pins the exact contract strings in
+// docs/user-guide/z-setup.md so a future edit that silently drops the bound or
+// the re-probe mention fails loudly here instead of shipping with drift between
+// the page and the code constant QUOTA_REPROBE_ROUNDS (lib/board.ts:47).
+describe("docs/user-guide/z-setup.md: sleep quota mode documents bounded abort (issue #166)", () => {
+  test("sleep quota mode description names bounded re-probe rounds and abort behavior", () => {
+    const docs = readFileSync(
+      join(import.meta.dir, "..", "docs", "user-guide", "z-setup.md"),
+      "utf8"
+    );
+    // The description must say sleep mode re-probes, not just waits and proceeds.
+    expect(docs).toMatch(/quota\.mode.*sleep.*re-probes/s);
+    // Must name the bound so the doc and QUOTA_REPROBE_ROUNDS (lib/board.ts)
+    // cannot silently drift apart.
+    expect(docs).toContain(`retries up to ${QUOTA_REPROBE_ROUNDS} bounded rounds`);
+    // Must state that it aborts rather than unconditionally proceeding.
+    expect(docs).toMatch(/aborts the run loudly.*unverified quota/s);
+    // Must mention both the first and final readings for distinguishing persistent low quota.
+    expect(docs).toContain("first and final");
   });
 });

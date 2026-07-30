@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   applyAction,
+  builtGuardFailure,
   canTransition,
   drainComplete,
   humanNeededStatus,
@@ -24,7 +25,10 @@ import {
   nextAction,
   parseSuiteFailCount,
   parseReviewerConfidence,
+  parseSkepticQuorum,
   parseStageResult,
+  MAX_COMMIT_RETRIES,
+  MAX_QUORUM_RETRIES,
   recordMergeGate,
   recordOutcome,
   recordProbe,
@@ -33,10 +37,11 @@ import {
   type LaneState,
   type LoopState,
   type Stage,
+  type StageOutcome,
   type SuiteRun,
   type TicketSnapshot,
 } from "../lib/loop.ts";
-import { ZError } from "../lib/config.ts";
+import { DEFAULT_MIN_SKEPTIC_QUORUM, ZError } from "../lib/config.ts";
 import { validateConfig } from "../lib/config-schema.ts";
 import {
   claimableTickets,
@@ -69,6 +74,15 @@ function ticket(number: number, status: TicketSnapshot["status"], dependsOn: num
 
 function lane(ticketNumber: number, stage: Stage, over: Partial<LaneState> = {}): LaneState {
   return { ticket: ticketNumber, stage, lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, ...over };
+}
+
+// #191: a review-approve outcome. `skeptics` is the skeptic-delivery denominator
+// the quorum gate reads; null means "no adversarial fan-out reported one", which
+// is what every case written before #191 meant -- so those cases keep judging
+// exactly the confidence floor they were written for, and the quorum path is
+// exercised by its own describe block below.
+function approve(confidence: number | null, skeptics: { received: number; of: number } | null = null): StageOutcome {
+  return { kind: "review-approve", confidence, skeptics };
 }
 
 function state(tickets: TicketSnapshot[], lanes: LaneState[] = [], maxLanes = 3, watchdogMinutes = 10): LoopState {
@@ -405,6 +419,7 @@ describe("reviewer confidence gate", () => {
     expect(parseStageResult("reviewer", "REVIEW-APPROVE: confidence=85 diff satisfies every criterion")).toEqual({
       kind: "review-approve",
       confidence: 85,
+      skeptics: null, // #191: no `skeptics=` token in this note -> no denominator
     });
   });
 
@@ -413,6 +428,7 @@ describe("reviewer confidence gate", () => {
     expect(parseStageResult("reviewer", "REVIEW-APPROVE: looks good, all criteria met")).toEqual({
       kind: "review-approve",
       confidence: null,
+      skeptics: null,
     });
   });
 
@@ -432,7 +448,7 @@ describe("reviewer confidence gate", () => {
   // passing score is visibly the advance to merge and a failing one is visibly
   // the park, exactly as before #178. The unstamped case is its own suite below.
   function reviewGate(confidence: number | null, minConfidence: number, belowAction: "block" | "retry" | "off"): Action {
-    const s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: { kind: "review-approve", confidence }, mergeGate: GREEN_GATE })]);
+    const s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: approve(confidence), mergeGate: GREEN_GATE })]);
     s.minReviewerConfidence = minConfidence;
     s.reviewerBelowThresholdAction = belowAction;
     return nextAction(s, 0);
@@ -486,6 +502,484 @@ describe("reviewer confidence gate", () => {
 });
 
 // -- reviewer bounce cap (issue #76): maxReviewBounces ------------------------
+// -- skeptic quorum gate (issue #191) -----------------------------------------
+
+// The hole #191 closes, stated exactly: the adversarial reviewer aggregates
+// confidence over the skeptics that REPORTED, so one skeptic returning "cannot
+// refute" is confidence=100 -- which clears #62's default floor of 70 and merges
+// as though three independent reviews agreed. Loop run 10 measured deliveries of
+// 0-of-3, so this is the ordinary case under load, not an edge. The confidence
+// token cannot express the denominator; `skeptics=<k>/3` is the missing fact.
+describe("skeptic quorum gate (issue #191)", () => {
+  test("parses skeptics=<k>/<of> off a reviewer note", () => {
+    expect(parseSkepticQuorum("confidence=100 skeptics=3/3 all clear")).toEqual({ received: 3, of: 3 });
+    expect(parseSkepticQuorum("confidence=100 skeptics=0/3 nothing came back")).toEqual({ received: 0, of: 3 });
+    expect(parseSkepticQuorum("SKEPTICS=2/3")).toEqual({ received: 2, of: 3 }); // case-insensitive, like confidence
+  });
+
+  test("an absent token is null, and neither token disturbs the other", () => {
+    expect(parseSkepticQuorum("confidence=100 looks good")).toBeNull();
+    // Adjacency both ways: #62's regex must not read the quorum's digits and
+    // this one must not read the confidence's.
+    expect(parseReviewerConfidence("skeptics=1/3 confidence=67 ok")).toBe(67);
+    expect(parseSkepticQuorum("skeptics=1/3 confidence=67 ok")).toEqual({ received: 1, of: 3 });
+  });
+
+  test("an incoherent denominator reads as null, never as a pass", () => {
+    expect(parseSkepticQuorum("skeptics=4/3")).toBeNull(); // nobody delivered 4 of 3
+    expect(parseSkepticQuorum("skeptics=0/0")).toBeNull(); // no fan-out to have a quorum over
+    // A 3rd digit at that position is not a truncated match, same discipline as
+    // parseReviewerConfidence's (?!\d).
+    expect(parseSkepticQuorum("skeptics=1/300")).toBeNull();
+  });
+
+  test("parseStageResult carries both tokens off one REVIEW-APPROVE marker", () => {
+    expect(parseStageResult("reviewer", "REVIEW-APPROVE: confidence=100 skeptics=3/3 every criterion holds")).toEqual({
+      kind: "review-approve",
+      confidence: 100,
+      skeptics: { received: 3, of: 3 },
+    });
+  });
+
+  // One lane in Review with an approve that CLEARS the confidence floor, so the
+  // only thing left to decide is the quorum. The lane also carries a green
+  // merge-gate stamp (#178) for the same reason it carries confidence=100: with
+  // the suite gate already satisfied, a met quorum is visibly the advance to
+  // merge and a short one is visibly the reviewer re-spawn.
+  function quorumGate(
+    skeptics: { received: number; of: number } | null,
+    minSkepticQuorum: number,
+    laneOver: Partial<LaneState> = {}
+  ): Action {
+    const s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: approve(100, skeptics), mergeGate: GREEN_GATE, ...laneOver })]);
+    s.minReviewerConfidence = 70;
+    s.reviewerBelowThresholdAction = "block";
+    s.minSkepticQuorum = minSkepticQuorum;
+    return nextAction(s, 0);
+  }
+
+  test("a full quorum merges", () => {
+    expect(quorumGate({ received: 3, of: 3 }, 2)).toMatchObject({ kind: "advance", ticket: 1, to: "merge" });
+    expect(quorumGate({ received: 2, of: 3 }, 2)).toMatchObject({ kind: "advance", ticket: 1, to: "merge" });
+  });
+
+  // THE headline case. Before #191 this merged: confidence=100 >= 70, gate done.
+  test("a short quorum re-spawns the REVIEWER, not the builder, and does not merge", () => {
+    const a = quorumGate({ received: 1, of: 3 }, 2);
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "reviewer" });
+    expect((a as { note: string }).note).toContain("skeptic quorum not met (1/3 verdicts delivered, 2 required)");
+    // Rebuilding a diff nobody faulted fixes nothing and pays a builder + a QA
+    // pass for it, so the retry must NOT go to the builder.
+    expect(a).not.toMatchObject({ to: "builder" });
+  });
+
+  test("zero verdicts re-spawns too, and says nobody looked", () => {
+    const a = quorumGate({ received: 0, of: 3 }, 2);
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "reviewer" });
+    expect((a as { note: string }).note).toContain("no verdicts at all");
+  });
+
+  test("the re-spawn's board status is Review, so the move is a no-op", () => {
+    // canTransition("Review","Review") is already legal and STATUS_FOR_STAGE
+    // maps reviewer -> Review, so the advance needs no new transition.
+    expect(canTransition("Review", "Review")).toBe(true);
+    let s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: approve(100, { received: 0, of: 3 }) })]);
+    s.minSkepticQuorum = 2;
+    s = applyAction(s, nextAction(s, 0), 0);
+    expect(s.tickets[0].status).toBe("Review");
+    expect(s.lanes[0].stage).toBe("reviewer");
+  });
+
+  test("the retry is spent once, then the ticket parks Blocked", () => {
+    const a = quorumGate({ received: 0, of: 3 }, 2, { quorumRetries: MAX_QUORUM_RETRIES });
+    expect(a).toMatchObject({ kind: "park", ticket: 1, status: "Blocked" });
+    const note = (a as { note: string }).note;
+    expect(note).toContain("environmental, not luck");
+    expect(note).toContain("lower minSkepticQuorum");
+    // The human must not read this as "the reviewer rejected the diff".
+    expect(note).toContain("The diff itself was never faulted.");
+  });
+
+  // Without applyAction's reviewer->reviewer increment, `spent` never grows and
+  // a project with broken sub-agent delivery re-spawns the same reviewer forever
+  // -- a paid infinite loop. This drives the real sequence to prove it converges.
+  test("a reviewer that starves twice terminates instead of looping forever", () => {
+    let s = state([ticket(1, "Review")], [lane(1, "reviewer")]);
+    s.minReviewerConfidence = 70;
+    s.minSkepticQuorum = 2;
+    const STARVED = "REVIEW-APPROVE: confidence=100 skeptics=0/3 no skeptic reported";
+
+    s = recordOutcome(s, 1, STARVED, 0);
+    const first = nextAction(s, 0);
+    expect(first).toMatchObject({ kind: "advance", to: "reviewer" });
+    s = applyAction(s, first, 0);
+    expect(s.lanes[0].quorumRetries).toBe(1);
+
+    s = recordOutcome(s, 1, STARVED, 0); // the re-spawned reviewer starves again
+    expect(nextAction(s, 0)).toMatchObject({ kind: "park", ticket: 1, status: "Blocked" });
+  });
+
+  // Two failures, two budgets: a delivery race must not consume the rebuild a
+  // genuine finding needs, and must not park the ticket under "review bounce cap
+  // reached" -- which would tell the human a reviewer faulted this diff twice.
+  test("a quorum re-spawn spends quorumRetries and leaves reviewBounces alone", () => {
+    let s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: approve(100, { received: 0, of: 3 }) })]);
+    s.minSkepticQuorum = 2;
+    s = applyAction(s, nextAction(s, 0), 0);
+    expect(s.lanes[0].quorumRetries).toBe(1);
+    expect(s.lanes[0].reviewBounces).toBe(0);
+    // And the converse: a real reviewer->builder bounce leaves quorumRetries at 0.
+    let t = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: { kind: "review-findings", note: "1) bad" } })]);
+    t.maxReviewBounces = 2;
+    t = applyAction(t, nextAction(t, 0), 0);
+    expect(t.lanes[0].reviewBounces).toBe(1);
+    expect(t.lanes[0].quorumRetries ?? 0).toBe(0);
+  });
+
+  test("minSkepticQuorum 0 disables the gate entirely", () => {
+    expect(quorumGate({ received: 0, of: 3 }, 0)).toMatchObject({ kind: "advance", ticket: 1, to: "merge" });
+  });
+
+  // A single-pass review reports no denominator by design, so the gate has
+  // nothing to judge -- #62's floor is the only thing that ruled, unchanged.
+  test("a review with no denominator is untouched by the gate", () => {
+    expect(quorumGate(null, 2)).toMatchObject({ kind: "advance", ticket: 1, to: "merge" });
+  });
+
+  // A lane's outcome is PERSISTED in state.json, so a loop upgraded onto #191
+  // mid-drain reads approve outcomes recorded before the field existed.
+  test("a pre-#191 persisted outcome with no skeptics key does not crash the tick", () => {
+    const s = state([ticket(1, "Review")], [lane(1, "reviewer", { mergeGate: GREEN_GATE })]);
+    // Exactly what the old code wrote: no `skeptics` key at all, not null.
+    (s.lanes[0] as { outcome: unknown }).outcome = approve(100);
+    s.minSkepticQuorum = 2;
+    expect(nextAction(s, 0)).toMatchObject({ kind: "advance", ticket: 1, to: "merge" });
+  });
+
+  // Ordering: the confidence floor runs FIRST, so a below-floor approve parks
+  // with the truth-check note even when its quorum was full. Otherwise the
+  // quorum note would mask the more serious failure.
+  test("a below-floor confidence still parks on the truth check, quorum notwithstanding", () => {
+    const s = state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: approve(50, { received: 3, of: 3 }) })]);
+    s.minReviewerConfidence = 70;
+    s.reviewerBelowThresholdAction = "block";
+    s.minSkepticQuorum = 2;
+    expect(nextAction(s, 0)).toMatchObject({ kind: "park", status: "Blocked", note: "truth-check failed (confidence 50/100)" });
+  });
+
+  test("ingest threads --min-skeptic-quorum and preserves it across re-ingest", () => {
+    const items = [{ number: 1, title: "t", fields: { Status: "Ready" } }];
+    const first = ingestBoardItems(null, items, { "1": "body" }, { minSkepticQuorum: 1 });
+    expect(first.minSkepticQuorum).toBe(1);
+    // A re-ingest with no cfg keeps the captured value, like every sibling knob.
+    expect(ingestBoardItems(first, items, { "1": "body" }, {}).minSkepticQuorum).toBe(1);
+    // Default when nobody supplies one.
+    expect(ingestBoardItems(null, items, { "1": "body" }, {}).minSkepticQuorum).toBe(DEFAULT_MIN_SKEPTIC_QUORUM);
+    expect(DEFAULT_MIN_SKEPTIC_QUORUM).toBe(2); // a majority of the 3-skeptic fan-out
+  });
+
+});
+
+// A `built` marker used to advance a lane to QA on the marker ALONE. Run 9's
+// #155 builder emitted BUILT with everything still uncommitted, so QA reviewed
+// the BASE tree and passed a diff that did not exist. These drive the guard that
+// closes it (issue #177) -- the facts are passed as data, so no real git is
+// needed and the whole block stays a free gate test.
+describe("built guard: clean tree + moved HEAD (#177)", () => {
+  const BASE = "1111111111111111111111111111111111111111";
+  const HEAD = "2222222222222222222222222222222222222222";
+  // What `git status --porcelain --branch` prints for a clean lane worktree: the
+  // `## <branch>` header and nothing else. The header is REQUIRED (an empty
+  // payload is a git status that never ran), so no fixture may omit it.
+  const CLEAN = "## z/ticket-1-thing...origin/main [ahead 1]\n";
+  // The AC's setup: staged (`M `) + unstaged (` M`) edits and an unadded new
+  // file, no commit, HEAD still at the base SHA.
+  const DIRTY_NO_COMMIT = {
+    porcelain: `${CLEAN}M  lib/loop.ts\n M tests/loop.test.ts\n?? docs/new.md\n`,
+    headSha: BASE,
+    baseSha: BASE,
+  };
+  const CLEAN_MOVED = { porcelain: CLEAN, headSha: HEAD, baseSha: BASE };
+
+  test("the guard passes a clean tree with a commit off base, and fails on either half alone", () => {
+    expect(builtGuardFailure(CLEAN_MOVED)).toBeNull();
+    // Trailing/blank lines are not dirt -- git's porcelain output ends in \n.
+    expect(builtGuardFailure({ porcelain: `${CLEAN}\n   \n`, headSha: HEAD, baseSha: BASE })).toBeNull();
+    expect(builtGuardFailure(DIRTY_NO_COMMIT)).toContain("uncommitted work");
+    // Committed SOMETHING but left the rest behind: still an incomplete diff.
+    const half = builtGuardFailure({ porcelain: `${CLEAN}?? tests/new.test.ts\n`, headSha: HEAD, baseSha: BASE })!;
+    expect(half).toContain("1 uncommitted path(s)");
+    expect(half).toContain("Commit what is already in the worktree");
+    // Clean tree, no commit: the lane holds nothing at all, so the fix line must
+    // NOT tell that builder to commit files nobody wrote.
+    const nothing = builtGuardFailure({ porcelain: CLEAN, headSha: BASE, baseSha: BASE })!;
+    expect(nothing).toContain("still an ancestor of the base branch");
+    expect(nothing).toContain("Nothing at all is on this branch");
+  });
+
+  // The porcelain half needs the SAME fail-closed twin the SHA half has. The
+  // orchestrator collects status with `> file`, and a redirect creates the file
+  // BEFORE git runs -- so a `git status` that failed leaves an EMPTY file, which a
+  // bare porcelain payload cannot tell apart from a clean tree. With a moved HEAD
+  // that read a half-committed build straight into QA. `--branch` closes it: git
+  // always emits the `## <branch>` header, so its absence means "no status".
+  test("a status payload with no `## ` header fails closed instead of reading as clean", () => {
+    const empty = builtGuardFailure({ porcelain: "", headSha: HEAD, baseSha: BASE })!;
+    expect(empty).toContain("uncommitted work");
+    expect(empty).toContain("`## <branch>` header is missing");
+    // ...and the fix line cannot claim the branch is empty or that files are
+    // waiting -- neither is known.
+    expect(empty).toContain("look before you build");
+    expect(empty).not.toContain("Nothing at all is on this branch");
+    // Whitespace-only and dirt-without-a-header are the same unproven state.
+    expect(builtGuardFailure({ porcelain: "\n \n", headSha: HEAD, baseSha: BASE })).toContain("header is missing");
+    expect(builtGuardFailure({ porcelain: " M lib/loop.ts\n", headSha: HEAD, baseSha: BASE })).toContain("header is missing");
+    // A `##` inside a path is not the header (git's own header is `## ` + branch).
+    expect(builtGuardFailure({ porcelain: "?? docs/##notes.md\n", headSha: HEAD, baseSha: BASE })).toContain("header is missing");
+  });
+
+  // Reading a 7-char abbreviation as "different from" its own full OID would fail
+  // OPEN: the guard would report a moved HEAD for a branch still on base -- the
+  // exact build this ticket exists to stop.
+  test("an abbreviated or upper-case SHA still reads as the same commit", () => {
+    expect(builtGuardFailure({ porcelain: CLEAN, headSha: BASE, baseSha: BASE.slice(0, 7) })).toContain("uncommitted work");
+    expect(builtGuardFailure({ porcelain: CLEAN, headSha: BASE.toUpperCase(), baseSha: BASE })).toContain("uncommitted work");
+    // A genuinely different commit, abbreviated, still reads as moved.
+    expect(builtGuardFailure({ porcelain: CLEAN, headSha: HEAD.slice(0, 7), baseSha: BASE })).toBeNull();
+  });
+
+  test("an unreadable SHA fails closed instead of reading as a moved HEAD", () => {
+    expect(builtGuardFailure({ porcelain: CLEAN, headSha: "", baseSha: BASE })).toContain("no readable HEAD/base SHA");
+    expect(builtGuardFailure({ porcelain: CLEAN, headSha: HEAD, baseSha: "  " })).toContain("no readable HEAD/base SHA");
+  });
+
+  // `baseSha` is the MERGE-BASE of the base branch and HEAD, not the base tip, and
+  // the difference is the whole guard on a re-claimed worktree: the tip moves when
+  // step 7 pulls the base forward between loops, so a lane that committed NOTHING
+  // has a HEAD that differs from the tip. Only the merge-base answers "does HEAD
+  // carry a commit of its own" -- it EQUALS HEAD exactly when HEAD is an ancestor
+  // of the base. Real git, so the identity is git's, not a fixture's.
+  test("the merge-base -- not the base tip -- is what proves a commit of its own", () => {
+    const repo = mkdtempSync(join(tmpdir(), "zstack-builtguard-git-"));
+    const git = (...args: string[]) => {
+      const p = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
+      if (p.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${p.stderr.toString()}`);
+      return p.stdout.toString().trim();
+    };
+    try {
+      git("init", "-q", "-b", "main");
+      git("config", "user.email", "t@t.t");
+      git("config", "user.name", "t");
+      writeFileSync(join(repo, "a.txt"), "1");
+      git("add", "-A");
+      git("commit", "-qm", "base");
+      // A lane branch cut from base that commits NOTHING, then a base branch that
+      // advances underneath it (what the next loop's `git pull` does).
+      git("branch", "z/ticket-1");
+      writeFileSync(join(repo, "a.txt"), "2");
+      git("commit", "-qam", "base moved on");
+      const headSha = git("rev-parse", "z/ticket-1");
+      const baseTip = git("rev-parse", "main");
+      const mergeBase = git("merge-base", "main", "z/ticket-1");
+      const facts = (baseSha: string) => ({ porcelain: `## z/ticket-1\n`, headSha, baseSha });
+      // Ground truth: the lane branch has no commit of its own.
+      expect(git("rev-list", "--count", "main..z/ticket-1")).toBe("0");
+      // The base TIP differs from HEAD, so a tip-based check reads "moved" and
+      // fails OPEN -- this is the bug the merge-base closes, pinned as a fact.
+      expect(baseTip).not.toBe(headSha);
+      expect(builtGuardFailure(facts(baseTip))).toBeNull();
+      // The merge-base equals HEAD, so the guard holds the lane.
+      expect(mergeBase).toBe(headSha);
+      expect(builtGuardFailure(facts(mergeBase))).toContain("no commit of its own");
+      // And a lane that DID commit passes on the same merge-base input.
+      git("checkout", "-q", "z/ticket-1");
+      writeFileSync(join(repo, "b.txt"), "own work");
+      git("add", "-A");
+      git("commit", "-qm", "the lane's own commit");
+      const ownHead = git("rev-parse", "HEAD");
+      expect(builtGuardFailure({ porcelain: `## z/ticket-1\n`, headSha: ownHead, baseSha: git("merge-base", "main", "HEAD") })).toBeNull();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  // AC1: dirty tree + no commit + BUILT -> held, flagged, builder asked to commit.
+  test("AC1: a dirty, no-commit BUILT does NOT advance to QA -- the builder is asked to commit", () => {
+    let s = state([ticket(1, "Building")], [lane(1, "builder")]);
+    s = recordOutcome(s, 1, HAPPY.builder, 0, DIRTY_NO_COMMIT);
+    // Asserted field-by-field, not via toMatchObject + expect.stringContaining:
+    // bun 1.3.14's toMatchObject REPLACES a matched value with the asymmetric
+    // matcher object in the received value, which would corrupt the very state
+    // this test goes on to drive through nextAction.
+    expect(s.lanes[0].outcome!.kind).toBe("built");
+    expect((s.lanes[0].outcome as { unverified?: string }).unverified).toContain("uncommitted work");
+    const a = nextAction(s, 0);
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "builder" });
+    expect(a).not.toMatchObject({ to: "qa" });
+    expect((a as { note: string }).note).toContain("uncommitted work");
+    s = applyAction(s, a, 0);
+    expect(s.tickets[0].status).toBe("Building"); // never reached QA
+    expect(s.lanes[0].stage).toBe("builder");
+    expect(s.lanes[0].commitRetries).toBe(1);
+    expect(s.lanes[0].outcome).toBeUndefined(); // fresh spawn, same lane
+  });
+
+  // AC2: clean tree + one commit ahead + BUILT -> the normal walk to QA.
+  test("AC2: a clean tree one commit ahead of base advances to QA normally", () => {
+    let s = state([ticket(1, "Building")], [lane(1, "builder")]);
+    s = recordOutcome(s, 1, HAPPY.builder, 0, CLEAN_MOVED);
+    expect(s.lanes[0].outcome).toEqual({ kind: "built" }); // no `unverified` key at all
+    const a = nextAction(s, 0);
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "qa" });
+    s = applyAction(s, a, 0);
+    expect(s.tickets[0].status).toBe("QA");
+    expect(s.lanes[0].commitRetries ?? 0).toBe(0);
+  });
+
+  // #130's shortcut would otherwise hand the reviewer the same empty diff.
+  test("a skip-qa ticket does not walk to Review on an unverified BUILT either", () => {
+    let s = state([ticket(1, "Building", [], { skipQa: true })], [lane(1, "builder")]);
+    s = recordOutcome(s, 1, HAPPY.builder, 0, DIRTY_NO_COMMIT);
+    expect(nextAction(s, 0)).toMatchObject({ kind: "advance", to: "builder" });
+    // The same label with a VERIFIED build still takes the shortcut, unchanged.
+    let t = state([ticket(1, "Building", [], { skipQa: true })], [lane(1, "builder")]);
+    t = recordOutcome(t, 1, HAPPY.builder, 0, CLEAN_MOVED);
+    expect(nextAction(t, 0)).toMatchObject({ kind: "advance", to: "reviewer" });
+  });
+
+  // Without applyAction's builder->builder increment, `spent` never grows and a
+  // builder that keeps reporting BUILT with nothing committed is re-spawned
+  // forever -- a paid infinite loop. This drives the real sequence to prove it
+  // converges.
+  test("the retry is spent once, then the ticket parks Blocked with the uncommitted-work note", () => {
+    let s = state([ticket(1, "Building")], [lane(1, "builder")]);
+    s = recordOutcome(s, 1, HAPPY.builder, 0, DIRTY_NO_COMMIT);
+    s = applyAction(s, nextAction(s, 0), 0);
+    expect(s.lanes[0].commitRetries).toBe(MAX_COMMIT_RETRIES);
+    s = recordOutcome(s, 1, HAPPY.builder, 0, DIRTY_NO_COMMIT); // does it again
+    const a = nextAction(s, 0);
+    expect(a).toMatchObject({ kind: "park", ticket: 1, status: "Blocked" });
+    const note = (a as { note: string }).note;
+    expect(note).toContain("uncommitted work");
+    expect(note).toContain("not a slip");
+    expect(note).toContain("worktree"); // the human is told where to look
+    s = applyAction(s, a, 0);
+    expect(s.tickets[0].status).toBe("Blocked");
+    expect(s.lanes).toEqual([]);
+  });
+
+  // This park is the only one in the machine whose work is NOT already committed
+  // on a branch, and parking removes the lane lock -- which makes the worktree an
+  // orphan the next run's reconcile plan prunes with `git worktree remove --force`
+  // (lib/reconcile.ts), gated by Step 0(b) BEFORE the loop will start. A note that
+  // said "the worktree is left in place -- commit or discard what is there" was
+  // pointing the human at a directory the loop deletes first. So the note must name
+  // the salvage patch and warn, and the SKILL must actually dump it.
+  test("the park note points at a durable salvage patch, not the doomed worktree", () => {
+    let s = state([ticket(7, "Building")], [lane(7, "builder", { commitRetries: MAX_COMMIT_RETRIES })]);
+    s = recordOutcome(s, 7, HAPPY.builder, 0, DIRTY_NO_COMMIT);
+    const note = (nextAction(s, 0) as { note: string }).note;
+    // The SKILL keys the salvage dump on this PREFIX (the same way the park row
+    // keys Notify on `Dependency deadlock:`), so the prefix is part of the contract.
+    expect(note.startsWith("uncommitted work:")).toBe(true);
+    expect(note).toContain("reports/uncommitted-7.patch"); // the ticket's own patch
+    expect(note).toContain("git apply");
+    expect(note).toContain("force-removes it");
+    expect(note).toContain("BEFORE the next /z-loop run");
+    expect(note).not.toContain("it is left in place");
+    // The park path has to write that patch, or the note lies. Keyed on the note's
+    // `uncommitted work:` prefix, the same way the row keys Notify on
+    // `Dependency deadlock:`.
+    const skill = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
+    const has = (s: string) => skill.includes(s); // see the canary below re: file dumps
+    expect(has("uncommitted work:")).toBe(true);
+    expect(has(`diff --cached --binary HEAD > "$HOME/.zstack/projects/$SLUG/reports/uncommitted-<N>.patch"`)).toBe(true);
+    expect(has(`git -C ".worktrees/ticket-<N>" add -A`)).toBe(true);
+  });
+
+  // Three failures, three budgets: "you forgot to commit" must not consume the
+  // rebuild a QA bug or a reviewer finding needs, nor park under their notes.
+  test("a commit re-spawn spends commitRetries and leaves qaBounces/reviewBounces alone", () => {
+    let s = state([ticket(1, "Building")], [lane(1, "builder")]);
+    s = recordOutcome(s, 1, HAPPY.builder, 0, DIRTY_NO_COMMIT);
+    s = applyAction(s, nextAction(s, 0), 0);
+    expect(s.lanes[0].commitRetries).toBe(1);
+    expect(s.lanes[0].qaBounces).toBe(0);
+    expect(s.lanes[0].reviewBounces).toBe(0);
+    // And the converse: a QA bounce back to the builder leaves commitRetries at 0.
+    let t = state([ticket(2, "QA")], [lane(2, "qa", { outcome: { kind: "qa-bugs", note: "1) boom" } })]);
+    t.maxQaPasses = 3;
+    t = applyAction(t, nextAction(t, 0), 0);
+    expect(t.lanes[0].qaBounces).toBe(1);
+    expect(t.lanes[0].commitRetries ?? 0).toBe(0);
+  });
+
+  // The pure reducer keeps its old contract: no facts -> no verdict, byte-identical
+  // to pre-#177. That is what a state file recorded by an older loop mid-drain
+  // looks like, and what the e2e/orchestrator-context eval harnesses pass. The CLI
+  // is where the facts are made non-optional for a real builder lane (below).
+  test("a BUILT recorded with no git facts stays a plain built and advances", () => {
+    let s = state([ticket(1, "Building")], [lane(1, "builder")]);
+    s = recordOutcome(s, 1, HAPPY.builder, 0);
+    expect(s.lanes[0].outcome).toEqual({ kind: "built" });
+    expect(nextAction(s, 0)).toMatchObject({ kind: "advance", to: "qa" });
+  });
+
+  test("the facts are ignored on every non-builder stage", () => {
+    let s = state([ticket(1, "QA")], [lane(1, "qa")]);
+    s = recordOutcome(s, 1, HAPPY.qa, 0, DIRTY_NO_COMMIT);
+    expect(s.lanes[0].outcome).toEqual({ kind: "qa-pass" });
+    expect(nextAction(s, 0)).toMatchObject({ kind: "advance", to: "reviewer" });
+  });
+
+  // The guard only fires if the orchestrator collects the facts, and the retry is
+  // only useful if the note reaches the re-spawned builder -- both live in the
+  // SKILL, so both are pinned here (same doc-canary discipline as the C8 claim
+  // limitation in tests/safety.test.ts).
+  test("the SKILL documents the git-fact flags, the commitNotes route, and the attempt count", () => {
+    const skill = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
+    expect(skill).toContain("--porcelain");
+    expect(skill).toContain("--head-sha");
+    expect(skill).toContain("--base-sha");
+    expect(skill).toMatch(/from `builder`[^|]*`commitNotes`/);
+    // Without commitRetries in the attempt count, the re-spawned builder's
+    // transcript overwrites its predecessor's -- a silent Actual undercount.
+    expect(skill).toContain("qaBounces + reviewBounces + commitRetries + 1");
+    const docs = readFileSync(join(REPO_ROOT, "docs", "user-guide", "z-loop.md"), "utf8");
+    expect(docs).toMatch(/`git status --porcelain --branch` must report a clean tree/);
+    expect(docs).toMatch(/`HEAD` must have moved off the base branch/);
+    expect(docs).toContain("git merge-base");
+    expect(docs).toContain("uncommitted-<N>.patch");
+  });
+
+  // The two collection flags carry the guard's fail-closed halves, and BOTH have a
+  // shorter form that reads as working while failing open. The verdict is in code,
+  // but the INPUTS are the SKILL's, so the exact commands are pinned here -- this
+  // canary is what catches a future edit "simplifying" either one.
+  test("the SKILL collects status --branch and the merge-base, never the bare forms", () => {
+    const skill = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
+    // Booleans, not toContain: a miss on a 60KB SKILL.md dumps the entire file
+    // into the failure output, and the test name already says what is missing.
+    const has = (s: string) => skill.includes(s);
+    expect(has(`git -C "$WT" status --porcelain --branch > "$TMP/porcelain-<N>.txt"`)).toBe(true);
+    expect(has(`--base-sha "$(git -C "$WT" merge-base "$BASE" HEAD)"`)).toBe(true);
+    // The base TIP cannot answer "does HEAD carry a commit of its own" once the
+    // base has moved under a re-claimed worktree (see the real-git test above).
+    expect(has(`--base-sha "$(git -C "$WT" rev-parse "$BASE")"`)).toBe(false);
+    // A bare `status --porcelain >` redirect leaves an empty file when git fails.
+    expect(has(`status --porcelain > "$TMP/porcelain-<N>.txt"`)).toBe(false);
+  });
+
+  // #177's untracked-file strictness is right (an un-added test file is exactly the
+  // work that goes missing) but it makes .gitignore part of the guard: scratch
+  // output every agent in this repo produces would hold an honest, fully committed
+  // BUILT as "uncommitted work" and then tell the builder to commit scratch.
+  test("this repo's own mandatory graphify scratch output is gitignored", () => {
+    const p = Bun.spawnSync(["git", "check-ignore", "-q", "graphify-out/graph.json"], { cwd: REPO_ROOT, stdout: "pipe", stderr: "pipe" });
+    expect(p.exitCode).toBe(0); // 0 = ignored, 1 = would show up as `??` in the guard
+  });
+});
+
 // #62 shipped reviewerBelowThresholdAction: "retry" with no cap on the
 // reviewer->builder bounce -- this closes it, mirroring the maxQaPasses gate
 // tests' fixture-then-nextAction shape above.
@@ -663,8 +1157,8 @@ describe("merge ordering", () => {
     let s = state(
       [ticket(20, "Review"), ticket(21, "Review", [20])],
       [
-        lane(21, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, mergeGate: GREEN_GATE }),
-        lane(20, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, mergeGate: GREEN_GATE }),
+        lane(21, "reviewer", { outcome: approve(100), mergeGate: GREEN_GATE }),
+        lane(20, "reviewer", { outcome: approve(100), mergeGate: GREEN_GATE }),
       ]
     );
     // The parent merges first even though the child's lane comes first in the array.
@@ -694,8 +1188,8 @@ describe("merge-gate cycle parks instead of throwing (#146)", () => {
     const s = state(
       [ticket(10, "Review", [11]), ticket(11, "Review", [10])],
       [
-        lane(10, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
-        lane(11, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+        lane(10, "reviewer", { outcome: approve(100) }),
+        lane(11, "reviewer", { outcome: approve(100) }),
       ]
     );
     expect(() => nextAction(s, 0)).not.toThrow();
@@ -712,9 +1206,9 @@ describe("merge-gate cycle parks instead of throwing (#146)", () => {
     let s = state(
       [ticket(10, "Review", [11]), ticket(11, "Review", [10]), ticket(30, "Review")],
       [
-        lane(10, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
-        lane(11, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
-        lane(30, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, mergeGate: GREEN_GATE }),
+        lane(10, "reviewer", { outcome: approve(100) }),
+        lane(11, "reviewer", { outcome: approve(100) }),
+        lane(30, "reviewer", { outcome: approve(100), mergeGate: GREEN_GATE }),
       ]
     );
     // The cycle doesn't block the independent lane: #30 merges this very tick.
@@ -738,8 +1232,8 @@ describe("merge-gate cycle parks instead of throwing (#146)", () => {
     let s = state(
       [ticket(10, "Review", [11]), ticket(11, "Review", [10])],
       [
-        lane(10, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
-        lane(11, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }),
+        lane(10, "reviewer", { outcome: approve(100) }),
+        lane(11, "reviewer", { outcome: approve(100) }),
       ]
     );
     const first = nextAction(s, 0);
@@ -988,20 +1482,24 @@ describe("fresh-stage lane state", () => {
     // Compile-time half: this constant stops typechecking if LaneState's key
     // set ever drifts from the ten named here (issue #76 added reviewBounces,
     // mirroring qaBounces; #125 added lastWroteStatus, the resync origin marker;
+    // #191 added quorumRetries, a budget deliberately separate from
+    // reviewBounces; #177 added commitRetries, separate for the same reason;
     // #178 added the mechanical merge-gate verdict + its attempt count).
+    // Every addition must be a deliberate edit here -- this gate
+    // is what keeps a conversation/session id from ever riding between stages.
     type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
     const _laneKeysExact: Exact<
       keyof LaneState,
-      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "workerDead" | "outcome" | "lastWroteStatus" | "mergeGate" | "mergeGateRuns"
+      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "quorumRetries" | "commitRetries" | "workerDead" | "outcome" | "lastWroteStatus" | "mergeGate" | "mergeGateRuns"
     > = true;
     void _laneKeysExact;
     // Runtime half: a fully-populated lane exposes exactly those keys, and none
     // of them smells like a carried conversation.
     const full: Required<LaneState> = {
-      ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, workerDead: false, outcome: { kind: "built" }, lastWroteStatus: "Building",
+      ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, quorumRetries: 0, commitRetries: 0, workerDead: false, outcome: { kind: "built" }, lastWroteStatus: "Building",
       mergeGate: { green: true, attempts: 1, failCount: 0, note: "green" }, mergeGateRuns: 1,
     };
-    expect(Object.keys(full).sort()).toEqual(["lastActivityMs", "lastWroteStatus", "mergeGate", "mergeGateRuns", "outcome", "qaBounces", "reviewBounces", "stage", "ticket", "workerDead"]);
+    expect(Object.keys(full).sort()).toEqual(["commitRetries", "lastActivityMs", "lastWroteStatus", "mergeGate", "mergeGateRuns", "outcome", "qaBounces", "quorumRetries", "reviewBounces", "stage", "ticket", "workerDead"]);
     for (const k of Object.keys(full)) {
       expect(k).not.toMatch(/conversation|session|context|transcript|agent/i);
     }
@@ -1035,7 +1533,7 @@ describe("parseStageResult", () => {
     expect(parseStageResult("builder", "BUILT: all green")).toEqual({ kind: "built" });
     expect(parseStageResult("builder", "NEEDS-INPUT: pick a currency")).toEqual({ kind: "needs-input", note: "pick a currency" });
     expect(parseStageResult("qa", "QA-BUGS: 1) x\n2) y")).toEqual({ kind: "qa-bugs", note: "1) x\n2) y" });
-    expect(parseStageResult("reviewer", "REVIEW-APPROVE: verified")).toEqual({ kind: "review-approve", confidence: null });
+    expect(parseStageResult("reviewer", "REVIEW-APPROVE: verified")).toEqual(approve(null));
     expect(parseStageResult("merge", "MERGED: https://pr/9")).toEqual({ kind: "merged", note: "https://pr/9" });
     expect(parseStageResult("merge", "BLOCKED: conflict gauntlet failed")).toEqual({ kind: "stage-blocked", note: "conflict gauntlet failed" });
   });
@@ -1137,7 +1635,7 @@ describe("stage/status desync fails soft (#110)", () => {
     let s = state(
       [ticket(1, "Building"), ticket(2, "Building")],
       [
-        lane(1, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } }), // dragged Review -> Building
+        lane(1, "reviewer", { outcome: approve(100) }), // dragged Review -> Building
         lane(2, "builder", { outcome: { kind: "built" } }), // healthy, ready to advance
       ]
     );
@@ -1179,7 +1677,7 @@ describe("resync-on-lag vs genuine move-back (#116)", () => {
   test("AC2: two hops behind (reviewer lane at Building) is a genuine move-back -- stop-lane, and the ticket re-claims as a fresh builder", () => {
     let s = state(
       [ticket(1, "Building")],
-      [lane(1, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } })] // human dragged Review -> Building
+      [lane(1, "reviewer", { outcome: approve(100) })] // human dragged Review -> Building
     );
     const a = nextAction(s, 0);
     expect(a).toMatchObject({ kind: "stop-lane", ticket: 1 });
@@ -1206,7 +1704,7 @@ describe("one-hop resync: lagged write vs genuine move-back by origin (#125)", (
   // the merge-gate action is not resync-carrying, and the advance that follows
   // it is the one under test here.
   const reviewerLane = (over: Partial<LaneState> = {}) =>
-    lane(1, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, mergeGate: GREEN_GATE, ...over });
+    lane(1, "reviewer", { outcome: approve(100), mergeGate: GREEN_GATE, ...over });
 
   test("AC1: a reviewer lane one hop behind (board QA) with the loop's Review write still in flight resyncs to Review and advances to merge", () => {
     const s = state([ticket(1, "QA")], [reviewerLane({ lastWroteStatus: "Review" })]);
@@ -1961,6 +2459,96 @@ describe("loop CLI", () => {
     expect(JSON.parse(proc2.stdout.toString())).toMatchObject({ tripped: true, alreadyNotified: true });
   });
 
+  // -- #177: a BUILDER outcome may not be recorded without its git facts ------
+  // The pure recordOutcome treats them as optional (a pre-#177 state file must
+  // still load); this CLI edge is what makes the guard impossible to omit, the
+  // same fail-loud-on-tick-1 reasoning as z-loop-tick's required --session (#198).
+  describe("outcome (#177 builder verification)", () => {
+    const BASE = "1111111111111111111111111111111111111111";
+    const HEAD = "2222222222222222222222222222222222222222";
+
+    function runOutcome(statePath: string, message: string, extra: string[]) {
+      const msgPath = join(dir, "outcome-msg.txt");
+      writeFileSync(msgPath, message);
+      const proc = Bun.spawnSync(
+        ["bun", join(REPO_ROOT, "lib", "loop.ts"), "outcome", statePath, "1", msgPath, "--now", "0", ...extra],
+        { stdout: "pipe", stderr: "pipe" }
+      );
+      return { exitCode: proc.exitCode, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
+    }
+
+    function porcelainFile(name: string, content: string): string {
+      const p = join(dir, name);
+      writeFileSync(p, content);
+      return p;
+    }
+
+    test("a builder lane with no git facts exits 1 and leaves the state untouched", () => {
+      const statePath = join(dir, "outcome-nofacts.json");
+      const before = JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder")]));
+      writeFileSync(statePath, before);
+      const r = runOutcome(statePath, "BUILT: all criteria pass\n", []);
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain("git facts");
+      expect(r.stderr).toContain("--porcelain");
+      expect(readFileSync(statePath, "utf8")).toBe(before); // no outcome recorded
+    });
+
+    test("a partial set of facts is refused too (all three or none)", () => {
+      const statePath = join(dir, "outcome-partial.json");
+      writeFileSync(statePath, JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder")])));
+      const r = runOutcome(statePath, "BUILT: x\n", ["--head-sha", HEAD, "--base-sha", BASE]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain("git facts");
+    });
+
+    test("dirty + no commit records the unverified reason; clean + moved records a plain built", () => {
+      const statePath = join(dir, "outcome-dirty.json");
+      writeFileSync(statePath, JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder")])));
+      const dirty = runOutcome(statePath, "BUILT: done\n", [
+        "--porcelain", porcelainFile("porcelain-dirty.txt", "## z/ticket-1\n M lib/loop.ts\n?? tests/new.test.ts\n"),
+        "--head-sha", BASE, "--base-sha", BASE,
+      ]);
+      expect(dirty.exitCode).toBe(0);
+      const outcome = JSON.parse(dirty.stdout) as { kind: string; unverified?: string };
+      expect(outcome.kind).toBe("built");
+      expect(outcome.unverified).toContain("uncommitted work");
+      // And the same command on a clean, moved worktree records no reason at all.
+      const cleanPath = join(dir, "outcome-clean.json");
+      writeFileSync(cleanPath, JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder")])));
+      const clean = runOutcome(cleanPath, "BUILT: done\n", [
+        "--porcelain", porcelainFile("porcelain-clean.txt", "## z/ticket-1...origin/main\n"),
+        "--head-sha", HEAD, "--base-sha", BASE,
+      ]);
+      expect(clean.exitCode).toBe(0);
+      expect(JSON.parse(clean.stdout)).toEqual({ kind: "built" });
+    });
+
+    // The redirect that collects the facts creates the file BEFORE git runs, so a
+    // `git status` that FAILED hands the CLI an existing, empty file -- the one
+    // shape a missing-file check (ENOENT -> exit 1) cannot catch. With a moved HEAD
+    // it used to read as a clean tree and walk to QA.
+    test("an empty porcelain file (a git status that failed) is held, not read as clean", () => {
+      const statePath = join(dir, "outcome-emptyporcelain.json");
+      writeFileSync(statePath, JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder")])));
+      const r = runOutcome(statePath, "BUILT: done\n", [
+        "--porcelain", porcelainFile("porcelain-empty.txt", ""),
+        "--head-sha", HEAD, "--base-sha", BASE,
+      ]);
+      expect(r.exitCode).toBe(0);
+      const outcome = JSON.parse(r.stdout) as { kind: string; unverified?: string };
+      expect(outcome.unverified).toContain("header is missing");
+    });
+
+    test("a non-builder lane still records with no facts (the dead-merge PR-state path)", () => {
+      const statePath = join(dir, "outcome-merge.json");
+      writeFileSync(statePath, JSON.stringify(state([ticket(1, "Review")], [lane(1, "merge")])));
+      const r = runOutcome(statePath, "MERGED: https://github.com/x/y/pull/1\n", []);
+      expect(r.exitCode).toBe(0);
+      expect(JSON.parse(r.stdout)).toEqual({ kind: "merged", note: "https://github.com/x/y/pull/1" });
+    });
+  });
+
   // -- stage-model (issue #82): the real CLI wiring the SKILL shells out to --
   describe("stage-model", () => {
     test("prints the resolved model, reading a REAL config.json through loadConfig (not hardcoded)", () => {
@@ -2279,6 +2867,56 @@ describe("batch-scoped claiming + drain (#131)", () => {
     expect(nextRun.mergedThisRun).toEqual([]); // fresh batch resets the counters
     expect(nextAction(nextRun, 0)).toEqual({ kind: "claim", ticket: 3, stage: "builder" });
   });
+
+  // #168 (adversarial review of #150, unpinned gap 2): a ticket that a
+  // ticketLimit cap leaves in Ready -- excluded from batchTickets, the CLAIM
+  // allow-list -- is NOT excluded from initialBatchTickets, the
+  // humanNeededStatus SCOPE, once the next batch captures it. The two lists
+  // answer different questions (what may THIS run claim vs. what counts toward
+  // THIS run's safety-control numerator) and must not collapse into the same
+  // set. Reverting #150's isNewBatchTicket-based capture to the narrower
+  // flagged allow-list makes every assertion below fail.
+  test("#168: a ticket left out of a capped batchTickets by the ticket-limit still lands in the NEXT batch's initialBatchTickets, and counts toward humanNeededStatus if it parks", () => {
+    const nums = [1, 2, 3, 4, 5];
+    const bodies = Object.fromEntries(nums.map((n) => [String(n), "no deps"]));
+    const readyItems = nums.map((n) => ({ number: n, title: `t${n}`, fields: { Status: "Ready" } }));
+
+    // First capped batch: ticketLimit 2 over 5 Ready tickets flags [1, 2];
+    // #3/#4/#5 stay Ready, outside batchTickets -- the deliberately-excluded
+    // leftovers #150's context describes.
+    const first = ingestBoardItems(null, readyItems, bodies, { ticketLimit: 2 });
+    expect(first.batchTickets).toEqual([1, 2]);
+
+    // Drain it -- drainHappy claims/completes only the flagged pair (batch-scoped
+    // claiming, #131), leaving #3/#4/#5 untouched at Ready.
+    const drained = drainHappy(first).state;
+    expect(drained.tickets.filter((t) => t.status === "Done").map((t) => t.number)).toEqual([1, 2]);
+    expect(drained.tickets.filter((t) => t.status === "Ready").map((t) => t.number)).toEqual([3, 4, 5]);
+
+    // Re-invocation (Step 3, passes --ticket-limit again) against that drained
+    // state captures the NEXT batch: batchTickets caps at the lowest 2 of the 3
+    // leftovers ([3, 4]), but initialBatchTickets -- the same Ready-or-new rule
+    // initialReadyCount uses, not the capped allow-list -- picks up all 3,
+    // including leftover #5.
+    const drainedItems = [
+      { number: 1, title: "t1", fields: { Status: "Done" } },
+      { number: 2, title: "t2", fields: { Status: "Done" } },
+      ...[3, 4, 5].map((n) => ({ number: n, title: `t${n}`, fields: { Status: "Ready" } })),
+    ];
+    const next = ingestBoardItems(drained, drainedItems, bodies, { ticketLimit: 2, humanNeededPercent: 30 });
+    expect(next.batchTickets).toEqual([3, 4]); // the cap: #5 excluded from the claim allow-list
+    expect(next.initialBatchTickets).toEqual([3, 4, 5]); // the scope: #5 included anyway
+    expect(next.initialBatchTickets).not.toEqual(next.batchTickets);
+
+    // Park leftover #5 -- outside the cap, so nextAction's own claim/deadlock
+    // steps never reach it; this simulates whatever park path (human or a later
+    // run) eventually resolves it -- and confirm it counts toward THIS batch's
+    // human-needed numerator exactly like a flagged, in-cap ticket would.
+    const parked = applyAction(next, { kind: "park", ticket: 5, status: "Blocked", note: "test park" }, 0);
+    const hn = humanNeededStatus(parked);
+    expect(hn.blocked).toBe(1);
+    expect(hn.tickets.blocked).toEqual([5]);
+  });
 });
 
 describe("context ceiling gate (#131)", () => {
@@ -2371,6 +3009,7 @@ describe("ingestBoardItems: batch + context knobs (#131)", () => {
     const prev: LoopState = {
       ...state([ticket(1, "Done"), ticket(2, "Ready"), ticket(3, "Ready")]),
       batchTickets: [1, 2, 3],
+      initialBatchTickets: [1, 2, 3], // #150: this batch's own captured numerator scope
       contextTokens: 600000,
       contextTokenLimit: 550000,
       initialReadyCount: 3,
@@ -2388,6 +3027,12 @@ describe("ingestBoardItems: batch + context knobs (#131)", () => {
     // reading (the context-cleared orchestrator's first tick).
     const resumed = ingestBoardItems(prev, items, bodies, { contextTokens: 5000 });
     expect(resumed.batchTickets).toEqual([1, 2, 3]); // preserved verbatim (startingFreshBatch false)
+    // #168 (adversarial review of #150, unpinned gap 1): initialBatchTickets
+    // rides the SAME non-fresh carry-forward as batchTickets (both gated on
+    // startingFreshBatch false) -- pinned here so a future edit that drops it
+    // from that carry-forward fails loudly instead of silently re-scoping
+    // humanNeededStatus's numerator mid-run.
+    expect(resumed.initialBatchTickets).toEqual([1, 2, 3]);
     expect(resumed.contextTokens).toBe(5000);
     expect(resumed.contextTokenLimit).toBe(550000); // preserved
     // The gate is now open -> claiming resumes on the next flagged-but-unbuilt ticket.
@@ -2395,7 +3040,7 @@ describe("ingestBoardItems: batch + context knobs (#131)", () => {
   });
 });
 
-describe("validateConfig: ticketLimit / contextTokenLimit (#131 AC10)", () => {
+describe("validateConfig: ticketLimit / contextTokenLimit (#131 AC10) + minSkepticQuorum (#191)", () => {
   const baseConfig = () => ({
     slug: "s",
     owner: "o",
@@ -2421,6 +3066,20 @@ describe("validateConfig: ticketLimit / contextTokenLimit (#131 AC10)", () => {
 
   test("ticketLimit 0 and contextTokenLimit 0 both pass (disabled is legal)", () => {
     expect(() => validateConfig({ ...baseConfig(), ticketLimit: 0, contextTokenLimit: 0 })).not.toThrow();
+  });
+
+  // #191: a quorum above the fixed 3-skeptic fan-out is unsatisfiable, so every
+  // adversarial review would park Blocked. That is a config error at write time,
+  // not a mystery at drain time.
+  test("minSkepticQuorum is bounded to the fan-out it is a quorum over", () => {
+    for (const bad of [4, 1.5, -1]) {
+      expect(() => validateConfig({ ...baseConfig(), minSkepticQuorum: bad })).toThrow(
+        /"minSkepticQuorum" must be an integer 0-3 \(0 disables the gate\)/
+      );
+    }
+    for (const ok of [0, 1, 2, 3]) {
+      expect(() => validateConfig({ ...baseConfig(), minSkepticQuorum: ok })).not.toThrow();
+    }
   });
 });
 
@@ -2602,7 +3261,7 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
     // A state.json holding one review-approved lane, ungated.
     function stateFile(name: string): string {
       const p = join(dir, `${name}-state.json`);
-      writeFileSync(p, JSON.stringify(state([ticket(7, "Review")], [lane(7, "reviewer", { outcome: { kind: "review-approve", confidence: 100 } })])));
+      writeFileSync(p, JSON.stringify(state([ticket(7, "Review")], [lane(7, "reviewer", { outcome: approve(100) })])));
       return p;
     }
     const readState = (p: string): LoopState => JSON.parse(readFileSync(p, "utf8"));
@@ -2658,7 +3317,7 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
   // These pin the scheduler-side answer: the gate is the only door.
   describe("nextAction refuses the merge stage without a green gate", () => {
     const approved = (over: Partial<LaneState> = {}) =>
-      state([ticket(7, "Review")], [lane(7, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, ...over })]);
+      state([ticket(7, "Review")], [lane(7, "reviewer", { outcome: approve(100), ...over })]);
 
     test("a review-approved lane with NO verdict gets merge-gate, never an advance to merge", () => {
       expect(nextAction(approved(), 0)).toEqual({ kind: "merge-gate", ticket: 7 });
@@ -2675,8 +3334,8 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
       const s = state(
         [ticket(7, "Review"), ticket(8, "Review", [7])],
         [
-          lane(7, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, mergeGate: GREEN_GATE }),
-          lane(8, "reviewer", { outcome: { kind: "review-approve", confidence: 100 }, mergeGate: GREEN_GATE }),
+          lane(7, "reviewer", { outcome: approve(100), mergeGate: GREEN_GATE }),
+          lane(8, "reviewer", { outcome: approve(100), mergeGate: GREEN_GATE }),
         ]
       );
       expect(nextAction(s, 0)).toEqual({ kind: "advance", ticket: 7, to: "merge", stackedOn: [] });

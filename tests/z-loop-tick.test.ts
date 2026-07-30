@@ -118,7 +118,7 @@ describe("z-loop-tick", () => {
     const tickState = join(dir, "tick-state.json");
 
     const proc = Bun.spawnSync(
-      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp],
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp, "--session", "test-session"],
       { env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
     );
     expect(proc.exitCode).toBe(0);
@@ -207,7 +207,7 @@ describe("z-loop-tick", () => {
     const tickTmp = join(dir, "tick-tmp");
     const tickState = join(dir, "tick-state.json");
     const proc = Bun.spawnSync(
-      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp],
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp, "--session", "test-session"],
       { cwd, env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
     );
     expect(proc.exitCode).toBe(0);
@@ -246,6 +246,21 @@ describe("z-loop-tick", () => {
     expect(proc.stderr.toString()).toContain("usage: z-loop-tick");
   });
 
+  // #198: --session is required, not optional. An absent session would silently
+  // disable the liveness heartbeat and reintroduce "a live loop reads stale"
+  // with no symptom until a second invocation reconciled over a running drain.
+  test("#198: a missing --session fails loudly and prints no Action", () => {
+    const dir = mkTmp();
+    const stub = writeStubZBoard(dir);
+    const proc = Bun.spawnSync(
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", join(dir, "s.json"), "--tmp", join(dir, "t")],
+      { env: { ...process.env, Z_BOARD: stub }, stdout: "pipe", stderr: "pipe" }
+    );
+    expect(proc.exitCode).not.toBe(0);
+    expect(proc.stdout.toString().trim()).toBe("");
+    expect(proc.stderr.toString()).toContain("--session");
+  });
+
   // -- issue #63: the human-needed safety control -----------------------------
   test("human-needed: writes tripped:true when parked tickets cross the threshold, and an unconfigured notify send never aborts the tick or sets the fire-once flag", () => {
     const dir = mkTmp();
@@ -258,7 +273,7 @@ describe("z-loop-tick", () => {
     const tickState = join(dir, "tick-state.json");
 
     const proc = Bun.spawnSync(
-      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp],
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp, "--session", "test-session"],
       { env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
     );
     // The tick must exit 0 and still print exactly one Action line even though
@@ -304,7 +319,7 @@ describe("z-loop-tick", () => {
     const priorBodies = JSON.stringify({ "1": "no deps", "2": "no deps", "3": "no deps" });
     const stub = writeStubZBoard(dir, priorItems, priorBodies);
     const tick1 = Bun.spawnSync(
-      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp],
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp, "--session", "test-session"],
       { env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
     );
     expect(tick1.exitCode).toBe(0);
@@ -321,7 +336,7 @@ describe("z-loop-tick", () => {
     writeStubZBoard(dir, freshItems, freshBodies); // same stub path -- overwrites with the new board
 
     const tick2 = Bun.spawnSync(
-      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp],
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp, "--session", "test-session"],
       { env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
     );
     expect(tick2.exitCode).toBe(0);
@@ -387,7 +402,7 @@ describe("z-loop-tick", () => {
 
     try {
       const proc = Bun.spawn(
-        ["bash", Z_LOOP_TICK, "--slug", slug, "--state", tickState, "--tmp", tickTmp],
+        ["bash", Z_LOOP_TICK, "--slug", slug, "--state", tickState, "--tmp", tickTmp, "--session", "test-session"],
         {
           env: {
             ...process.env,

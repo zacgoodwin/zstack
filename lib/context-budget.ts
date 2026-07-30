@@ -35,7 +35,9 @@ import { SYNTHETIC_MODEL, parseLine } from "./cost.ts";
 // directory with every non-alphanumeric character replaced by "-" (verified
 // against real dirs on disk, e.g. "D:\Users\zacgo\...\zstack-1" ->
 // "D--Users-zacgo---zstack-1", case preserved as the process reported the cwd).
-function mangleProjectDir(cwd: string): string {
+// Exported for lib/transcripts.ts (#190), which names the same directory in its
+// "cannot resolve the session" error -- one copy of the mangling rule, not two.
+export function mangleProjectDir(cwd: string): string {
   return cwd.replace(/[^a-zA-Z0-9]/g, "-");
 }
 

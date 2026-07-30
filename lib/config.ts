@@ -63,6 +63,25 @@ export type EpicStyle = "milestones" | "issue-type";
 export type AdversarialMode = "off" | "non-trivial" | "always";
 export const ADVERSARIAL_MODES: AdversarialMode[] = ["off", "non-trivial", "always"];
 
+// The owner's bot-vs-human-account choice for the loop's GitHub identity
+// (issue #66): whether /z-loop runs as a dedicated bot collaborator or
+// continues under the human owner's own `gh` login. This is never a second
+// copy of a login -- ME is always `gh api user -q .login` (z-loop/SKILL.md
+// Step 0) and stays the single source of truth -- only the human's recorded
+// DECISION, so /z-setup and /z-update know whether to raise the choice
+// (absent) or leave it alone (already answered, either way).
+export type IdentityChoice = "bot" | "human";
+export const IDENTITY_MODES: IdentityChoice[] = ["bot", "human"];
+
+export interface IdentityRecord {
+  mode: IdentityChoice;
+  recordedAt: string; // ISO 8601, when the choice was (re)recorded
+  // Human-facing note of where the bot's token/gh-auth profile lives (e.g.
+  // "gh auth login (bot profile)" or "GH_TOKEN env var in the loop's launch
+  // script"). "bot" mode only; never a login or the token itself.
+  tokenLocation?: string;
+}
+
 // Per-stage model routing (issue #82): overrides the ticket's board Model
 // field for one or more of the loop's four stage spawns. Not a Stage-keyed
 // import from lib/loop.ts (that would cycle back through this file) -- the
@@ -129,6 +148,18 @@ export interface BoardConfig {
   // builder->QA->review forever. Same optional-with-fallback treatment as the
   // gate knobs above.
   maxReviewBounces?: number;
+  // Skeptic quorum floor (issue #191): how many of the 3 skeptic verdicts an
+  // ADVERSARIAL review must actually have received for its aggregated confidence
+  // to merge. The confidence token alone cannot express this, and the gap is not
+  // theoretical: one skeptic reporting "cannot refute" aggregates to
+  // confidence=100, clears the default floor of 70, and merges as though three
+  // independent reviews agreed. Default 2 -- a majority of the fan-out had to
+  // look. 0 disables the gate; 1 accepts a single opinion as an adversarial pass,
+  // which is the hole this closes, so lower it only deliberately. A short quorum
+  // re-spawns the REVIEWER once (a thin review is not a bad diff), then parks
+  // Blocked. Only ever consulted when the reviewer emitted a `skeptics=` token,
+  // so a project with adversarialMode "off" is entirely unaffected.
+  minSkepticQuorum?: number;
   // Safety control (issue #63): mid-run breakdown notification when parked
   // tickets (Blocked + Skipped + Questions) exceed this percent of the
   // batch's initial committed-to-Building count. 0 disables the control.
@@ -163,6 +194,13 @@ export interface BoardConfig {
   // (including {}) -> used exactly as written, no default layered on. See the
   // StageModels comment above for why loadConfig must never fill this in.
   stageModels?: StageModels;
+  // Issue #66: the owner's recorded bot-vs-human-account choice. Absent means
+  // "never asked" (a project that predates this ticket) -- deliberately NOT
+  // defaulted by loadConfig below (unlike every numeric knob above), because
+  // "absent" and "chose human" must stay distinguishable: that distinction is
+  // what lets z-update's re-check (SKILL.md) prompt an old project exactly
+  // once and never re-prompt one that already answered either way.
+  identity?: IdentityRecord;
 }
 
 export const DEFAULT_QUOTA: QuotaConfig = { threshold: 100, mode: "sleep" };
@@ -178,6 +216,7 @@ export const DEFAULT_TICK_THROTTLE_SECONDS = 0;
 export const DEFAULT_MIN_REVIEWER_CONFIDENCE = 70;
 export const DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION = "block" as const;
 export const DEFAULT_MAX_REVIEW_BOUNCES = 2;
+export const DEFAULT_MIN_SKEPTIC_QUORUM = 2;
 export const DEFAULT_HUMAN_NEEDED_PERCENT = 30;
 export const DEFAULT_TICKET_LIMIT = 0;
 export const DEFAULT_CONTEXT_TOKEN_LIMIT = 550000;
@@ -285,6 +324,7 @@ export function loadConfig(slug?: string, home = homedir()): BoardConfig {
   cfg.minReviewerConfidence = cfg.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE;
   cfg.reviewerBelowThresholdAction = cfg.reviewerBelowThresholdAction ?? DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION;
   cfg.maxReviewBounces = cfg.maxReviewBounces ?? DEFAULT_MAX_REVIEW_BOUNCES;
+  cfg.minSkepticQuorum = cfg.minSkepticQuorum ?? DEFAULT_MIN_SKEPTIC_QUORUM;
   cfg.humanNeededPercent = cfg.humanNeededPercent ?? DEFAULT_HUMAN_NEEDED_PERCENT;
   cfg.ticketLimit = cfg.ticketLimit ?? DEFAULT_TICKET_LIMIT;
   cfg.contextTokenLimit = cfg.contextTokenLimit ?? DEFAULT_CONTEXT_TOKEN_LIMIT;

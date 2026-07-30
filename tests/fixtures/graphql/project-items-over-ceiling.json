@@ -1,0 +1,39 @@
+{
+  "node": {
+    "items": {
+      "pageInfo": { "hasNextPage": false, "endCursor": null },
+      "nodes": [
+        {
+          "content": {
+            "number": 21,
+            "title": "Over-ceiling ticket",
+            "url": "https://github.com/zacgoodwin/zstack/issues/21",
+            "body": "over ceiling body",
+            "labels": { "pageInfo": { "hasNextPage": true }, "nodes": [] }
+          },
+          "fieldValues": {
+            "pageInfo": { "hasNextPage": false },
+            "nodes": [
+              { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "Building", "field": { "name": "Status" } }
+            ]
+          }
+        },
+        {
+          "content": {
+            "number": 22,
+            "title": "Healthy ticket",
+            "url": "https://github.com/zacgoodwin/zstack/issues/22",
+            "body": "healthy body",
+            "labels": { "pageInfo": { "hasNextPage": false }, "nodes": [{ "name": "bug" }] }
+          },
+          "fieldValues": {
+            "pageInfo": { "hasNextPage": false },
+            "nodes": [
+              { "__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "Ready", "field": { "name": "Status" } }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

@@ -10,6 +10,7 @@ import {
   ADVERSARIAL_MODES,
   BoardConfig,
   FieldDataType,
+  IDENTITY_MODES,
   ZError,
 } from "./config.ts";
 import { loadRates, resolveRate } from "./estimate.ts";
@@ -173,6 +174,12 @@ export function validateConfig(cfg: unknown): BoardConfig {
   // meaningless too; not requirePositiveNumber (which would silently accept
   // e.g. 2.5).
   requireNumber("maxReviewBounces", c.maxReviewBounces, { min: 1, integer: true, desc: "a positive integer (>= 1)" });
+  // minSkepticQuorum (issue #191): the skeptic-delivery floor. A count of
+  // verdicts out of the fixed 3-skeptic fan-out, so a fraction is meaningless and
+  // anything above 3 is unsatisfiable -- a max of 3 turns "quorum can never be
+  // met, every adversarial review parks Blocked" into a config error at write
+  // time. `0` legitimately disables the gate, so this is a non-negative guard.
+  requireNumber("minSkepticQuorum", c.minSkepticQuorum, { min: 0, max: 3, integer: true, desc: "an integer 0-3 (0 disables the gate)" });
   if (c.quota !== undefined) validateQuota(c.quota);
 
   // humanNeededPercent (issue #63): the mid-run breakdown notification's trip
@@ -204,6 +211,13 @@ export function validateConfig(cfg: unknown): BoardConfig {
   // at config-write (z-setup) / config-load (loadConfig) time -- instead of
   // silently at spawn time.
   if (c.stageModels !== undefined) validateStageModels(c.stageModels);
+
+  // identity (issue #66): the owner's bot-vs-human-account choice for the
+  // loop's GitHub identity. Validated only when present -- absent means
+  // "never asked" and must stay absent (loadConfig deliberately never
+  // defaults it; see lib/config.ts). z-setup/z-update write through this via
+  // lib/identity.ts; loadConfig reads through it like every other field.
+  if (c.identity !== undefined) validateIdentity(c.identity);
 
   return c as BoardConfig;
 }
@@ -305,5 +319,57 @@ export function validateStageModels(stageModels: unknown): void {
           `Known: ${Object.keys(rates.rates).join(", ")}.`
       );
     }
+  }
+}
+
+// identity (issue #66): the owner's recorded bot-vs-human-account choice.
+// `mode` is the only field z-setup/z-update decide on; `recordedAt` is
+// written by lib/identity.ts's recordIdentityChoice, never hand-supplied;
+// `tokenLocation` is an optional human-facing note (never a login or a
+// secret) of where the bot's token/gh-auth profile lives.
+export function validateIdentity(identity: unknown): void {
+  if (typeof identity !== "object" || identity === null || Array.isArray(identity)) {
+    throw new ZError(`Config "identity" must be an object, not an array.`);
+  }
+  const i = identity as any;
+  if (!IDENTITY_MODES.includes(i.mode)) {
+    throw new ZError(
+      `Config "identity.mode" must be "bot" or "human", got ${JSON.stringify(i.mode)}.`
+    );
+  }
+  if (typeof i.recordedAt !== "string" || !i.recordedAt) {
+    throw new ZError(`Config "identity.recordedAt" must be a non-empty string.`);
+  }
+  if (i.tokenLocation !== undefined) {
+    if (typeof i.tokenLocation !== "string" || !i.tokenLocation) {
+      throw new ZError(`Config "identity.tokenLocation" must be a non-empty string when present.`);
+    }
+    assertNotACredential(i.tokenLocation);
+  }
+}
+
+// GitHub credential prefixes: `github_pat_` (fine-grained) and the
+// classic/OAuth/app family. Used ONLY to reject a credential pasted into the
+// tokenLocation POINTER field -- never to validate a token, which is GitHub's
+// job.
+const CREDENTIAL_PREFIXES = ["github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
+
+// tokenLocation is a human-facing NOTE of where the bot's token lives, so the
+// obvious wrong thing to put there is the token. This is not hypothetical: the
+// setup flow that writes this field hands the operator a token seconds earlier,
+// and this project has already burned two PATs by routing them through the
+// wrong channel (#66). config.json is plaintext on disk, so a credential landing
+// here is a durable leak, not a transient one.
+//
+// Like the discordWebhookUrl guard above, the error names the FIELD and the
+// matched prefix class ONLY and never echoes the value -- this message can end
+// up in a terminal, a log, or a pasted bug report, and echoing a live credential
+// into any of those is the very thing the guard exists to prevent.
+export function assertNotACredential(value: string): void {
+  const hit = CREDENTIAL_PREFIXES.find((p) => value.startsWith(p));
+  if (hit) {
+    throw new ZError(
+      `Config "identity.tokenLocation" must say WHERE the token lives (e.g. "GH_TOKEN env var in the loop's launch script"), not the token itself -- the value supplied starts with "${hit}", a GitHub credential prefix. Record the location and keep the credential in \`gh auth\` or an env var. If this credential was written to disk or shared, revoke it.`
+    );
   }
 }

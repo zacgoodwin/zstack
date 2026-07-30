@@ -43,6 +43,32 @@ records the result. It never re-derives a scheduling decision in prose.
   single `bin/z-loop-tick` call (snapshot → ingest → `next`) that prints only the
   one-line next Action, so the repeated bash never re-enters context. A long
   batch drains in one session without tripping auto-compaction.
+- **A `BUILT` that shipped nothing does not reach QA.** `BUILT` is a claim, and
+  the loop verifies it against the lane worktree's own git facts before the lane
+  advances: `git status --porcelain --branch` must report a clean tree, untracked
+  files included — a new test file the builder never `git add`ed is exactly the
+  work that would go missing — **and** `HEAD` must have moved off the base branch
+  (at least one commit of its own). Both halves fail closed. The status payload is
+  read `--branch`, so git's own `## <branch>` header is required and a `git status`
+  that failed (an empty file) can never read as "clean"; the commit half compares
+  `HEAD` against `git merge-base <base> HEAD`, not the base tip, so a leftover
+  worktree re-claimed under a base branch that has since been pulled forward
+  cannot read as having committed something it never did. Run 9 produced the
+  failure this closes: a builder reported `BUILT` with everything still
+  uncommitted, so QA reviewed the BASE tree and passed a diff that did not exist.
+  On a failure the ticket does not advance to QA — nor to Review under `skip-qa`,
+  which would hand the reviewer the same empty diff. The lane re-spawns its **own
+  builder** once with an `uncommitted work` note naming what it left behind (dirty
+  paths, a HEAD with no commit of its own) and telling it to commit what is already
+  in the worktree rather than rebuild it. A second `BUILT` with nothing committed
+  parks the ticket Blocked with that note, and because parking releases the lane
+  lock — which makes the worktree an orphan the next run's reconcile scan
+  force-removes — the park first dumps the worktree's uncommitted state to
+  `~/.zstack/projects/<slug>/reports/uncommitted-<N>.patch`. Re-apply it with
+  `git apply` in a fresh worktree, or commit/stash the worktree yourself **before**
+  the next `/z-loop` run. That retry has its own budget — "you forgot to commit" is
+  neither a QA bug nor a reviewer finding, so it never consumes a rebuild those
+  caps are holding.
 - **Adversarial review, when the card earns it.** When `adversarialMode` is
   active for a card, the Review stage runs a super-truth pass: it fans out
   independent skeptic sub-agents that each try to REFUTE the diff against the
@@ -68,6 +94,19 @@ records the result. It never re-derives a scheduling decision in prose.
   scheduler refuses to advance a ticket into the merge stage without a green
   one, so "was the gate even run?" is decided in code too. See
   [The merge green gate](#the-merge-green-gate).
+- **A confidence with nobody behind it does not merge either.** The aggregated
+  confidence is computed over the skeptics that actually *reported*, so ONE
+  skeptic answering "cannot refute" is `confidence=100` — which clears the
+  default floor of 70 and merges as though three independent reviews agreed. Sub-
+  agent delivery is best-effort (run 10 measured deliveries of 0 of 3), so the
+  reviewer now reports the denominator too: `skeptics=<k>/3`. Below config
+  `minSkepticQuorum` (default 2) the ticket does not merge; it re-spawns the
+  **reviewer** once — a thin review is not a bad diff, and rebuilding something
+  nobody faulted fixes nothing — and if the second reviewer also cannot reach
+  quorum, parks Blocked naming the delivery failure and saying the diff itself was
+  never faulted. That retry has its own budget, separate from `maxReviewBounces`,
+  so a delivery race never consumes the rebuild a genuine finding needs. A
+  single-pass review reports no `skeptics=` token and is untouched by this gate.
 - **Reviewer->builder bounces are capped.** A `REVIEW-FINDINGS` and a
   `reviewerBelowThresholdAction: "retry"` both send the ticket back to the
   builder from Review, and both draw on the same per-lane budget: at config
@@ -100,10 +139,23 @@ records the result. It never re-derives a scheduling decision in prose.
 - **Per-stage transcript layout.** Each stage's copy lands at
   `~/.zstack/projects/<slug>/state/transcripts/ticket-<N>/<stage>-<attempt>.jsonl`
   — `<stage>` is `builder`/`qa`/`reviewer`/`merge`, `<attempt>` is that lane's
-  1-based spawn count for the stage (a QA bounce or a reviewer bounce, either
-  one, re-spawns builder — so `builder-3.jsonl` might follow one bounce of
-  each kind, not necessarily three QA passes). This naming is what lets the
-  end-of-loop report break spend down by stage instead of only by ticket.
+  1-based spawn count for the stage (a QA bounce, a reviewer bounce, and an
+  uncommitted-work re-spawn each re-spawn builder — so `builder-3.jsonl` might
+  follow two bounces of different kinds, not necessarily three QA passes). This
+  naming is what lets the end-of-loop report break spend down by stage instead
+  of only by ticket.
+- **Sub-agent transcripts count too.** A stage that spawns its own sub-agents —
+  the adversarial reviewer's 3 skeptics are the case that matters — lands each
+  one beside its parent as `<stage>-<attempt>-sub-<agentId>.jsonl`, and those
+  tokens are that stage's spend. Collection is by **parentage**, not by
+  timestamp: `lib/transcripts.ts` walks the harness's own `parentAgentId` links
+  from the stage agent's transcript, found by an opaque spawn tag the prompt
+  carries. Before this (#190), a prose step said "take the file for that spawn"
+  and the skeptics were collected by nobody, so every adversarial review's
+  Actual undercounted by the majority of what it spent. A modification-time
+  sweep is not a substitute — three lanes drain concurrently, so sibling
+  reviewers' skeptics interleave in one flat directory, and the sweep tried by
+  hand during a real run gave a reviewer with 3 skeptics 8 transcripts.
 - **Per-stage model routing.** The merge stage is mechanical (`gh pr create`, a
   conflict check, `gh pr merge`) and doesn't need the ticket's build-tier
   model; the `stageModels` config knob (default `{"merge": "haiku"}`)
@@ -365,8 +417,10 @@ the batch (`state/transcripts/*/*.jsonl`), folded per-stage by
 `lib/endloop.ts`'s `sumByStage`. All five rows always render, `$0.00`
 included — a run with no reviewer bounces still shows the full shape instead
 of a table that grows and shrinks between loops. `other` catches any
-transcript file whose name doesn't match `<stage>-<attempt>.jsonl` (e.g. a
-manually-dropped file). A loop run's report predating this feature simply has
+transcript file whose name doesn't match `<stage>-<attempt>.jsonl` or
+`<stage>-<attempt>-sub-<agentId>.jsonl` (e.g. a manually-dropped file); stage
+attribution splits on the first `-`, so a sub-agent's spend lands in the row of
+the stage that spawned it. A loop run's report predating this feature simply has
 no `## Spend by stage` section at all — the field is optional and the rest of
 the report is unaffected.
 
@@ -402,9 +456,9 @@ model rate key defined in `references/rates.json` (the same lookup
 family substring); an unknown value fails `validateConfig` loudly, naming
 `stageModels.<stage>`, never silently at spawn time.
 
-`/z-setup` writes `{"merge": "haiku"}` into every newly-created project's
-config. An adopted or already-configured project keeps whatever it already
-has — add the key by hand to opt in (see
+`/z-setup` writes `{"merge": "haiku"}` into every project's config, whether it
+creates the project or adopts an existing one (issue #156) — hand-edit
+`config.json` to change it (see
 [z-setup.md → Config knobs](z-setup.md#config-knobs-hand-edit-configjson-after-setup)).
 
 **It survives a later `z-setup` re-apply (issue #97).** Re-running `/z-setup`

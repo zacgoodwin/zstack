@@ -13,8 +13,8 @@ import { readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Board, ghExecutor } from "./board.ts";
 import { handleCliError, parseFlags, str } from "./cli.ts";
-import { TERMINAL_STATUSES, loadConfig } from "./config.ts";
-import { defaultLocksDir, listLaneLocks, type LaneLock } from "./locks.ts";
+import { DEFAULT_LOCK_STALENESS_MINUTES, TERMINAL_STATUSES, ZError, loadConfig } from "./config.ts";
+import { defaultLocksDir, inspectLoopLock, listLaneLocks, type LaneLock } from "./locks.ts";
 import { BOARD_STATUSES, type BoardStatus, type LaneState, type TicketSnapshot } from "./loop.ts";
 
 // -- orphan scan --------------------------------------------------------------
@@ -256,8 +256,13 @@ const USAGE = `reconcile <command> [args] --slug S
 
   scan   [--now MS]   scan orphans + build the plan; print JSON {hasOrphans, orphans, plan}
   plan   [--now MS]   print the reconcile action list as JSON
-  apply  [--now MS]   execute the plan: release claims, park to Ready, prune worktrees,
-                      remove stale locks (never deletes branches or comments)
+  apply  [--now MS] [--session ID]
+                      execute the plan: release claims, park to Ready, prune worktrees,
+                      remove stale locks (never deletes branches or comments).
+                      REFUSES while a loop lock is live, since reconciling a
+                      running loop parks its tickets and deletes its worktrees.
+                      --session is the owning loop's own id: /z-loop reconciles
+                      AFTER taking the lock, so it passes its session to proceed.
 
   --dir / --worktrees override the locks + worktrees dirs (tests). Otherwise
   locks default to ~/.zstack/projects/<slug>/locks and worktrees to ./.worktrees.`;
@@ -271,6 +276,26 @@ export async function sweep(board: Board): Promise<BoardTicketStatus[]> {
     for (const it of await board.list(status)) out.push({ number: it.number, status });
   }
   return out;
+}
+
+// Throws unless it is safe to reconcile: the loop lock must be free, stale, or
+// held by the caller itself (#198). Exported so the refusal is gate-testable
+// without a board or a network call.
+export function assertNotReconcilingLiveLoop(
+  locksDir: string,
+  nowMs: number,
+  cfg: { lockStalenessMinutes?: number },
+  session: string | undefined
+): void {
+  const stalenessMs = (cfg.lockStalenessMinutes ?? DEFAULT_LOCK_STALENESS_MINUTES) * 60_000;
+  const st = inspectLoopLock(locksDir, nowMs, stalenessMs);
+  if (st.state !== "live") return;
+  if (session !== undefined && st.lock!.session === session) return; // our own recovery pass
+  throw new ZError(
+    `Refusing to reconcile: a /z-loop is running on this project in session ` +
+      `"${st.lock!.session}". Reconciling would park its tickets back to Ready and ` +
+      `delete its worktrees. Stop that loop first.`
+  );
 }
 
 export async function main(argv: string[]): Promise<number> {
@@ -291,6 +316,21 @@ export async function main(argv: string[]): Promise<number> {
     const locksDir = str(flags, "dir") ?? defaultLocksDir(cfg.slug);
     const worktreesDir = str(flags, "worktrees") ?? join(process.cwd(), ".worktrees");
 
+    // #198: refuse to reconcile a LIVE loop, before doing any work.
+    //
+    // Until now this module only ASSUMED the loop lock was free or stale (see the
+    // comment on scanOrphans); nothing verified it. So a --reconcile run against a
+    // live loop treated that loop's live lane locks as crashed lanes -- parking its
+    // tickets back to Ready and force-deleting the running builders' worktrees.
+    // The trigger was #198: a loop outliving lockStalenessMinutes read stale, and
+    // the acquire error told the operator to reconcile.
+    //
+    // Checked BEFORE the board sweep so a refusal costs no GraphQL. The sanctioned
+    // caller (z-loop/SKILL.md Step 0) reconciles AFTER taking the lock, so it
+    // passes its own --session and is let through; a bare human invocation has no
+    // session and refuses on any live lock, which is the safe default.
+    if (cmd === "apply") assertNotReconcilingLiveLoop(locksDir, nowMs, cfg, str(flags, "session"));
+
     const orphans = scanOrphans(locksDir, worktreesDir, await sweep(board), nowMs);
     const plan = reconcilePlan(orphans);
 
@@ -302,7 +342,6 @@ export async function main(argv: string[]): Promise<number> {
       console.log(JSON.stringify(plan, null, 2));
       return 0;
     }
-    // apply
     await applyReconcile(plan, realEffects(board));
     const counts = plan.reduce((m, a) => ((m[a.kind] = (m[a.kind] ?? 0) + 1), m), {} as Record<string, number>);
     console.log(`reconciled: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(", ") || "nothing"}`);

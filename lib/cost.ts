@@ -230,9 +230,14 @@ function apportionCents(rawDollars: number[], targetCents: number): number[] {
   return cents;
 }
 
-// Stage encoded in a transcript file's name (`<stage>-<attempt>.jsonl`,
-// z-loop/SKILL.md Step 4's per-stage transcript copy): the segment of the
-// basename before its first "-". A name that doesn't match a KNOWN_STAGE (no
+// Stage encoded in a transcript file's name: the segment of the basename before
+// its first "-". lib/transcripts.ts (#190) writes two shapes, and splitting on
+// the FIRST "-" buckets both under the same stage with no change here:
+//   <stage>-<attempt>.jsonl                the stage agent's own transcript
+//   <stage>-<attempt>-sub-<agentId>.jsonl  each sub-agent it spawned (the
+//                                          adversarial reviewer's 3 skeptics,
+//                                          whose tokens ARE reviewer spend)
+// A name that doesn't match a KNOWN_STAGE (no
 // "-" at all, or a prefix that isn't one of the four real stages -- e.g. a
 // manually-dropped "notes.jsonl" or "manual-drop.jsonl") maps to "other"
 // rather than being dropped -- every dollar the batch spent must show up
@@ -243,7 +248,11 @@ function apportionCents(rawDollars: number[], targetCents: number): number[] {
 // duplicate guard below (ticket #152, catches a transcript copied into the
 // wrong stage's file before it can silently misattribute spend).
 const STAGE_PREFIX = /^([^-]+)-/;
-const KNOWN_STAGES = new Set(["builder", "qa", "reviewer", "merge"]);
+// Exported for lib/transcripts.ts (#190): its `tag` verb validates --stage
+// against this exact set, so a typo'd stage cannot mint a tag whose collected
+// files would then bucket to "other" and vanish from the reviewer row. Pinned
+// equal to lib/loop.ts's Stage keys by a gate test.
+export const KNOWN_STAGES = new Set(["builder", "qa", "reviewer", "merge"]);
 
 function stageOfFile(file: string): string {
   const base = file.replace(/\\/g, "/").split("/").pop()!.replace(/\.jsonl$/i, "");

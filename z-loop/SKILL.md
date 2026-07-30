@@ -57,7 +57,25 @@ export ZSTACK_SLUG="$SLUG"   # H13: every z-board / lib call resolves the slug f
                              # --slug where already present -- explicit still wins.
 BASE=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
 BASE_SHA_START=$(git rev-parse "origin/$BASE" 2>/dev/null || git rev-parse "$BASE")  # C8: the e2e-detection diff base
+# issue #66: whoever `gh` is authed as -- a dedicated bot account is the
+# supported way to give the loop its own identity; see
+# docs/user-guide/bot-identity.md and z-setup/SKILL.md Step 7. No code here
+# prefers or hardcodes the owner -- this line is the single source of truth
+# for the session name, lane locks, claims, AND the git commit author.
+#
+# ME_EMAIL is the git AUTHOR half. `gh` auth decides who calls the API and who
+# pushes; it does NOT decide the author stamped into a commit object -- that is
+# git's own user.name/user.email, which on a developer machine is the human. So
+# a bot-authed loop with no ME_EMAIL still lands commits authored by the owner,
+# breaking "if the bot takes an action it shows up as that GH user". Both come
+# out of the SAME single `gh api user` request, so they can never disagree with
+# the live auth and neither is stored in config.json. The <id>+<login> form is
+# GitHub's noreply address, which links the commit to the account even when its
+# email is private. Applied PER-WORKTREE at claim time (Step 4's `claim` row),
+# never repo-wide -- see the WARNING there for why that distinction matters.
 ME=$(gh api user -q .login)
+ME_ID=$(gh api user -q .id)
+ME_EMAIL="$ME_ID+$ME@users.noreply.github.com"
 SESSION="$ME-$(date +%s)"   # names this loop in the lock (second-invocation refusal)
 STATE_DIR="$HOME/.zstack/projects/$SLUG/loop"
 STATE="$STATE_DIR/state.json"; TMP="$STATE_DIR/tmp"
@@ -76,12 +94,13 @@ mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports" 
 4. Read the loop knobs from config (defaults 3 lanes / 10 minutes / audits
    every 5th loop / 3 QA passes before Blocked / investigate from QA bounce 2 /
    human-needed at 30% parked / reviewer-confidence floor 70, block a
-   sub-floor approve / 2 reviewer->builder bounces before Blocked / no per-loop
+   sub-floor approve / 2 reviewer->builder bounces before Blocked / 2 of 3
+   skeptic verdicts required for an adversarial approve to merge / no per-loop
    ticket cap / context ceiling 550000 tokens):
 
 ```bash
-read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMAN_NEEDED_PERCENT MIN_REVIEWER_CONFIDENCE REVIEWER_BELOW_ACTION MAX_REVIEW_BOUNCES TICKET_LIMIT CONTEXT_TOKEN_LIMIT <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
-  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.humanNeededPercent, c.minReviewerConfidence, c.reviewerBelowThresholdAction, c.maxReviewBounces, c.ticketLimit, c.contextTokenLimit)")"
+read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMAN_NEEDED_PERCENT MIN_REVIEWER_CONFIDENCE REVIEWER_BELOW_ACTION MAX_REVIEW_BOUNCES MIN_SKEPTIC_QUORUM TICKET_LIMIT CONTEXT_TOKEN_LIMIT <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
+  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.humanNeededPercent, c.minReviewerConfidence, c.reviewerBelowThresholdAction, c.maxReviewBounces, c.minSkepticQuorum, c.ticketLimit, c.contextTokenLimit)")"
 ```
 
 5. **Startup orphan scan (C7).** A crashed prior loop leaves lane locks in
@@ -104,7 +123,7 @@ if [ "$HAS_ORPHANS" = "true" ] && [ -z "$RECONCILE" ]; then
   bun "$PACK/lib/locks.ts" release --slug "$SLUG"   # don't hold the lock while refusing
   exit 1
 fi
-[ -n "$RECONCILE" ] && bun "$PACK/lib/reconcile.ts" apply --slug "$SLUG"
+[ -n "$RECONCILE" ] && bun "$PACK/lib/reconcile.ts" apply --slug "$SLUG" --session "$SESSION"
 ```
 
 Set `RECONCILE=1` when the human invoked `/z-loop --reconcile`; leave it empty
@@ -177,7 +196,7 @@ bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" \
   --max-qa-passes "$MAX_QA_PASSES" --qa-investigate-after "$QA_INVESTIGATE_AFTER" \
   --human-needed-percent "$HUMAN_NEEDED_PERCENT" \
   --min-reviewer-confidence "$MIN_REVIEWER_CONFIDENCE" --reviewer-below-threshold-action "$REVIEWER_BELOW_ACTION" \
-  --max-review-bounces "$MAX_REVIEW_BOUNCES" \
+  --max-review-bounces "$MAX_REVIEW_BOUNCES" --min-skeptic-quorum "$MIN_SKEPTIC_QUORUM" \
   --ticket-limit "$TICKET_LIMIT" --context-token-limit "$CONTEXT_TOKEN_LIMIT"
 ```
 
@@ -211,7 +230,7 @@ and prints **only** the one-line Action JSON, so on a long drain's 100+ iteratio
 the repeated bash command text never re-enters your context (ticket #57, Leak 2):
 
 ```bash
-ACTION=$("$PACK/bin/z-loop-tick" --slug "$SLUG" --state "$STATE" --tmp "$TMP")
+ACTION=$("$PACK/bin/z-loop-tick" --slug "$SLUG" --state "$STATE" --tmp "$TMP" --session "$SESSION")
 ```
 
 `z-loop-tick` re-reads the board FIRST every iteration — refreshing each ticket's
@@ -231,6 +250,42 @@ ticket has the `skip-qa` label, a finished builder advances straight to Review
 for an error fix, a question answer, or a blocker resolution. The QA
 bounce/investigate machinery is unchanged for every ticket without the label.
 
+**BUILT verification (#177).** A `BUILT` marker is a claim, not proof: run 9's
+#155 builder emitted it with everything still uncommitted, so QA reviewed the
+BASE tree and passed a diff that did not exist. Recording a **builder** lane's
+outcome therefore REQUIRES that lane worktree's own git facts, and
+`loop outcome` refuses (exit 1, with these commands) without them:
+
+```bash
+WT=".worktrees/ticket-<N>"
+git -C "$WT" status --porcelain --branch > "$TMP/porcelain-<N>.txt"
+bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt \
+  --porcelain "$TMP/porcelain-<N>.txt" \
+  --head-sha "$(git -C "$WT" rev-parse HEAD)" \
+  --base-sha "$(git -C "$WT" merge-base "$BASE" HEAD)"
+```
+
+Both flags in that command are load-bearing, and neither is interchangeable with
+the obvious shorter form:
+
+- `--branch` — git always emits a `## <branch>` header with it, and the guard
+  REQUIRES that header. A `> file` redirect creates the file before git runs, so
+  a `git status` that failed leaves an EMPTY file, which a bare `--porcelain`
+  payload cannot tell apart from a clean tree.
+- `merge-base "$BASE" HEAD`, not `rev-parse "$BASE"` — the check is "does HEAD
+  carry a commit `$BASE` does not". The base TIP only answers that while it has
+  not moved since the worktree was created; a leftover worktree re-claimed in a
+  later loop sits under a `$BASE` that step 7 already pulled forward, so a lane
+  that committed NOTHING would read as moved.
+
+The three facts are all it takes; the verdict is the state machine's
+(`builtGuardFailure`), never yours. A `BUILT` with a dirty tree OR a HEAD still
+an ancestor of `$BASE` does not advance to QA (nor to Review under `skip-qa`): the
+lane re-spawns its own builder ONCE with an `uncommitted work` note asking it to
+commit, and a second such `BUILT` parks the ticket Blocked with that note (see the
+`park N Blocked` row for the salvage dump that park REQUIRES first). Every other
+stage has nothing to verify, so its `outcome` call is unchanged.
+
 **Human-needed safety control (issue #63).** `z-loop-tick` also recomputes the
 parked-tickets breakdown every iteration and fires a ONE-TIME mid-run Discord
 notification (`human-needed` event) the moment `(Blocked + Skipped +
@@ -247,16 +302,16 @@ Perform exactly that action, then record it. Action → side effects:
 
 | Action | What you do |
 |---|---|
-| `claim N` | 1. `"$Z_BOARD" claim <N> "$ME"` **before anything else**. Claim lost → `bun "$PACK/lib/loop.ts" claim-lost "$STATE" <N>` and re-run `next` (next ticket). 2. **Deferred commit (#133) — move the ticket to its claimed stage's status, ONLY after the claim succeeds** (a claim loser must never move a ticket, same C7 reason as the lock below): `"$Z_BOARD" move <N> <status> --slug "$SLUG"` where `<status>` mirrors the reducer's `STATUS_FOR_STAGE[stage]` — `builder`→`Building`, `qa`→`QA`, `reviewer`→`Review`. A fresh `builder` claim moves Ready→Building (the old Step 2 up-front move, now deferred to here); a resume claim at `qa`/`reviewer` is already at its stage's status, so the move is a no-op. 3. **Write the lane lock** (C7 — a claim loser never leaves a lock): `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <stage> --session "$SESSION"`. 4. Worktree (skip if it exists — a resume claim at stage qa/reviewer reuses it): `TSLUG=$(bun -e "import {slugifyTitle} from '$PACK/lib/ticket-schema.ts'; console.log(slugifyTitle(process.argv[1]))" "<title>")` then `git worktree add ".worktrees/ticket-<N>" -b "z/ticket-<N>-$TSLUG" "$BASE"`. 5. Apply: write the action JSON to a file, `bun "$PACK/lib/loop.ts" apply "$STATE" action.json` (its `claim` reducer sets the state-file status to `STATUS_FOR_STAGE[stage]`, matching the board move above). 6. Spawn the action's stage (table below). |
-| `advance N to S` | **Re-stamp the lane lock** to the new stage: `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <S> --session "$SESSION"`. Apply, then spawn stage S fresh. Before applying, read the lane's CURRENT stage from the state file: an advance to `builder` from `qa` passes the action's `note` as `qaNotes` (+ `investigateFirst`); from `reviewer`, as `reviewNotes`. |
+| `claim N` | 1. `"$Z_BOARD" claim <N> "$ME"` **before anything else**. Claim lost → `bun "$PACK/lib/loop.ts" claim-lost "$STATE" <N>` and re-run `next` (next ticket). 2. **Deferred commit (#133) — move the ticket to its claimed stage's status, ONLY after the claim succeeds** (a claim loser must never move a ticket, same C7 reason as the lock below): `"$Z_BOARD" move <N> <status> --slug "$SLUG"` where `<status>` mirrors the reducer's `STATUS_FOR_STAGE[stage]` — `builder`→`Building`, `qa`→`QA`, `reviewer`→`Review`. A fresh `builder` claim moves Ready→Building (the old Step 2 up-front move, now deferred to here); a resume claim at `qa`/`reviewer` is already at its stage's status, so the move is a no-op. 3. **Write the lane lock** (C7 — a claim loser never leaves a lock): `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <stage> --session "$SESSION"`. 4. Worktree (skip if it exists — a resume claim at stage qa/reviewer reuses it): `TSLUG=$(bun -e "import {slugifyTitle} from '$PACK/lib/ticket-schema.ts'; console.log(slugifyTitle(process.argv[1]))" "<title>")` then `git worktree add ".worktrees/ticket-<N>" -b "z/ticket-<N>-$TSLUG" "$BASE"`. 4b. **Stamp the lane's git author (#66) — every commit this lane makes must be authored by the account `gh` is authed as, not by this machine's global git identity:** `git config extensions.worktreeConfig true` then `git -C ".worktrees/ticket-<N>" config --worktree user.name "$ME"` and `git -C ".worktrees/ticket-<N>" config --worktree user.email "$ME_EMAIL"`. **WARNING — `--worktree` is load-bearing, do not drop it.** Git worktrees SHARE the main repo's `.git/config`, so the plain `git -C <worktree> config user.name` form silently rewrites the identity of the human's OWN checkout too, re-authoring their personal commits in this repo. `--worktree` scopes the write to `.git/worktrees/<name>/config.worktree`, leaving the main checkout untouched; it hard-fails unless `extensions.worktreeConfig` is on, which is why that line comes first (idempotent, additive, and safe at repo format version 0 — verified on git 2.55). Re-running on an existing worktree (a resume claim) just rewrites the same two values. 5. Apply: write the action JSON to a file, `bun "$PACK/lib/loop.ts" apply "$STATE" action.json` (its `claim` reducer sets the state-file status to `STATUS_FOR_STAGE[stage]`, matching the board move above). 6. Spawn the action's stage (table below). |
+| `advance N to S` | **Re-stamp the lane lock** to the new stage: `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <S> --session "$SESSION"`. Apply, then spawn stage S fresh. Before applying, read the lane's CURRENT stage from the state file: an advance to `builder` from `qa` passes the action's `note` as `qaNotes` (+ `investigateFirst`); from `reviewer`, as `reviewNotes`; from `builder` (the #177 commit re-spawn), as `commitNotes`. |
 | `park N Questions` | Comment the note as `## Needs input --` + the question, `"$Z_BOARD" move <N> Questions`, apply, then **remove the lane lock** (`bun "$PACK/lib/locks.ts" lane-remove --slug "$SLUG" <N>`). Tell the human in the comment which status to return the ticket to. Keep the worktree. **Notify** `human-pause` (`{ticket,title,note}`; see the Notify block below). |
-| `park N Blocked` | Comment the note (what was wrong + recommended next steps), `move <N> Blocked`, apply, remove the lane lock. **Notify** `token-burn` (`{ticket,detail:note}`) when the note begins `Dependency deadlock:` (the step-6 deadlock break); otherwise `ticket-parked` (`{ticket,title,status:"Blocked",note}`). |
+| `park N Blocked` | **First**, when the note begins `uncommitted work:` (#177's exhausted commit retry): salvage the lane worktree's uncommitted state BEFORE anything else — `git -C ".worktrees/ticket-<N>" add -A && git -C ".worktrees/ticket-<N>" diff --cached --binary HEAD > "$HOME/.zstack/projects/$SLUG/reports/uncommitted-<N>.patch"` (`add -A` so untracked files land in the patch too; the worktree is doomed, so mutating its index costs nothing). This is the ONE park whose only copy of real work is uncommitted — every other park's work is already committed on a branch, and branches are never deleted (issue #2) — and removing the lane lock below turns the worktree into an orphan the next run's reconcile scan force-removes. The note already names that patch path, so this dump is what makes the note true. Then: comment the note (what was wrong + recommended next steps), `move <N> Blocked`, apply, remove the lane lock. **Notify** `token-burn` (`{ticket,detail:note}`) when the note begins `Dependency deadlock:` (the step-6 deadlock break); otherwise `ticket-parked` (`{ticket,title,status:"Blocked",note}`). |
 | `skip N` | Comment the note (the confusion or the dead-worker evidence), `move <N> Skipped`, apply, remove the lane lock. (PROCESS.md global rule.) **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:note}`) when the note begins `Worker died mid-` (a watchdog dead-worker skip); otherwise `ticket-parked` (`{ticket,title,status:"Skipped",note}`). |
 | `stop-lane N` | A human moved #N to a stop status (Blocked/Questions/Skipped/Done) mid-run; the board already reflects it — do NOT move or comment it. Tear down the lane's background agent, remove the lane lock (`lane-remove`), keep the worktree for inspection, and apply (drops the lane, leaves the human's status). Other lanes are unaffected. |
 | `merge-gate N` | **The loop-owned green gate (#178) — the only door into the merge stage.** Run it; do NOT spawn a merge agent from this row and do NOT judge any test output yourself. Run 9's merge worker read a suite reporting 9 failures, called it green in prose, merged, and broke `$BASE` (reverted in PR #158). <br>`bun "$PACK/lib/loop.ts" merge-gate ".worktrees/ticket-<N>" --state "$STATE" --ticket <N>` <br>**Give this Bash call an explicit `timeout` of `600000` (10 min, the tool's maximum) — never the harness default of 120000ms.** It runs the full `bun test` + `bun run typecheck` in the worktree (~1 min on this repo and growing), and the contention path adds a 15s wait plus a second full gauntlet (~2-3 min worst case), so the default kills it mid-run while the maximum leaves several times the headroom. Nonzero exit is EXPECTED on a red verdict — it is the gate's answer, not a tick failure, so run it as a bare command (no `set -e` script, nothing that aborts the tick on exit 1). The command stamps the verdict on the lane, so you never parse its output: just re-run `next`, which returns `advance N to merge` on green and `park N Blocked` (carrying the gate's own note, fail count included) on red. A killed call stamps no verdict and `next` simply returns `merge-gate N` again; the second silent attempt parks the lane Blocked, so a too-short timeout costs the lane. The gate already retried once for process contention, so a red verdict is never "try again": nothing merges until a rebuild or a human makes the suite green. |
 | `check-worker N` | Is the lane's background agent still running (harness task list)? Alive → `bun "$PACK/lib/loop.ts" probe "$STATE" <N> alive`. Dead with no final message: **if the lane's stage is `merge`, do NOT probe-dead/skip** — verify PR state first (H9): `gh pr view <branch> --json state,url -q '.state'`. If `MERGED`, the PR landed before the worker died, so record it as merged (`printf 'MERGED: %s\n' "$prUrl" > msg.txt; bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`) → the reducer completes it and counts it in `mergedThisRun` (so a stacked child still retargets and the batch-end branch delete can't close its PR). If NOT merged, record `printf 'BLOCKED: merge worker died with the PR unmerged (%s)\n' "$state" > msg.txt; outcome ...` → parks it Blocked for a human, and **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:"merge worker died with the PR unmerged"}`). For any OTHER stage, dead with no final message → `probe "$STATE" <N> dead` (the next `next` returns the skip). |
 | `complete N` | The completion flow — Step 6 — then apply, then **remove the lane lock**. |
-| `wait` | Block until a background stage agent finishes (the harness notifies you) or one minute passes, then re-run `next` — the watchdog only fires if `next` is called with a fresh clock. When an agent finishes: save its final message to a file and `bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`, then update Actual (below), then re-run `next`. |
+| `wait` | Block until a background stage agent finishes (the harness notifies you) or one minute passes, then re-run `next` — the watchdog only fires if `next` is called with a fresh clock. When an agent finishes: save its final message to a file and `bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt` — a **builder** lane additionally requires the three git-fact flags (see **BUILT verification (#177)** above; the command refuses without them) — then update Actual (below), then re-run `next`. |
 | `context-clear` | The context ceiling (`contextTokenLimit`, #131) is reached, every lane is idle, and the batch still has unbuilt tickets — a mid-batch PAUSE, distinct from `drain-complete`. Apply it (a pure no-op on state). Then: release the loop lock (`bun "$PACK/lib/locks.ts" release --slug "$SLUG"`), **keep** every worktree/branch and `state.json` (the batch is un-drained — `batchTickets` still holds the unbuilt tickets), and **exit WITHOUT running Step 7 end-of-loop** (no regression, no deploy — the batch isn't done). Print the resume instruction: the operator (or harness) clears this session's context and re-invokes `/z-loop`; the fresh orchestrator reads a small context on its first tick, so the gate is open and Step 3's ingest (seeing the un-drained `state.json`, `startingFreshBatch` false) preserves `batchTickets` and resumes claiming the next flagged-but-unbuilt ticket. In-flight lanes are never cut short — `context-clear` only fires with all lanes idle. |
 | `drain-complete` | Step 7. |
 
@@ -303,15 +358,37 @@ the input file, never through your context; ticket #57, Leak 1):
    `input-<N>.json` stays EXACTLY the four blinded keys `{ticketBody,
    acceptanceCriteria, diff, worktreePath}` — `input-<N>.json`'s path is a
    constructor argument, not a key, so blindness is untouched.
-2. `bun "$PACK/lib/stage-prompts.ts" prompt <stage> "$TMP/input-<N>.json" > "$TMP/prompt-<N>.txt"`
-   (1b) — the constructor prints a POINTER prompt: small/fixed fields inline plus
-   an instruction to read `ticketBody`/`diff`/`acceptanceCriteria` from the
+2. **Stamp the spawn, then build the prompt (1b).** `<attempt>` is that lane's
+   1-based spawn count for this stage, computed from the SAME state-file bounce
+   counters used elsewhere in this step: `qa` and `reviewer` are
+   `qaBounces`/`reviewBounces` + 1 (the `qa` row below already computes this as
+   `qaPass` — reuse it), `builder` is `qaBounces + reviewBounces + commitRetries + 1`
+   (any of the three re-spawns the builder; `commitRetries` is #177's commit
+   re-spawn and is absent from a state file that never spent one — read it as 0),
+   `merge` is always `1`.
+
+   ```bash
+   TAG=$(bun "$PACK/lib/transcripts.ts" tag --slug "$SLUG" --ticket <N> --stage <stage> --attempt <attempt>)
+   bun "$PACK/lib/stage-prompts.ts" prompt <stage> "$TMP/input-<N>.json" --spawn-tag "$TAG" > "$TMP/prompt-<N>.txt"
+   ```
+
+   The tag is an opaque digest of those four facts and nothing else, so it is
+   **recomputable** — the per-stage Actual step below re-runs the identical `tag`
+   command instead of depending on `$TAG` surviving between calls. It is what lets
+   that step find this spawn's transcript deterministically (#190); skip it and
+   the stage's dollars go uncounted. Never invent a tag by hand.
+
+   The constructor prints a POINTER prompt: small/fixed fields inline plus an
+   instruction to read `ticketBody`/`diff`/`acceptanceCriteria` from the
    ABSOLUTE path of `input-<N>.json`. `prompt-<N>.txt` stays small (payload-
    independent), so reading it to spawn the Agent is cheap. The constructor is the
    contract; if it exits non-zero the input is wrong, fix the input, never
-   hand-write the prompt. The `reviewer` stage is the one exception that takes two
-   extra flags (`--adversarial-mode`, `--labels`) — see its row below; they decide
-   the super-truth fan-out and NEVER become input keys.
+   hand-write the prompt. The `reviewer` stage additionally takes two flags
+   (`--adversarial-mode`, `--labels`) — see its row below. All three ride as
+   FLAGS and NEVER become input keys, so the reviewer's four-key blindness gate is
+   untouched (the tag is a digest for that reason too: a readable
+   `<slug>/t<n>/<stage>/<attempt>` would tell the reviewer which review attempt
+   this is).
 3. Spawn a FRESH harness Agent (Agent tool), `run_in_background: true`, with
    that prompt and `model` resolved through the per-stage router (issue #82:
    the merge stage is mechanical — a PR create, a conflict check, a PR merge —
@@ -332,28 +409,47 @@ the input file, never through your context; ticket #57, Leak 1):
 
 | Stage | Input JSON fields |
 |---|---|
-| `builder` | `ticketNumber`, `ticketTitle`, `ticketBody` (fresh `gh issue view` → `"$TMP/body-<N>.md"`, injected `--rawfile`), `worktreePath` (`.worktrees/ticket-<N>`), `branch`, `baseBranch`; on a bounce also `qaNotes`/`investigateFirst` or `reviewNotes` per the advance row above. |
+| `builder` | `ticketNumber`, `ticketTitle`, `ticketBody` (fresh `gh issue view` → `"$TMP/body-<N>.md"`, injected `--rawfile`), `worktreePath` (`.worktrees/ticket-<N>`), `branch`, `baseBranch`; on a bounce also `qaNotes`/`investigateFirst`, `reviewNotes`, or `commitNotes` per the advance row above. |
 | `qa` | `ticketNumber`, `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `worktreePath`, `branch`, `qaPass` (the lane's `qaBounces` in the state file + 1), `webTarget` (true when the ticket changes a web-served surface — your judgment; QA then drives gstack /qa). |
-| `reviewer` | **BLINDED — exactly** `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `acceptanceCriteria` (the `### Acceptance Criteria` section to a file: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$TMP/body-<N>.md" > "$TMP/ac-<N>.md"`, injected `--rawfile`), `diff` (exclude lockfiles to avoid flooding the reviewer with generated code: `git -C .worktrees/ticket-<N> diff "$BASE"...HEAD -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)pnpm-lock.yaml' ':(exclude)yarn.lock' > "$TMP/diff-<N>.txt"`; if the filtered diff is empty — a lockfile-only change — fall back to the unfiltered diff: `[ ! -s "$TMP/diff-<N>.txt" ] && git -C .worktrees/ticket-<N> diff "$BASE"...HEAD > "$TMP/diff-<N>.txt"`. Injected `--rawfile` so it never enters your context), `worktreePath` = a THROWAWAY worktree of the head commit, placed under the repo's own `.worktrees/` — NEVER under `$TMP` / `~/.zstack` (issue #118: the reviewer runs the full `bun test` suite in this worktree, and several tests write to/delete real `~/.zstack` subtrees via `homedir()`; a throwaway worktree rooted there lets that suite's cleanup destroy the loop's own live state.json/locks/transcripts mid-run) — `git worktree add ".worktrees/review-<N>" <head-sha>`; remove it after the stage (`git worktree remove ".worktrees/review-<N>" --force`). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. **Adversarial control (#59):** build this stage's prompt with two extra flags — `MODE=$("$Z_BOARD" ... )` the project's `adversarialMode` (read it from `~/.zstack/projects/$SLUG/config.json`; `loadConfig` defaults it to `non-trivial`) and `LABELS=$(gh issue view <N> --json labels -q '[.labels[].name]')` (a JSON array — labels live on the GitHub issue, NOT on the board item, so `board.list` never fetched them; get them here). Then `bun "$PACK/lib/stage-prompts.ts" prompt reviewer "$TMP/input-<N>.json" --adversarial-mode "$MODE" --labels "$LABELS" > "$TMP/prompt-<N>.txt"`. The predicate (`adversarialActive`) reads the diff's own changed-line count from the blinded input — `always`/`non-trivial`-on-a-big-or-labeled diff spawns the skeptic fan-out (and stamps a `confidence=` token onto `REVIEW-FINDINGS` too); `off`/small-unlabeled is the single pass. Either way `REVIEW-APPROVE` always carries a `confidence=` token (issue #62's safety gate reads it regardless) — see `/z-loop`'s reviewer-confidence-gate section for what a sub-floor score does. Mode + labels ride as FLAGS; the four-key input JSON is untouched. |
-| `merge` | `ticketNumber`, `prTitle` (the ticket title), `branch`, `baseBranch`, `worktreePath`, `stackedOn` (from the advance action — parents whose branches this PR stacks on; the prompt carries the PROCESS.md step 18 chain rules: parents first, no branch deletion mid-batch, retarget, delete last). **You cannot reach this spawn without a green gate** — `next` only emits `advance N to merge` for a lane carrying a green `merge-gate` verdict (see that action's row), so the permission is enforced by the reducer, not by this table. The prompt still makes the agent run the gate itself as its Step 0, covering the code it is actually merging. |
+| `reviewer` | **BLINDED — exactly** `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `acceptanceCriteria` (the `### Acceptance Criteria` section to a file: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$TMP/body-<N>.md" > "$TMP/ac-<N>.md"`, injected `--rawfile`), `diff` (exclude lockfiles to avoid flooding the reviewer with generated code: `git -C .worktrees/ticket-<N> diff "$BASE"...HEAD -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)pnpm-lock.yaml' ':(exclude)yarn.lock' > "$TMP/diff-<N>.txt"`; if the filtered diff is empty — a lockfile-only change — fall back to the unfiltered diff: `[ ! -s "$TMP/diff-<N>.txt" ] && git -C .worktrees/ticket-<N> diff "$BASE"...HEAD > "$TMP/diff-<N>.txt"`. Injected `--rawfile` so it never enters your context), `worktreePath` = a THROWAWAY worktree of the head commit, placed under the repo's own `.worktrees/` — NEVER under `$TMP` / `~/.zstack` (issue #118: the reviewer runs the full `bun test` suite in this worktree, and several tests write to/delete real `~/.zstack` subtrees via `homedir()`; a throwaway worktree rooted there lets that suite's cleanup destroy the loop's own live state.json/locks/transcripts mid-run) — `git worktree add ".worktrees/review-<N>" <head-sha>`; remove it after the stage (`git worktree remove ".worktrees/review-<N>" --force`). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. **Adversarial control (#59):** build this stage's prompt with two extra flags — `MODE=$("$Z_BOARD" ... )` the project's `adversarialMode` (read it from `~/.zstack/projects/$SLUG/config.json`; `loadConfig` defaults it to `non-trivial`) and `LABELS=$(gh issue view <N> --json labels -q '[.labels[].name]')` (a JSON array — labels live on the GitHub issue, NOT on the board item, so `board.list` never fetched them; get them here). Then `bun "$PACK/lib/stage-prompts.ts" prompt reviewer "$TMP/input-<N>.json" --adversarial-mode "$MODE" --labels "$LABELS" --spawn-tag "$TAG" > "$TMP/prompt-<N>.txt"` (`--spawn-tag` per step 1b — required here like every other stage, and #190's skeptic transcripts are the reason it exists at all). The predicate (`adversarialActive`) reads the diff's own changed-line count from the blinded input — `always`/`non-trivial`-on-a-big-or-labeled diff spawns the skeptic fan-out (and stamps a `confidence=` token onto `REVIEW-FINDINGS` too); `off`/small-unlabeled is the single pass. Either way `REVIEW-APPROVE` always carries a `confidence=` token (issue #62's safety gate reads it regardless) — see `/z-loop`'s reviewer-confidence-gate section for what a sub-floor score does. Mode + labels ride as FLAGS; the four-key input JSON is untouched. |
+| `merge` | `ticketNumber`, `prTitle` (the ticket title), `branch`, `baseBranch`, `worktreePath`, `stackedOn` (from the advance action — parents whose branches this PR stacks on; the prompt carries the PROCESS.md step 18 chain rules: parents first, no branch deletion mid-batch, retarget, delete last). **You cannot reach this spawn without a green gate** — `next` only emits `advance N to merge` for a lane carrying a green `merge-gate` verdict (see that action's row), so the permission is enforced by the reducer, not by this table. The prompt still makes the agent run the gate itself as its Step 0 — the STAMPING form, so a post-conflict re-gate lands on the lane too — covering the code it is actually merging. |
 
 **Per-stage Actual (every stage, no exceptions):** when a stage agent finishes,
-copy its transcript jsonl into
-`"$STATE_DIR/transcripts/ticket-<N>/<stage>-<attempt>.jsonl"` (the harness
-writes session transcripts under `~/.claude/projects/`; take the file for that
-spawn) — never an unnamed/default filename. `<stage>` is one of
-`builder`/`qa`/`reviewer`/`merge`; `<attempt>` is that lane's 1-based spawn
-count for the stage, taken from the SAME state-file bounce counters this step
-already reads elsewhere: `qa` and `reviewer` are `qaBounces`/`reviewBounces` + 1
-(the `qa` row above already computes this as `qaPass` — reuse it, don't
-recompute), `builder` is `qaBounces + reviewBounces + 1` (either bounce type
-re-spawns builder, so its attempt count is the sum + the initial spawn), and
-`merge` is always `1` (it never bounces back to builder). This deterministic
-naming is what lets the end-of-loop spend-by-stage table (Step 7a item 5)
-attribute dollars per stage instead of only per ticket. Then price the
-ticket's whole directory — the glob accumulates every stage so far, and z-cost
-dedupes by requestId, so its total IS the cumulative and you never add dollars
-in prose:
+collect its transcripts with `lib/transcripts.ts` — never by picking files
+yourself. Recompute the same tag the spawn was stamped with (step 1b above; same
+four facts, same digest), then collect:
+
+```bash
+TAG=$(bun "$PACK/lib/transcripts.ts" tag --slug "$SLUG" --ticket <N> --stage <stage> --attempt <attempt>)
+bun "$PACK/lib/transcripts.ts" collect --tag "$TAG" \
+  --dest "$STATE_DIR/transcripts/ticket-<N>" --name "<stage>-<attempt>" >/dev/null
+```
+
+`collect` finds the stage agent by its stamped tag and copies **it plus every
+sub-agent it spawned, transitively** — `<stage>-<attempt>.jsonl` for the stage
+itself and `<stage>-<attempt>-sub-<agentId>.jsonl` for each descendant. `<stage>`
+is one of `builder`/`qa`/`reviewer`/`merge` (the `tag` verb rejects anything else,
+since only those four have a spend-by-stage row); `<attempt>` is the same 1-based
+spawn count step 1b computed. Sub-agents are the
+whole point (#190): the adversarial reviewer spawns 3 skeptics whose tokens ARE
+reviewer spend, and the old prose here said "take the file for that spawn" — a
+latent step, so they were collected by nobody and every adversarial review's
+Actual undercounted by most of what it spent. Do NOT sweep by modification time:
+three lanes run concurrently, so sibling reviewers' skeptics interleave in one
+flat directory, and that sweep gave a reviewer with 3 skeptics 8 transcripts.
+
+It exits non-zero rather than writing a partial set — a missing stage transcript
+is exactly the silent undercount #190 filed. If it fails, the tag never reached
+the agent (step 1b was skipped, or `<attempt>` disagrees between the two calls):
+say so in the completion note instead of guessing a number, price whatever the
+directory does hold, and keep the drain moving.
+
+Then price the ticket's whole directory — the glob accumulates every stage so far,
+and z-cost dedupes by requestId, so its total IS the cumulative and you never add
+dollars in prose. This deterministic naming is also what lets the end-of-loop
+spend-by-stage table (Step 7a item 5) attribute dollars per stage instead of only
+per ticket (`stageOfFile` splits on the first `-`, so a `-sub-` file buckets under
+the stage that spawned it):
 
 ```bash
 ACTUAL=$("$Z_COST" --json "$STATE_DIR/transcripts/ticket-<N>/*.jsonl" | jq -r .total)
@@ -479,10 +575,14 @@ PLAN=$(bun "$PACK/lib/endloop.ts" plan "$TMP/regression.json" "$LOOP_COUNT" "$AU
 ```
 
 **3a. Red path** (`$PLAN` is `["file-bugs","report"]`) — every finding becomes
-a Backlog bug, NO deploy Skill is ever invoked:
+a Backlog bug, NO deploy Skill is ever invoked. Iterate
+`bun "$PACK/lib/endloop.ts" findings "$TMP/regression.json"`, NEVER
+`regression.json`'s raw `.findings` directly -- a red verdict with an empty
+`findings[]` (a gate-wiring anomaly, not a real "nothing to file") degrades to
+one generic bug there instead of this step silently doing nothing (issue #151):
 
 ```bash
-jq -c '.findings[]' "$TMP/regression.json" | while read -r FINDING; do
+bun "$PACK/lib/endloop.ts" findings "$TMP/regression.json" | jq -c '.[]' | while read -r FINDING; do
   echo "$FINDING" > "$TMP/finding.json"
   bun "$PACK/lib/endloop.ts" bug "$TMP/finding.json" regression "$LOOP_COUNT" > "$TMP/bug.json"
   jq -r .body "$TMP/bug.json" > "$TMP/bug-body.md"
@@ -606,14 +706,20 @@ Two lock kinds live under `$LOCKS` (`~/.zstack/projects/<slug>/locks/`):
 > cross-machine claim needs shared board-held state (a claim marker both loops
 > check), which is deliberately out of scope for this remediation (issue #14 C8).
 > Run one loop per (login, project) at a time; if you must parallelize, use
-> distinct logins or distinct projects.
+> distinct logins or distinct projects. A dedicated bot GitHub identity per
+> loop (issue #66; see docs/user-guide/bot-identity.md and z-setup/SKILL.md
+> Step 7) is the supported way to get that distinct login without creating a
+> second human account -- it does not add cross-machine coordination (a
+> second loop under a DIFFERENT bot login still needs a distinct project, or
+> the same race above), it just makes "distinct logins" cheap and
+> attributable instead of a spare personal account.
 
 **Startup, without `--reconcile`:** if `loop.lock` is live → refuse (name the
 session). If it is stale, or any orphans exist (lane locks with no running loop,
 worktrees with no lock, Building tickets with neither) → refuse and tell the
 human to re-run with `--reconcile`.
 
-**Startup, with `--reconcile`:** `bun "$PACK/lib/reconcile.ts" apply --slug "$SLUG"`
+**Startup, with `--reconcile`:** `bun "$PACK/lib/reconcile.ts" apply --slug "$SLUG" --session "$SESSION"`
 first clears the wedge, then the loop starts normally. Reconcile:
 
 - **releases claims** — `z-board release <N>` unassigns the ticket so it can be

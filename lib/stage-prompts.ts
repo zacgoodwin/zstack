@@ -26,6 +26,31 @@ import { ADVERSARIAL_MODES, DEFAULT_ADVERSARIAL_MODE, ZError, type AdversarialMo
 // owns the prompt-side adversarial helpers (config.ts is the definitional home).
 export type { AdversarialMode } from "./config.ts";
 
+// -- spawn tag (#190) ----------------------------------------------------------
+
+// The orchestrator never learns the agent id the harness assigns to a spawn, so
+// a stage's own transcript is only findable by a token guaranteed to appear in
+// its first user message. This is that token's marker; lib/transcripts.ts
+// searches for it. Defined HERE, in the module that emits it, so the format has
+// exactly one definition (the reader imports this constant).
+export const SPAWN_TAG_MARKER = "zstack-spawn:";
+
+// One inert line, prepended to every stage prompt when a tag is supplied. An
+// HTML comment so no worker reads it as an instruction, and FIRST so the reader
+// finds it inside a bounded prefix of the transcript's opening line instead of
+// loading a multi-megabyte file.
+//
+// Omitted (or empty) renders "", which keeps every prompt BYTE-IDENTICAL to
+// pre-#190 -- that is what lets tests/reviewer-single-pass.golden.txt stand
+// unregenerated, and it is a positional scalar arg, never an input key, so the
+// reviewer's exact-four-key blindness gate is untouched. The tag's own value is
+// an opaque digest for the same reason (see spawnTag in lib/transcripts.ts): a
+// readable <slug>/t<n>/<stage>/<attempt> would tell the blinded reviewer which
+// review ATTEMPT this is.
+function spawnStamp(tag: string | undefined): string {
+  return tag ? `<!-- ${SPAWN_TAG_MARKER} ${tag} (orchestrator bookkeeping; ignore) -->\n` : "";
+}
+
 // -- builder ------------------------------------------------------------------
 
 export interface BuilderPromptInput {
@@ -37,20 +62,28 @@ export interface BuilderPromptInput {
   baseBranch: string;
   qaNotes?: string; // present on a QA bounce-back
   reviewNotes?: string; // present on a reviewer bounce-back
+  commitNotes?: string; // #177: present on a builder->builder re-spawn (BUILT shipped nothing)
   investigateFirst?: boolean; // second QA bounce: root-cause before touching code
 }
 
 // Derived from docs/user-guide/spec/WORKER SAMPLE.md (unattended discipline, exit
 // contract, anti-loophole) and PRINCIPLES.md (ponytail ladder, tests + evals +
 // docs in the same diff, latent vs deterministic).
-export function builderPrompt(i: BuilderPromptInput, inputPath: string): string {
+export function builderPrompt(i: BuilderPromptInput, inputPath: string, tag?: string): string {
   const bounce = i.qaNotes
     ? `\n## QA findings from the previous pass\n\n${i.investigateFirst ? "Bugs survived a rebuild once already. Run the /investigate skill on these findings FIRST and root-cause them before changing any code -- a symptom patch here earns a third strike and blocks the ticket.\n\n" : ""}Read the findings you must address from \`qaNotes\` in ${inputPath}.\n`
     : "";
   const review = i.reviewNotes
     ? `\n## Reviewer findings to address\n\nRead them from \`reviewNotes\` in ${inputPath}.\n`
     : "";
-  return `You are the BUILDER for ticket #${i.ticketNumber}: "${i.ticketTitle}", running UNATTENDED inside the zstack dev loop. No user is available -- never ask a question, never wait for input; decide or exit via the contract below.
+  // #177: this lane's previous builder reported BUILT with nothing on the branch.
+  // Stated up front, before the ticket body, because the work may already be done
+  // and sitting uncommitted in the worktree -- rebuilding it from scratch would be
+  // the wrong move.
+  const commit = i.commitNotes
+    ? `\n## Your predecessor on this lane shipped nothing\n\nRead what the pre-advance guard found from \`commitNotes\` in ${inputPath}. Start by inspecting the worktree (\`git status\`, \`git log ${i.baseBranch}..HEAD\`): finish and COMMIT whatever is already there rather than rebuilding it, and only build from scratch if the worktree is genuinely empty. A BUILT is not accepted until the tree is clean and the branch carries at least one commit.\n`
+    : "";
+  return `${spawnStamp(tag)}You are the BUILDER for ticket #${i.ticketNumber}: "${i.ticketTitle}", running UNATTENDED inside the zstack dev loop. No user is available -- never ask a question, never wait for input; decide or exit via the contract below.
 
 ## Workspace
 - Worktree: ${i.worktreePath} -- work ONLY here. Other lanes run in sibling worktrees; never read or write outside your own.
@@ -58,7 +91,7 @@ export function builderPrompt(i: BuilderPromptInput, inputPath: string): string 
 
 ## Ticket
 Read your full ticket body (Context, Plan, Acceptance Criteria, Tests + evals, Docs pages touched, Out of scope) from ${inputPath} -- field \`ticketBody\` -- before doing anything else. That body is the contract for this build.
-${bounce}${review}
+${bounce}${review}${commit}
 ## Discipline
 - Ponytail ladder before writing any code: does it need to exist at all; does this codebase already have it; does the stdlib/platform/an installed dep cover it; can it be one line -- only then write the minimum that works. Smallest correct diff, full scope.
 - If the ticket has a \`## Files\` section, it is the map -- start from those paths instead of searching.
@@ -69,7 +102,7 @@ ${bounce}${review}
 - Do not edit the issue body, comment on issues, close issues, or expand scope beyond the ticket.
 
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
-BUILT: <one-line summary>            all acceptance criteria pass, tests green in the worktree, work committed on ${i.branch}
+BUILT: <one-line summary>            all acceptance criteria pass, tests green in the worktree, work committed on ${i.branch} -- VERIFIED before the lane advances: \`git status --porcelain\` empty AND HEAD off ${i.baseBranch}. A BUILT with work still uncommitted sends this lane straight back to you.
 NEEDS-INPUT: <the exact question>    a human decision is required; stop immediately, commit nothing half-wired
 BLOCKED: <reason>                    cannot proceed (broken dependency, failing environment) after a real attempt
 CONFUSED: <what makes no sense>      the ticket cannot be understood as written`;
@@ -88,11 +121,11 @@ export interface QaPromptInput {
 
 // PROCESS.md steps 11-16: functional + technical, as a fresh context that
 // distrusts the builder's own claims.
-export function qaPrompt(i: QaPromptInput, inputPath: string): string {
+export function qaPrompt(i: QaPromptInput, inputPath: string, tag?: string): string {
   const web = i.webTarget
     ? "\n- This ticket has a web-facing target: use the gstack /qa skill -- spin the site up and drive it as a real user. UI claims without a driven browser check do not count as verified."
     : "";
-  return `You are the QA stage for ticket #${i.ticketNumber} (QA pass ${i.qaPass}), running UNATTENDED in a fresh context inside the zstack dev loop. You did not build this; trust nothing you cannot execute yourself. No user is available -- use your judgment or exit via the contract below.
+  return `${spawnStamp(tag)}You are the QA stage for ticket #${i.ticketNumber} (QA pass ${i.qaPass}), running UNATTENDED in a fresh context inside the zstack dev loop. You did not build this; trust nothing you cannot execute yourself. No user is available -- use your judgment or exit via the contract below.
 
 ## Workspace
 - Worktree: ${i.worktreePath}, branch ${i.branch}. Execute here freely. Do NOT fix anything -- report; the rebuild is the builder's job in a fresh spawn.
@@ -197,15 +230,36 @@ export function adversarialActive(mode: AdversarialMode, diffLineCount: number, 
 // additionally folds in the super-truth skeptic fan-out and stamps the same
 // token onto REVIEW-FINDINGS too. The token rides inside the marker's note, so
 // loop.ts's marker regex parses it unchanged regardless of branch.
-export function reviewerPrompt(input: ReviewerPromptInput, inputPath: string, adversarial: boolean = false): string {
+export function reviewerPrompt(input: ReviewerPromptInput, inputPath: string, adversarial: boolean = false, tag?: string): string {
   assertReviewerInput(input);
   // ponytail: N=3 skeptics is a fixed ceiling (no config knob this ticket); a
   // per-project skeptic count is a follow-on if 3 proves too few/many.
+  //
+  // #191: three failure modes were measured in loop run 10, all from the same
+  // gap -- the block described the happy path (three verdicts arrive) and said
+  // nothing about what to do when fewer do. Reviewers hung waiting on a skeptic
+  // that never reported, ended a turn with no marker at all (parsed as CONFUSED,
+  // which SKIPS the ticket), or reported confidence=100 with no verdicts in hand,
+  // which the #62 gate then read as three independent agreements and merged on.
+  // Delivery is best-effort by nature (a sub-agent can die or time out), so the
+  // fix is to make the DENOMINATOR mandatory and machine-readable rather than to
+  // pretend delivery is reliable: `skeptics=<k>/3` is what lib/loop.ts's quorum
+  // gate reads. The k-to-confidence mapping is given as a lookup table, never a
+  // formula -- arithmetic in a model reply is exactly what PRINCIPLES.md forbids,
+  // and for k <= 3 the whole space is nine entries.
   const superTruth = adversarial
     ? `
 ## Super-truth pass (adversarial mode active)
 This card's blast radius earned an adversarial review; do NOT trust your single read. Spawn 3 INDEPENDENT skeptic sub-agents with the Agent tool -- nested \`claude -p\` is denied by the classifier, so use the Agent tool, not headless claude. Give each skeptic ONLY the four inputs you were given (this ticket, the acceptance criteria, the diff, the throwaway worktree); they are blinded exactly as you are. Task each one to REFUTE that the diff satisfies the acceptance criteria: find the one criterion it violates, the edge it breaks, a test that passes without the change. They work in isolation -- no skeptic sees another's verdict.
-Reconcile the three verdicts into an aggregated confidence 0-100: the percentage of skeptics that could NOT refute the diff (3/3 unrefuted = 100, 2/3 = 67, 1/3 = 33, 0/3 = 0). A criterion any skeptic refutes with concrete evidence is a finding, not a vote to be outnumbered -- surface it. Report the confidence in your exit marker below.
+
+Delivery is BEST-EFFORT and you must report how many verdicts arrived. A skeptic can die, time out, or come back with nothing usable; that is a delivery race, not evidence about the diff. Check for outstanding verdicts AT MOST ONCE per skeptic, then stop waiting and reconcile the \`k\` verdicts you actually hold (0 <= k <= 3). Do not spawn replacements. Do NOT end your turn without one of the exit markers below -- a final message with no marker is parsed as CONFUSED and SKIPS this ticket, which is the worst outcome available to you.
+
+Report BOTH tokens in your marker: \`skeptics=<k>/3\` -- the number of verdicts you actually received -- and \`confidence=<0-100>\`, the share of THOSE k that could not refute the diff. Read it off this table; do no arithmetic:
+- k=3: 3 unrefuted -> 100, 2 -> 67, 1 -> 33, 0 -> 0
+- k=2: 2 unrefuted -> 100, 1 -> 50, 0 -> 0
+- k=1: 1 unrefuted -> 100, 0 -> 0
+- k=0: nobody looked. Report \`skeptics=0/3\` and, as the confidence, YOUR OWN single-pass certainty that every criterion holds -- never 100, which would claim three independent agreements that never happened.
+A criterion any skeptic refutes with concrete evidence is a finding, not a vote to be outnumbered -- surface it. An honest low \`k\` costs this card one more review pass; an inflated one merges a diff nobody refuted, so report the number you actually have.
 `
     : "";
   // REVIEW-FINDINGS' confidence token rides inside the marker's note only on
@@ -216,7 +270,12 @@ Reconcile the three verdicts into an aggregated confidence 0-100: the percentage
   // confidence=<0-100> token below -- self-assessed on a single pass,
   // aggregated across skeptics when the super-truth pass ran.
   const conf = adversarial ? "confidence=<0-100> " : "";
-  return `You are an ADVERSARIAL REVIEWER in a fresh context, running UNATTENDED inside the zstack dev loop. You are blinded by design: your ONLY inputs are the ticket, its acceptance criteria, the diff, and a throwaway worktree of the head commit. There is no PR description, no plan rationale, no builder or QA transcript -- and any claim you cannot verify from these inputs yourself is unverified. Your job is to find the reasons this diff should NOT merge.
+  // #191's denominator token, adversarial-only for the same reason the fan-out
+  // is: with no skeptics there is no `k` to report, and a single-pass prompt that
+  // demanded one would invite an invented number. So the inactive branch stays
+  // byte-identical (reviewer-single-pass.golden.txt).
+  const skept = adversarial ? "skeptics=<k>/3 " : "";
+  return `${spawnStamp(tag)}You are an ADVERSARIAL REVIEWER in a fresh context, running UNATTENDED inside the zstack dev loop. You are blinded by design: your ONLY inputs are the ticket, its acceptance criteria, the diff, and a throwaway worktree of the head commit. There is no PR description, no plan rationale, no builder or QA transcript -- and any claim you cannot verify from these inputs yourself is unverified. Your job is to find the reasons this diff should NOT merge.
 
 ## Your inputs (read from the file -- do not look anywhere else)
 Read \`ticketBody\`, \`acceptanceCriteria\`, and \`diff\` from ${inputPath}. That file holds EXACTLY those three fields plus this worktree path and nothing else -- no PR description, no plan rationale, no builder or QA transcript reaches you. The acceptance criteria are the independent yardstick, authored before the implementation; hold the diff to them as written.
@@ -232,8 +291,8 @@ Run the typecheck and the tests this diff touches here. Nothing you do in it lan
 - Security holes at trust boundaries; data-loss edges; error paths that swallow failures.
 ${superTruth}
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
-REVIEW-APPROVE: confidence=<0-100> <one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green -- confidence is your certainty every criterion holds (aggregated per the super-truth pass above when it ran); a score below the project's configured floor will NOT merge
-REVIEW-FINDINGS: ${conf}<numbered findings>          each with file:line and why it blocks the merge
+REVIEW-APPROVE: confidence=<0-100> ${skept}<one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green -- confidence is your certainty every criterion holds (aggregated per the super-truth pass above when it ran); a score below the project's configured floor will NOT merge
+REVIEW-FINDINGS: ${conf}${skept}<numbered findings>          each with file:line and why it blocks the merge
 NEEDS-HUMAN: <the judgment call>              a genuine spec ambiguity a human must settle
 BLOCKED: <reason>                             the throwaway worktree is unusable -- can't check out or execute the diff at all
 CONFUSED: <what makes no sense>`;
@@ -273,12 +332,12 @@ export interface MergePromptInput {
   stackedOn: number[]; // parent tickets in this batch (PROCESS.md step 18)
 }
 
-export function mergePrompt(i: MergePromptInput, inputPath: string): string {
+export function mergePrompt(i: MergePromptInput, inputPath: string, tag?: string): string {
   const stacked = i.stackedOn.length
     ? `\n## Stacked chain (PROCESS.md step 18 -- order is not optional)
 This branch stacks on ticket(s) #${i.stackedOn.join(", #")}. Their PRs merge FIRST, each WITHOUT deleting its branch (deleting a base branch closes every dependent PR). After each parent lands, retarget this PR to ${i.baseBranch} (gh pr edit --base ${i.baseBranch}). Delete branches only after the whole batch has landed.\n`
     : "";
-  return `You are the MERGE stage for ticket #${i.ticketNumber}, running UNATTENDED inside the zstack dev loop. QA and adversarial review have both passed; your job is to land the branch cleanly.
+  return `${spawnStamp(tag)}You are the MERGE stage for ticket #${i.ticketNumber}, running UNATTENDED inside the zstack dev loop. QA and adversarial review have both passed; your job is to land the branch cleanly.
 
 ## Workspace
 - Worktree: ${i.worktreePath}, branch ${i.branch}, base ${i.baseBranch}.
@@ -381,6 +440,9 @@ const USAGE = `stage-prompts <command> [args]
   prompt reviewer <input.json> [--adversarial-mode <off|non-trivial|always>] [--labels <json-array>]
                                                     print the reviewer prompt; the flags decide the
                                                     super-truth fan-out deterministically (diff size + labels + mode)
+  ... [--spawn-tag <tag>]                           any stage: stamp an inert first line naming this spawn, so
+                                                    \`transcripts collect\` can find the agent's own transcript
+                                                    (\`transcripts tag\` prints the value). Omitted -> no stamp.
   note <input.json>                                 print the completion note (CompletionNoteInput)
   plan-edges <edges.json>                           print the plan-time "Needs input" edges comment
                                                     (CompletionEdge[]); prints nothing for an empty list`;
@@ -391,13 +453,20 @@ export function main(argv: string[]): number {
     console.log(USAGE);
     return cmd ? 0 : 1;
   }
-  // Shared CLI plumbing (lib/cli.ts): the reviewer's two optional flags
-  // (--adversarial-mode, --labels) split out here, positionals keep their order.
-  const { positionals, flags } = parseFlags(argv.slice(1));
   try {
+    // Shared CLI plumbing (lib/cli.ts): the reviewer's two optional flags
+    // (--adversarial-mode, --labels) split out here, positionals keep their
+    // order. Moved inside the try (issue #156): parseFlags can now throw a
+    // loud ZError on a trailing value-flag, and that needs the same
+    // handleCliError epilogue every other usage error in this function gets,
+    // not an uncaught throw out of main().
+    const { positionals, flags } = parseFlags(argv.slice(1));
     if (cmd === "prompt") {
       const stage = positionals[0];
       const path = positionals[1];
+      // #190: absent -> spawnStamp renders "" and the prompt is byte-identical
+      // to pre-#190, so an operator building a prompt by hand loses nothing.
+      const spawnTagFlag = str(flags, "spawn-tag");
       if (!stage || !path) throw new ZError("Usage: stage-prompts prompt <builder|qa|reviewer|merge> <input.json>");
       let input: any;
       try {
@@ -438,10 +507,12 @@ export function main(argv: string[]): number {
         const active = adversarialActive(mode, countDiffLines(typeof input.diff === "string" ? input.diff : ""), labels);
         // Pointer prompt (ticket #57): reviewer reads its payload from the input
         // file by ABSOLUTE path; the flag-derived `active` selects the fan-out.
-        console.log(reviewerPrompt(input, resolve(path), active));
+        // --spawn-tag (#190) is a fourth POSITIONAL scalar, same as mode/labels:
+        // it never enters the blinded four-key input JSON.
+        console.log(reviewerPrompt(input, resolve(path), active, spawnTagFlag));
         return 0;
       }
-      const builders: Record<string, (i: any, inputPath: string) => string> = {
+      const builders: Record<string, (i: any, inputPath: string, tag?: string) => string> = {
         builder: builderPrompt,
         qa: qaPrompt,
         merge: mergePrompt,
@@ -450,7 +521,7 @@ export function main(argv: string[]): number {
       if (!build) throw new ZError(`Unknown stage "${stage}". Valid: builder, qa, reviewer, merge.`);
       // The pointer prompt references this input file by ABSOLUTE path, so the
       // worker (a fresh Agent with its own CWD) resolves it unambiguously.
-      console.log(build(input, resolve(path)));
+      console.log(build(input, resolve(path), spawnTagFlag));
       return 0;
     }
     if (cmd === "note") {

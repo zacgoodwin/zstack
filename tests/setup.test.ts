@@ -638,7 +638,7 @@ describe("SetupBoard.apply — pre-flight input validation (F9)", () => {
     expect(backend.calls).toEqual([]); // nothing reached the backend, mutation or read
   });
 
-  // -- issue #82 (AC6): stageModels default only for a brand-new project ------
+  // -- issue #82, revised by #156: stageModels default on created AND adopted
   test("a brand-new project's config includes the stageModels default and passes validateConfig", async () => {
     const backend = setupBackend();
     const setup = new SetupBoard(backend.exec);
@@ -648,35 +648,32 @@ describe("SetupBoard.apply — pre-flight input validation (F9)", () => {
     expect(() => validateConfig(result.config)).not.toThrow();
   });
 
-  // Re-running setup against an existing config (adoption) never touches
-  // stageModels -- neither injecting the default nor stripping a key the
-  // config didn't have. Simulates a config written BEFORE this ticket (no
-  // stageModels key at all): a second apply/write against the now-existing
-  // project must leave the file byte-identical. Also issue #97 AC2 (no-drift
-  // re-run over a prior config carrying none of the four preserved optional
-  // fields stays byte-identical): the second apply() now reads this SAME
-  // `home`'s config.json (via buildConfig's priorOptionalFields), so this test
-  // doubles as proof that reading it back injects nothing new.
-  test("re-running setup against an existing config without stageModels leaves it byte-identical", async () => {
+  // Issue #156: adopting an existing project whose on-disk config predates
+  // this knob (no stageModels key at all, the shape a config written before
+  // #156 would have) now gets the SAME default a brand-new project gets --
+  // it used to be left out entirely on the adopt path (created === false),
+  // a latent inconsistency between created and adopted config.json if the
+  // pack default ever changed. The runtime `resolveStageModel` fallback in
+  // lib/loop.ts is untouched; this is only about what buildConfig writes.
+  test("adopting an existing project without stageModels gets the same default a brand-new project gets", async () => {
     const backend = setupBackend();
     const setup = new SetupBoard(backend.exec);
     const home = testHome();
 
     // First run creates the project; strip stageModels to simulate a config
     // that predates this ticket, then write it -- the "existing config
-    // without the key" AC6 names.
+    // without the key" scenario.
     const first = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
     delete (first.config as any).stageModels;
     const path = writeConfig(first.config, home);
-    const before = readFileSync(path, "utf8");
 
     // Second run adopts the now-existing project (created === false) and reads
     // the file just written above from the same `home`.
     const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
     expect(second.created).toBe(false);
-    expect(second.config.stageModels).toBeUndefined(); // adoption never injects the default
+    expect(second.config.stageModels).toEqual({ merge: "haiku" }); // adoption now injects the default too
     writeConfig(second.config, home);
-    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(JSON.parse(readFileSync(path, "utf8")).stageModels).toEqual({ merge: "haiku" });
   });
 
   // -- issue #97 AC1: a re-apply that genuinely rewrites the config (the board
@@ -720,6 +717,40 @@ describe("SetupBoard.apply — pre-flight input validation (F9)", () => {
     expect(written.adversarialMode).toBe("always");
   });
 
+  // -- issue #66: a re-apply must never silently drop a recorded identity
+  // choice. Without this, any board-shape-drift re-apply of /z-setup after
+  // the owner answered the identity step (a separate SKILL.md step from this
+  // GraphQL-driven apply) would wipe it back to "unset" and force a
+  // re-prompt -- same hazard issue #97 already closed for the other four
+  // optional fields, same fix shape.
+  test("a re-apply over a drifted board preserves a hand-recorded identity choice (issue #66)", async () => {
+    const backend = setupBackend();
+    const setup = new SetupBoard(backend.exec);
+    const home = testHome();
+
+    const first = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
+    const withIdentity: BoardConfig = {
+      ...first.config,
+      identity: { mode: "bot", recordedAt: "2026-07-29T00:00:00.000Z", tokenLocation: "GH_TOKEN env var" },
+    };
+    writeConfig(withIdentity, home);
+
+    // Force board-shape drift so apply()'s mutation loop -- and therefore a
+    // real buildConfig/writeConfig, not the common no-op re-run -- executes.
+    backend.project!.fields.find((f) => f.name === "Model")!.options = ["haiku", "sonnet", "opus"];
+
+    const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
+    expect(second.actions.some((a) => a.kind === "set-field-options" && a.name === "Model")).toBe(true);
+    expect(second.config.identity).toEqual({
+      mode: "bot",
+      recordedAt: "2026-07-29T00:00:00.000Z",
+      tokenLocation: "GH_TOKEN env var",
+    });
+
+    const path = writeConfig(second.config, home);
+    expect(JSON.parse(readFileSync(path, "utf8")).identity).toEqual(second.config.identity);
+  });
+
   // -- issue #97 AC3: first-time setup, no prior config.json on disk at all --
   test("first-time setup with no prior config.json tolerates the absent file (no crash, unchanged default)", async () => {
     const backend = setupBackend();
@@ -731,6 +762,7 @@ describe("SetupBoard.apply — pre-flight input validation (F9)", () => {
     expect(result.config.stageModels).toEqual({ merge: "haiku" });
     expect(result.config.notifications).toBeUndefined();
     expect(result.config.adversarialMode).toBeUndefined();
+    expect(result.config.identity).toBeUndefined(); // issue #66: no choice recorded yet
     expect(() => writeConfig(result.config, home)).not.toThrow();
   });
 
@@ -746,7 +778,7 @@ describe("SetupBoard.apply — pre-flight input validation (F9)", () => {
 
     const second = await setup.apply("zacgoodwin", "zstack", { slug: "zstack", title: "zstack", home });
     expect(second.config.quota).toEqual({ threshold: 100, mode: "sleep" }); // fresh default, nothing preserved
-    expect(second.config.stageModels).toBeUndefined(); // adoption path -- no default injected either
+    expect(second.config.stageModels).toEqual({ merge: "haiku" }); // issue #156: default written on adopt too
   });
 
   // Reviewer finding 1 (blocker): a validly-parsed JSON value whose SHAPE is
@@ -1109,6 +1141,50 @@ describe("validateConfig", () => {
     });
   });
 
+  // -- issue #66: the owner's recorded bot-vs-human-account identity choice ---
+  describe("identity (issue #66)", () => {
+    test("rejects a bad identity.mode, naming the field and the valid set", () => {
+      const cfg = goodConfig() as any;
+      cfg.identity = { mode: "owner", recordedAt: "2026-07-29T00:00:00.000Z" };
+      expect(() => validateConfig(cfg)).toThrow(/identity\.mode.*"bot" or "human"/);
+    });
+
+    test("rejects a missing or empty recordedAt", () => {
+      const cfg = goodConfig() as any;
+      cfg.identity = { mode: "bot" };
+      expect(() => validateConfig(cfg)).toThrow(/identity\.recordedAt/);
+      cfg.identity.recordedAt = "";
+      expect(() => validateConfig(cfg)).toThrow(/identity\.recordedAt/);
+    });
+
+    test("rejects a non-string tokenLocation when present, but tokenLocation itself is optional", () => {
+      const cfg = goodConfig() as any;
+      cfg.identity = { mode: "bot", recordedAt: "2026-07-29T00:00:00.000Z", tokenLocation: 5 };
+      expect(() => validateConfig(cfg)).toThrow(/identity\.tokenLocation/);
+      delete cfg.identity.tokenLocation;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    test("accepts a valid identity for both modes and is optional (absent stays absent, never defaulted)", () => {
+      const cfg = goodConfig() as any;
+      for (const mode of ["bot", "human"]) {
+        cfg.identity = { mode, recordedAt: "2026-07-29T00:00:00.000Z" };
+        expect(() => validateConfig(cfg)).not.toThrow();
+      }
+      delete cfg.identity;
+      expect(() => validateConfig(cfg)).not.toThrow();
+      expect(cfg.identity).toBeUndefined(); // never defaulted, unlike e.g. quota/adversarialMode
+    });
+
+    test("a non-object identity (including a bare array) fails", () => {
+      const cfg = goodConfig() as any;
+      cfg.identity = "bot";
+      expect(() => validateConfig(cfg)).toThrow(/"identity" must be an object/);
+      cfg.identity = ["bot"];
+      expect(() => validateConfig(cfg)).toThrow(/"identity" must be an object/);
+    });
+  });
+
   // -- issue #58: the tick-throttle pacing knob --------------------------------
   describe("tickThrottleSeconds (issue #58)", () => {
     // AC3: 0 -- the required "off" value -- must NOT be rejected the way
@@ -1185,6 +1261,28 @@ describe("validateConfig", () => {
       cfg.maxReviewBounces = 4;
       expect(() => validateConfig(cfg)).not.toThrow();
       delete cfg.maxReviewBounces;
+      expect(() => validateConfig(cfg)).not.toThrow();
+    });
+  });
+
+  // -- issue #191: the skeptic-delivery quorum knob ----------------------------
+  describe("minSkepticQuorum (issue #191)", () => {
+    // Bounded on BOTH ends, unlike maxReviewBounces: it is a quorum over a fixed
+    // 3-skeptic fan-out, so 4 could never be met and would park every adversarial
+    // review Blocked. 0 is the documented "disable" value.
+    test.each([4, 10, -1, 1.5, NaN, "2"])("rejects %p, naming the field and the 0-3 integer rule", (bad) => {
+      const cfg = goodConfig() as any;
+      cfg.minSkepticQuorum = bad;
+      expect(() => validateConfig(cfg)).toThrow(/"minSkepticQuorum" must be an integer 0-3 \(0 disables the gate\)/);
+    });
+
+    test("accepts 0 through 3 and is optional", () => {
+      const cfg = goodConfig() as any;
+      for (const ok of [0, 1, 2, 3]) {
+        cfg.minSkepticQuorum = ok;
+        expect(() => validateConfig(cfg)).not.toThrow();
+      }
+      delete cfg.minSkepticQuorum;
       expect(() => validateConfig(cfg)).not.toThrow();
     });
   });
@@ -1393,6 +1491,20 @@ describe("loadConfig deep validation", () => {
     expect(loadConfig("zstack", home).maxReviewBounces).toBe(5);
   });
 
+  // -- issue #191: minSkepticQuorum end to end through loadConfig -------------
+  test("#191: minSkepticQuorum above the 3-skeptic fan-out, negative, or fractional fails loadConfig", () => {
+    for (const bad of [4, -1, 1.5]) {
+      const home = writeRaw("zstack", validRawConfig({ minSkepticQuorum: bad }));
+      expect(() => loadConfig("zstack", home)).toThrow(/"minSkepticQuorum" must be an integer 0-3 \(0 disables the gate\)/);
+    }
+  });
+
+  test("#191: minSkepticQuorum absent -> loadConfig defaults it to 2, and an explicit 0 survives", () => {
+    expect(loadConfig("zstack", writeRaw("zstack", validRawConfig())).minSkepticQuorum).toBe(2);
+    // 0 disables the gate, so it must NOT be swallowed by the ?? default.
+    expect(loadConfig("zstack", writeRaw("zstack", validRawConfig({ minSkepticQuorum: 0 }))).minSkepticQuorum).toBe(0);
+  });
+
   // -- issue #58: tickThrottleSeconds default-and-override through loadConfig --
   test("AC1: tickThrottleSeconds absent -> loadConfig defaults it to 0 (today's behavior unchanged)", () => {
     const home = writeRaw("zstack", validRawConfig());
@@ -1402,5 +1514,31 @@ describe("loadConfig deep validation", () => {
   test("AC2: tickThrottleSeconds 120 in config.json is honored through loadConfig, not overridden by the default", () => {
     const home = writeRaw("zstack", validRawConfig({ tickThrottleSeconds: 120 }));
     expect(loadConfig("zstack", home).tickThrottleSeconds).toBe(120);
+  });
+
+  // -- issue #66: identity absent -> loadConfig leaves it undefined (it is
+  // deliberately NEVER defaulted, unlike every knob above) -- this is the
+  // real end-to-end proof behind lib/identity.ts's identityState() reading
+  // "unset" for a project that predates this ticket.
+  test("#66: identity absent from config.json stays undefined through loadConfig (never defaulted)", () => {
+    const home = writeRaw("zstack", validRawConfig());
+    expect(loadConfig("zstack", home).identity).toBeUndefined();
+  });
+
+  test("#66: a recorded identity in config.json is honored verbatim through loadConfig", () => {
+    const home = writeRaw(
+      "zstack",
+      validRawConfig({ identity: { mode: "bot", recordedAt: "2026-07-29T00:00:00.000Z", tokenLocation: "GH_TOKEN" } })
+    );
+    expect(loadConfig("zstack", home).identity).toEqual({
+      mode: "bot",
+      recordedAt: "2026-07-29T00:00:00.000Z",
+      tokenLocation: "GH_TOKEN",
+    });
+  });
+
+  test("#66: an invalid recorded identity.mode fails loadConfig loudly, naming the field", () => {
+    const home = writeRaw("zstack", validRawConfig({ identity: { mode: "owner", recordedAt: "t" } }));
+    expect(() => loadConfig("zstack", home)).toThrow(/is invalid:.*identity\.mode/);
   });
 });

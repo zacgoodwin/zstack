@@ -19,6 +19,7 @@ import {
   shSingleQuote,
   ADVERSARIAL_TRIGGER_LABELS,
   REVIEWER_INPUT_KEYS,
+  SPAWN_TAG_MARKER,
   type BuilderPromptInput,
   type CompletionEdge,
   type CompletionNoteInput,
@@ -234,23 +235,37 @@ describe("pointer prompts are size-invariant to the payload (AC1)", () => {
   const HUGE = "X".repeat(100_000); // 100 KB ticketBody / diff
   const AC = "Y".repeat(100_000);
 
+  const TINY = "x"; // the same fields at 1 byte, for the invariance comparison
+
   // The builder/qa injection carries the huge body; the reviewer additionally
   // carries a huge diff + acceptance criteria. Every stage's input-<N>.json is
   // referenced by absolute path; the built prompt must not embed the payload.
-  const CASES: { stage: string; build: () => string; payloads: string[] }[] = [
-    { stage: "builder", build: () => builderPrompt({ ...BUILDER_INPUT, ticketBody: HUGE }, INPUT_PATH), payloads: [HUGE] },
-    { stage: "qa", build: () => qaPrompt({ ...QA_INPUT, ticketBody: HUGE }, INPUT_PATH), payloads: [HUGE] },
-    { stage: "reviewer", build: () => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: HUGE, diff: HUGE, acceptanceCriteria: AC }, INPUT_PATH), payloads: [HUGE, AC] },
+  //
+  // `cap` is a per-stage absolute ceiling, not the contract itself: the contract
+  // is INVARIANCE (`buildTiny().length === buildHuge().length`), asserted below,
+  // which is strictly stronger than any single number. The cap stays as a second
+  // guard so a future edit that inlines something unrelated still trips. #191
+  // raised the adversarial reviewer's alone, deliberately: hardening the
+  // super-truth block against starved skeptic delivery added ~1 KB of FIXED
+  // instructions. That is not the failure this test guards against -- its
+  // invariance assertion is unaffected -- so the number moved and every other
+  // stage kept 4 KB.
+  const CASES: { stage: string; build: (payload: string, ac: string) => string; cap: number; payloads: string[] }[] = [
+    { stage: "builder", build: (b) => builderPrompt({ ...BUILDER_INPUT, ticketBody: b }, INPUT_PATH), cap: 4096, payloads: [HUGE] },
+    { stage: "qa", build: (b) => qaPrompt({ ...QA_INPUT, ticketBody: b }, INPUT_PATH), cap: 4096, payloads: [HUGE] },
+    { stage: "reviewer", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH), cap: 4096, payloads: [HUGE, AC] },
     // The adversarial reviewer branch fans out skeptics but STILL points at the
     // file for its payload -- it must stay size-invariant too.
-    { stage: "reviewer (adversarial)", build: () => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: HUGE, diff: HUGE, acceptanceCriteria: AC }, INPUT_PATH, true), payloads: [HUGE, AC] },
-    { stage: "merge", build: () => mergePrompt(MERGE_INPUT, INPUT_PATH), payloads: [] },
+    { stage: "reviewer (adversarial)", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH, true), cap: 5120, payloads: [HUGE, AC] },
+    { stage: "merge", build: () => mergePrompt(MERGE_INPUT, INPUT_PATH), cap: 4096, payloads: [] },
   ];
 
   for (const c of CASES) {
-    test(`${c.stage}: 100 KB payload -> < 4 KB prompt, omits the payload, contains the absolute input path`, () => {
-      const p = c.build();
-      expect(p.length).toBeLessThan(4096);
+    test(`${c.stage}: 100 KB payload -> same-length prompt under ${c.cap}B, omits the payload, contains the absolute input path`, () => {
+      const p = c.build(HUGE, AC);
+      // The contract: a 100,000x bigger payload changes the prompt not at all.
+      expect(p.length).toBe(c.build(TINY, TINY).length);
+      expect(p.length).toBeLessThan(c.cap);
       for (const payload of c.payloads) expect(p).not.toContain(payload);
       expect(isAbsolute(INPUT_PATH)).toBe(true);
       expect(p).toContain(INPUT_PATH);
@@ -304,13 +319,107 @@ describe("adversarial reviewer prompt", () => {
   test("inactive prompt is byte-identical to the pinned single-pass baseline", () => {
     expect(reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, false)).toBe(SINGLE_PASS_BASELINE);
     // And the active prompt is the single pass PLUS exactly the super-truth
-    // block and REVIEW-FINDINGS' confidence token -- REVIEW-APPROVE's
-    // confidence (present in both) is part of the shared, unchanged body.
+    // block, REVIEW-FINDINGS' confidence token, and (#191) each marker's
+    // skeptics=<k>/3 denominator -- REVIEW-APPROVE's confidence (present in
+    // both) is part of the shared, unchanged body.
+    //
+    // The block is bounded by the section that FOLLOWS it, not by a phrase
+    // inside it: an earlier version matched lazily up to the first "below.\n",
+    // so lengthening the block (as #191 did) left its tail behind and the
+    // difference showed up as an unrelated-looking golden mismatch.
     const active = reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, true);
     const stripped = active
-      .replace(/\n## Super-truth pass[\s\S]*?below\.\n/, "")
+      .replace(/\n## Super-truth pass[\s\S]*?(?=\n## Exit contract)/, "")
+      .replaceAll("skeptics=<k>/3 ", "")
       .replace("REVIEW-FINDINGS: confidence=<0-100> ", "REVIEW-FINDINGS: ");
     expect(stripped).toBe(SINGLE_PASS_BASELINE);
+  });
+
+  // #191: the three run-10 failure modes the block now names explicitly.
+  // Reviewers hung on a skeptic that never reported, ended a turn with no marker
+  // (CONFUSED -> the ticket is SKIPPED), or reported confidence=100 holding zero
+  // verdicts -- which #62's gate read as three independent agreements.
+  test("the super-truth block makes delivery best-effort with a mandatory denominator", () => {
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
+    expect(active).toContain("Delivery is BEST-EFFORT");
+    expect(active).toContain("AT MOST ONCE per skeptic");
+    expect(active).toContain("Do not spawn replacements");
+    expect(active).toContain("Do NOT end your turn without one of the exit markers");
+    // Both markers carry the denominator, so a starved review is legible on
+    // either path.
+    expect(active).toContain("REVIEW-APPROVE: confidence=<0-100> skeptics=<k>/3");
+    expect(active).toContain("REVIEW-FINDINGS: confidence=<0-100> skeptics=<k>/3");
+  });
+
+  test("the k -> confidence mapping is an enumerated table, not a formula", () => {
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
+    expect(active).toContain("do no arithmetic");
+    // Every reachable (k, unrefuted) pair is spelled out, so the reviewer never
+    // computes 100*u/k in prose (PRINCIPLES.md, latent vs deterministic).
+    expect(active).toContain("k=3: 3 unrefuted -> 100, 2 -> 67, 1 -> 33, 0 -> 0");
+    expect(active).toContain("k=2: 2 unrefuted -> 100, 1 -> 50, 0 -> 0");
+    expect(active).toContain("k=1: 1 unrefuted -> 100, 0 -> 0");
+    // The k=0 case is the one that used to merge on a fabricated 100.
+    expect(active).toContain("skeptics=0/3");
+    expect(active).toContain("never 100");
+  });
+
+  // The denominator is adversarial-only: with no fan-out there is no k, and
+  // demanding one would invite an invented number.
+  test("the single pass demands no denominator", () => {
+    const inactive = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false);
+    expect(inactive).not.toContain("skeptics=");
+    expect(inactive).not.toContain("BEST-EFFORT");
+  });
+});
+
+// -- spawn tag (#190) ---------------------------------------------------------
+
+// The stamp lib/transcripts.ts searches for. Two properties matter and are
+// pinned per stage: omitting the tag leaves the prompt BYTE-IDENTICAL to
+// pre-#190 (which is what lets reviewer-single-pass.golden.txt stand
+// unregenerated), and supplying one adds EXACTLY one leading line and changes
+// nothing else.
+describe("spawn tag stamp (#190)", () => {
+  const TAG = "zs-a1b2c3d4e5f6";
+  const STAMP = `<!-- ${SPAWN_TAG_MARKER} ${TAG} (orchestrator bookkeeping; ignore) -->\n`;
+  const STAGES: [string, (tag?: string) => string][] = [
+    ["builder", (t) => builderPrompt(BUILDER_INPUT, INPUT_PATH, t)],
+    ["qa", (t) => qaPrompt(QA_INPUT, INPUT_PATH, t)],
+    ["reviewer (single pass)", (t) => reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false, t)],
+    ["reviewer (adversarial)", (t) => reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true, t)],
+    ["merge", (t) => mergePrompt(MERGE_INPUT, INPUT_PATH, t)],
+  ];
+
+  for (const [name, build] of STAGES) {
+    test(`${name}: omitted tag is byte-identical to no stamp at all`, () => {
+      expect(build(undefined)).toBe(build());
+      // An empty string is the shell's "unset variable" case: `--spawn-tag ""`
+      // must not stamp a tagless marker that then matches nothing.
+      expect(build("")).toBe(build());
+      expect(build()).not.toContain(SPAWN_TAG_MARKER);
+    });
+
+    test(`${name}: a tag adds exactly one leading line and nothing else`, () => {
+      const tagged = build(TAG);
+      expect(tagged).toBe(STAMP + build());
+      // First line, so lib/transcripts.ts finds it inside its bounded prefix
+      // read of the transcript's opening line.
+      expect(tagged.split("\n")[0]).toContain(`${SPAWN_TAG_MARKER} ${TAG}`);
+      expect(tagged.split(SPAWN_TAG_MARKER)).toHaveLength(2);
+    });
+  }
+
+  // Blindness (issue #8 AC3) is why the tag is an opaque digest rather than
+  // `<slug>/t<n>/<stage>/<attempt>`: a readable tag would tell the reviewer this
+  // is review ATTEMPT 2, i.e. that an earlier review rejected the diff. The
+  // constructor cannot enforce the value's shape, but it must not be the place
+  // that composes a readable one -- it stamps exactly what it is handed.
+  test("the reviewer's stamp carries only the opaque tag it was handed", () => {
+    const tagged = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true, TAG);
+    const stamp = tagged.split("\n")[0];
+    expect(stamp).toBe(STAMP.trimEnd());
+    for (const leak of ["attempt", "t42", "/reviewer/"]) expect(stamp).not.toContain(leak);
   });
 });
 
@@ -352,6 +461,28 @@ describe("builder prompt", () => {
     expect(pr).toContain("Reviewer findings");
     expect(pr).toContain("`reviewNotes`");
     expect(pr).not.toContain("1) AC weakened");
+  });
+
+  // #177: the commit re-spawn's whole value is telling the fresh builder that the
+  // work may already exist, uncommitted, in the worktree -- a rebuild from scratch
+  // is the wrong move -- and that BUILT is verified, so the same slip loops.
+  test("the commit re-spawn points at commitNotes and says commit, do not rebuild", () => {
+    const p = builderPrompt({ ...BUILDER_INPUT, commitNotes: "uncommitted work: 3 uncommitted path(s)" }, INPUT_PATH);
+    expect(p).toContain("`commitNotes`");
+    expect(p).toContain(INPUT_PATH);
+    expect(p).not.toContain("3 uncommitted path(s)"); // payload lives in the input file
+    expect(p).toContain("COMMIT whatever is already there");
+    expect(p).toContain("git status");
+    // Absent on every other spawn, so a first-pass builder prompt is unchanged.
+    expect(builderPrompt(BUILDER_INPUT, INPUT_PATH)).not.toContain("commitNotes");
+  });
+
+  // The exit contract itself has to state what BUILT is checked against, or the
+  // guard is a surprise the builder learns by being re-spawned.
+  test("the BUILT marker states the clean-tree + moved-HEAD requirement", () => {
+    const p = builderPrompt(BUILDER_INPUT, INPUT_PATH);
+    expect(p).toContain("git status --porcelain` empty");
+    expect(p).toContain(`HEAD off ${BUILDER_INPUT.baseBranch}`);
   });
 });
 
@@ -573,6 +704,44 @@ describe("stage-prompts CLI", () => {
     const leaky = join(dir, "leaky-cli.json");
     writeFileSync(leaky, JSON.stringify({ ...REVIEWER_INPUT, prDescription: "trust me" }));
     const bad = run("prompt", "reviewer", leaky, "--adversarial-mode", "always");
+    expect(bad.exitCode).toBe(1);
+    expect(bad.stderr.toString()).toContain("blinded by design");
+  });
+
+  // #190: the flag every stage accepts. It rides as a FLAG, so the reviewer's
+  // blinded four-key input JSON is untouched -- same treatment as
+  // --adversarial-mode / --labels above.
+  test("--spawn-tag stamps every stage; omitting it changes nothing", () => {
+    const TAG = "zs-000102030405";
+    const inputs: [string, unknown][] = [
+      ["builder", BUILDER_INPUT],
+      ["qa", QA_INPUT],
+      ["reviewer", REVIEWER_INPUT],
+      ["merge", MERGE_INPUT],
+    ];
+    for (const [stage, input] of inputs) {
+      const file = join(dir, `spawn-${stage}.json`);
+      writeFileSync(file, JSON.stringify(input));
+
+      const tagged = run("prompt", stage, file, "--spawn-tag", TAG);
+      expect(tagged.exitCode).toBe(0);
+      expect(tagged.stdout.toString().split("\n")[0]).toContain(`${SPAWN_TAG_MARKER} ${TAG}`);
+
+      const plain = run("prompt", stage, file);
+      expect(plain.exitCode).toBe(0);
+      expect(plain.stdout.toString()).not.toContain(SPAWN_TAG_MARKER);
+      // The stamp is additive: strip the first line and the two agree byte for
+      // byte, for every stage.
+      expect(tagged.stdout.toString().split("\n").slice(1).join("\n")).toBe(plain.stdout.toString());
+    }
+  });
+
+  // A leaky input file must still fail loudly WITH the flag present -- the tag
+  // must not become a fifth smuggled key by another route.
+  test("--spawn-tag does not weaken the reviewer's blindness gate", () => {
+    const leaky = join(dir, "leaky-spawn.json");
+    writeFileSync(leaky, JSON.stringify({ ...REVIEWER_INPUT, planRationale: "because" }));
+    const bad = run("prompt", "reviewer", leaky, "--spawn-tag", "zs-000102030405");
     expect(bad.exitCode).toBe(1);
     expect(bad.stderr.toString()).toContain("blinded by design");
   });

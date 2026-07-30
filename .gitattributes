@@ -30,6 +30,10 @@ evals/fixture-app/scripts/deploy text eol=lf
 # output is LF (its *.ts source is eol=lf), so the golden must stay LF too or the
 # comparison would spuriously fail on a CRLF Windows checkout.
 tests/reviewer-single-pass.golden.txt text eol=lf
+# Eval fixture diffs are fed to `git apply`. A CRLF checkout puts a \r at the end
+# of every added line, so every hunk raises "trailing whitespace" and the applied
+# source carries the \r into the reviewer's input (#108).
+*.patch text eol=lf
 
 # Diagrams: never touch bytes.
 *.png binary

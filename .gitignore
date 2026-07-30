@@ -2,3 +2,7 @@
 node_modules/
 .claude/
 .gstack/
+# Scratch output of the graphify hook every agent in this repo runs. Untracked
+# here would make #177's BUILT guard hold an honest, fully committed build as
+# "uncommitted work" and then tell the builder to commit scratch into the PR.
+graphify-out/
