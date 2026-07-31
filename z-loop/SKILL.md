@@ -264,7 +264,9 @@ for a lane that exists (park/skip), comment the note anyway (the issue is still
 there), `lane-remove`, and apply a **`stop-lane`** action instead of the park —
 `{"kind":"stop-lane","ticket":<N>,"note":"#<N> is no longer on the project board; releasing its lane."}`
 — which drops the lane and writes no status. For the `claim` row (no lane yet)
-take the claim-lost path already in that row.
+take the claim-lost path already in that row. For Step 6's Done move the recovery
+is the opposite one — apply `complete` anyway, never `stop-lane`; see Step 6
+item 4 for why the merge record cannot be dropped.
 
 **Skip QA (#130).** The board snapshot now carries each issue's labels. When a
 ticket has the `skip-qa` label, a finished builder advances straight to Review
@@ -516,8 +518,17 @@ bun "$PACK/lib/stage-prompts.ts" note "$TMP/note-<N>.json" > "$TMP/note-<N>.md"
    data-loss-ish, spec-ambiguous, or default-chosen behavior, each as
    `{check, doStep, expect}` so the template renders "to check X, do Y,
    expect Z"), `filedTickets` (from 2), `actualDollars` = `$ACTUAL`.
-4. `"$Z_BOARD" move <N> Done` and apply the action. The issue stays OPEN — a
-   human reviews Done tickets and closes them (never `gh issue close`).
+4. `"$Z_BOARD" move <N> Done --if-present` and apply the action. The issue stays
+   OPEN — a human reviews Done tickets and closes them (never `gh issue close`).
+   On `moved:false` (#138 — the ticket left the board after this tick's last
+   confirm pass) apply the **`complete`** action anyway, NOT the `stop-lane` the
+   park/skip rows use: the PR really landed, and `complete` is the only reducer
+   that records #N in `mergedThisRun`. Dropping that record breaks a stacked
+   child's step-18 retarget and lets Step 7's branch delete close the child's PR
+   — the same H9 reason a dead merge lane is never blind-skipped. The board
+   cannot show Done for a ticket that is no longer on it; `state.json` carries
+   the truth and the lane is released either way, so the completion flow
+   finishes normally instead of aborting on the move.
 5. `git worktree remove ".worktrees/ticket-<N>"`. Do NOT delete the branch yet
    — a dependent PR may stack on it (branch cleanup is Step 7).
 

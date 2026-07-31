@@ -70,7 +70,9 @@ records the result. It never re-derives a scheduling decision in prose.
   as `z-board move <N> <S> --if-present`, which reports
   `{"moved":false,"reason":"not-on-project"}` (exit 0) instead of aborting the
   tick when a ticket was removed between two confirms. The lane is released
-  instead of the drain wedging.
+  instead of the drain wedging — including on the final move to Done, where the
+  merge is still recorded even though the board can no longer show it, so a
+  stacked child's PR retarget survives.
 - **A `BUILT` that shipped nothing does not reach QA.** `BUILT` is a claim, and
   the loop verifies it against the lane worktree's own git facts before the lane
   advances: `git status --porcelain --branch` must report a clean tree, untracked
