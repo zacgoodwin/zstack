@@ -187,7 +187,10 @@ bun "$PACK/lib/loop.ts" merge-gate .worktrees/ticket-<N> --state "$STATE" --tick
 
 What it does, in the lane's own worktree:
 
-1. Runs `bun test`, then `bun run typecheck` if the tests were clean.
+1. Runs `bun test`, then `bun run typecheck` if the tests were clean — both with
+   color pinned off (`NO_COLOR=1`, `FORCE_COLOR=0`), because everything below
+   is read off those bytes and bun wraps its summary lines in escape codes the
+   moment the ambient environment asks for color.
 2. Judges the result by two machine-readable facts only — the `N fail` count on
    the suite's **summary line** and the process **exit code**. Per-test `(fail)`
    lines and prose like `tests/e2e-check.test.ts`'s intentional
@@ -195,12 +198,27 @@ What it does, in the lane's own worktree:
    saying `0 fail` at exit 0 is green even when such a line is present. When two
    summaries appear (a test that spawns a nested `bun test`), the higher fail
    count wins.
-3. Allows **exactly one** retry, after a 15s wait, and only for the contention
+3. Checks that the summary it read is **this run's**. Every `bun test` run
+   brackets itself — a `bun test v…` banner when it starts, a
+   `Ran N tests across M files.` when it finishes — so the gate counts both. A
+   test that shells a nested `bun test` with inherited stdio writes that run's
+   banner *and* summary into the same stream; if the outer run then dies without
+   printing its own (a `process.exit(0)` inside a test), the only summary left
+   belongs to somebody else. Fewer finishes than starts is red, whatever the
+   fail count says. This is #132's "the suite did not run" shape wearing another
+   run's verdict, and it was reproducible end-to-end before the count existed.
+4. Allows **exactly one** retry, after a 15s wait, and only for the contention
    shape: a nonzero exit (or a missing summary) with no reported test failures.
    A summary reporting failures is never retried.
-4. Prints the verdict as JSON (`{green, attempts, failCount, note}`), **exits
-   0 only when green**, and — with `--state`/`--ticket` — stamps the verdict
-   onto that lane.
+5. Prints the verdict as JSON (`{green, attempts, failCount, note, commit}`),
+   **exits 0 only when green**, and — with `--state`/`--ticket` — stamps the
+   verdict onto that lane. `commit` is the worktree HEAD the verdict vouches
+   for: a gate result is about one commit, so a re-run after a conflict
+   resolution stamps a verdict naming the *new* sha.
+
+The gauntlet is bun's, by name. On a project that runs its tests some other way
+the gate produces no bun output at all and refuses the merge, saying so in those
+words — fail-closed, and never the misleading "the suite did not run".
 
 ### Who runs it, and why it cannot be skipped
 
@@ -233,6 +251,19 @@ before any `gh pr merge` — and again after any conflict resolution, since the
 loop's run vouches for the commit it gated, not for code the agent changed
 afterwards. Its prompt never asserts that an earlier gate passed; it hands over
 a command and an exit code. Under no circumstance does a red suite merge.
+
+Two details of that command matter, because both once broke it:
+
+- **Every path in it is absolute**, the worktree included. The prompt tells the
+  agent to resolve conflicts *on the branch*, so it may well be sitting inside
+  the worktree when it runs Step 0 — and a relative `.worktrees/ticket-<N>`
+  read from there resolves to nothing, the gate exits nonzero, and the prompt's
+  own "any nonzero exit = BLOCKED" rule false-blocks a mergeable branch.
+- **It carries `--state`/`--ticket`**, so the agent's own run stamps too. The
+  loop cannot slip a tick between "conflict resolved" and `gh pr merge`, so the
+  conflict path is the one place a verdict could go unrecorded; stamping puts
+  it on the lane with the sha it tested, which is what makes "was the code I
+  merged the code that was gated?" a readable fact rather than a claim.
 
 ## Ticket and context limits
 

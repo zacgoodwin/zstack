@@ -1515,6 +1515,14 @@ export interface MergeGateVerdict {
   attempts: number; // 1 or 2 -- exactly one retry is allowed, for contention
   failCount: number | null; // summary fail-count of the deciding run (null = no summary line)
   note: string; // one line; goes verbatim into the lane's BLOCKED note
+  // The worktree HEAD this verdict vouches for. A gate result is only ever
+  // about ONE commit, and the merge agent may change the branch under it (a
+  // conflict resolution) after the loop's own pre-merge run: re-running the
+  // STAMPING form then lands a verdict naming the NEW sha, which is what makes
+  // "was the code I merged the code that was gated?" a readable fact instead of
+  // a prose claim. Optional: provenance, never permission -- a gate that cannot
+  // shell git still returns a real green/red.
+  commit?: string;
 }
 
 // The one contention retry's wait. Long enough for another lane's suite/tsc to
@@ -1529,6 +1537,37 @@ export const MERGE_GATE_RETRY_WAIT_MS = 15_000;
 // a long enough timeout" and nothing more.
 export const MERGE_GATE_MAX_RUNS = 2;
 
+// bun wraps its summary lines in SGR escapes whenever the ambient environment
+// asks for color (a parent tool exporting FORCE_COLOR is enough), and
+// `\x1b[0m\x1b[2m 0 fail\x1b[0m` matches none of the line anchors below -- a
+// GREEN suite would read red, burn both retries, and park the lane. runGauntlet
+// pins the color env off at the source; every parse here strips escapes anyway,
+// so the gate's reading is a property of the parse rather than an accident of
+// whoever launched the orchestrator.
+const ANSI_ESCAPE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+export function stripAnsi(s: string): string {
+  return s.replace(ANSI_ESCAPE, "");
+}
+
+// A `bun test` run brackets itself in its own output: one `bun test v<version>`
+// banner when it starts, one `Ran N tests across M files.` when it finishes.
+// Counting both is how the gate knows WHOSE summary it is reading. A test that
+// shells a nested `bun test` with inherited stdio writes that run's banner AND
+// summary into this same stream, so "there is a ` 0 fail` line here" proves
+// nothing on its own -- and when the outer run then dies without printing its
+// own (a `process.exit(0)` inside a test), the only summary left is the nested
+// run's: exit 0, ` 0 fail`, and a real failing test on disk. That is exactly
+// #132's "the suite did not run" wearing somebody else's verdict. Equal counts
+// mean every run in the stream reported, and parseSuiteFailCount's MAX then
+// speaks for all of them.
+export function countSuiteRuns(output: string): { started: number; finished: number } {
+  const clean = stripAnsi(output);
+  return {
+    started: (clean.match(/^bun test v/gm) ?? []).length,
+    finished: (clean.match(/^Ran \d+ tests? across \d+ files?\./gm) ?? []).length,
+  };
+}
+
 // The fail-count off a `bun test` run, read ONLY from its summary line
 // (`^ N fail`), never from per-test `(fail) name` lines or a literal like
 // tests/e2e-check.test.ts's intentional `FAIL merge-order` self-test output
@@ -1537,13 +1576,14 @@ export const MERGE_GATE_MAX_RUNS = 2;
 // can print a second (green) summary into the same stream, and the fail-closed
 // reading is "any summary reporting failures is a failure".
 export function parseSuiteFailCount(output: string): number | null {
-  const counts = [...output.matchAll(/^[ \t]*(\d+)[ \t]+fail\b/gm)].map((m) => Number(m[1]));
+  const counts = [...stripAnsi(output).matchAll(/^[ \t]*(\d+)[ \t]+fail\b/gm)].map((m) => Number(m[1]));
   return counts.length ? Math.max(...counts) : null;
 }
 
-// One attempt's verdict. Green demands all three: a summary line, zero fails in
-// it, and exit 0 -- exit 0 with NO summary means the suite may not have run at
-// all (the #132 shape), so it is not green.
+// One attempt's verdict. Green demands, in order: no summary reporting
+// failures, exit 0, a `bun test` run that actually started, a summary line to
+// read a count off, and as many runs finished as started (so that count is THIS
+// run's verdict and not a nested run's). Anything else refuses the merge.
 function judgeSuiteRun(run: SuiteRun, attempt: number): MergeGateVerdict {
   const failCount = parseSuiteFailCount(run.output);
   const red = (why: string): MergeGateVerdict => ({ green: false, attempts: attempt, failCount, note: `${why} -- refusing the merge` });
@@ -1553,8 +1593,23 @@ function judgeSuiteRun(run: SuiteRun, attempt: number): MergeGateVerdict {
   if (run.exitCode !== 0) {
     return red(`merge gate RED on attempt ${attempt}: gauntlet exited ${run.exitCode}${failCount === null ? " with no test-summary line" : " with 0 fail (typecheck or a crashed run)"}`);
   }
+  const runs = countSuiteRuns(run.output);
+  if (runs.started === 0) {
+    // Names which of the two it is instead of the blanket "the suite did not
+    // run" below: this gate shells `bun test` then `bun run typecheck`, so a
+    // project on another runner emits no bun output at all and every one of its
+    // lanes would otherwise park Blocked on a note that reads like a broken suite.
+    return red(
+      `merge gate RED on attempt ${attempt}: exit 0 but the output holds no \`bun test\` run at all -- the gate runs \`bun test\` then \`bun run typecheck\` in the worktree, so either the suite never started or this project does not run on bun`
+    );
+  }
   if (failCount === null) {
     return red(`merge gate RED on attempt ${attempt}: exit 0 but no "N fail" summary line -- the suite did not run`);
+  }
+  if (runs.started !== runs.finished) {
+    return red(
+      `merge gate RED on attempt ${attempt}: ${runs.started} \`bun test\` run(s) started in this output but only ${runs.finished} finished -- a run died without reporting (a \`process.exit\` inside a test), so the ${failCount} fail on the summary line is a different run's verdict, not this one's`
+    );
   }
   return { green: true, attempts: attempt, failCount: 0, note: `merge gate GREEN on attempt ${attempt}: 0 fail, exit 0` };
 }
@@ -1578,13 +1633,29 @@ export function mergeGate(
 // The real attempt: `bun test` then, only if that is clean, `bun run typecheck`
 // -- both in the merge worktree. process.execPath is this bun binary (no PATH
 // lookup, which is what breaks the spawn on Windows).
+//
+// The environment is the caller's with color pinned OFF. Everything the gate
+// decides is read off these bytes, and bun emits SGR-wrapped summary lines
+// under FORCE_COLOR: without this the verdict would depend on whichever tool
+// happened to launch the orchestrator (measured: a passing project reads
+// `{"green":false,...,"failCount":null}` under FORCE_COLOR=1).
 function runGauntlet(cwd: string): SuiteRun {
   const dec = (b: unknown): string => (b instanceof Uint8Array ? new TextDecoder().decode(b) : "");
-  const test = Bun.spawnSync([process.execPath, "test"], { cwd, stdout: "pipe", stderr: "pipe" });
+  const env = { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" };
+  const test = Bun.spawnSync([process.execPath, "test"], { cwd, stdout: "pipe", stderr: "pipe", env });
   const testOut = dec(test.stdout) + dec(test.stderr);
   if (test.exitCode !== 0) return { exitCode: test.exitCode, output: testOut };
-  const tc = Bun.spawnSync([process.execPath, "run", "typecheck"], { cwd, stdout: "pipe", stderr: "pipe" });
+  const tc = Bun.spawnSync([process.execPath, "run", "typecheck"], { cwd, stdout: "pipe", stderr: "pipe", env });
   return { exitCode: tc.exitCode, output: testOut + dec(tc.stdout) + dec(tc.stderr) };
+}
+
+// The worktree's HEAD sha, for the verdict's `commit`. Best-effort by design:
+// the sha is provenance, so a checkout where `git` cannot be shelled still gets
+// a real green/red rather than a gate that refuses to answer.
+function gitHead(cwd: string): string | undefined {
+  const p = Bun.spawnSync(["git", "-C", cwd, "rev-parse", "HEAD"], { stdout: "pipe", stderr: "pipe" });
+  if (p.exitCode !== 0) return undefined;
+  return new TextDecoder().decode(p.stdout).trim() || undefined;
 }
 
 // -- CLI ---------------------------------------------------------------------
@@ -1774,6 +1845,11 @@ export function main(argv: string[]): number {
         throw new ZError(`--retry-wait-ms must be a non-negative number, got ${JSON.stringify(rawWait)}.`);
       }
       const now = Number(str(flags, "now") ?? Date.now());
+      // Read-modify-write, re-read immediately before each write so the window
+      // in which another writer's change could be lost is microseconds, not the
+      // minutes the gauntlet itself takes. That matters because the merge AGENT
+      // runs this same stamping form (its Step 0, and again after resolving a
+      // conflict) while the orchestrator keeps ticking other lanes.
       const stamp = (v: MergeGateVerdict | null): void => {
         if (gateState === undefined) return;
         atomicWrite(gateState, JSON.stringify(recordMergeGate(readJson(gateState) as LoopState, gateTicket!, v, now), null, 2));
@@ -1782,7 +1858,9 @@ export function main(argv: string[]): number {
       let verdict: MergeGateVerdict;
       try {
         if (!existsSync(worktree)) throw new ZError(`Merge gate: worktree ${worktree} does not exist.`);
-        verdict = mergeGate(() => runGauntlet(worktree), (ms) => Bun.sleepSync(ms), retryWaitMs);
+        // The sha is captured AFTER the gauntlet, from the tree the gauntlet
+        // actually ran on, so a verdict never names a commit it did not test.
+        verdict = { ...mergeGate(() => runGauntlet(worktree), (ms) => Bun.sleepSync(ms), retryWaitMs), commit: gitHead(worktree) };
       } catch (e) {
         // Standalone (a merge agent's own run): keep the loud CLI error. Stamping
         // (the loop's own run): a gate that cannot RUN is a red gate, not a

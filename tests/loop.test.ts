@@ -19,11 +19,13 @@ import {
   ingestBoardItems,
   markClaimLost,
   markHumanNeededNotified,
+  countSuiteRuns,
   mergeGate,
   MERGE_GATE_MAX_RUNS,
   MERGE_GATE_RETRY_WAIT_MS,
   nextAction,
   parseSuiteFailCount,
+  stripAnsi,
   parseReviewerConfidence,
   parseSkepticQuorum,
   parseStageResult,
@@ -3091,10 +3093,15 @@ describe("validateConfig: ticketLimit / contextTokenLimit (#131 AC10) + minSkept
 // mergeGate -- no spawns, no waiting -- and assert block / retry-then-pass /
 // pass, plus the two real-CLI ends.
 
-// A bun test tail, exactly as bun prints it (the summary line is the only thing
-// the gate is allowed to read).
+// ONE `bun test` run, banner to summary, byte-shaped like bun's real output
+// (captured from `bun test` on a throwaway project: the banner goes to stdout,
+// the summary block to stderr, and runGauntlet concatenates them). Both ends
+// matter: the banner is how the gate counts runs STARTED, the `Ran N tests`
+// line how it counts them FINISHED, and the ` N fail` line in between is the
+// only verdict it reads.
+const SUITE_BANNER = "bun test v1.3.14 (0d9b296a)\n";
 const suiteTail = (pass: number, fail: number) =>
-  ` ${pass} pass\n ${fail} fail\n ${pass + fail} expect() calls\nRan ${pass + fail} tests across 3 files. [900.00ms]\n`;
+  `${SUITE_BANNER} ${pass} pass\n ${fail} fail\n ${pass + fail} expect() calls\nRan ${pass + fail} tests across 3 files. [900.00ms]\n`;
 
 // Drives mergeGate over a scripted list of attempts. An attempt beyond the
 // script THROWS -- that is how "no retry happened" is proven, not by a count an
@@ -3201,6 +3208,94 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
     expect(verdict.attempts).toBe(2);
   });
 
+  // -- QA finding 1: a summary line does not prove WHOSE summary it is --------
+  //
+  // Reproduced end-to-end before the fix, on a real project: `a.test.ts` fails,
+  // `z.test.ts` shells a nested `bun test` on a passing subproject with inherited
+  // stdio and then calls process.exit(0). The outer run never prints its own
+  // summary, the inner one prints ` 0 fail`, the process exits 0 -- and the gate
+  // returned {"green":true,"failCount":0} on a project with a failing test, the
+  // exact "#132 suite did not run" shape it exists to refuse. The two banners
+  // were in the stream the whole time; nothing counted them.
+  describe("a nested bun test run cannot lend its verdict to the outer one", () => {
+    // The captured shape: banner, banner, one summary, exit 0.
+    const NESTED_ONLY_SUMMARY = `${SUITE_BANNER}${suiteTail(1, 0)}`;
+
+    test("two runs started, one finished, exit 0, 0 fail -> RED, never a merge", () => {
+      const { verdict } = driveGate([
+        { exitCode: 0, output: NESTED_ONLY_SUMMARY },
+        { exitCode: 0, output: NESTED_ONLY_SUMMARY },
+      ]);
+      expect(verdict.green).toBe(false);
+      expect(verdict.note).toContain("2 `bun test` run(s) started");
+      expect(verdict.note).toContain("only 1 finished");
+      expect(verdict.note).toContain("refusing the merge");
+    });
+
+    test("a nested run that DOES finish is fine -- both summaries are attributable, MAX decides", () => {
+      // Two complete runs in one stream: nothing died, so the fail-closed MAX
+      // over both summaries is the verdict. Green when both are green...
+      expect(driveGate([{ exitCode: 0, output: suiteTail(3, 0) + suiteTail(1261, 0) }]).verdict.green).toBe(true);
+      // ...and red the moment either reports a failure.
+      const red = driveGate([{ exitCode: 1, output: suiteTail(3, 2) + suiteTail(1261, 0) }]).verdict;
+      expect(red.green).toBe(false);
+      expect(red.failCount).toBe(2);
+    });
+
+    test("countSuiteRuns counts banners as starts and `Ran N tests` as finishes", () => {
+      expect(countSuiteRuns(suiteTail(1, 0))).toEqual({ started: 1, finished: 1 });
+      expect(countSuiteRuns(NESTED_ONLY_SUMMARY)).toEqual({ started: 2, finished: 1 });
+      expect(countSuiteRuns(suiteTail(1, 0) + suiteTail(2, 0))).toEqual({ started: 2, finished: 2 });
+      expect(countSuiteRuns("error: EBUSY\n")).toEqual({ started: 0, finished: 0 });
+      // Singular/plural both ways -- bun writes "Ran 1 test across 1 file."
+      expect(countSuiteRuns(`${SUITE_BANNER}Ran 1 test across 1 file. [24.00ms]\n`).finished).toBe(1);
+    });
+
+    // Finding 7's readable half: on a project that is not a bun project the
+    // gauntlet produces no bun output at all, and the note has to say that
+    // rather than "the suite did not run", which reads like a broken suite.
+    test("no bun test run in the output at all names the cause instead of blaming the suite", () => {
+      const { verdict } = driveGate([
+        { exitCode: 0, output: "PASS tests/foo.spec.js\nTests: 12 passed\n" },
+        { exitCode: 0, output: "PASS tests/foo.spec.js\nTests: 12 passed\n" },
+      ]);
+      expect(verdict.green).toBe(false);
+      expect(verdict.note).toContain("no `bun test` run at all");
+      expect(verdict.note).toContain("does not run on bun");
+    });
+  });
+
+  // -- QA finding 2: the anchors must not depend on the ambient environment ---
+  //
+  // bun wraps its summary in SGR escapes whenever the env asks for color, and
+  // `\x1b[0m\x1b[2m 0 fail\x1b[0m` matched no anchor: a GREEN project read
+  // {"green":false,"failCount":null}, burned both attempts, and parked the lane.
+  describe("colorized bun output reads identically to plain output", () => {
+    // Captured verbatim from `FORCE_COLOR=1 bun test | cat -v` on a passing project.
+    const COLOR = "\x1b[0m\x1b[1mbun test \x1b[0m\x1b[2mv1.3.14 (0d9b296a)\x1b[0m\n\n\x1b[0m\x1b[32m 1 pass\x1b[0m\n\x1b[0m\x1b[2m 0 fail\x1b[0m\n 1 expect() calls\nRan 1 test across 1 file. \x1b[0m\x1b[2m[\x1b[1m24.00ms\x1b[0m\x1b[2m]\x1b[0m\n";
+
+    test("the fail count and the run counts survive the escapes", () => {
+      expect(parseSuiteFailCount(COLOR)).toBe(0);
+      expect(countSuiteRuns(COLOR)).toEqual({ started: 1, finished: 1 });
+      expect(stripAnsi(COLOR)).toContain(" 0 fail\n");
+    });
+
+    test("a colorized green run is GREEN on the first attempt, with no retry burned", () => {
+      const { verdict, attempts, waits } = driveGate([{ exitCode: 0, output: COLOR }]);
+      expect(verdict).toMatchObject({ green: true, attempts: 1, failCount: 0 });
+      expect(attempts).toEqual([1]);
+      expect(waits).toEqual([]);
+    });
+
+    test("a colorized RED run still reports its fail count", () => {
+      const red = COLOR.replace("\x1b[2m 0 fail", "\x1b[31m 9 fail");
+      const { verdict } = driveGate([{ exitCode: 1, output: red }]);
+      expect(verdict.green).toBe(false);
+      expect(verdict.failCount).toBe(9);
+      expect(verdict.note).toContain("9 fail");
+    });
+  });
+
   describe("parseSuiteFailCount reads the summary line only", () => {
     test("no summary line -> null", () => {
       expect(parseSuiteFailCount("error: EBUSY\nFAIL  merge-order\n(fail) something\n")).toBeNull();
@@ -3220,12 +3315,14 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
     const dir = mkdtempSync(join(tmpdir(), "zstack-merge-gate-"));
     afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
-    // A throwaway "worktree": one test file plus a typecheck script that is a
-    // no-op, so the gate's two real spawns stay well inside the gate budget.
-    function project(name: string, body: string): string {
+    // A throwaway "worktree": one test file plus a typecheck script, so the
+    // gate's two real spawns stay well inside the gate budget. `typecheck`
+    // defaults to a no-op that always exits 0; a caller passing its own script
+    // is exercising the typecheck limb of the gauntlet.
+    function project(name: string, body: string, typecheck = "bun --version"): string {
       const p = join(dir, name);
       mkdirSync(p, { recursive: true });
-      writeFileSync(join(p, "package.json"), JSON.stringify({ name, scripts: { typecheck: "bun --version" } }));
+      writeFileSync(join(p, "package.json"), JSON.stringify({ name, scripts: { typecheck } }));
       writeFileSync(join(p, "x.test.ts"), body);
       return p;
     }
@@ -3254,6 +3351,94 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
       const proc = runGate(join(dir, "does-not-exist"));
       expect(proc.exitCode).not.toBe(0);
       expect(proc.stderr.toString()).toContain("does not exist");
+    });
+
+    // QA finding 3: the gauntlet is `bun test` AND `bun run typecheck`, and
+    // every other CLI project here scripts typecheck as `bun --version` -- so
+    // deleting the typecheck spawn outright left the whole suite green. This is
+    // the pin: a green suite with a red typecheck must not merge.
+    test("a green suite with a FAILING typecheck never merges (the typecheck limb is really run)", () => {
+      const p = project("tc-red", PASSING, "bun tc.ts");
+      writeFileSync(join(p, "tc.ts"), "process.exit(3);\n");
+      const proc = runGate(p, "--retry-wait-ms", "0");
+      expect(proc.exitCode).toBe(1);
+      const verdict = JSON.parse(proc.stdout.toString());
+      // 0 fail from the suite, nonzero from tsc: the exit code alone is the red.
+      expect(verdict).toMatchObject({ green: false, failCount: 0, attempts: 2 });
+      expect(verdict.note).toContain("exited 3");
+    });
+
+    // QA finding 1, end to end on the real deployed path: `a.test.ts` fails,
+    // `z.test.ts` shells a nested `bun test` on a passing subproject with
+    // INHERITED stdio and then process.exit(0)s. Two banners, one summary
+    // (` 0 fail`, the nested run's), exit 0 -- and before the run-count check
+    // this printed {"green":true,"attempts":1,"failCount":0} and merged.
+    test("a nested stdio-inherited bun test cannot green-light a project with a failing test", () => {
+      const p = project("nested", FAILING);
+      const inner = join(p, "inner");
+      mkdirSync(inner, { recursive: true });
+      writeFileSync(join(inner, "package.json"), JSON.stringify({ name: "inner" }));
+      writeFileSync(join(inner, "i.test.ts"), PASSING);
+      writeFileSync(
+        join(p, "z.test.ts"),
+        'import {test} from "bun:test";\n' +
+          'test("nested", () => {\n' +
+          '  Bun.spawnSync([process.execPath, "test"], { cwd: import.meta.dir + "/inner", stdout: "inherit", stderr: "inherit" });\n' +
+          "  process.exit(0);\n" +
+          "});\n"
+      );
+      const proc = runGate(p, "--retry-wait-ms", "0");
+      expect(proc.exitCode).toBe(1);
+      expect(JSON.parse(proc.stdout.toString()).green).toBe(false);
+    });
+
+    // QA finding 2, end to end: the gate spawns the gauntlet with color pinned
+    // off, so an orchestrator launched by a tool that exports FORCE_COLOR reads
+    // the same verdict as one launched from a bare shell. Before this, a GREEN
+    // worktree returned {"green":false,"failCount":null} and parked the lane.
+    const forceColor = (cwd: string) =>
+      Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "merge-gate", cwd], {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env, FORCE_COLOR: "1" },
+      });
+
+    test("a green worktree is green even when the caller's env forces color", () => {
+      const proc = forceColor(project("color", PASSING));
+      expect(proc.exitCode).toBe(0);
+      expect(JSON.parse(proc.stdout.toString())).toMatchObject({ green: true, attempts: 1, failCount: 0 });
+    });
+
+    // ...and the pin is at the SOURCE, not only in the parser: the gauntlet's
+    // child process sees color switched off whatever the caller exported, so
+    // the bytes the gate reads are plain to begin with. Asserted from inside
+    // the gated suite, which is the only place that env is observable.
+    test("the gauntlet's child process runs with color pinned off, whatever the caller exported", () => {
+      const p = project(
+        "color-env",
+        'import {test,expect} from "bun:test";\n' +
+          'test("env", () => {\n' +
+          '  expect(process.env.NO_COLOR).toBe("1");\n' +
+          '  expect(process.env.FORCE_COLOR).toBe("0");\n' +
+          "});\n"
+      );
+      expect(forceColor(p).exitCode).toBe(0);
+    });
+
+    // A verdict vouches for ONE commit (QA finding 6): the merge agent re-runs
+    // the gate after resolving a conflict, and the sha is what makes the re-run
+    // a different, checkable fact rather than a repeat of the same claim.
+    test("the verdict names the worktree HEAD it tested, and omits it where there is no git", () => {
+      const p = project("sha", PASSING);
+      // Not a git repo yet: provenance is best-effort, never a refusal to answer.
+      const ungit = JSON.parse(runGate(p).stdout.toString());
+      expect(ungit.green).toBe(true);
+      expect(ungit.commit).toBeUndefined();
+      for (const args of [["init", "-q"], ["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]]) {
+        expect(Bun.spawnSync(["git", "-C", p, ...args]).exitCode).toBe(0);
+      }
+      const head = new TextDecoder().decode(Bun.spawnSync(["git", "-C", p, "rev-parse", "HEAD"], { stdout: "pipe" }).stdout).trim();
+      expect(JSON.parse(runGate(p).stdout.toString()).commit).toBe(head);
     });
 
     // -- the stamping form: the verdict lands on the lane, which is what makes
@@ -3409,6 +3594,17 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
       const ms = [...row.matchAll(/`(\d{6,})`/g)].map((m) => Number(m[1]));
       expect(Math.max(...ms)).toBeGreaterThanOrEqual(600_000); // >= 10 min: two full gauntlets + the 15s wait, with room to grow
       expect(row).toContain("120000"); // and names the default it must not inherit
+    });
+
+    // QA finding 6: without statePath in the merge stage's input JSON the
+    // prompt renders the READ-ONLY gate command, so the agent's own Step 0 --
+    // and, worse, its re-run after resolving a conflict -- stamps nothing and
+    // the lane keeps a verdict for a commit that no longer exists.
+    test("the merge stage's input row supplies statePath, so the agent's own gate run stamps", () => {
+      const row = skill().split("\n").find((l) => l.startsWith("| `merge` |"))!;
+      expect(row).toContain("`statePath`");
+      expect(row).toContain('`"$STATE"`');
+      expect(row).toMatch(/STAMPING form/);
     });
 
     test("a red verdict parks the lane Blocked and no merge agent is ever spawned from this row", () => {

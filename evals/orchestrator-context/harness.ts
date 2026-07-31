@@ -75,7 +75,10 @@ function afterPromptBytes(stage: Stage, p: Payloads): number {
       ).length;
     case "merge":
       return mergePrompt(
-        { ticketNumber: 1, prTitle: "Ticket 1", branch: "z/ticket-1-demo", baseBranch: "main", worktreePath: ".worktrees/ticket-1", stackedOn: [] },
+        // statePath is what the SKILL's merge row supplies (#178): it renders
+        // the stamping form of the gate command, so the measured prompt is the
+        // one the orchestrator actually builds.
+        { ticketNumber: 1, prTitle: "Ticket 1", branch: "z/ticket-1-demo", baseBranch: "main", worktreePath: ".worktrees/ticket-1", stackedOn: [], statePath: "loop/state.json" },
         INPUT_PATH
       ).length;
   }
