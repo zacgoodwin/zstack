@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   Board,
+  main,
   ghExecutor,
   type GraphQLExecutor,
   type GraphQLData,
@@ -46,6 +47,7 @@ const CFG: BoardConfig = {
 const FIXTURE_BY_OP: Record<string, string> = {
   ProjectItems: "project-items",
   IssueLookup: "issue-lookup",
+  ItemLookup: "item-lookup", // #138: the single-ticket confirm read
   FieldValue: "field-value-model",
   RepoMeta: "repo-meta",
   CreateIssue: "create-issue",
@@ -609,6 +611,169 @@ describe("move", () => {
     const board = new Board(CFG, makeExecutor({ calls }));
     await expect(board.move(5, "Shipped")).rejects.toThrow(/Unknown status/);
     expect(calls.some((c) => c.op === "SetSingleSelect")).toBe(false);
+  });
+});
+
+// -- #138: the single-ticket lookup and the --if-present write backstop -------
+// The whole point of `item` is that its NEGATIVE answer is trustworthy: unlike
+// list/snapshot (paginated, so a short page reads as an absence), this resolves
+// one issue straight to its project item.
+describe("item (#138)", () => {
+  // The one project item the fixture's issue #5 does NOT have: same issue,
+  // linked only to some other board.
+  const otherBoardOnly = {
+    repository: {
+      issue: {
+        number: 5,
+        title: "C2: bin/z-board",
+        url: "http://x/5",
+        body: "b",
+        labels: { pageInfo: { hasNextPage: false }, nodes: [] },
+        projectItems: { pageInfo: { hasNextPage: false }, nodes: [{ project: { number: 99 }, fieldValues: { pageInfo: { hasNextPage: false }, nodes: [] } }] },
+      },
+    },
+  };
+
+  test("a ticket on the board comes back as a full BoardItem plus its body", async () => {
+    const board = new Board(CFG, makeExecutor());
+    const r = await board.item(5);
+    expect(r.present).toBe(true);
+    expect(r.number).toBe(5);
+    if (!r.present) throw new Error("unreachable");
+    expect(r.item.fields).toEqual({ Status: "In progress", Model: "opus", Estimate: 6 });
+    expect(r.item.labels).toEqual(["skip-qa"]);
+    expect(r.item.milestone).toBe("M1");
+    // The body rides along: a ticket spliced back into a read without it would
+    // silently lose its `Depends on` lines at ingest.
+    expect(r.body).toContain("Depends on #3");
+  });
+
+  test("an issue that is not on THIS project answers not-on-project (never another board's item)", async () => {
+    const board = new Board(CFG, makeExecutor({ overrides: { ItemLookup: otherBoardOnly } }));
+    expect(await board.item(5)).toEqual({ number: 5, present: false, reason: "not-on-project" });
+  });
+
+  test("a deleted issue answers issue-not-found -- also positive, also safe to release", async () => {
+    const board = new Board(CFG, makeExecutor({ overrides: { ItemLookup: { repository: { issue: null } } } }));
+    expect(await board.item(5)).toEqual({ number: 5, present: false, reason: "issue-not-found" });
+  });
+
+  test("a null REPOSITORY throws instead of reporting the ticket gone", async () => {
+    // A config/permission failure is evidence about the SLUG, not about #5.
+    // Reading it as an absence would release every lane on the next tick.
+    const board = new Board(CFG, makeExecutor({ overrides: { ItemLookup: { repository: null } } }));
+    await expect(board.item(5)).rejects.toThrow(/Refusing to read that as/);
+  });
+
+  test("a projectItems page overflow throws (a truncated page must never read as absent)", async () => {
+    const truncated = structuredClone(otherBoardOnly);
+    truncated.repository.issue.projectItems.pageInfo.hasNextPage = true;
+    const board = new Board(CFG, makeExecutor({ overrides: { ItemLookup: truncated } }));
+    await expect(board.item(5)).rejects.toThrow(/exceeds its single query page/);
+  });
+});
+
+describe("move --if-present (#138 AC8)", () => {
+  const notOnBoard = {
+    repository: {
+      issue: {
+        id: "I_5",
+        number: 5,
+        title: "t",
+        body: "b",
+        assignees: { pageInfo: { hasNextPage: false }, nodes: [] },
+        projectItems: { pageInfo: { hasNextPage: false }, nodes: [{ id: "PVTI_other", project: { number: 99 } }] },
+      },
+    },
+  };
+
+  test("an issue with no project item reports {moved:false, reason} and issues no mutation", async () => {
+    const calls: Call[] = [];
+    const board = new Board(CFG, makeExecutor({ calls, overrides: { IssueLookup: notOnBoard } }));
+    expect(await board.moveIfPresent(5, "Done")).toEqual({ moved: false, reason: "not-on-project" });
+    expect(calls.some((c) => c.op === "SetSingleSelect")).toBe(false);
+  });
+
+  test("a present issue reports {moved:true} and the status is actually set", async () => {
+    const calls: Call[] = [];
+    const board = new Board(CFG, makeExecutor({ calls }));
+    expect(await board.moveIfPresent(5, "Done")).toEqual({ moved: true });
+    const set = calls.find((c) => c.op === "SetSingleSelect")!;
+    expect(set.vars).toMatchObject({ item: "PVTI_5", field: "F_status", option: "opt_done" });
+  });
+
+  test("the flag is opt-in: a plain move on the same absent issue still throws loudly", async () => {
+    const board = new Board(CFG, makeExecutor({ overrides: { IssueLookup: notOnBoard } }));
+    await expect(board.move(5, "Done")).rejects.toThrow(/is not on project zstack \(#1\)/);
+  });
+
+  test("an unknown status is still rejected before any lookup or mutation", async () => {
+    const calls: Call[] = [];
+    const board = new Board(CFG, makeExecutor({ calls }));
+    await expect(board.moveIfPresent(5, "Shipped")).rejects.toThrow(/Unknown status/);
+    expect(calls.length).toBe(0);
+  });
+
+  // AC8 at the CLI edge, through the real `main` with a fixture-backed Board:
+  // the printed JSON AND the exit code, in the order the criterion names them.
+  test("AC8: the CLI prints {moved:false,reason} then {moved:true}, exit 0 both times", async () => {
+    const calls: Call[] = [];
+    const printed: string[] = [];
+    const log = console.log;
+    console.log = (...a: unknown[]) => void printed.push(a.join(" "));
+    try {
+      const absent = await main(["move", "5", "Done", "--if-present"], () =>
+        new Board(CFG, makeExecutor({ calls, overrides: { IssueLookup: notOnBoard } }))
+      );
+      expect(absent).toBe(0); // exit 0, not a thrown/1 abort of the tick
+      expect(JSON.parse(printed[0])).toEqual({ moved: false, reason: "not-on-project" });
+      expect(calls.some((c) => c.op === "SetSingleSelect")).toBe(false);
+
+      const present = await main(["move", "5", "Done", "--if-present"], () => new Board(CFG, makeExecutor({ calls })));
+      expect(present).toBe(0);
+      expect(JSON.parse(printed[1])).toEqual({ moved: true });
+      expect(calls.find((c) => c.op === "SetSingleSelect")!.vars).toMatchObject({
+        item: "PVTI_5",
+        field: "F_status",
+        option: "opt_done",
+      });
+    } finally {
+      console.log = log;
+    }
+  });
+
+  test("AC8: without the flag the same absent issue exits 1 (the loud path is unchanged)", async () => {
+    const err = console.error;
+    console.error = () => {};
+    try {
+      const code = await main(["move", "5", "Done"], () =>
+        new Board(CFG, makeExecutor({ overrides: { IssueLookup: notOnBoard } }))
+      );
+      expect(code).toBe(1);
+    } finally {
+      console.error = err;
+    }
+  });
+
+  test("--if-present is a BOOLEAN flag, so it never swallows the next argument", () => {
+    // `move 5 Done --if-present --slug x` must keep "Done" as the status; a
+    // value-taking flag would eat "--slug" and leave the slug unparsed.
+    const source = readFileSync(join(REPO_ROOT, "lib", "board.ts"), "utf8");
+    expect(source).toContain('parseFlags(argv.slice(1), ["json", "if-present"])');
+  });
+
+  test("the CLI exposes `item` and prints its lookup as one JSON line", async () => {
+    const printed: string[] = [];
+    const log = console.log;
+    console.log = (...a: unknown[]) => void printed.push(a.join(" "));
+    try {
+      expect(await main(["item", "5"], () => new Board(CFG, makeExecutor()))).toBe(0);
+    } finally {
+      console.log = log;
+    }
+    expect(printed.length).toBe(1);
+    expect(printed[0]).not.toContain("\n");
+    expect(JSON.parse(printed[0])).toMatchObject({ number: 5, present: true });
   });
 });
 

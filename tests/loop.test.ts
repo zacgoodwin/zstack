@@ -11,8 +11,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   applyAction,
+  applyConfirmations,
   builtGuardFailure,
   canTransition,
+  confirmTargets,
   drainComplete,
   humanNeededStatus,
   humanNeededTripped,
@@ -1391,33 +1393,270 @@ describe("dead merge worker path", () => {
   });
 });
 
-// -- ingest drops an orphaned lane (issue #14 H14) ---------------------------
+// -- #138: positive-evidence ingest ------------------------------------------
+// The rule this replaces H14 (issue #14) with: the board affects loop state ONLY
+// through positive observations. A ticket absent from a PAGINATED bulk read is a
+// non-observation -- a short page and a real removal are indistinguishable at
+// this boundary -- so absence carries forward and only a single-ticket lookup's
+// positive "not on this project" (confirmedGone) removes anything.
+describe("#138 positive-evidence ingest: absence carries forward", () => {
+  // The board the loop is mid-drain on for AC1-AC3: 68 tickets, a lane on #40.
+  function prev68(): LoopState {
+    return {
+      tickets: Array.from({ length: 68 }, (_, i) =>
+        ticket(i + 1, i + 1 === 40 ? "Building" : "Ready", i + 1 === 7 ? [3] : [])
+      ),
+      lanes: [lane(40, "builder", { lastWroteStatus: "Building" })],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      mergedThisRun: [12],
+      initialReadyCount: 68,
+      initialBatchTickets: [40],
+      batchTickets: [40],
+      humanNeededNotified: false,
+    };
+  }
 
-describe("ingest drops a lane whose ticket vanished", () => {
-  test("a lane whose ticket left the board is dropped; nextAction/apply never throw", () => {
+  // AC1: a two-item read over a 68-ticket board.
+  test("AC1: a 2-item read carries the other 66 forward unchanged, keeps the lane, and deep-clones", () => {
+    const prev = prev68();
+    const s = ingestBoardItems(
+      prev,
+      [
+        { number: 40, title: "Ticket 40", fields: { Status: "Building" } },
+        { number: 41, title: "Ticket 41", fields: { Status: "Done" } },
+      ],
+      { "40": "", "41": "" },
+      undefined,
+      []
+    );
+    expect(s.tickets.length).toBe(68);
+    expect(s.tickets.map((t) => t.number)).toEqual(Array.from({ length: 68 }, (_, i) => i + 1));
+    expect(s.lanes.map((l) => l.ticket)).toEqual([40]); // the in-flight lane is intact
+    // The 66 unobserved tickets are byte-identical to what prev held -- status,
+    // deps, everything -- and the 2 observed ones took the read's values.
+    const byNum = new Map(s.tickets.map((t) => [t.number, t]));
+    expect(byNum.get(7)).toEqual(prev.tickets.find((t) => t.number === 7)!);
+    expect(byNum.get(41)!.status).toBe("Done");
+    expect(byNum.get(68)!.status).toBe("Ready");
+
+    // Deep clone, no aliasing: mutating the result never reaches prev.
+    s.tickets[0].status = "Skipped";
+    s.tickets[0].title = "mutated";
+    s.lanes[0].stage = "merge";
+    s.mergedThisRun!.push(999);
+    s.batchTickets!.push(999);
+    s.initialBatchTickets!.push(999);
+    expect(prev.tickets[0].status).toBe("Ready");
+    expect(prev.tickets[0].title).toBe("Ticket 1");
+    expect(prev.lanes[0].stage).toBe("builder");
+    expect(prev.mergedThisRun).toEqual([12]);
+    expect(prev.batchTickets).toEqual([40]);
+    expect(prev.initialBatchTickets).toEqual([40]);
+  });
+
+  // AC2: the #127 empty-read special case is GONE -- 0 items is just the case
+  // where nothing was observed, and it flows through the same merge.
+  test("AC2: a 0-item read carries everything forward through the same merge path", () => {
+    const prev = prev68();
+    const empty = ingestBoardItems(prev, [], {}, undefined, []);
+    // Identical to a 1-item read of a ticket that did not change: same merge, no
+    // branch. (Compared against a read of #40 exactly as prev already holds it.)
+    const oneNoOp = ingestBoardItems(
+      prev,
+      [{ number: 40, title: "Ticket 40", fields: { Status: "Building", Model: "sonnet" }, labels: [] }],
+      { "40": "" },
+      undefined,
+      []
+    );
+    expect(JSON.stringify(empty.tickets)).toBe(JSON.stringify(oneNoOp.tickets));
+    expect(empty.lanes).toEqual(prev.lanes);
+    expect(drainComplete(empty.tickets, empty.lanes, empty.batchTickets)).toBe(false);
+    expect(nextAction(empty, 0).kind).not.toBe("drain-complete");
+    // Never `prev` by reference (the old special case returned it verbatim).
+    expect(empty).not.toBe(prev);
+    empty.tickets[0].status = "Skipped";
+    expect(prev.tickets[0].status).toBe("Ready");
+  });
+
+  // Source canary, comments stripped (the removal is DOCUMENTED in a comment
+  // there, and documenting it must not satisfy the gate): no code path in
+  // lib/loop.ts branches on an empty read any more.
+  test("AC2: ingestBoardItems no longer carries an items.length === 0 special case", () => {
+    const code = readFileSync(join(REPO_ROOT, "lib", "loop.ts"), "utf8")
+      .split("\n")
+      .filter((l) => !l.trim().startsWith("//"))
+      .join("\n");
+    expect(code).not.toContain("items.length === 0");
+    expect(code).not.toContain("items.length ===");
+  });
+
+  // AC3: the H14 outcome survives, but ONLY on positive confirmation.
+  test("AC3: confirmedGone drops exactly that ticket and its lane, nothing else", () => {
+    const prev = prev68();
+    const s = ingestBoardItems(prev, [{ number: 41, title: "Ticket 41", fields: { Status: "Done" } }], { "41": "" }, undefined, [40]);
+    expect(s.tickets.find((t) => t.number === 40)).toBeUndefined();
+    expect(s.lanes).toEqual([]); // the confirmed-gone ticket's lane is released
+    expect(s.tickets.length).toBe(67); // every other ticket untouched
+    expect(s.tickets.find((t) => t.number === 39)).toEqual(prev.tickets.find((t) => t.number === 39)!);
+    // And the state stays usable: the old H14 failure was a later apply throwing
+    // in findTicket on the orphaned lane.
+    expect(() => applyAction(s, nextAction(s, 0), 0)).not.toThrow();
+  });
+
+  // Without this, the confirm pass re-looks-up a ticket it already proved gone on
+  // EVERY remaining tick (it is still in batchTickets and still absent from every
+  // read) -- one API call and one log line per tick for the rest of the drain.
+  test("a confirmed-gone ticket leaves batchTickets, so it is never re-confirmed", () => {
+    const prev = prev68();
+    const s = ingestBoardItems(prev, [], {}, undefined, [40]);
+    expect(s.batchTickets).toEqual([]);
+    expect(confirmTargets(s, [])).toEqual([]);
+    expect(prev.batchTickets).toEqual([40]); // and prev is untouched
+    // The capture-once contract is otherwise intact: nothing was re-selected.
+    expect(ingestBoardItems(prev, [], {}, undefined, []).batchTickets).toEqual([40]);
+  });
+
+  // AC6: the false mid-batch drain the prior design's review found (finding 3).
+  test("AC6: a truncated read that drops the last un-built batch ticket does not drain-complete", () => {
     const prev: LoopState = {
-      tickets: [ticket(1, "Building"), ticket(2, "Building")],
-      lanes: [lane(1, "builder"), lane(2, "builder", { outcome: { kind: "built" } })],
+      tickets: [ticket(1, "Done"), ticket(2, "Done"), ticket(3, "Ready")],
+      lanes: [],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      mergedThisRun: [1, 2],
+      initialReadyCount: 3,
+      initialBatchTickets: [1, 2, 3],
+      batchTickets: [1, 2, 3],
+      humanNeededNotified: false,
+    };
+    const s = ingestBoardItems(
+      prev,
+      [
+        { number: 1, title: "Ticket 1", fields: { Status: "Done" } },
+        { number: 2, title: "Ticket 2", fields: { Status: "Done" } },
+      ],
+      { "1": "", "2": "" },
+      undefined,
+      []
+    );
+    expect(s.tickets.find((t) => t.number === 3)!.status).toBe("Ready");
+    expect(s.batchTickets).toEqual([1, 2, 3]); // the allow-list did not evaporate
+    expect(drainComplete(s.tickets, s.lanes, s.batchTickets)).toBe(false);
+    expect(nextAction(s, 0)).toMatchObject({ kind: "claim", ticket: 3 });
+  });
+
+  // AC7: an honest read with a big legitimate shrink in workable tickets is
+  // ingested verbatim -- there is no shrink predicate anywhere on the path.
+  test("AC7: an honest read in which 30 tickets went Done ingests exactly as read", () => {
+    const nums = Array.from({ length: 40 }, (_, i) => i + 1);
+    const prev: LoopState = {
+      tickets: nums.map((n) => ticket(n, "Ready")),
+      lanes: [],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      mergedThisRun: [],
+      initialReadyCount: 40,
+      initialBatchTickets: nums,
+      batchTickets: nums,
+      humanNeededNotified: false,
+    };
+    const items = nums.map((n) => ({ number: n, title: `Ticket ${n}`, fields: { Status: n <= 30 ? "Done" : "Ready" } }));
+    const bodies = Object.fromEntries(nums.map((n) => [String(n), ""]));
+    const s = ingestBoardItems(prev, items, bodies, undefined, []);
+    expect(s.tickets.filter((t) => t.status === "Done").length).toBe(30);
+    expect(s.tickets.map((t) => t.number)).toEqual(nums); // nothing held back
+    // Byte-identical to a plain ingest of the same read with no prior state at
+    // all: carry-forward contributed nothing, so no heuristic could have.
+    expect(JSON.stringify(s.tickets)).toBe(JSON.stringify(ingestBoardItems(null, items, bodies).tickets));
+  });
+
+  // The origin marker (#125) may only be cleared by a FRESH observation.
+  // applyAction writes a lane's ticket status and its lastWroteStatus together,
+  // so clearing off the merged (carried-forward) set would disarm the desync
+  // guard with no board evidence at all.
+  test("a carried-forward lane keeps its #125 origin marker; an observed one clears it", () => {
+    const prev: LoopState = {
+      tickets: [ticket(1, "QA"), ticket(2, "QA")],
+      lanes: [lane(1, "qa", { lastWroteStatus: "QA" }), lane(2, "qa", { lastWroteStatus: "QA" })],
       maxLanes: 3,
       watchdogMinutes: 10,
       mergedThisRun: [],
     };
-    // #2 was removed from the project mid-run; the snapshot only has #1. Before the
-    // fix, lane #2 survived and the next apply threw in findTicket(#2), wedging
-    // every subsequent apply.
-    const s = ingestBoardItems(prev, [{ number: 1, title: "t1", fields: { Status: "Building" } }], { "1": "" });
-    expect(s.tickets.map((t) => t.number)).toEqual([1]);
-    expect(s.lanes.map((l) => l.ticket)).toEqual([1]); // lane #2 dropped
-    const a = nextAction(s, 0);
-    expect(() => applyAction(s, a, 0)).not.toThrow();
+    const s = ingestBoardItems(prev, [{ number: 2, title: "Ticket 2", fields: { Status: "QA" } }], { "2": "" });
+    expect(s.lanes.find((l) => l.ticket === 1)!.lastWroteStatus).toBe("QA"); // unobserved -> unproven
+    expect(s.lanes.find((l) => l.ticket === 2)!.lastWroteStatus).toBeUndefined(); // observed -> landed
+  });
+});
+
+// -- #138: which absences are worth a lookup, and folding the answers back in --
+
+describe("#138 confirmTargets", () => {
+  const items = [{ number: 5, title: "t5", fields: { Status: "Ready" } }];
+
+  test("names the lane and batch tickets the read did not show, sorted, deduped", () => {
+    const prev: LoopState = {
+      tickets: [ticket(5, "Ready")],
+      lanes: [lane(9, "builder"), lane(2, "qa")],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      batchTickets: [2, 5, 7],
+    };
+    expect(confirmTargets(prev, items)).toEqual([2, 7, 9]);
+  });
+
+  test("no prior state (tick 1) and a fully-observed board both confirm nothing", () => {
+    expect(confirmTargets(null, items)).toEqual([]);
+    const prev: LoopState = { tickets: [ticket(5, "Ready")], lanes: [lane(5, "builder")], maxLanes: 3, watchdogMinutes: 10, batchTickets: [5] };
+    expect(confirmTargets(prev, items)).toEqual([]);
+  });
+});
+
+describe("#138 applyConfirmations", () => {
+  const items = [{ number: 5, title: "t5", fields: { Status: "Ready" } }];
+  const bodies = { "5": "body5" };
+
+  test("a found ticket is spliced into the read (body included) and is not confirmed gone", () => {
+    const r = applyConfirmations(items, bodies, [
+      { number: 1, present: true, item: { number: 1, title: "t1", fields: { Status: "QA" } }, body: "Depends on #5" },
+    ]);
+    expect(r.items.map((i) => i.number)).toEqual([5, 1]);
+    expect(r.bodies["1"]).toBe("Depends on #5");
+    expect(r.confirmedGone).toEqual([]);
+    expect(r.notes[0]).toContain("read missed #1");
+    expect(r.notes[0]).toContain("still on the board");
+  });
+
+  test("a positively absent ticket becomes confirmedGone with the reason in its note", () => {
+    const r = applyConfirmations(items, bodies, [{ number: 1, present: false, reason: "not-on-project" }]);
+    expect(r.confirmedGone).toEqual([1]);
+    expect(r.items.map((i) => i.number)).toEqual([5]);
+    expect(r.notes[0]).toContain("gone from the board (not-on-project)");
+    expect(r.notes[0]).toContain("releasing its lane");
+  });
+
+  test("a lookup for a ticket the read already showed, or one with no usable answer, changes nothing", () => {
+    const already = applyConfirmations(items, bodies, [{ number: 5, present: false, reason: "not-on-project" }]);
+    expect(already.confirmedGone).toEqual([]); // the read is the newer positive observation
+    expect(already.notes).toEqual([]);
+    const malformed = applyConfirmations(items, bodies, [{ number: 1, present: true }]);
+    expect(malformed.confirmedGone).toEqual([]); // never drops a lane on a malformed answer
+    expect(malformed.items.map((i) => i.number)).toEqual([5]);
+    expect(malformed.notes[0]).toContain("carrying it forward");
+  });
+
+  test("no lookups at all is a pure pass-through (the fail-open shape)", () => {
+    const r = applyConfirmations(items, bodies, []);
+    expect(r.items).toEqual(items);
+    expect(r.bodies).toEqual(bodies);
+    expect(r.confirmedGone).toEqual([]);
+    expect(r.items).not.toBe(items); // and never aliases its input
   });
 });
 
 // -- #127: a transient empty snapshot must NOT wipe tickets/lanes -------------
-// Counterpoint to the H14 test above: ONE vanished ticket is a real removal (its
-// lane is dropped); a snapshot of ZERO items over a populated prior state is a
-// GitHub hiccup and must be treated as stale, or nextAction returns a FALSE
-// drain-complete mid-batch and orphans the running stage agents.
+// #138 kept this contract and generalized it: the empty read is no longer a
+// special case, it is the carry-forward merge with nothing observed.
 describe("ingest preserves state on a transient empty snapshot (#127)", () => {
   test("a 0-item snapshot over tickets + in-flight lanes preserves both and does not drain-complete", () => {
     const prev: LoopState = {

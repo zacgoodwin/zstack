@@ -1244,24 +1244,15 @@ export function ingestBoardItems(
     ticketLimit?: number; // #131: cap used to compute batchTickets on a fresh batch
     contextTokens?: number; // #131: live orchestrator context reading, stored fresh
     contextTokenLimit?: number; // #131: context ceiling, captured once like the other knobs
-  }
+  },
+  // #138: the ONLY input that removes a ticket (and its lane) from loop state.
+  // Each number here must have been PROVED absent by a single-ticket lookup
+  // (lib/board.ts `item`); absence from `items` proves nothing and never lands
+  // here. Default [] = no confirm pass ran, which degrades to pure carry-forward.
+  confirmedGone: number[] = []
 ): LoopState {
-  // #127 backstop: a transient GitHub hiccup can make `z-board snapshot` return
-  // 0 items for a board that actually has many (observed live: one read returned
-  // 0, the next returned all 68). Faithfully ingesting that empty read would
-  // overwrite tickets with [] and drop every in-flight lane (H14 below), and
-  // nextAction would then return a FALSE drain-complete mid-batch -- ending the
-  // loop early and orphaning running stage agents. A genuinely empty board only
-  // exists before any ticket is created, a state a mid-drain loop is never in, so
-  // when the snapshot is empty but `prev` still tracked tickets or lanes, treat
-  // the read as stale and keep the prior state unchanged. The caller re-snapshots
-  // next tick (snapshot() also retries at the source); nothing here reports drain-
-  // complete off the stale read. First ingest (prev null / empty) is untouched.
-  if (items.length === 0 && prev && (prev.tickets.length > 0 || prev.lanes.length > 0)) {
-    return prev;
-  }
   const prevByNumber = new Map((prev?.tickets ?? []).map((t) => [t.number, t]));
-  const tickets = items.map((it) => {
+  const observed = items.map((it) => {
     const status = String(it.fields["Status"] ?? "") as BoardStatus;
     if (!BOARD_STATUSES.includes(status)) {
       throw new ZError(`Issue #${it.number} has unknown Status ${JSON.stringify(it.fields["Status"])}.`);
@@ -1280,13 +1271,32 @@ export function ingestBoardItems(
     if (prevByNumber.get(it.number)?.claimedByOther) t.claimedByOther = true;
     return t;
   });
-  // Drop any lane whose ticket vanished from the snapshot (issue #14 H14): if an
-  // issue is removed from the project mid-run, keeping its lane would make the
-  // next apply throw in findTicket and wedge every subsequent apply. The worker
-  // (if any) is left for the SKILL to tear down; the loop simply stops tracking a
-  // ticket the board no longer knows about.
-  const present = new Set(tickets.map((t) => t.number));
-  const statusByNumber = new Map(tickets.map((t) => [t.number, t.status]));
+  // #138 positive-evidence merge. A board read is a set of POSITIVE observations,
+  // never a census: every read path here pages the GitHub API (`z-board snapshot`,
+  // Step 3's per-status `list` loop, any future caller), and at THIS boundary a
+  // page that came back short is indistinguishable from a ticket that was really
+  // removed -- no shrink predicate, hold counter, or "believe the board or hold"
+  // rule can recover ground truth from a non-observation. So a prev ticket absent
+  // from `items` carries forward UNCHANGED and a present one updates, which makes
+  // correctness independent of which read path fed this call. #127's
+  // `items.length === 0` special case is gone with the same reasoning: an empty
+  // read is simply the case where nothing was observed, and it now carries
+  // everything forward through this one merge path (and returns a fresh clone,
+  // never `prev` by reference). The old H14 lane drop -- a lane whose ticket
+  // vanished from the read -- is likewise gone; the ONLY removal is
+  // `confirmedGone`, a caller's positive proof from a single-ticket lookup.
+  const gone = new Set(confirmedGone);
+  const merged = new Map<number, TicketSnapshot>();
+  for (const t of prev?.tickets ?? []) merged.set(t.number, structuredClone(t));
+  for (const t of observed) merged.set(t.number, t);
+  for (const n of gone) merged.delete(n);
+  const tickets = [...merged.values()].sort((a, b) => a.number - b.number);
+  // Deliberately built from the OBSERVED items only, not the merged set: this map
+  // is what clears #125's origin marker, and applyAction sets a lane's ticket
+  // status and its lastWroteStatus in the SAME write -- so a carried-forward
+  // (unobserved) ticket always "matches" its own marker and would clear it with
+  // no board evidence at all, silently disarming the desync guard.
+  const statusByNumber = new Map(observed.map((t) => [t.number, t.status]));
   // #125: the moment the freshly-read board shows the status the loop last
   // wrote for a lane, that write has LANDED -- drop the origin marker. From
   // then on a one-hop-behind read for that lane is a genuine human move-back
@@ -1294,7 +1304,7 @@ export function ingestBoardItems(
   // (resync). While the write lags (board != lastWroteStatus) the marker
   // survives so the guard still resyncs.
   const lanes = (prev?.lanes ?? [])
-    .filter((l) => present.has(l.ticket))
+    .filter((l) => !gone.has(l.ticket))
     .map((l) => {
       if (l.lastWroteStatus !== undefined && statusByNumber.get(l.ticket) === l.lastWroteStatus) {
         const cleared = { ...l };
@@ -1380,7 +1390,7 @@ export function ingestBoardItems(
       (!priorBatchActive || ticketLimitProvided));
 
   return {
-    tickets: tickets.sort((a, b) => a.number - b.number),
+    tickets,
     lanes: structuredClone(lanes),
     maxLanes: cfg?.maxLanes ?? prev?.maxLanes ?? DEFAULT_MAX_LANES,
     watchdogMinutes: cfg?.watchdogMinutes ?? prev?.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES,
@@ -1397,18 +1407,95 @@ export function ingestBoardItems(
     // #150: captured ONCE at the same fresh-batch boundary as initialReadyCount
     // and preserved verbatim across every re-ingest -- humanNeededStatus's
     // numerator scope for the life of this batch.
-    initialBatchTickets: startingFreshBatch ? tickets.filter(isNewBatchTicket).map((t) => t.number) : prev!.initialBatchTickets,
+    // structuredClone on the preserved arms (here and batchTickets below): the
+    // returned state must never alias `prev`'s arrays, or a caller mutating the
+    // ingest result silently rewrites the state it was merged from (#138 AC1).
+    initialBatchTickets: startingFreshBatch
+      ? tickets.filter(isNewBatchTicket).map((t) => t.number)
+      : structuredClone(prev!.initialBatchTickets),
     humanNeededNotified: startingFreshBatch ? false : (prev!.humanNeededNotified ?? false),
     // #131: the flagged allow-list is captured ONCE at the fresh-batch boundary
     // (same as initialReadyCount) and preserved verbatim across every re-ingest
-    // and context clear -- so a resume continues the same batch.
-    batchTickets: startingFreshBatch ? selectBatch(tickets, cfg?.ticketLimit ?? DEFAULT_TICKET_LIMIT) : prev!.batchTickets,
+    // and context clear -- so a resume continues the same batch. #138 adds the
+    // one subtraction: a ticket PROVED gone is not a member of any batch, and
+    // leaving it here would put it back on the confirm pass's target list every
+    // tick for the rest of the drain -- one lookup and one log line each, forever.
+    // (initialBatchTickets stays verbatim: it scopes humanNeededStatus's
+    // numerator over tickets that still exist, so a removed number cannot
+    // contribute to it and shrinking it would only muddy that capture-once
+    // contract.) The list still never GROWS or re-selects, which is what #131 and
+    // #157 protect.
+    batchTickets: startingFreshBatch
+      ? selectBatch(tickets, cfg?.ticketLimit ?? DEFAULT_TICKET_LIMIT)
+      : prev!.batchTickets?.filter((n) => !gone.has(n)),
     // contextTokens is a LIVE per-tick reading -- always taken fresh from cfg,
     // never preserved from prev (an unresolvable/absent reading degrades to 0,
     // which never gates). contextTokenLimit is captured once like the knobs.
     contextTokens: cfg?.contextTokens ?? 0,
     contextTokenLimit: cfg?.contextTokenLimit ?? prev?.contextTokenLimit ?? DEFAULT_CONTEXT_TOKEN_LIMIT,
   };
+}
+
+// -- #138 targeted confirm pass ----------------------------------------------
+// Carry-forward alone is always SAFE (a ticket the loop no longer needs simply
+// lingers), but on its own it is not complete: a ticket genuinely removed from
+// the board mid-run would keep its lane forever. These two pure functions are
+// the other half -- they turn "absent from a bulk read" into an actual
+// observation by naming exactly which tickets are worth ONE single-ticket
+// lookup each, and folding those lookups' answers back in. The IO between them
+// (the lookups themselves) belongs to the caller; ingestBoardItems stays pure.
+
+// The tickets whose absence from a read is worth confirming: the in-flight lanes
+// (a stuck lane is the failure carry-forward alone would leave behind) and this
+// batch's allow-list. Everything else on the board costs nothing to carry.
+export function confirmTargets(prev: LoopState | null, items: BoardItemLike[]): number[] {
+  if (!prev) return [];
+  const present = new Set(items.map((it) => it.number));
+  const watched = new Set<number>([...(prev.lanes ?? []).map((l) => l.ticket), ...(prev.batchTickets ?? [])]);
+  return [...watched].filter((n) => !present.has(n)).sort((a, b) => a - b);
+}
+
+// One single-ticket lookup's answer (lib/board.ts `item` prints exactly this).
+export interface ItemLookupResult {
+  number: number;
+  present: boolean;
+  item?: BoardItemLike;
+  body?: string;
+  reason?: string;
+}
+
+// Folds confirm-pass lookups into a read: a ticket the lookup found is SPLICED
+// into `items` (a positive observation beats carry-forward), a ticket the lookup
+// positively could not find becomes `confirmedGone`. Anything else -- a lookup
+// for a ticket the read already had, or a malformed present-but-itemless answer
+// -- proves nothing, so it is dropped and that ticket just carries forward.
+// `notes` are the log lines the caller prints; each states only what was proven.
+export function applyConfirmations(
+  items: BoardItemLike[],
+  bodies: Record<string, string>,
+  lookups: ItemLookupResult[]
+): { items: BoardItemLike[]; bodies: Record<string, string>; confirmedGone: number[]; notes: string[] } {
+  const present = new Set(items.map((it) => it.number));
+  const out = { items: [...items], bodies: { ...bodies }, confirmedGone: [] as number[], notes: [] as string[] };
+  for (const l of lookups ?? []) {
+    if (typeof l?.number !== "number" || present.has(l.number)) continue;
+    if (l.present && l.item) {
+      out.items.push(l.item);
+      out.bodies[String(l.number)] = l.body ?? "";
+      present.add(l.number);
+      out.notes.push(
+        `read missed #${l.number}; single-ticket lookup confirms it is still on the board (Status: ${l.item.fields?.["Status"] ?? "?"}).`
+      );
+    } else if (!l.present) {
+      out.confirmedGone.push(l.number);
+      out.notes.push(
+        `read missed #${l.number}; single-ticket lookup confirms it is gone from the board (${l.reason ?? "not-on-project"}); releasing its lane.`
+      );
+    } else {
+      out.notes.push(`read missed #${l.number}; its lookup answered nothing usable -- carrying it forward unchanged.`);
+    }
+  }
+  return out;
 }
 
 // -- CLI ---------------------------------------------------------------------
@@ -1429,7 +1516,10 @@ const USAGE = `loop <command> [args]
   claim-lost <state.json> <ticket>                   mark a ticket claimed by another session
   human-needed <state.json>                          print the breakdown + tripped/alreadyNotified (no writes)
   human-needed-ack <state.json>                       mark the mid-run notification as sent (fire-once flag)
-  ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M]
+  confirm-targets <state.json> <items.json>          print the lane/batch tickets the read did NOT
+                                                     show, one per line -- each worth one
+                                                     \`z-board item <N>\` before the ingest (#138)
+  ingest <state.json> <items.json> <bodies.json> [--lookups <F>] [--max-lanes N] [--watchdog-minutes M]
                       [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N]
                       [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off]
                       [--max-review-bounces N] [--min-skeptic-quorum N] [--ticket-limit N]
@@ -1624,11 +1714,33 @@ export function main(argv: string[]): number {
       console.log("human-needed notification acknowledged");
       return 0;
     }
+    if (cmd === "confirm-targets") {
+      // Read-only, and fail-open by construction: no state file yet (tick 1)
+      // means no lanes and no batch, so nothing is worth confirming.
+      if (!positionals[1]) throw new ZError("Usage: loop confirm-targets <state.json> <items.json>");
+      const targets = confirmTargets(readPrevState(statePath), readJson(positionals[1]) as BoardItemLike[]);
+      if (targets.length > 0) console.log(targets.join("\n"));
+      return 0;
+    }
     if (cmd === "ingest") {
-      if (!positionals[1] || !positionals[2]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off] [--max-review-bounces N] [--min-skeptic-quorum N] [--ticket-limit N] [--context-token-limit N] [--context-tokens N]");
+      if (!positionals[1] || !positionals[2]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--lookups <F>] [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off] [--max-review-bounces N] [--min-skeptic-quorum N] [--ticket-limit N] [--context-token-limit N] [--context-tokens N]");
       const prev = readPrevState(statePath);
-      const items = readJson(positionals[1]) as BoardItemLike[];
-      const bodies = readJson(positionals[2]) as Record<string, string>;
+      let items = readJson(positionals[1]) as BoardItemLike[];
+      let bodies = readJson(positionals[2]) as Record<string, string>;
+      // #138: the confirm pass's answers, if the caller ran one. Splicing a
+      // confirmed-present ticket back into the read and collecting the confirmed-
+      // gone numbers is a JSON transform, so it happens HERE (applyConfirmations),
+      // not in the wrapper's prose. Each note names only what was proven; they go
+      // to stderr because stdout of the tick is reserved for the Action line.
+      const lookupsFile = str(flags, "lookups");
+      let confirmedGone: number[] = [];
+      if (lookupsFile !== undefined) {
+        const confirmed = applyConfirmations(items, bodies, readJson(lookupsFile) as ItemLookupResult[]);
+        items = confirmed.items;
+        bodies = confirmed.bodies;
+        confirmedGone = confirmed.confirmedGone;
+        for (const note of confirmed.notes) console.error(note);
+      }
       const reviewerBelowThresholdAction = str(flags, "reviewer-below-threshold-action");
       if (
         reviewerBelowThresholdAction !== undefined &&
@@ -1643,7 +1755,7 @@ export function main(argv: string[]): number {
         const raw = str(flags, flag);
         if (raw !== undefined) cfg[camel(flag)] = Number(raw);
       }
-      const state = ingestBoardItems(prev, items, bodies, cfg as Parameters<typeof ingestBoardItems>[3]);
+      const state = ingestBoardItems(prev, items, bodies, cfg as Parameters<typeof ingestBoardItems>[3], confirmedGone);
       atomicWrite(statePath, JSON.stringify(state, null, 2));
       console.log(`${state.tickets.length} ticket(s), ${state.lanes.length} lane(s)`);
       return 0;

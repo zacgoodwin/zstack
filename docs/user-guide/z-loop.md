@@ -40,9 +40,37 @@ records the result. It never re-derives a scheduling decision in prose.
   stage's payload (body, diff) is assembled off-context into `input-<N>.json` and
   the printed prompt is a *pointer* to that file — small and payload-independent —
   so reading it to spawn the Agent stays cheap. And each drain iteration is a
-  single `bin/z-loop-tick` call (snapshot → ingest → `next`) that prints only the
-  one-line next Action, so the repeated bash never re-enters context. A long
-  batch drains in one session without tripping auto-compaction.
+  single `bin/z-loop-tick` call (snapshot → confirm → ingest → `next`) that prints
+  only the one-line next Action, so the repeated bash never re-enters context. A
+  long batch drains in one session without tripping auto-compaction.
+- **The board re-read is positive evidence, never a census.** Every iteration
+  re-reads the board so a human's mid-loop move is seen at the next boundary. But
+  that read is *paginated*, so a ticket **missing** from it proves nothing — a
+  short page and a genuinely removed ticket are identical at that boundary, and
+  no "the read looks too small" heuristic can tell them apart (several were tried;
+  each one either hung the drain on an honest read or believed a truncated one).
+  So the rule is one line: **absence from a board read is never a signal.** A
+  ticket the read did not show carries forward exactly as it was — status, flags,
+  dependencies, its lane — which makes correctness independent of which read path
+  ran and of how badly one read got truncated, up to and including a read that
+  came back empty. `state.json` is authoritative for in-flight lanes; the board
+  status is a write-through projection of it.
+  Carry-forward alone is safe but not complete, so the tick adds a **targeted
+  confirm**: for each lane or batch ticket the read missed (and only those), it
+  spends one `z-board item <N>` — a lookup that resolves the issue straight to its
+  project item with no pagination on the path, so it either returns the ticket or
+  positively answers "not on this project". Found → that fresh observation is
+  spliced into the read and wins over carry-forward; positively gone → the loop
+  releases its lane, the only thing that ever removes a ticket mid-run. A lookup
+  that fails outright changes nothing (the ticket just carries forward), and each
+  tick logs only what was proven: `read missed #N; single-ticket lookup confirms
+  it is still on the board`, or `... confirms it is gone from the board
+  (not-on-project); releasing its lane`.
+  On the write side the same rule gets a backstop: every lane's board move runs
+  as `z-board move <N> <S> --if-present`, which reports
+  `{"moved":false,"reason":"not-on-project"}` (exit 0) instead of aborting the
+  tick when a ticket was removed between two confirms. The lane is released
+  instead of the drain wedging.
 - **A `BUILT` that shipped nothing does not reach QA.** `BUILT` is a claim, and
   the loop verifies it against the lane worktree's own git facts before the lane
   advances: `git status --porcelain --branch` must report a clean tree, untracked
