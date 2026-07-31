@@ -1,0 +1,40 @@
+{
+  "repository": {
+    "issue": {
+      "number": 5,
+      "title": "C2: bin/z-board",
+      "url": "https://github.com/zacgoodwin/zstack/issues/5",
+      "body": "Original body.\nDepends on #3",
+      "milestone": { "title": "M1" },
+      "labels": { "pageInfo": { "hasNextPage": false }, "nodes": [{ "name": "skip-qa" }] },
+      "projectItems": {
+        "pageInfo": { "hasNextPage": false },
+        "nodes": [
+          {
+            "project": { "number": 1 },
+            "fieldValues": {
+              "pageInfo": { "hasNextPage": false },
+              "nodes": [
+                {
+                  "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                  "name": "In progress",
+                  "field": { "name": "Status" }
+                },
+                {
+                  "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                  "name": "opus",
+                  "field": { "name": "Model" }
+                },
+                {
+                  "__typename": "ProjectV2ItemFieldNumberValue",
+                  "number": 6,
+                  "field": { "name": "Estimate" }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

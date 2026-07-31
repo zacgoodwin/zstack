@@ -149,6 +149,38 @@ const Q_ISSUE_LOOKUP = `query IssueLookup($owner: String!, $repo: String!, $numb
   }
 }`;
 
+// Single-ticket board lookup (#138). Deliberately NOT a filtered form of
+// Q_PROJECT_ITEMS: that query pages the whole board, and a short page is
+// indistinguishable from a removed ticket, so absence from it proves nothing.
+// This one resolves ONE issue directly to its project item -- so it either
+// returns the ticket with its fields, or positively answers "that issue is not
+// on this project". Same per-item shape as Q_PROJECT_ITEMS's nodes (content +
+// fieldValues), so toItem parses both and the two can never drift.
+const Q_ITEM_LOOKUP = `query ItemLookup($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    issue(number: $number) {
+      number title url body
+      milestone { title }
+      labels(first: 20) { pageInfo { hasNextPage } nodes { name } }
+      projectItems(first: 20) {
+        pageInfo { hasNextPage }
+        nodes {
+          project { number }
+          fieldValues(first: 20) {
+            pageInfo { hasNextPage }
+            nodes {
+              __typename
+              ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2FieldCommon { name } } }
+              ... on ProjectV2ItemFieldTextValue { text field { ... on ProjectV2FieldCommon { name } } }
+              ... on ProjectV2ItemFieldNumberValue { number field { ... on ProjectV2FieldCommon { name } } }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
 const Q_FIELD_VALUE = `query FieldValue($owner: String!, $repo: String!, $number: Int!, $field: String!) {
   repository(owner: $owner, name: $repo) {
     issue(number: $number) {
@@ -240,6 +272,15 @@ export interface BoardItem {
   // fixtures elsewhere compile.
   milestone?: string;
 }
+
+// The answer to `item(n)` (#138): a positive observation either way. `present`
+// carries the item exactly as a bulk read would have reported it, plus the issue
+// body (the bulk read carries bodies too, and a spliced-in ticket whose body went
+// missing would silently lose its `Depends on` lines). `number` is always set, so
+// a caller can key the answer without tracking which call it came from.
+export type ItemLookup =
+  | { number: number; present: true; item: BoardItem; body: string }
+  | { number: number; present: false; reason: "not-on-project" | "issue-not-found" };
 
 export interface CreatedIssue {
   number: number;
@@ -430,16 +471,69 @@ export class Board {
     return { items, bodies, overCeiling };
   }
 
+  // One ticket, no pagination anywhere on the path (#138): the ONLY board read
+  // whose negative answer is trustworthy. `snapshot`/`list` page the board, so a
+  // ticket missing from them is undecidable -- a short page and a real removal
+  // look identical. This resolves the issue directly to its project item, so
+  // "not on this project" is a fact, not an inference from silence.
+  async item(n: number): Promise<ItemLookup> {
+    const data = await this.gql(Q_ITEM_LOOKUP, {
+      owner: this.cfg.owner,
+      repo: this.cfg.repo,
+      number: n,
+    });
+    // A null REPOSITORY is a config/permission failure, not evidence about #n --
+    // reading it as "gone" would release every lane on the next tick. Fail loud.
+    if (!data.repository) {
+      throw new ZError(
+        `Repository ${this.cfg.owner}/${this.cfg.repo} did not resolve for the #${n} lookup. ` +
+          `Refusing to read that as "#${n} left the board" -- check the slug's owner/repo and the token's access.`
+      );
+    }
+    const issue = data.repository.issue;
+    // A deleted issue is as positively absent as a de-linked one, and its number
+    // can never come back; both are safe to confirm, with the reason recorded.
+    if (!issue) return { number: n, present: false, reason: "issue-not-found" };
+    assertSinglePage(issue.projectItems, `projectItems for issue #${n} (ceiling: 20 boards per issue)`);
+    const node = (issue.projectItems?.nodes ?? []).find(
+      (i: any) => i.project?.number === this.cfg.projectNumber
+    );
+    if (!node) return { number: n, present: false, reason: "not-on-project" };
+    const item = toItem({ content: issue, fieldValues: node.fieldValues });
+    if (!item) {
+      throw new ZError(`Issue #${n} resolved to a project item with no readable content.`);
+    }
+    return { number: n, present: true, item, body: issue.body ?? "" };
+  }
+
   async move(n: number, status: string): Promise<void> {
+    const res = await this.moveIfPresent(n, status);
+    if (!res.moved) {
+      throw new ZError(
+        `Issue #${n} is not on project ${this.cfg.slug} (#${this.cfg.projectNumber}).`
+      );
+    }
+  }
+
+  // #138 write-path backstop: the same move, except an issue that is positively
+  // not on this project REPORTS that instead of throwing. A ticket removed from
+  // the board between two confirm passes would otherwise abort the whole tick on
+  // its lane's next park/skip/claim move; the caller releases the lane instead.
+  // Deliberately narrow -- only the not-on-project condition is swallowed. A
+  // missing issue, a bad status, or any transport failure still throws, so a
+  // misconfigured slug can never masquerade as "every ticket left the board".
+  async moveIfPresent(n: number, status: string): Promise<{ moved: boolean; reason?: "not-on-project" }> {
     this.assertStatus(status);
     const option = this.cfg.statusField.options![status];
-    const item = await this.itemId(n);
+    const item = await this.itemIdOrNull(n);
+    if (item === null) return { moved: false, reason: "not-on-project" };
     await this.gql(M_SET_SINGLE_SELECT, {
       project: this.cfg.projectId,
       item,
       field: this.cfg.statusField.id,
       option,
     });
+    return { moved: true };
   }
 
   async comment(n: number, bodyFile: string): Promise<void> {
@@ -696,17 +790,24 @@ export class Board {
     return issue as IssueNode;
   }
 
-  private async itemId(n: number): Promise<string> {
+  // No cross-project fallback: another board's item is not ours. null = the
+  // issue exists but carries no item for THIS project (moveIfPresent's one
+  // recoverable case); a missing issue still throws out of lookup().
+  private async itemIdOrNull(n: number): Promise<string | null> {
     const issue = await this.lookup(n);
-    const item = issue.projectItems.nodes.find(
-      (i) => i.project?.number === this.cfg.projectNumber
+    return (
+      issue.projectItems.nodes.find((i) => i.project?.number === this.cfg.projectNumber)?.id ?? null
     );
-    if (!item) {
+  }
+
+  private async itemId(n: number): Promise<string> {
+    const item = await this.itemIdOrNull(n);
+    if (item === null) {
       throw new ZError(
         `Issue #${n} is not on project ${this.cfg.slug} (#${this.cfg.projectNumber}).`
       );
     }
-    return item.id;
+    return item;
   }
 
   private async userId(login: string): Promise<string> {
@@ -894,7 +995,10 @@ const USAGE = `z-board <command> [args]
 
   list [--status <S>] [--json]      board items with fields (all statuses unless --status)
   snapshot --out-items <F> --out-bodies <F>   all-status items + each ticket's body, one pass (z-loop drain)
-  move <N> <S>                      set an issue's Status
+  item <N>                          ONE issue's board item as JSON: {number,present,item,body} or
+                                    {number,present:false,reason} -- the only read whose "no" is proof
+  move <N> <S> [--if-present]       set an issue's Status (--if-present: print {moved:false,
+                                    reason:"not-on-project"} and exit 0 instead of throwing)
   comment <N> --body-file <F>       add a comment
   field-get <N> <Field>             read a custom field (Model | Model Effort | Estimate | Actual)
   field-set <N> <Field> <V>         write a custom field
@@ -909,6 +1013,7 @@ const USAGE = `z-board <command> [args]
 const COMMANDS = new Set([
   "list",
   "snapshot",
+  "item",
   "move",
   "comment",
   "field-get",
@@ -928,7 +1033,16 @@ function requireInt(v: string | undefined, label: string): number {
   return n;
 }
 
-export async function main(argv: string[]): Promise<number> {
+// `boardFor` is the one seam in this CLI: the default resolves the slug's config
+// and the real gh-backed executor, exactly as before. A caller (the gate tests)
+// can hand in a fixture-backed Board instead, so the CLI edge -- what it prints
+// and what it EXITS with, not just what the Board class returns -- is testable
+// with no network, no gh, and no temp $HOME. Same injection style as
+// `Board(cfg, exec, sleep, now)` and `ghExecutor(spawn)`.
+export async function main(
+  argv: string[],
+  boardFor: (slug?: string) => Board = (slug) => new Board(loadConfig(slug), ghExecutor())
+): Promise<number> {
   const cmd = argv[0];
   if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
     console.log(USAGE);
@@ -942,10 +1056,9 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   try {
-    const { positionals, flags } = parseFlags(argv.slice(1), ["json"]);
+    const { positionals, flags } = parseFlags(argv.slice(1), ["json", "if-present"]);
     const slug = typeof flags.slug === "string" ? flags.slug : undefined;
-    const cfg = loadConfig(slug);
-    const board = new Board(cfg, ghExecutor());
+    const board = boardFor(slug);
 
     switch (cmd) {
       case "list": {
@@ -994,10 +1107,20 @@ export async function main(argv: string[]): Promise<number> {
         }
         return 0;
       }
+      case "item": {
+        // One JSON object on one line: the confirm pass slurps a stream of these.
+        const n = requireInt(positionals[0], "issue");
+        console.log(JSON.stringify(await board.item(n)));
+        return 0;
+      }
       case "move": {
         const n = requireInt(positionals[0], "issue");
         const status = positionals[1];
-        if (!status) throw new ZError("Usage: z-board move <N> <S>");
+        if (!status) throw new ZError("Usage: z-board move <N> <S> [--if-present]");
+        if (flags["if-present"]) {
+          console.log(JSON.stringify(await board.moveIfPresent(n, status)));
+          return 0;
+        }
         await board.move(n, status);
         console.log(`#${n} -> ${status}`);
         return 0;

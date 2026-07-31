@@ -79,23 +79,31 @@ function makeConfigHome(tickThrottleSeconds?: number): string {
   return home;
 }
 
-// A fake z-board that only implements `snapshot`, writing the given board to
-// the --out-items / --out-bodies paths (exactly what the real snapshot does).
-// Defaults to the module-level ITEMS/BODIES fixture; a test that needs a
-// different board (e.g. to trip the human-needed control) passes its own.
-function writeStubZBoard(dir: string, items = ITEMS, bodies = BODIES): string {
+// A fake z-board implementing the two subcommands the tick calls: `snapshot`
+// (writing the given board to --out-items / --out-bodies, exactly what the real
+// one does) and, for #138, `item <N>` (the single-ticket confirm lookup, answered
+// from `lookups`, keyed by issue number). Defaults to the module-level
+// ITEMS/BODIES fixture; a test that needs a different board (e.g. to trip the
+// human-needed control) passes its own. An `item` call with no stubbed answer
+// exits non-zero -- the real transport-failure shape, which the tick must
+// survive by carrying that ticket forward.
+function writeStubZBoard(dir: string, items = ITEMS, bodies = BODIES, lookups: Record<string, unknown> = {}): string {
   const stub = join(dir, "z-board");
+  const itemCases = Object.entries(lookups)
+    .map(([n, answer]) => `    ${n}) printf '%s\\n' ${JSON.stringify(JSON.stringify(answer))} ;;`)
+    .join("\n");
   writeFileSync(
     stub,
     `#!/usr/bin/env bash
 set -e
 cmd="$1"; shift || true
-OUT_ITEMS=""; OUT_BODIES=""
+OUT_ITEMS=""; OUT_BODIES=""; N=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --out-items) OUT_ITEMS="$2"; shift 2 ;;
     --out-bodies) OUT_BODIES="$2"; shift 2 ;;
-    *) shift ;;
+    --slug) shift 2 ;;
+    *) [ -z "$N" ] && N="$1"; shift ;;
   esac
 done
 if [ "$cmd" = "snapshot" ]; then
@@ -103,10 +111,42 @@ if [ "$cmd" = "snapshot" ]; then
   printf '%s' ${JSON.stringify(bodies)} > "$OUT_BODIES"
   echo "stub snapshot ok"   # discarded by z-loop-tick's >/dev/null
 fi
+if [ "$cmd" = "item" ]; then
+  case "$N" in
+${itemCases}
+    *) echo "stub z-board: no item fixture for #$N" >&2; exit 1 ;;
+  esac
+fi
 `
   );
   chmodSync(stub, 0o755);
   return stub;
+}
+
+// A prior state file with two in-flight builder lanes -- what the confirm pass
+// exists for. Written straight to disk (not built by an ingest) so the tick's
+// own read of state.json is what is under test.
+function writeLaneState(path: string): void {
+  writeFileSync(
+    path,
+    JSON.stringify({
+      tickets: [
+        { number: 1, title: "T1", status: "Building", dependsOn: [] },
+        { number: 2, title: "T2", status: "Building", dependsOn: [] },
+      ],
+      lanes: [
+        { ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0 },
+        { ticket: 2, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0 },
+      ],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      mergedThisRun: [],
+      initialReadyCount: 2,
+      initialBatchTickets: [1, 2],
+      batchTickets: [1, 2],
+      humanNeededNotified: false,
+    })
+  );
 }
 
 describe("z-loop-tick", () => {
@@ -443,6 +483,116 @@ describe("z-loop-tick", () => {
     }
   });
 
+  // -- #138: the targeted confirm pass ---------------------------------------
+  // Both cases run the REAL wrapper against a REAL prior state file with two
+  // in-flight lanes, and a snapshot double whose read is missing #1 -- the
+  // truncated-page shape. What separates them is only what the single-ticket
+  // lookup answers.
+  const MISSING_ONE_ITEMS = JSON.stringify([{ number: 2, title: "T2", url: "http://x/2", fields: { Status: "Building" } }]);
+  const MISSING_ONE_BODIES = JSON.stringify({ "2": "no deps" });
+
+  test("#138 AC4: a read that missed #1 + a lookup that finds it -> #1 ingests at its LOOKED-UP status, no lane dropped", () => {
+    const dir = mkTmp();
+    const stub = writeStubZBoard(dir, MISSING_ONE_ITEMS, MISSING_ONE_BODIES, {
+      1: { number: 1, present: true, item: { number: 1, title: "T1", url: "http://x/1", fields: { Status: "QA" } }, body: "no deps" },
+    });
+    const home = makeConfigHome();
+    const tickTmp = join(dir, "tick-tmp");
+    const tickState = join(dir, "tick-state.json");
+    writeLaneState(tickState);
+
+    const proc = Bun.spawnSync(
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp, "--session", "test-session"],
+      { env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
+    );
+    expect(proc.exitCode).toBe(0);
+
+    const state = JSON.parse(readFileSync(tickState, "utf8"));
+    // The positive observation beat carry-forward: #1 is at QA, not the Building
+    // the prior state held.
+    expect(state.tickets.find((t: any) => t.number === 1).status).toBe("QA");
+    expect(state.tickets.map((t: any) => t.number)).toEqual([1, 2]);
+    expect(state.lanes.map((l: any) => l.ticket)).toEqual([1, 2]); // nothing released
+
+    const log = proc.stderr.toString();
+    expect(log).toContain("read missed #1");
+    expect(log).toContain("still on the board");
+    expect(log).not.toContain("releasing its lane");
+  });
+
+  test("#138 AC5: the same read + a lookup that positively reports not-on-project -> #1 released, #2 untouched", () => {
+    const dir = mkTmp();
+    const stub = writeStubZBoard(dir, MISSING_ONE_ITEMS, MISSING_ONE_BODIES, {
+      1: { number: 1, present: false, reason: "not-on-project" },
+    });
+    const home = makeConfigHome();
+    const tickTmp = join(dir, "tick-tmp");
+    const tickState = join(dir, "tick-state.json");
+    writeLaneState(tickState);
+
+    const proc = Bun.spawnSync(
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp, "--session", "test-session"],
+      { env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
+    );
+    expect(proc.exitCode).toBe(0);
+
+    const state = JSON.parse(readFileSync(tickState, "utf8"));
+    expect(state.tickets.map((t: any) => t.number)).toEqual([2]); // confirmed gone
+    expect(state.lanes.map((l: any) => l.ticket)).toEqual([2]); // its lane released
+    expect(state.tickets[0].status).toBe("Building"); // #2 untouched
+
+    const log = proc.stderr.toString();
+    expect(log).toContain("read missed #1");
+    expect(log).toContain("gone from the board (not-on-project)");
+    expect(log).toContain("releasing its lane");
+  });
+
+  test("#138: an unparseable lookup answer degrades to no confirmations, never a dead tick", () => {
+    const dir = mkTmp();
+    const stub = writeStubZBoard(dir, MISSING_ONE_ITEMS, MISSING_ONE_BODIES, {});
+    // Overwrite the `item` branch with one that exits 0 printing garbage -- the
+    // mid-write shape, which `jq -s` cannot slurp.
+    writeFileSync(
+      stub,
+      readFileSync(stub, "utf8").replace('*) echo "stub z-board: no item fixture for #$N" >&2; exit 1 ;;', `*) printf '{"number": ' ;;`)
+    );
+    const home = makeConfigHome();
+    const tickTmp = join(dir, "tick-tmp");
+    const tickState = join(dir, "tick-state.json");
+    writeLaneState(tickState);
+
+    const proc = Bun.spawnSync(
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp, "--session", "test-session"],
+      { env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
+    );
+    expect(proc.exitCode).toBe(0);
+    expect(proc.stderr.toString()).toContain("unreadable");
+    const state = JSON.parse(readFileSync(tickState, "utf8"));
+    expect(state.tickets.map((t: any) => t.number)).toEqual([1, 2]); // both carried
+    expect(state.lanes.map((l: any) => l.ticket)).toEqual([1, 2]);
+  });
+
+  test("#138: a FAILING single-ticket lookup carries the ticket forward and never releases a lane", () => {
+    const dir = mkTmp();
+    // No `item` fixture for #1 at all -> the stub exits non-zero, the real
+    // transport-failure shape. Fail-open: same outcome as no confirm pass.
+    const stub = writeStubZBoard(dir, MISSING_ONE_ITEMS, MISSING_ONE_BODIES, {});
+    const home = makeConfigHome();
+    const tickTmp = join(dir, "tick-tmp");
+    const tickState = join(dir, "tick-state.json");
+    writeLaneState(tickState);
+
+    const proc = Bun.spawnSync(
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp, "--session", "test-session"],
+      { env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
+    );
+    expect(proc.exitCode).toBe(0); // the drain is never wedged by a failed lookup
+    const state = JSON.parse(readFileSync(tickState, "utf8"));
+    expect(state.tickets.find((t: any) => t.number === 1).status).toBe("Building"); // carried forward
+    expect(state.lanes.map((l: any) => l.ticket)).toEqual([1, 2]);
+    expect(proc.stderr.toString()).toContain("single-ticket lookup for #1 failed");
+  });
+
   // Ordering canary (issue #58): the throttle step must run BEFORE the
   // snapshot call, matching Plan step 4 ("before it issues the first
   // board.ts call of the cycle") -- mirrors the snapshot-before-ingest-before-
@@ -485,6 +635,20 @@ describe("z-loop-tick", () => {
     expect(ingestCommands.length).toBe(1);
     expect(ingestCommands[0]).toContain('--context-tokens "$CTX"');
     expect(ingestCommands[0]).not.toContain("--ticket-limit");
+  });
+
+  // #138: the confirm pass is between the snapshot and the ingest, and the
+  // ingest consumes its lookups file. A confirm pass computed AFTER the ingest
+  // (or an ingest that stopped reading it) would leave absence unconfirmed
+  // forever -- lanes on removed tickets would never be released.
+  test("#138: the confirm pass runs after the snapshot and its lookups reach the ingest", () => {
+    const tick = readFileSync(Z_LOOP_TICK, "utf8");
+    expect(tick).toContain('loop.ts" confirm-targets "$STATE" "$TMP/items.json"');
+    expect(tick).toContain('"$Z_BOARD" item "$MISSED"');
+    expect(tick.indexOf("snapshot --slug")).toBeLessThan(tick.indexOf("confirm-targets"));
+    expect(tick.indexOf("confirm-targets")).toBeLessThan(tick.indexOf('loop.ts" ingest'));
+    const ingest = tick.split(/\r?\n/).find((l) => /loop\.ts"?\s+ingest\b/.test(l))!;
+    expect(ingest).toContain('--lookups "$TMP/lookups.json"');
   });
 });
 

@@ -7,6 +7,7 @@ import { test, expect, describe } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveSlug } from "../lib/config.ts";
+import { applyAction, type LoopState } from "../lib/loop.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const zLoop = () => readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
@@ -240,5 +241,63 @@ describe("Ticket #133: the Building move is deferred to claim time, not batch-co
     const process = readFileSync(join(REPO_ROOT, "docs", "user-guide", "spec", "PROCESS.md"), "utf8");
     expect(process).not.toMatch(/Move every ticket in the work batch to \*\*Building\*\* up front/);
     expect(process).toMatch(/leave it in \*\*Ready\*\*/);
+  });
+});
+
+// ============================================================================
+// Ticket #138 -- lane-owned board moves take `--if-present`, so a ticket removed
+// from the project mid-run releases its lane instead of wedging the tick on an
+// exit-1 move. QA's finding on the first build: the rule was stated as universal
+// at Step 4's preamble while Step 6 item 4 (`move <N> Done`, reached from the
+// `complete N` row while the lane is still live) still used the bare form -- the
+// exact wedge the ticket exists to close. The first canary below is the lint
+// that makes any future omission unreachable rather than found by eye.
+// ============================================================================
+describe("Ticket #138: every lane-owned board move is --if-present", () => {
+  // Lane-owned moves are exactly the ones targeting the lane's own ticket
+  // placeholder `<N>`, in the two steps a lane runs under: Step 4's action table
+  // and Step 6's completion flow. Deliberately NOT covered: Step 1/2's parks (no
+  // lane exists yet), Step 6/7a's `move <new>|"$BUG_N" Backlog` (a just-created
+  // ticket, never a lane), and Step 7b's reconcile prose (#149).
+  test("no bare `move <N>` survives in Step 4 or Step 6", () => {
+    const md = zLoop();
+    for (const heading of ["## Step 4 — The drain loop", "## Step 6 — Completion"]) {
+      const body = section(md, heading);
+      expect(body).not.toBe("");
+      // Each move sits in a code span; scan to that span's closing backtick.
+      const moves = body.match(/move <N> [^`]*/g) ?? [];
+      expect(moves.length).toBeGreaterThan(0); // the scan actually found the rows
+      for (const m of moves) expect(m).toContain("--if-present");
+    }
+  });
+
+  test("Step 6 item 4 recovers a moved:false Done by applying `complete`, not `stop-lane`", () => {
+    const step6 = section(zLoop(), "## Step 6 — Completion");
+    expect(step6).toContain("move <N> Done --if-present");
+    expect(step6).toMatch(/moved:false/);
+    expect(step6).toContain("mergedThisRun"); // names why complete cannot be swapped out
+    expect(step6).not.toMatch(/apply .{0,20}stop-lane/); // never the park/skip recovery here
+  });
+
+  // The lib contract that recovery leans on: only `complete` records the merge,
+  // so substituting `stop-lane` (the park/skip recovery) would silently drop the
+  // stacked-child retarget record -- the same loss H9 refuses for a dead merge lane.
+  test("only the `complete` reducer records mergedThisRun; `stop-lane` drops the lane and nothing else", () => {
+    const base: LoopState = {
+      tickets: [{ number: 7, title: "Ticket 7", status: "Review", dependsOn: [], model: "sonnet" }],
+      lanes: [{ ticket: 7, stage: "merge", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0 }],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      mergedThisRun: [],
+    };
+    const completed = applyAction(base, { kind: "complete", ticket: 7, note: "merged" }, 1);
+    expect(completed.lanes).toEqual([]);
+    expect(completed.mergedThisRun).toEqual([7]);
+    expect(completed.tickets[0]!.status).toBe("Done");
+
+    const stopped = applyAction(base, { kind: "stop-lane", ticket: 7, note: "off the board" }, 1);
+    expect(stopped.lanes).toEqual([]);
+    expect(stopped.mergedThisRun).toEqual([]); // the retarget record would be lost
+    expect(stopped.tickets[0]!.status).toBe("Review");
   });
 });

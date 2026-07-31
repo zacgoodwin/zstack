@@ -85,10 +85,38 @@ bun "$PACK/lib/locks.ts" beat --slug "$SLUG" --session "$SESSION" >/dev/null || 
 #     substituted a 0 that reads as "context is fine".
 CTX=$(bun "$PACK/lib/context-budget.ts" current --project-dir "$PWD" || echo 0)
 [ -z "$CTX" ] && CTX=0
+# 1c. Targeted confirm pass (#138). The snapshot above is PAGINATED, so a ticket
+#     missing from it proves nothing -- a short page and a real removal look
+#     identical, and the ingest below simply carries every unobserved ticket
+#     forward. That is always safe but not complete: a ticket genuinely removed
+#     mid-run would keep its lane forever. So for exactly the tickets whose
+#     absence matters (this state's lanes + its batch allow-list, computed by
+#     `confirm-targets`, never guessed here), spend ONE single-ticket lookup
+#     each. `z-board item` resolves the issue directly to its project item with
+#     no pagination on the path, so its answer is positive either way: found ->
+#     spliced back into the read, positively not on the project -> confirmed
+#     gone, and only then does the ingest drop its lane. A lookup that FAILS
+#     (transport, quota) emits nothing and that ticket just carries forward --
+#     fail-open, the same safe direction as running no confirm pass at all.
+#     The lookups file is always written (empty array when nothing was missed),
+#     so the ingest command below has exactly one shape.
+: > "$TMP/lookups.jsonl"
+for MISSED in $(bun "$PACK/lib/loop.ts" confirm-targets "$STATE" "$TMP/items.json"); do
+  "$Z_BOARD" item "$MISSED" --slug "$SLUG" >> "$TMP/lookups.jsonl" \
+    || echo "z-loop-tick: single-ticket lookup for #$MISSED failed; carrying it forward unchanged" >&2
+done
+#     Fail-open on the slurp too: an unparseable line (a lookup killed mid-write)
+#     degrades to "no confirmations this tick", never a dead drain under `set -e`.
+jq -s '.' "$TMP/lookups.jsonl" > "$TMP/lookups.json" 2>/dev/null \
+  || { echo "z-loop-tick: confirm-pass lookups were unreadable; carrying every missed ticket forward" >&2; echo "[]" > "$TMP/lookups.json"; }
 # 2. Ingest: refresh ticket statuses; preserves lanes + lost-claim flags (no
 #    config flags here -- Step 3's first ingest already set maxLanes/watchdog);
-#    threads the fresh context reading (contextTokenLimit was captured at Step 3).
-bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" --context-tokens "$CTX" >/dev/null
+#    threads the fresh context reading (contextTokenLimit was captured at Step 3)
+#    and the confirm pass's answers (#138). Its stdout is discarded, but its
+#    stderr is NOT: the confirm notes ("read missed #N; ...") are the record of
+#    what was actually proven about a missing ticket, and they belong in the
+#    operator's tick output.
+bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" --lookups "$TMP/lookups.json" --context-tokens "$CTX" >/dev/null
 # 2b. Human-needed safety control (issue #63): recompute the parked-tickets
 # breakdown every tick (read-only) and fire the ONE-TIME mid-run breakdown
 # notification the instant it first crosses BoardConfig.humanNeededPercent.
