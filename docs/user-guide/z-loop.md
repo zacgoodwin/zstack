@@ -217,8 +217,23 @@ What it does, in the lane's own worktree:
    resolution stamps a verdict naming the *new* sha.
 
 The gauntlet is bun's, by name. On a project that runs its tests some other way
-the gate produces no bun output at all and refuses the merge, saying so in those
-words — fail-closed, and never the misleading "the suite did not run".
+the gate refuses the merge and says *that*, rather than the misleading "the
+suite did not run" — but the signal is not the missing banner: `bun test` prints
+`bun test v…` **before** it goes looking for test files, so a checkout holding
+only `main.go` still shows one banner. `error: 0 test files matching` is the
+line that means it, and the gate reads it *ahead* of the exit code, because bun
+exits 1 on it and the generic "gauntlet exited 1 with no test-summary line"
+buried the cause. A genuine contention kill — bannerless, and with no such line
+— keeps that honest exit-code note and its retry. The reordering is fail-closed
+by construction: it can only reword a verdict that is already red, since green
+requires a summary line and this branch requires there be none.
+
+A repo with `bun test` but **no `typecheck` script** is red as well: `bun run
+typecheck` exits 1 with `Script not found`, and red is unbypassable by design.
+The gate's two commands are pinned by name, unlike the end-of-loop regression
+pass, which detects each gate from `package.json` and skips the ones that do not
+exist. On a target repo missing either command, every lane parks Blocked at the
+merge stage until it is added.
 
 ### Who runs it, and why it cannot be skipped
 

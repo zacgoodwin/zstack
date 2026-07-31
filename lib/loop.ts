@@ -1568,6 +1568,17 @@ export function countSuiteRuns(output: string): { started: number; finished: num
   };
 }
 
+// The banner count alone cannot answer "is this even a bun project?": `bun test`
+// prints the banner BEFORE it goes looking for test files, so a checkout on some
+// other runner still counts as one started run. Measured on a directory holding
+// only `main.go`: `bun test v1.3.14 (0d9b296a)`, then this line, then exit 1.
+// This is the line that actually says "nothing ran here". Anchored to the line
+// start like every other parse, so a test that merely mentions the text in its
+// own source or assertions can never be mistaken for bun saying it.
+export function foundNoTestFiles(output: string): boolean {
+  return /^error: 0 test files matching/m.test(stripAnsi(output));
+}
+
 // The fail-count off a `bun test` run, read ONLY from its summary line
 // (`^ N fail`), never from per-test `(fail) name` lines or a literal like
 // tests/e2e-check.test.ts's intentional `FAIL merge-order` self-test output
@@ -1581,27 +1592,48 @@ export function parseSuiteFailCount(output: string): number | null {
 }
 
 // One attempt's verdict. Green demands, in order: no summary reporting
-// failures, exit 0, a `bun test` run that actually started, a summary line to
-// read a count off, and as many runs finished as started (so that count is THIS
-// run's verdict and not a nested run's). Anything else refuses the merge.
+// failures, test files that bun actually found, exit 0, a `bun test` run that
+// actually started, a summary line to read a count off, and as many runs
+// finished as started (so that count is THIS run's verdict and not a nested
+// run's). Anything else refuses the merge.
 function judgeSuiteRun(run: SuiteRun, attempt: number): MergeGateVerdict {
   const failCount = parseSuiteFailCount(run.output);
   const red = (why: string): MergeGateVerdict => ({ green: false, attempts: attempt, failCount, note: `${why} -- refusing the merge` });
+  // Names which of the two it is instead of the blanket "the suite did not run"
+  // or "gauntlet exited N": this gate shells `bun test` then `bun run
+  // typecheck`, so a project on another runner runs no tests at all and every
+  // one of its lanes would otherwise park Blocked on a note that reads like a
+  // broken suite and never names the real cause.
+  const notBun = (why: string): MergeGateVerdict =>
+    red(
+      `merge gate RED on attempt ${attempt}: exit ${run.exitCode} with no \`bun test\` run at all (${why}) -- the gate runs \`bun test\` then \`bun run typecheck\` in the worktree, so either the suite never started or this project does not run on bun`
+    );
   if (failCount !== null && failCount > 0) {
     return red(`merge gate RED on attempt ${attempt}: suite summary reports ${failCount} fail (exit ${run.exitCode})`);
+  }
+  // Ahead of the exit-code branch on purpose. `bun test` exits 1 when it finds
+  // no test files, so judging by exit code first buried this case -- and the
+  // message written for it -- under the generic "gauntlet exited 1 with no
+  // test-summary line", leaving an operator on a non-bun checkout reading a
+  // broken-suite note (QA finding 2). Only this signal jumps the queue, not a
+  // missing banner: a run killed by contention BEFORE it printed anything is
+  // also bannerless, and "gauntlet exited N" is the honest note for that one.
+  // Guarded on failCount === null so the reordering can only ever change the
+  // WORDING of an already-red verdict -- green demands a summary line, and this
+  // branch requires there be none.
+  if (failCount === null && foundNoTestFiles(run.output)) {
+    return notBun("bun found 0 test files");
   }
   if (run.exitCode !== 0) {
     return red(`merge gate RED on attempt ${attempt}: gauntlet exited ${run.exitCode}${failCount === null ? " with no test-summary line" : " with 0 fail (typecheck or a crashed run)"}`);
   }
   const runs = countSuiteRuns(run.output);
   if (runs.started === 0) {
-    // Names which of the two it is instead of the blanket "the suite did not
-    // run" below: this gate shells `bun test` then `bun run typecheck`, so a
-    // project on another runner emits no bun output at all and every one of its
-    // lanes would otherwise park Blocked on a note that reads like a broken suite.
-    return red(
-      `merge gate RED on attempt ${attempt}: exit 0 but the output holds no \`bun test\` run at all -- the gate runs \`bun test\` then \`bun run typecheck\` in the worktree, so either the suite never started or this project does not run on bun`
-    );
+    // Exit 0 with no banner: nothing bun ran produced this output. Fail-closed
+    // in both directions -- a foreign runner that printed nothing parseable,
+    // and one whose output happens to parse as `N fail`, are equally not a
+    // verdict this gate may merge on.
+    return notBun("no `bun test` banner in the output");
   }
   if (failCount === null) {
     return red(`merge gate RED on attempt ${attempt}: exit 0 but no "N fail" summary line -- the suite did not run`);

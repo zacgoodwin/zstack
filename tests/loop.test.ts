@@ -20,6 +20,7 @@ import {
   markClaimLost,
   markHumanNeededNotified,
   countSuiteRuns,
+  foundNoTestFiles,
   mergeGate,
   MERGE_GATE_MAX_RUNS,
   MERGE_GATE_RETRY_WAIT_MS,
@@ -3252,8 +3253,8 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
     });
 
     // Finding 7's readable half: on a project that is not a bun project the
-    // gauntlet produces no bun output at all, and the note has to say that
-    // rather than "the suite did not run", which reads like a broken suite.
+    // gauntlet runs no tests at all, and the note has to say that rather than
+    // "the suite did not run", which reads like a broken suite.
     test("no bun test run in the output at all names the cause instead of blaming the suite", () => {
       const { verdict } = driveGate([
         { exitCode: 0, output: "PASS tests/foo.spec.js\nTests: 12 passed\n" },
@@ -3262,6 +3263,57 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
       expect(verdict.green).toBe(false);
       expect(verdict.note).toContain("no `bun test` run at all");
       expect(verdict.note).toContain("does not run on bun");
+    });
+  });
+
+  // -- QA finding 2 (2nd pass): the "not a bun project" note was unreachable ---
+  //
+  // Two independent reasons, and QA named only the first: the exit-code branch
+  // ran ahead of it, AND `bun test` prints its banner BEFORE it looks for test
+  // files, so the banner count is 1 on a checkout with no bun tests at all --
+  // reordering alone would not have reached it. Captured verbatim from
+  // `bun test` in a directory holding only `main.go` (bun 1.3.14): banner,
+  // this error, exit 1. The real signal is the error line.
+  describe("a checkout with no bun test files says so instead of blaming the suite", () => {
+    const NON_BUN_OUTPUT =
+      `${SUITE_BANNER}error: 0 test files matching **{.test,.spec,_test_,_spec_}.{js,ts,jsx,tsx} in --cwd="C:\\repo"\n`;
+
+    test("bun still prints its banner, so the banner count cannot detect this", () => {
+      expect(countSuiteRuns(NON_BUN_OUTPUT)).toEqual({ started: 1, finished: 0 });
+      expect(foundNoTestFiles(NON_BUN_OUTPUT)).toBe(true);
+      expect(foundNoTestFiles(suiteTail(1261, 0))).toBe(false);
+    });
+
+    test("exit 1 with 0 test files names the cause, not the generic exit code", () => {
+      const { verdict, attempts } = driveGate([
+        { exitCode: 1, output: NON_BUN_OUTPUT },
+        { exitCode: 1, output: NON_BUN_OUTPUT },
+      ]);
+      expect(verdict.green).toBe(false);
+      expect(verdict.note).toContain("no `bun test` run at all");
+      expect(verdict.note).toContain("bun found 0 test files");
+      expect(verdict.note).toContain("does not run on bun");
+      expect(verdict.note).not.toContain("no test-summary line");
+      expect(attempts).toEqual([1, 2]); // still the contention shape: one retry, then refuse
+    });
+
+    // The branch jumps the exit-code queue, so it must not be able to reword a
+    // genuine contention kill -- that one is bannerless AND has no error line.
+    test("a contention kill with no output keeps the honest `gauntlet exited N` note", () => {
+      const { verdict } = driveGate([
+        { exitCode: 1, output: "error: EBUSY\n" },
+        { exitCode: 1, output: "error: EBUSY\n" },
+      ]);
+      expect(verdict.note).toContain("gauntlet exited 1 with no test-summary line");
+      expect(verdict.note).not.toContain("bun found 0 test files");
+    });
+
+    // The whole reordering is note-only by construction: the branch requires
+    // failCount === null and green requires a summary line, so no output that
+    // used to read green can reach it.
+    test("the error line cannot turn a run that reported a summary red", () => {
+      const withStray = suiteTail(1261, 0) + "error: 0 test files matching x in --cwd=\"C:\\nested\"\n";
+      expect(driveGate([{ exitCode: 0, output: withStray }]).verdict.green).toBe(true);
     });
   });
 
