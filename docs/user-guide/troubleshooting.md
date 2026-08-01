@@ -160,24 +160,38 @@ detached checkout of the head commit the reviewer and its skeptics read — so
 removing them is always safe.
 
 They pile up because in-run removal waits for the reviewer's whole spawn subtree
-to go quiet (the skeptics execute inside the worktree and outlive their parent;
-removing it under a live one is what #66 hit), and that settling window is 15
-minutes, so the reviewer almost always returns first. The loop sweeps them with a
-command on every exit path — batch cleanup on drain-complete, and Step 0 of the
-next run for the exits that never reach it — but a pack older than that fix, or a
-directory the loop no longer scans, can leave a backlog. Clear it by hand:
+to finish (the skeptics execute inside the worktree and outlive their parent;
+removing it under a live one is what #66 hit), and a skeptic that was still working
+when the reviewer returned holds it back. The loop sweeps them with a command on
+every exit path — batch cleanup on drain-complete, and Step 0 of the next run for
+the exits that never reach it — but a pack older than that fix, or a directory the
+loop no longer scans, can leave a backlog. Clear it by hand:
 
 ```bash
 bun ~/.claude/skills/zstack/lib/reconcile.ts sweep-review
 ```
 
 It removes `.worktrees/review-<N>` (and the `-lead`/`-base` variants) and nothing
-else: no board read, no locks, no slug. Run it from the repo root. It is safe to
-run at any time: it checks the same liveness evidence the in-run gate does and
-removes **nothing** while any sub-agent of the current session is still unproven,
-printing who is live instead. If it reports `swept 0` for that reason and you are
-certain nothing is running, the leftovers are swept by the next `/z-loop`'s Step 0
-anyway — that runs in a fresh session, which by definition has spawned nothing.
+else: no board read, no locks, no slug. Run it from the repo root — `--worktrees`
+defaults to `<cwd>/.worktrees`, so from anywhere else it scans a directory that
+does not exist and reports 0 without saying why. It is safe to run at any time: it
+checks the same liveness evidence the in-run gate does and removes **nothing**
+while any sub-agent of the current session is still unproven, printing who is live
+instead.
+
+If it reports `swept 0` for that reason, look at the ids it named. An agent that
+returned normally does not hold the sweep back (its transcript ends on a
+turn-ending stop reason, which reads finished at once); one that was **killed
+mid-tool-call** never reports finished on shape at all, so it holds the sweep until
+its transcript goes stale — 8 hours by default. When you know the session is dead,
+say so:
+
+```bash
+bun ~/.claude/skills/zstack/lib/reconcile.ts sweep-review --stale-ms 1000
+```
+
+That treats any transcript untouched for a second as finished. Do not use it while
+a review is genuinely running: it is the same removal, without the protection.
 
 ## "Rates last checked … over the 14-day limit"
 

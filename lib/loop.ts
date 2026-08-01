@@ -551,9 +551,23 @@ export type Action =
   // used the previous one, and a re-used spawn tag makes `transcripts collect`
   // refuse to guess), and the note the fresh agent is briefed with.
   | { kind: "respawn"; ticket: number; stage: Stage; attempt: number; note: string }
-  | { kind: "park"; ticket: number; status: "Questions" | "Blocked"; note: string }
-  | { kind: "skip"; ticket: number; note: string }
-  | { kind: "stop-lane"; ticket: number; note: string }
+  // `salvage` (#209): the lane worktree holds UNCOMMITTED work that this action
+  // is about to strand, so the orchestrator must dump
+  // `reports/uncommitted-<N>.patch` BEFORE it removes the lane lock. Every one of
+  // these three actions drops the lane, and a lockless worktree is an orphan the
+  // next run's reconcile scan force-removes -- so "the worktree survives for you
+  // to look at" is only ever true until the next `--reconcile`.
+  //
+  // It is a FIELD rather than a phrase in the note (which is how the two salvage
+  // rows keyed it first) because a prose trigger is matched by whatever sentence
+  // happens to contain it: the stop-lane note below carries the words
+  // "uncommitted work" while routing to a row that dumped nothing, so the same
+  // key meant two different things one edit apart. The orchestrator now reads
+  // `.salvage` off the action JSON -- one structural key, three rows, no
+  // substring in it.
+  | { kind: "park"; ticket: number; status: "Questions" | "Blocked"; note: string; salvage?: true }
+  | { kind: "skip"; ticket: number; note: string; salvage?: true }
+  | { kind: "stop-lane"; ticket: number; note: string; salvage?: true }
   | { kind: "check-worker"; ticket: number }
   | { kind: "complete"; ticket: number; note: string }
   | { kind: "wait" }
@@ -645,8 +659,9 @@ const RESPAWN_STAGES: readonly Stage[] = ["builder", "qa"];
 // prune has run. Every other park's work is already committed on a branch, and
 // branches are never deleted (issue #2) -- this is the ONE park whose only copy of
 // real work is uncommitted, so the note names the salvage patch the orchestrator
-// dumps first (z-loop/SKILL.md `park N Blocked`) and says plainly that the
-// worktree does not survive the next run.
+// dumps first (z-loop/SKILL.md `park N Blocked`, triggered by the action's own
+// `salvage` field) and says plainly that the worktree does not survive the next
+// run.
 function commitRetryAction(lane: LaneState, detail: string): Action {
   const spent = lane.commitRetries ?? 0;
   if (spent >= MAX_COMMIT_RETRIES) {
@@ -654,6 +669,7 @@ function commitRetryAction(lane: LaneState, detail: string): Action {
       kind: "park",
       ticket: lane.ticket,
       status: "Blocked",
+      salvage: true,
       note:
         `${detail}\n\nA re-prompted builder reported BUILT with nothing committed again ` +
         `(${spent + 1} attempt(s)), so this is not a slip. The work was dumped to ` +
@@ -804,16 +820,31 @@ function deadWorkerAction(lane: LaneState, wd: number, parkedByHuman: boolean): 
   // a fresh paid agent into a ticket a human just dragged to Blocked/Questions,
   // overriding the one instruction the board is guaranteed to carry. stop-lane
   // rather than skip: the human already set the status, so it is not ours to
-  // overwrite with Skipped, and the worktree survives for them to look at.
+  // overwrite with Skipped.
+  //
+  // The uncommitted work is salvaged here for exactly the reason the skip below
+  // salvages it, and the note must not say otherwise: stop-lane removes the lane
+  // lock too, so this worktree is an orphan to the next run's reconcile scan
+  // (lib/reconcile.ts orphanWorktrees -> pruneWorktreeReal -> `git worktree
+  // remove --force`) whatever the board says. An earlier cut of this branch
+  // promised the tree was "kept for inspection" 33 lines above the code that
+  // proves it is not.
   if (parkedByHuman) {
+    const dirty = lane.worktreeDirty === true;
     return {
       kind: "stop-lane",
       ticket: lane.ticket,
+      ...(dirty ? { salvage: true as const } : {}),
       note:
         `Worker died mid-${lane.stage} (silent past the ${wd}-minute watchdog, not alive on probe), and a human ` +
         `had already moved #${lane.ticket} to a stop status during the run; stopping its lane cleanly instead of ` +
-        `re-spawning or skipping${lane.worktreeDirty === true ? " -- its worktree still holds uncommitted work, kept for inspection" : ""} ` +
-        `(other lanes continue).`,
+        `re-spawning or skipping${
+          dirty
+            ? ` -- its worktree still held uncommitted work, dumped to \`~/.zstack/projects/<slug>/reports/uncommitted-${lane.ticket}.patch\` ` +
+              `(re-apply it with \`git apply\`) because releasing the lane lock leaves the worktree an orphan the next run's reconcile ` +
+              `force-removes`
+            : ""
+        } (other lanes continue).`,
     };
   }
   // Per STAGE, not per lane: a builder that died silently is no evidence about the
@@ -848,10 +879,12 @@ function deadWorkerAction(lane: LaneState, wd: number, parkedByHuman: boolean): 
   // scan whatever the board says -- it is force-removed (uncommitted work
   // discarded) before the loop will start. Same salvage contract as #177's park:
   // the note names the patch the orchestrator dumps first (z-loop/SKILL.md
-  // `skip N`), keyed on the `uncommitted work` phrase, so the note is true.
+  // `skip N`, triggered by this action's own `salvage` field), so the note is
+  // true.
   return {
     kind: "skip",
     ticket: lane.ticket,
+    salvage: true,
     note:
       `${base} ${spent > 0 ? `A re-spawned ${lane.stage} died the same way (${spent + 1} attempt(s)), so this is not a slip. ` : ""}` +
       `Its worktree still holds uncommitted work, which was dumped to ` +
@@ -1416,6 +1449,17 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
     case "respawn": {
       const lane = next.lanes.find((l) => l.ticket === action.ticket);
       if (!lane) throw new ZError(`No lane holds #${action.ticket} to re-spawn.`);
+      // The action names the stage it was computed for, and the budget spent is
+      // the LANE's current one -- so a stale action (one built before some other
+      // tick moved this lane) would spend the wrong stage's re-spawn and shift
+      // the wrong stage's stageAttempt. That is the duplicate-spawn-tag class the
+      // derivation header exists to prevent, so it throws rather than guessing.
+      if (action.stage !== lane.stage) {
+        throw new ZError(
+          `Stale respawn for #${action.ticket}: the action was built for stage "${action.stage}" but the lane is now at "${lane.stage}". ` +
+            `Re-run \`loop next\` and apply what it returns.`
+        );
+      }
       lane.respawns = { ...lane.respawns, [lane.stage]: respawnsAt(lane, lane.stage) + 1 };
       lane.lastActivityMs = nowMs;
       delete lane.outcome;

@@ -107,12 +107,18 @@ BLOCKED: could not read stage prompt at ${promptPath}`;
 // parses as CONFUSED, so that lane was one recorded outcome away from being
 // skipped with the finished diff sitting uncommitted in its worktree.
 //
-// Shared verbatim by the builder and QA prompts (the two stages that run the
-// gauntlet). The reviewer's own version of this rule is inside #191's super-truth
-// block, where the thing being waited on is a skeptic rather than a test run, and
-// the single-pass reviewer prompt stays byte-identical (its golden file).
+// Shared verbatim by all three judging stages. The REVIEWER carries it too, and
+// that is where the observed damage actually is: reviewers were 3 of run 11's 4
+// markerless exits, and run 12 reproduced it three more times (#149, #178, #205
+// each ended a turn with no marker while waiting on skeptics, each needing a
+// manual resume to avoid being parsed as CONFUSED and skipped). The reviewer runs
+// the same typecheck-and-touched-tests gauntlet in its throwaway worktree, and
+// #191's super-truth block only covers the skeptic half of the wait -- so the
+// generic rule goes to all three and the single-pass reviewer's golden file was
+// regenerated rather than protected. Merge is excluded: it runs `gh pr merge`,
+// not a gauntlet, and H9 already refuses to blind-skip a dead merge worker.
 const FOREGROUND_RULE = `## Verification runs in the FOREGROUND
-Every command you verify with -- the test suite, typecheck, build, anything you would cite as evidence -- must run to completion IN THE FOREGROUND before your final message. Never background a gate and end your turn waiting on it: no one will wake you (this loop sends a stage agent exactly one message, by design), so the run's result reaches nobody. Ending your turn with a background job still pending is parsed as CONFUSED, the same as any final message with no marker, and CONFUSED skips this ticket -- the worst outcome available to you. If a check is too slow to finish, report what you actually ran and what you did not.`;
+Every command you verify with -- the test suite, typecheck, build, anything you would cite as evidence -- must run to completion IN THE FOREGROUND before your final message. Never background a gate and end your turn waiting on it: no one will wake you (this loop sends a stage agent exactly one message, by design), so the run's result reaches nobody. The same goes for anything else you are waiting on, a sub-agent included: report what you actually hold. Ending your turn with a background job still pending is parsed as CONFUSED, the same as any final message with no marker, and CONFUSED skips this ticket -- the worst outcome available to you. If a check is too slow to finish, report what you actually ran and what you did not.`;
 
 // #209: the briefing a stage gets when it is a RE-SPAWN of a worker that died
 // without ever reporting. Its predecessor's changes are still in the worktree,
@@ -334,7 +340,7 @@ export function reviewerPrompt(input: ReviewerPromptInput, inputPath: string, ad
 ## Super-truth pass (adversarial mode active)
 This card's blast radius earned an adversarial review; do NOT trust your single read. Spawn 3 INDEPENDENT skeptic sub-agents with the Agent tool -- nested \`claude -p\` is denied by the classifier, so use the Agent tool, not headless claude. Give each skeptic ONLY the four inputs you were given (this ticket, the acceptance criteria, the diff, the throwaway worktree); they are blinded exactly as you are. Task each one to REFUTE that the diff satisfies the acceptance criteria: find the one criterion it violates, the edge it breaks, a test that passes without the change. They work in isolation -- no skeptic sees another's verdict.
 
-Delivery is BEST-EFFORT and you must report how many verdicts arrived. A skeptic can die, time out, or come back with nothing usable; that is a delivery race, not evidence about the diff. Check for outstanding verdicts AT MOST ONCE per skeptic, then stop waiting and reconcile the \`k\` verdicts you actually hold (0 <= k <= 3). Do not spawn replacements. Do NOT end your turn without one of the exit markers below -- a final message with no marker is parsed as CONFUSED and SKIPS this ticket, which is the worst outcome available to you.
+Delivery is BEST-EFFORT and you must report how many verdicts arrived. A skeptic can die, time out, or come back with nothing usable; that is a delivery race, not evidence about the diff. Check for outstanding verdicts AT MOST ONCE per skeptic, then stop waiting and reconcile the \`k\` verdicts you actually hold (0 <= k <= 3). Do not spawn replacements. Do NOT end your turn without one of the exit markers below -- a final message with no marker is parsed as CONFUSED and SKIPS this ticket, which is the worst outcome available to you. "Still waiting on a skeptic" is not an exception to that, it is the single most common way a review is lost: three reviews in one run ended a turn on exactly those words and had to be rescued by hand.
 
 Report BOTH tokens in your marker: \`skeptics=<k>/3\` -- the number of verdicts you actually received -- and \`confidence=<0-100>\`, the share of THOSE k that could not refute the diff. Read it off this table; do no arithmetic:
 - k=3: 3 unrefuted -> 100, 2 -> 67, 1 -> 33, 0 -> 0
@@ -372,6 +378,8 @@ Run the typecheck and the tests this diff touches here. Nothing you do in it lan
 - Scope creep, dead code, abstractions the ticket never asked for.
 - Security holes at trust boundaries; data-loss edges; error paths that swallow failures.
 ${superTruth}
+${FOREGROUND_RULE}
+
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
 REVIEW-APPROVE: confidence=<0-100> ${skept}<one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green -- confidence is your certainty every criterion holds (aggregated per the super-truth pass above when it ran); a score below the project's configured floor will NOT merge
 REVIEW-FINDINGS: ${conf}${skept}<numbered findings>          each with file:line and why it blocks the merge

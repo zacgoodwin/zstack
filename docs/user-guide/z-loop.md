@@ -203,7 +203,9 @@ records the result. It never re-derives a scheduling decision in prose.
   merge lane keeps its own PR-state resolution. A ticket a **human** moved to a
   stop status mid-run is never re-spawned either: that move is respected, so the
   lane stops cleanly at the dead worker, spends nothing, and leaves the human's
-  own status and the worktree alone.
+  own status alone — with the same patch dumped first if that lane's worktree held
+  uncommitted work, since stopping the lane releases its lock and the worktree is
+  no more durable there than after a skip.
   Every stage prompt that runs the gauntlet now also states the other half: run
   verification in the FOREGROUND, because ending a turn with a background job
   still pending is parsed as CONFUSED.
@@ -247,12 +249,20 @@ records the result. It never re-derives a scheduling decision in prose.
   is indistinguishable from a skeptic that simply failed). Removal is now gated
   on the same parentage walk that collects the transcripts: a stage's worktree
   goes only once every descendant has been observed finishing.
-  "Finishing" is read from each descendant's **own** transcript — its last record
-  is a final answer (text, no pending tool call) and nothing has been appended
-  since for 15 minutes. That window is measured, not guessed: across all 1,388
-  sub-agent transcripts on this machine, an agent that narrated mid-work and then
+  "Finishing" is read from each descendant's **own** transcript, three ways, in
+  order of how strong the evidence is. A turn-ending stop reason on the last
+  record is proof by itself and needs no wait — measured over all 1,546 sub-agent
+  transcripts on this machine, 1,310 of the 1,532 finished ones end that way and
+  none of the 10,517 mid-work records carry one. Failing that, a final-answer
+  shape (text, no pending tool call) counts once nothing has been appended for 15
+  minutes; that window is measured too, since an agent that narrated mid-work and
   kept going went quiet for as long as 423 seconds before its next record, so a
-  shorter window declares a working skeptic finished. The parent's transcript
+  shorter one declares a working skeptic finished. And whatever the shape, a
+  transcript nobody has written to for 8 hours reads finished — without that
+  ceiling an agent killed mid-tool-call could never satisfy the shape check at any
+  age, and a single one of those (17 of 1,490 transcripts here) held the sweep
+  open forever. `sweep-review --stale-ms` overrides that ceiling for a session you
+  know is dead. The parent's transcript
   cannot answer it either: the skeptics
   are background spawns, so the only record the reviewer ever gets for one is the
   "launched successfully" acknowledgement written the instant it starts, and
@@ -264,20 +274,21 @@ records the result. It never re-derives a scheduling decision in prose.
   as still running. That never stalls the drain: nothing
   waits on the flag, and a leftover directory is the cheap direction to be wrong
   in.
-  Because a 15-minute settling window makes "leftover" the **usual** outcome
-  rather than the exception, the sweep that collects them is a command
+  Whatever the in-stage gate declines to remove is collected by a command
   (`bun lib/reconcile.ts sweep-review`, which touches `.worktrees/review-<N>` and
   nothing else). It carries the same guard rather than working around it: it
   removes nothing while **any** sub-agent of the session is still unproven, since
   a reviewer returning with skeptics still executing is the designed case, not an
-  anomaly — the reviewer checks each skeptic at most once and stops waiting. So it
-  is called where it can actually do work: at batch cleanup when the drain
-  completes (sweeping if the session has genuinely gone quiet), and at the start
-  of the next run right after the loop lock is acquired — that second one both
-  covers the exits batch cleanup never reaches (a context-clear pause, a crash)
-  and is the point where nothing has been spawned yet, so it always sweeps.
-  `--reconcile` prunes them too, under the same hold. They never block
-  startup: a scratch checkout nobody owns is litter, not a wedge, so it is
+  anomaly — the reviewer checks each skeptic at most once and stops waiting. It is
+  called at batch cleanup when the drain completes, and at the start of the next
+  run right after the loop lock is acquired, which covers the exits batch cleanup
+  never reaches (a context-clear pause, a crash). Neither call assumes the session
+  is quiet — both check and print what they found, because `/z-loop` can be invoked
+  inside a session that already holds sub-agent transcripts. Those are the only
+  two places the loop removes a review worktree by hand; a park, a skip, or a
+  stop-lane never does, because the same live skeptic is at stake whichever action
+  is being taken. `--reconcile` prunes them too, under the same hold. They never
+  block startup: a scratch checkout nobody owns is litter, not a wedge, so it is
   swept rather than reported as an orphan.
 - **Per-stage model routing.** The merge stage is mechanical (`gh pr create`, a
   conflict check, `gh pr merge`) and doesn't need the ticket's build-tier

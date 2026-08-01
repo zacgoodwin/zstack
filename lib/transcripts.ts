@@ -34,7 +34,7 @@
 // the prompt as an inert HTML comment, and the same string is passed back here.
 // Ambiguity is resolved structurally, not by heuristic -- see findRootAgents.
 import { createHash } from "node:crypto";
-import { closeSync, copyFileSync, mkdirSync, openSync, readFileSync, readSync, readdirSync } from "node:fs";
+import { closeSync, copyFileSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { handleCliError, parseFlags, requireFlag, str } from "./cli.ts";
@@ -303,27 +303,115 @@ export const SUBTREE_QUIET_MS = 900_000;
 // margin; the gate test is the enforcement.
 export const MEASURED_MIDWORK_GAP_MS = 423_110;
 
-// Has this agent's own transcript come to rest on a final answer? See above for
-// why both halves are required and why every failure returns false (= live).
-function agentFinished(subagentsDir: string, id: string, now: number, quietMs: number): boolean {
-  let text: string;
+// The `stop_reason` values that END a turn. A record carrying one is the agent's
+// last word by definition -- the harness has nothing more to append until someone
+// messages it -- so it needs no quiet window at all.
+//
+// MEASURED, like every other constant here, over all 1,546 sub-agent transcripts
+// on this machine. Of the 1,532 that end on a final-answer-shaped record, 1,294
+// carry `end_turn`, 16 carry `stop_sequence`, and 222 carry `null` (the streaming
+// split the fixtures reproduce). Of the 10,517 final-answer-shaped records that
+// were NOT last in their file -- every case this heuristic can be wrong about --
+// 10,472 carry `null`, 44 carry `tool_use`, 1 carries `max_tokens`, and ZERO carry
+// either value below. So the fast path has no observed false positive, and the
+// quiet window still covers the 14.5% of real returns that land with `null`.
+//
+// This is what makes the batch sweep able to fire at all. Without it, an agent
+// that returned normally reads LIVE for the whole 15-minute window, so z-loop's
+// Step 7 -- which runs seconds after the merge stage returns, in the same
+// `subagents/` directory liveAgentsIn scans -- could never sweep anything.
+const TERMINAL_STOP_REASONS = new Set(["end_turn", "stop_sequence"]);
+
+// The longest observed gap between a NON-final-shaped record (the `tool_use` an
+// agent is blocked on, the `tool_result` it just took, a bare `thinking` chunk)
+// and that agent's next record: 135,373 samples over the same 1,546 transcripts.
+// p50 1.3s, p90 9.6s, p99 77s, 25 over 600s, 5 over 1800s, and one 13,004s Bash
+// call (the runner-up is 2,986s). That tail is dominated by permission prompts
+// and suspended machines rather than work, but it is real and it is measured, so
+// the ceiling below is taken against it.
+export const MEASURED_MAX_STALL_MS = 13_003_952;
+
+// When a transcript that is NOT resting on a final answer stops proving anything.
+//
+// The shape check alone can never be satisfied by an agent killed mid-tool-call
+// -- the watchdog/crash population #209 exists for -- so before this it read LIVE
+// at ANY age, forever. Measured across every sub-agent transcript on this machine,
+// 17 of 1,490 were permanently live that way, spread over 8 of 114 sessions (7%),
+// and ONE of them disables both `sweep-review` and reconcile's throwaway prunes
+// for that session with no way out: the documented escape hatch
+// (docs/user-guide/troubleshooting.md) is the thing that gets wedged.
+//
+// So silence itself eventually reads as finished, whatever the last record's
+// shape. The same 2x-the-measured-ceiling rule SUBTREE_QUIET_MS uses: 2 x
+// MEASURED_MAX_STALL_MS is 26,008s, rounded up to 8 hours. Long on purpose --
+// under this ceiling the ONLY cost of being wrong is a leftover scratch directory
+// -- and overridable per call (`--stale-ms`) for the operator who knows the
+// session is dead and wants the sweep now.
+export const SUBTREE_STALE_MS = 28_800_000;
+
+export interface LivenessWindow {
+  now?: number;
+  quietMs?: number;
+  staleMs?: number;
+}
+
+// The clock + both windows, defaults applied once so every caller in this file
+// asks the same question.
+function window(opts: LivenessWindow): { now: number; quietMs: number; staleMs: number } {
+  return { now: opts.now ?? Date.now(), quietMs: opts.quietMs ?? SUBTREE_QUIET_MS, staleMs: opts.staleMs ?? SUBTREE_STALE_MS };
+}
+
+// When this agent's transcript was last touched, for the staleness ceiling only.
+// The record's own `timestamp` is the primary source (copying a transcript, which
+// collection does, must never change the answer); the file's mtime is the fallback
+// for the unreadable/undated cases, where it can only ever say "recent" -- which
+// keeps them LIVE, the safe direction, until the ceiling clears them.
+function lastTouchedMs(subagentsDir: string, id: string, stamped: number): number | undefined {
+  if (Number.isFinite(stamped)) return stamped;
+  for (const f of [`agent-${id}.jsonl`, `agent-${id}.meta.json`]) {
+    try {
+      return statSync(join(subagentsDir, f)).mtimeMs;
+    } catch {
+      /* try the next one */
+    }
+  }
+  return undefined;
+}
+
+// Has this agent's own transcript come to rest? Three answers, in the order their
+// evidence is strongest: a turn-ending `stop_reason` (proof), silence past the
+// staleness ceiling (nothing is running behind a transcript nobody has written to
+// in 8 hours), and a final-answer shape that has been quiet for the settling
+// window. Everything else -- and every unreadable input -- is LIVE.
+function agentFinished(subagentsDir: string, id: string, now: number, quietMs: number, staleMs: number): boolean {
+  let text: string | undefined;
   try {
     text = readFileSync(join(subagentsDir, `agent-${id}.jsonl`), "utf8");
   } catch {
-    return false; // no transcript to prove anything with
+    text = undefined; // no transcript to prove anything with
   }
-  const lines = text.trimEnd().split("\n");
   let last: any;
-  try {
-    last = JSON.parse(lines[lines.length - 1]);
-  } catch {
-    return false; // a half-written final line IS the harness writing right now
+  if (text !== undefined) {
+    const lines = text.trimEnd().split("\n");
+    try {
+      last = JSON.parse(lines[lines.length - 1]);
+    } catch {
+      last = undefined; // a half-written final line IS the harness writing right now
+    }
   }
+  const stamped = Date.parse(last?.timestamp ?? "");
+  // The ceiling comes first because it is the one answer that must hold for EVERY
+  // shape, including the mid-tool-call crash that can never satisfy the checks
+  // below. It is also the only check allowed to fall back to the file's mtime: a
+  // ceiling of hours cannot be fooled by a copy, while the settling window --
+  // seconds to minutes -- would be, so that one stays on the record's own stamp.
+  const touched = lastTouchedMs(subagentsDir, id, stamped);
+  if (touched !== undefined && now - touched >= staleMs) return true;
   if (last?.type !== "assistant" || !Array.isArray(last.message?.content)) return false;
   const blocks: string[] = last.message.content.map((b: any) => b?.type);
   if (blocks.includes("tool_use") || !blocks.includes("text")) return false;
-  const at = Date.parse(last.timestamp ?? "");
-  return Number.isFinite(at) && now - at >= quietMs;
+  if (TERMINAL_STOP_REASONS.has(last.message.stop_reason)) return true;
+  return Number.isFinite(stamped) && now - stamped >= quietMs;
 }
 
 // Which of a stage's descendants have NOT been observed finishing, sorted.
@@ -331,11 +419,10 @@ export function liveDescendants(
   subagentsDir: string,
   metas: AgentMeta[],
   root: string,
-  opts: { now?: number; quietMs?: number } = {}
+  opts: LivenessWindow = {}
 ): string[] {
-  const now = opts.now ?? Date.now();
-  const quietMs = opts.quietMs ?? SUBTREE_QUIET_MS;
-  return descendantsOf(metas, root).filter((id) => !agentFinished(subagentsDir, id, now, quietMs));
+  const { now, quietMs, staleMs } = window(opts);
+  return descendantsOf(metas, root).filter((id) => !agentFinished(subagentsDir, id, now, quietMs, staleMs));
 }
 
 // The agent id a skipped meta FILENAME describes. readAgentMetas only ever
@@ -363,12 +450,11 @@ function agentIdFromMetaName(file: string): string | undefined {
 export function liveUnknownParentage(
   subagentsDir: string,
   skippedMeta: string[],
-  opts: { now?: number; quietMs?: number } = {}
+  opts: LivenessWindow = {}
 ): string[] {
-  const now = opts.now ?? Date.now();
-  const quietMs = opts.quietMs ?? SUBTREE_QUIET_MS;
+  const { now, quietMs, staleMs } = window(opts);
   const ids = skippedMeta.map(agentIdFromMetaName).filter((id): id is string => id !== undefined);
-  return ids.filter((id) => !agentFinished(subagentsDir, id, now, quietMs)).sort();
+  return ids.filter((id) => !agentFinished(subagentsDir, id, now, quietMs, staleMs)).sort();
 }
 
 // Every agent in the directory that has not been observed finishing, sorted --
@@ -393,9 +479,8 @@ export function liveUnknownParentage(
 // Cost is bounded and paid at most twice a run (Step 0, Step 7): one whole-file
 // read per sub-agent transcript in the session -- 174 files, ~650 KB at the
 // largest, in a real three-lane drain.
-export function liveAgentsIn(subagentsDir: string, opts: { now?: number; quietMs?: number } = {}): string[] {
-  const now = opts.now ?? Date.now();
-  const quietMs = opts.quietMs ?? SUBTREE_QUIET_MS;
+export function liveAgentsIn(subagentsDir: string, opts: LivenessWindow = {}): string[] {
+  const { now, quietMs, staleMs } = window(opts);
   let entries: string[];
   try {
     entries = readdirSync(subagentsDir);
@@ -406,7 +491,7 @@ export function liveAgentsIn(subagentsDir: string, opts: { now?: number; quietMs
   for (const f of entries) {
     const m = /^agent-(.+)\.jsonl$/.exec(f);
     if (!m) continue;
-    if (!agentFinished(subagentsDir, m[1], now, quietMs)) out.push(m[1]);
+    if (!agentFinished(subagentsDir, m[1], now, quietMs, staleMs)) out.push(m[1]);
   }
   return out.sort();
 }
@@ -455,9 +540,11 @@ export function collectTranscripts(opts: {
   dest: string;
   name: string;
   // #209: injected only by the liveness tests, which need a fixed clock to pin
-  // the quiet window's boundary. Production always takes the defaults.
+  // the quiet window's and the staleness ceiling's boundaries. Production always
+  // takes the defaults.
   now?: number;
   quietMs?: number;
+  staleMs?: number;
 }): CollectResult {
   const { metas, skipped } = readAgentMetas(opts.subagentsDir);
   const roots = findRootAgents(opts.subagentsDir, opts.tag, metas);
@@ -491,11 +578,11 @@ export function collectTranscripts(opts: {
   // so it must not read as a finished subtree). The union is what `subtreeDone`
   // answers, so the teardown gate can never be told DONE on evidence this object
   // was already holding in `skippedMeta` and ignoring.
-  const window = { now: opts.now, quietMs: opts.quietMs };
+  const w: LivenessWindow = { now: opts.now, quietMs: opts.quietMs, staleMs: opts.staleMs };
   const live = [
     ...new Set([
-      ...liveDescendants(opts.subagentsDir, metas, root, window),
-      ...liveUnknownParentage(opts.subagentsDir, skipped, window),
+      ...liveDescendants(opts.subagentsDir, metas, root, w),
+      ...liveUnknownParentage(opts.subagentsDir, skipped, w),
     ]),
   ].sort();
   return {

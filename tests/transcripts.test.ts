@@ -14,7 +14,7 @@
 // the stamp's format on the writer side fails here on the reader side rather
 // than silently making every future collect find nothing. No LLM calls.
 import { test, expect, describe, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, utimesSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ZError } from "../lib/config.ts";
@@ -22,8 +22,10 @@ import { KNOWN_STAGES } from "../lib/cost.ts";
 import { STATUS_FOR_STAGE } from "../lib/loop.ts";
 import { SPAWN_TAG_MARKER, builderPrompt, reviewerPrompt } from "../lib/stage-prompts.ts";
 import {
+  MEASURED_MAX_STALL_MS,
   MEASURED_MIDWORK_GAP_MS,
   SUBTREE_QUIET_MS,
+  SUBTREE_STALE_MS,
   collectTranscripts,
   descendantsOf,
   findRootAgents,
@@ -160,6 +162,22 @@ function appendFinalAnswer(dir: string, id: string, at: string = QUIET): void {
     agentId: id,
     type: "assistant",
     message: { role: "assistant", stop_reason: null, content: [{ type: "text", text: "COULD NOT REFUTE: ..." }] },
+    timestamp: at,
+  });
+}
+
+// What it ends on when it returns and the harness records WHY the turn ended:
+// a terminal `stop_reason`. 1,310 of this machine's 1,532 finished sub-agent
+// transcripts look like this, and no mid-work record in the corpus does -- which
+// is what lets it skip the settling window. `reason` is a parameter so the
+// non-terminal values that also appear on text-only records (`tool_use`,
+// `max_tokens`) can be held to the window instead.
+function appendTerminalAnswer(dir: string, id: string, at: string = QUIET, reason: string = "end_turn"): void {
+  append(dir, id, {
+    isSidechain: true,
+    agentId: id,
+    type: "assistant",
+    message: { role: "assistant", stop_reason: reason, content: [{ type: "text", text: "COULD NOT REFUTE: ..." }] },
     timestamp: at,
   });
 }
@@ -587,6 +605,89 @@ describe("subtree liveness (#209)", () => {
     test("a missing sub-agent directory is no live agents", () => {
       expect(liveAgentsIn(join(mkTmp(), "never-created"))).toEqual([]);
     });
+
+    // The wedge this bound exists for, at the level the operator meets it: ONE
+    // agent killed mid-tool-call disabled `sweep-review` and reconcile's
+    // throwaway prunes for that whole session, at any age, with no override --
+    // and `sweep-review` is what troubleshooting.md sells as the by-hand clear.
+    // Measured: 17 of 1,490 sub-agent transcripts on this machine were
+    // permanently live that way, across 8 of 114 sessions.
+    test("one agent killed mid-tool-call does not wedge the sweep forever", () => {
+      const dir = mkTmp();
+      writeAgent(dir, "crashed");
+      writeAgent(dir, "done");
+      appendRunning(dir, "crashed", new Date(NOW - SUBTREE_STALE_MS).toISOString());
+      appendTerminalAnswer(dir, "done");
+      // One second short of the ceiling it still holds the sweep...
+      expect(liveAgentsIn(dir, { now: NOW - 1 })).toEqual(["crashed"]);
+      // ...and at it, the sweep runs.
+      expect(liveAgentsIn(dir, { now: NOW })).toEqual([]);
+      // The operator override, for the session they know is dead.
+      expect(liveAgentsIn(dir, { now: NOW - 1, staleMs: 1_000 })).toEqual([]);
+    });
+  });
+
+  // Why Step 7's sweep can fire at all. It runs seconds after the merge stage
+  // returns, scanning the same `subagents/` directory that stage agent lives in,
+  // so under shape+quiescence alone every stage agent of the batch read LIVE for
+  // 15 minutes and the call could never sweep anything -- theater in the SKILL.
+  // A turn-ending stop_reason is the harness saying the agent has no more to
+  // write, and it is measured to be unambiguous: 1,310 of this machine's 1,532
+  // finished transcripts end on one, and of the 10,517 final-answer-shaped
+  // records that were NOT last in their file, ZERO carry one.
+  test("a turn-ending stop_reason is proof on its own -- no settling window", () => {
+    const dir = mkTmp();
+    twoReviewersWithSkeptics(dir);
+    appendTerminalAnswer(dir, "s1a", RECENT); // returned 5 seconds ago
+    appendTerminalAnswer(dir, "s1b", RECENT, "stop_sequence");
+    appendFinalAnswer(dir, "s1c", RECENT); // same shape, stop_reason null: still noisy
+    expect(live(dir, "r1")).toEqual(["s1c"]);
+  });
+
+  // ...but the fast path is the stop_reason, not the shape: `tool_use` and
+  // `max_tokens` both mean more is coming, and both appear on mid-work records in
+  // the corpus (44 and 1).
+  test("a non-terminal stop_reason still waits out the settling window", () => {
+    const dir = mkTmp();
+    twoReviewersWithSkeptics(dir);
+    appendTerminalAnswer(dir, "s1a", RECENT, "tool_use");
+    appendTerminalAnswer(dir, "s1b", RECENT, "max_tokens");
+    appendTerminalAnswer(dir, "s1c", QUIET, "tool_use"); // quiet long enough anyway
+    expect(live(dir, "r1")).toEqual(["s1a", "s1b"]);
+  });
+
+  // The ceiling is a measurement like the window is, and this is its gate. The
+  // sample: 135,373 gaps between a NON-final-shaped record (the tool_use an agent
+  // is blocked on, the tool_result it just took, a bare thinking chunk) and that
+  // agent's next one, over all 1,546 sub-agent transcripts. p50 1.3s, p99 77s, 25
+  // over 600s, and one 13,004s Bash call.
+  test("the staleness ceiling clears the measured max stall by 2x, and outlasts the quiet window", () => {
+    expect(MEASURED_MAX_STALL_MS).toBe(13_003_952);
+    expect(SUBTREE_STALE_MS).toBeGreaterThanOrEqual(2 * MEASURED_MAX_STALL_MS);
+    // It is the OUTER bound: a shape the quiet window could clear must never be
+    // held open by the ceiling instead.
+    expect(SUBTREE_STALE_MS).toBeGreaterThan(SUBTREE_QUIET_MS);
+    // A skeptic blocked on the longest real stall in the corpus is still live.
+    const dir = mkTmp();
+    twoReviewersWithSkeptics(dir);
+    for (const s of ["s1a", "s1b", "s1c"]) appendRunning(dir, s, new Date(NOW - MEASURED_MAX_STALL_MS).toISOString());
+    expect(live(dir, "r1")).toEqual(["s1a", "s1b", "s1c"]);
+  });
+
+  // The ceiling has to cover the shapes that carry no usable timestamp too --
+  // otherwise the "fails toward LIVE" rule above is a second way to wedge
+  // forever. The file's own mtime answers for those, and only for the ceiling:
+  // the settling window stays on the record's stamp, so copying a transcript
+  // (which collection does) can never make a live agent look finished.
+  test("an undated transcript nobody has touched in ages is finished too", () => {
+    const dir = mkTmp();
+    writeAgent(dir, "r1");
+    writeAgent(dir, "s1", { parent: "r1" });
+    append(dir, "s1", { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "done" }] } });
+    const metas = readAgentMetas(dir).metas;
+    expect(liveDescendants(dir, metas, "r1", { now: NOW })).toEqual(["s1"]); // no timestamp: live
+    const old = statSync(join(dir, "agent-s1.jsonl")).mtimeMs + SUBTREE_STALE_MS;
+    expect(liveDescendants(dir, metas, "r1", { now: old })).toEqual([]);
   });
 
   // The verdict is in code, but the REMOVAL is the SKILL's, so the ordering is

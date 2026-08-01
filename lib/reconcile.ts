@@ -158,9 +158,12 @@ export function planReviewSweep(opts: {
   subagentsDir: string | undefined;
   now?: number;
   quietMs?: number;
+  staleMs?: number;
 }): { paths: string[]; live: string[] } {
   const live =
-    opts.subagentsDir === undefined ? [] : liveAgentsIn(opts.subagentsDir, { now: opts.now, quietMs: opts.quietMs });
+    opts.subagentsDir === undefined
+      ? []
+      : liveAgentsIn(opts.subagentsDir, { now: opts.now, quietMs: opts.quietMs, staleMs: opts.staleMs });
   const found = listThrowawayWorktrees(opts.worktreesDir).map((w) => w.path);
   return { paths: live.length > 0 ? [] : found, live };
 }
@@ -362,7 +365,8 @@ const USAGE = `reconcile <command> [args] --slug S
 
   scan   [--now MS]   scan orphans + build the plan; print JSON {hasOrphans, orphans, plan}
   plan   [--now MS]   print the reconcile action list as JSON
-  sweep-review [--project-dir D] [--subagents-dir D] [--quiet-ms MS]
+  sweep-review [--worktrees D] [--project-dir D] [--subagents-dir D]
+               [--quiet-ms MS] [--stale-ms MS]
                       remove leftover throwaway reviewer worktrees (.worktrees/review-<N>)
                       and nothing else. No board read, no locks, no slug needed --
                       z-loop/SKILL.md Step 0 / Step 7 cleanup, as a command instead of
@@ -370,6 +374,13 @@ const USAGE = `reconcile <command> [args] --slug S
                       REMOVES NOTHING while any sub-agent of this session has not
                       been observed finishing: the skeptics execute inside those
                       worktrees and outlive the reviewer that spawned them (#209).
+                      --worktrees is the directory scanned, default <cwd>/.worktrees
+                      -- run it from the repo root or pass the flag, or it sweeps a
+                      directory that does not exist and reports 0 either way.
+                      --stale-ms is the ceiling past which a transcript nobody has
+                      written to reads finished whatever its last record was
+                      (default 8h, SUBTREE_STALE_MS): the override for a session
+                      holding an agent that was killed mid-tool-call.
   apply  [--now MS] [--session ID]
                       execute the plan: release claims, park to Ready, prune worktrees,
                       remove stale locks (never deletes branches or comments).
@@ -420,13 +431,15 @@ function reviewSweepSubagentsDir(flags: ParsedArgs["flags"]): string | undefined
   return str(flags, "subagents-dir") ?? subagentsDirFor(str(flags, "project-dir") ?? process.cwd());
 }
 
-// --quiet-ms: the settling window, injected only by the gate tests (which need a
-// boundary they can pin). Production takes SUBTREE_QUIET_MS.
-function quietMsFlag(flags: ParsedArgs["flags"]): number | undefined {
-  const v = str(flags, "quiet-ms");
+// --quiet-ms / --stale-ms: the two liveness windows (lib/transcripts.ts). The
+// gate tests inject both to pin their boundaries; the operator override matters
+// for --stale-ms, which is the way out when a session holds an agent that was
+// killed mid-tool-call and would otherwise hold the sweep for its full ceiling.
+function msFlag(flags: ParsedArgs["flags"], name: string): number | undefined {
+  const v = str(flags, name);
   if (v === undefined) return undefined;
   const n = Number(v);
-  if (!Number.isFinite(n) || n < 0) throw new ZError(`--quiet-ms must be a non-negative number of milliseconds, got ${JSON.stringify(v)}.`);
+  if (!Number.isFinite(n) || n < 0) throw new ZError(`--${name} must be a non-negative number of milliseconds, got ${JSON.stringify(v)}.`);
   return n;
 }
 
@@ -454,7 +467,8 @@ export async function main(argv: string[]): Promise<number> {
         worktreesDir: dir,
         subagentsDir: reviewSweepSubagentsDir(flags),
         now: nowMs,
-        quietMs: quietMsFlag(flags),
+        quietMs: msFlag(flags, "quiet-ms"),
+        staleMs: msFlag(flags, "stale-ms"),
       });
       // Declining is a normal outcome, not an error: nothing waits on this sweep
       // (a leftover scratch checkout is litter, never a wedge), and exiting
@@ -465,7 +479,8 @@ export async function main(argv: string[]): Promise<number> {
           `swept 0 of ${listThrowawayWorktrees(dir).length} throwaway review worktree(s): ` +
             `${live.length} agent(s) of this session have not been observed finishing (${live.join(", ")}), ` +
             `and a skeptic still reading .worktrees/review-<N> must not have it removed underneath it (#209). ` +
-            `They are swept by the next run's Step 0, after the loop-lock acquire proves the session is quiet.`
+            `They wait for the next sweep that finds the session quiet. If you know it is not -- an agent killed ` +
+            `mid-tool-call never reports finished until its transcript goes stale -- re-run with --stale-ms.`
         );
         return 0;
       }
@@ -519,7 +534,8 @@ export async function main(argv: string[]): Promise<number> {
       worktreesDir,
       subagentsDir: reviewSweepSubagentsDir(flags),
       now: nowMs,
-      quietMs: quietMsFlag(flags),
+      quietMs: msFlag(flags, "quiet-ms"),
+      staleMs: msFlag(flags, "stale-ms"),
     }).live;
     const runnable = holdLiveThrowawayPrunes(plan, live);
     await applyReconcile(runnable, realEffects(board));

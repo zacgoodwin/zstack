@@ -51,6 +51,7 @@ import {
   type ReconcileAction,
   type ReconcileEffects,
 } from "../lib/reconcile.ts";
+import { SUBTREE_STALE_MS } from "../lib/transcripts.ts";
 import {
   applyAction,
   ingestBoardItems,
@@ -958,6 +959,43 @@ describe("control 2: orphan scan (crash recovery)", () => {
     expect(await reconcileMain(["sweep-review", "--worktrees", worktreesDir, "--subagents-dir", quiet, "--now", String(NOW)])).toBe(0);
     expect(existsSync(join(worktreesDir, "review-66"))).toBe(false);
     expect(existsSync(join(worktreesDir, "ticket-66"))).toBe(true);
+  });
+
+  // The wedge the staleness ceiling exists for, at the CLI. An agent killed
+  // mid-tool-call can never satisfy the finished SHAPE at any age, so before the
+  // ceiling one of them disabled this command (and reconcile's throwaway prunes)
+  // for the whole session -- and `sweep-review` is what troubleshooting.md sells
+  // as the by-hand clear, so the documented escape hatch was the thing that got
+  // wedged. Measured: 17 of 1,490 sub-agent transcripts on this machine.
+  test("a crashed agent stops holding the sweep once it is stale, and --stale-ms is the override", async () => {
+    const worktreesDir = tmp();
+    mkdirSync(join(worktreesDir, "review-66"));
+    const wedged = subagents([{ id: "crashed", live: true }]); // last record: a tool_use, 5s old
+    expect(planReviewSweep({ worktreesDir, subagentsDir: wedged, now: NOW }).live).toEqual(["crashed"]);
+    // Far enough past its last record, it is not running anything.
+    expect(planReviewSweep({ worktreesDir, subagentsDir: wedged, now: NOW + SUBTREE_STALE_MS }).paths).toHaveLength(1);
+    // ...and the operator who knows the session is dead does not have to wait.
+    expect(
+      await reconcileMain([
+        "sweep-review",
+        "--worktrees",
+        worktreesDir,
+        "--subagents-dir",
+        wedged,
+        "--now",
+        String(NOW),
+        "--stale-ms",
+        "1000",
+      ])
+    ).toBe(0);
+    expect(existsSync(join(worktreesDir, "review-66"))).toBe(false);
+  });
+
+  test("--stale-ms and --quiet-ms reject a value that is not a non-negative number", async () => {
+    for (const flag of ["--stale-ms", "--quiet-ms"]) {
+      expect(await reconcileMain(["sweep-review", "--worktrees", tmp(), "--subagents-dir", subagents([]), flag, "soon"])).toBe(1);
+      expect(await reconcileMain(["sweep-review", "--worktrees", tmp(), "--subagents-dir", subagents([]), flag, "-1"])).toBe(1);
+    }
   });
 
   // Step 0's shape: a fresh session has spawned nothing, so the directory does

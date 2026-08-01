@@ -251,14 +251,16 @@ describe("pointer prompts are size-invariant to the payload (AC1)", () => {
   // super-truth block against starved skeptic delivery added ~1 KB of FIXED
   // instructions. That is not the failure this test guards against -- its
   // invariance assertion is unaffected -- so the number moved and every other
-  // stage kept 4 KB.
+  // stage kept 4 KB. #209 moved it once more for the same reason: the shared
+  // foreground rule (~0.7 KB of fixed text) now goes to the reviewer too, which
+  // is where the markerless exits were actually observed.
   const CASES: { stage: string; build: (payload: string, ac: string) => string; cap: number; payloads: string[] }[] = [
     { stage: "builder", build: (b) => builderPrompt({ ...BUILDER_INPUT, ticketBody: b }, INPUT_PATH), cap: 4096, payloads: [HUGE] },
     { stage: "qa", build: (b) => qaPrompt({ ...QA_INPUT, ticketBody: b }, INPUT_PATH), cap: 4096, payloads: [HUGE] },
     { stage: "reviewer", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH), cap: 4096, payloads: [HUGE, AC] },
     // The adversarial reviewer branch fans out skeptics but STILL points at the
     // file for its payload -- it must stay size-invariant too.
-    { stage: "reviewer (adversarial)", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH, true), cap: 5120, payloads: [HUGE, AC] },
+    { stage: "reviewer (adversarial)", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH, true), cap: 6144, payloads: [HUGE, AC] },
     { stage: "merge", build: () => mergePrompt(MERGE_INPUT, INPUT_PATH), cap: 4096, payloads: [] },
   ];
 
@@ -328,10 +330,13 @@ describe("adversarial reviewer prompt", () => {
     // The block is bounded by the section that FOLLOWS it, not by a phrase
     // inside it: an earlier version matched lazily up to the first "below.\n",
     // so lengthening the block (as #191 did) left its tail behind and the
-    // difference showed up as an unrelated-looking golden mismatch.
+    // difference showed up as an unrelated-looking golden mismatch. #209 put a
+    // shared section between this block and the exit contract, so the bound moved
+    // to that one -- ending at "## Exit contract" would now strip the foreground
+    // rule the single pass also carries.
     const active = reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, true);
     const stripped = active
-      .replace(/\n## Super-truth pass[\s\S]*?(?=\n## Exit contract)/, "")
+      .replace(/\n## Super-truth pass[\s\S]*?(?=\n## Verification runs in the FOREGROUND)/, "")
       .replaceAll("skeptics=<k>/3 ", "")
       .replace("REVIEW-FINDINGS: confidence=<0-100> ", "REVIEW-FINDINGS: ");
     expect(stripped).toBe(SINGLE_PASS_BASELINE);
@@ -364,6 +369,29 @@ describe("adversarial reviewer prompt", () => {
     // The k=0 case is the one that used to merge on a fabricated 100.
     expect(active).toContain("skeptics=0/3");
     expect(active).toContain("never 100");
+  });
+
+  // #209, the dominant observed case. The Plan asked for the foreground rule on
+  // "builder and QA at minimum", but the data says reviewers: 3 of run 11's 4
+  // markerless exits, and run 12 reproduced it three more times (#149, #178, #205
+  // each ended a turn with no marker while waiting on skeptics, each rescued by
+  // hand). The reviewer runs the same typecheck-and-touched-tests gauntlet, so it
+  // carries the same rule -- on BOTH branches, since the single pass has no
+  // super-truth block to hide the marker reminder in.
+  test("the reviewer carries the foreground rule on both branches", () => {
+    for (const adversarial of [false, true]) {
+      const p = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, adversarial);
+      expect(p).toContain("Verification runs in the FOREGROUND");
+      expect(p).toContain("Never background a gate and end your turn waiting on it");
+      expect(p).toContain("Ending your turn with a background job still pending is parsed as CONFUSED");
+      // The reviewer's wait is usually a sub-agent, not a test run.
+      expect(p).toContain("a sub-agent included");
+      // It lands before the markers it is talking about.
+      expect(p.indexOf("Verification runs in the FOREGROUND")).toBeLessThan(p.indexOf("## Exit contract"));
+    }
+    // ...and the skeptic wait is named outright where the fan-out is described.
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
+    expect(active).toContain('"Still waiting on a skeptic" is not an exception');
   });
 
   // The denominator is adversarial-only: with no fan-out there is no k, and

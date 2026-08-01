@@ -436,4 +436,29 @@ describe("Ticket #209: leftover review worktrees are swept by a command on every
     expect(block).toContain("sweep-review");
     expect(block).not.toContain("Step 7's batch cleanup sweeps leftover review worktrees"); // the old prose-only promise
   });
+
+  // AC7's rule is about the REMOVAL, not about one row: the gate was taught to the
+  // stage-teardown row only, and this ticket's own review reproduced #66 anyway --
+  // the orchestrator's `park N Blocked` cleanup force-removed `.worktrees/review-209`
+  // while a skeptic was still working in it, following the SKILL exactly as written
+  // (it said nothing either way). So the SKILL now names the only two places that
+  // may remove one, and this pins the count: a third `git worktree remove` of a
+  // review path anywhere in the file is a new ungated path.
+  test("only the gated teardown removes a review worktree by hand", () => {
+    const md = zLoop();
+    const removals = md.match(/git worktree remove "\.worktrees\/review-[^"]*"/g) ?? [];
+    expect(removals).toHaveLength(1);
+    // ...and that one sits behind the subtree gate.
+    const gate = md.indexOf('jq -r .subtreeDone "$TMP/collected-<N>.json"');
+    expect(gate).toBeGreaterThan(-1);
+    expect(md.indexOf(removals[0]!)).toBeGreaterThan(gate);
+
+    // The rule itself is written down, and every lane-dropping row points at it.
+    const rule = section(md, "**Removing a review worktree.**");
+    // Booleans, not the section: a miss must not dump 60KB into the failure.
+    expect(rule === "").toBe(false);
+    expect(rule.includes("sweep-review")).toBe(true);
+    expect(rule.includes("not in a park, not in a skip, not in a")).toBe(true);
+    expect(md.match(/\(\*\*Removing a review worktree\*\* below\)/g)).toHaveLength(3);
+  });
 });

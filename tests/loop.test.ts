@@ -858,23 +858,44 @@ describe("built guard: clean tree + moved HEAD (#177)", () => {
   test("the park note points at a durable salvage patch, not the doomed worktree", () => {
     let s = state([ticket(7, "Building")], [lane(7, "builder", { commitRetries: MAX_COMMIT_RETRIES })]);
     s = recordOutcome(s, 7, HAPPY.builder, 0, DIRTY_NO_COMMIT);
-    const note = (nextAction(s, 0) as { note: string }).note;
-    // The SKILL keys the salvage dump on this PREFIX (the same way the park row
-    // keys Notify on `Dependency deadlock:`), so the prefix is part of the contract.
+    const a = nextAction(s, 0);
+    // The dump is triggered by the action's own field, never by a phrase in the
+    // note (#209): a prose key is matched by whatever sentence happens to contain
+    // it, and two different notes carried this one.
+    expect(a).toMatchObject({ kind: "park", salvage: true });
+    const note = (a as { note: string }).note;
     expect(note.startsWith("uncommitted work:")).toBe(true);
     expect(note).toContain("reports/uncommitted-7.patch"); // the ticket's own patch
     expect(note).toContain("git apply");
     expect(note).toContain("force-removes it");
     expect(note).toContain("BEFORE the next /z-loop run");
     expect(note).not.toContain("it is left in place");
-    // The park path has to write that patch, or the note lies. Keyed on the note's
-    // `uncommitted work:` prefix, the same way the row keys Notify on
-    // `Dependency deadlock:`.
+    // The park path has to write that patch, or the note lies.
     const skill = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
     const has = (s: string) => skill.includes(s); // see the canary below re: file dumps
-    expect(has("uncommitted work:")).toBe(true);
-    expect(has(`diff --cached --binary HEAD > "$HOME/.zstack/projects/$SLUG/reports/uncommitted-<N>.patch"`)).toBe(true);
+    expect(has('when the action carries `"salvage": true`')).toBe(true);
+    expect(has("diff --cached --binary HEAD")).toBe(true);
+    expect(has(`> "$HOME/.zstack/projects/$SLUG/reports/uncommitted-<N>.patch"`)).toBe(true);
     expect(has(`git -C ".worktrees/ticket-<N>" add -A`)).toBe(true);
+  });
+
+  // Every action that drops a lane must agree on the trigger, and only the ones
+  // whose worktree really holds work may set it -- an unconditional flag would
+  // stage-and-diff a worktree a human is still reading.
+  test("`salvage` is the one structural key, set by exactly the actions that strand work", () => {
+    const skill = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
+    // All three lane-dropping rows read the same field...
+    expect(skill.match(/when the action carries `"salvage": true`/g)?.length).toBe(3);
+    // ...and no row keys a dump on a phrase in the note any more.
+    expect(skill.includes("when the note mentions `uncommitted work`")).toBe(false);
+    expect(skill.includes("when the note begins `uncommitted work:`")).toBe(false);
+
+    // An ordinary park (a QA-bugs cap, say) strands nothing: its work is committed
+    // on a branch, and branches are never deleted (issue #2).
+    let s = state([ticket(1, "QA")], [lane(1, "qa", { qaBounces: 3 })]);
+    s = recordOutcome(s, 1, "QA-BUGS: still broken", 0);
+    expect(nextAction(s, 0)).toMatchObject({ kind: "park", status: "Blocked" });
+    expect((nextAction(s, 0) as { salvage?: true }).salvage).toBeUndefined();
   });
 
   // Three failures, three budgets: "you forgot to commit" must not consume the
@@ -1550,7 +1571,6 @@ describe("dead-worker re-spawn (#209)", () => {
       const a = nextAction(s, NOW);
       expect(a.kind).toBe("stop-lane");
       expect((a as { note: string }).note).toContain("a human");
-      expect((a as { note: string }).note).toContain("uncommitted work, kept for inspection");
       s = applyAction(s, a, NOW);
       expect(s.lanes).toEqual([]); // lane dropped...
       expect(s.tickets[0].status).toBe(status); // ...and the human's status untouched
@@ -1559,6 +1579,31 @@ describe("dead-worker re-spawn (#209)", () => {
     const parked = deadLane(DIRTY);
     parked.tickets[0].status = "Blocked";
     expect(applyAction(parked, nextAction(parked, NOW), NOW).lanes).toHaveLength(0);
+  });
+
+  // stop-lane drops the lane lock exactly like park and skip do, so the lockless
+  // `ticket-<N>` worktree is an orphan the next `--reconcile` force-removes
+  // (lib/reconcile.ts: orphanWorktrees -> prune-worktree -> `git worktree remove
+  // --force`). An earlier cut of this branch promised that tree was "kept for
+  // inspection" -- and pinned the promise in a test -- 33 lines above the skip
+  // branch that documents the same chain and dumps a patch because of it.
+  test("the human-park stop-lane salvages the work it used to promise to keep", () => {
+    const s = deadLane(DIRTY);
+    s.tickets[0].status = "Blocked";
+    const a = nextAction(s, NOW);
+    expect(a).toMatchObject({ kind: "stop-lane", salvage: true });
+    const note = (a as { note: string }).note;
+    expect(note).toContain("reports/uncommitted-1.patch");
+    expect(note).toContain("git apply");
+    expect(note).not.toContain("kept for inspection"); // the claim reconcile disproves
+
+    // Nothing to strand, nothing to dump: no flag, no patch promised.
+    const clean = deadLane(CLEAN);
+    clean.tickets[0].status = "Blocked";
+    const b = nextAction(clean, NOW);
+    expect(b.kind).toBe("stop-lane");
+    expect((b as { salvage?: true }).salvage).toBeUndefined();
+    expect((b as { note: string }).note).not.toContain("uncommitted-1.patch");
   });
 
   test("a QA lane recovers the same way; a reviewer lane never does", () => {
@@ -1606,20 +1651,43 @@ describe("dead-worker re-spawn (#209)", () => {
   // Skipping removes the lane lock, and a lockless worktree is force-removed by
   // the next run's reconcile scan -- so a skip note promising "worktree left for
   // inspection" would be pointing the human at a directory the loop deletes.
-  // Same salvage contract as #177's park, keyed on the same phrase.
+  // Same salvage contract as #177's park, on the same structural key.
   test("the cap-exhausted skip names a durable salvage patch, and the SKILL dumps it", () => {
     const s = deadLane(DIRTY, { respawns: { builder: MAX_DEAD_RESPAWNS } });
-    const note = (nextAction(s, NOW) as { note: string }).note;
+    const a = nextAction(s, NOW);
+    expect(a).toMatchObject({ kind: "skip", salvage: true });
+    const note = (a as { note: string }).note;
     expect(note.startsWith("Worker died mid-")).toBe(true); // the SKILL's Notify key
-    expect(note).toContain("uncommitted work"); // the SKILL's salvage-dump key
     expect(note).toContain("reports/uncommitted-1.patch");
     expect(note).toContain("git apply");
     expect(note).toContain("force-removes it");
     expect(note).not.toContain("worktree left for inspection");
+    // ...and the skip with nothing to strand carries no flag at all.
+    expect((nextAction(deadLane(CLEAN), NOW) as { salvage?: true }).salvage).toBeUndefined();
     const skill = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
     const has = (x: string) => skill.includes(x); // booleans: a miss must not dump 60KB
     expect(has(`git -C ".worktrees/ticket-<N>" add -A`)).toBe(true);
-    expect(has(`diff --cached --binary HEAD > "$HOME/.zstack/projects/$SLUG/reports/uncommitted-<N>.patch"`)).toBe(true);
+    expect(has("diff --cached --binary HEAD")).toBe(true);
+    expect(has(`> "$HOME/.zstack/projects/$SLUG/reports/uncommitted-<N>.patch"`)).toBe(true);
+  });
+
+  // applyAction spends `respawns[lane.stage]`, not `respawns[action.stage]`, and
+  // reads the attempt off the lane too -- so applying an action built for a stage
+  // the lane has since left would spend the wrong budget and shift the wrong
+  // stage's stageAttempt. That is the duplicate-spawn-tag class the derivation
+  // header exists to prevent (a re-used tag makes `transcripts collect` refuse and
+  // a re-used transcript name overwrites its predecessor's spend), so it throws.
+  test("a respawn action for a stage the lane has left is refused, not applied to the wrong one", () => {
+    const s = deadLane(DIRTY);
+    const a = nextAction(s, NOW);
+    expect(a).toMatchObject({ kind: "respawn", stage: "builder" });
+    const moved = structuredClone(s);
+    moved.lanes[0].stage = "qa"; // some other tick advanced it first
+    expect(() => applyAction(moved, a, NOW)).toThrow(ZError);
+    expect(() => applyAction(moved, a, NOW)).toThrow(/stage "builder" but the lane is now at "qa"/);
+    expect(moved.lanes[0].respawns).toBeUndefined(); // no budget spent on the wrong stage
+    // The matching lane still applies, unchanged.
+    expect(applyAction(s, a, NOW).lanes[0].respawns).toEqual({ builder: 1 });
   });
 
   test("an alive probe clears a stale worktree reading", () => {
