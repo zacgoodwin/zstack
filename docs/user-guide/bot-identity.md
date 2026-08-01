@@ -150,6 +150,39 @@ permission gap. Either exempt the bot account from required-reviewer rules
 or leave protection as-is and expect the merge stage to report a blocked PR,
 same as it would for a human's PR under the same rules.
 
+### Required reviews and the loop
+
+This is the one rule that reliably stops a loop that is otherwise working. A
+ruleset carrying a `pull_request` rule with
+`required_approving_review_count >= 1` blocks every loop PR: the bot cannot
+approve its own, and a review gate satisfied by the system it gates is not a
+gate. The loop's own adversarial reviewer stage runs before the PR is opened
+and does not count toward GitHub's requirement.
+
+Note that individual users cannot be ruleset bypass actors — GitHub allows only
+roles, teams, and apps — so "just exempt the bot" usually means exempting the
+Write role, which exempts every human collaborator too. Three honest options:
+
+| Option | Keeps | Costs |
+| --- | --- | --- |
+| Set the count to 0 | PRs still mandatory on the base branch; no direct pushes | No approval gate on any PR, human or bot |
+| Bypass actor for a role/team the bot is in | The rule on paper | Everyone in that role bypasses too |
+| Loop runs against a non-default integration branch | The gate on the real base branch | An extra branch, and you merge in batches |
+
+Whichever you pick, check it **before** starting a run rather than discovering
+it at the merge stage with the batch already paid for (that is #228's Step 0
+preflight). Read the current state with:
+
+```bash
+gh api repos/<owner>/<repo>/rulesets --jq '.[] | {id, name, enforcement}'
+gh api repos/<owner>/<repo>/rulesets/<ID> \
+  --jq '[.rules[] | select(.type=="pull_request") | .parameters.required_approving_review_count]'
+```
+
+On this repo (2026-07-31) the count was set to 0 on ruleset 19184288 after a
+full batch parked Blocked at merge under the new bot identity; the
+wait-for-human-approval flow is tracked in the Review Step milestone (#226).
+
 ## Step 3 — Generate a token and authenticate `gh` as the bot
 
 Two ways to get `gh` talking to GitHub as the bot; pick one.

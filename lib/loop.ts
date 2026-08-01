@@ -1223,6 +1223,41 @@ export interface BoardItemLike {
   labels?: string[]; // #130: issue labels riding the snapshot (lib/board.ts BoardItem.labels)
 }
 
+// Splits a read into the items the loop's state machine can drive and the ones
+// it cannot. A human may add columns to the board -- a staging queue, a triage
+// lane -- and a status outside BOARD_STATUSES must never crash the loop; before
+// this, one such ticket threw out of ingest and killed every tick (#226).
+//
+// An unknown status is a POSITIVE observation, not an absence, so it is
+// evidence under #138's rule rather than an exception to it: the read proves
+// the ticket sits somewhere the loop does not drive. That is why an ignored
+// ticket is REMOVED from state rather than merely skipped -- skipping alone
+// would leave #138's carry-forward holding the ticket's last known status
+// forever, so a human moving a ticket out of Ready into their own column would
+// leave the loop still seeing it as Ready and free to claim it.
+//
+// A missing Status field lands here too (rendered "(none)"): an item with no
+// status is likewise not work the loop was handed.
+export function partitionKnownStatus(items: BoardItemLike[]): {
+  known: BoardItemLike[];
+  ignored: { number: number; status: string }[];
+  notes: string[];
+} {
+  const known: BoardItemLike[] = [];
+  const ignored: { number: number; status: string }[] = [];
+  for (const it of items) {
+    const status = String(it.fields?.["Status"] ?? "");
+    if (BOARD_STATUSES.includes(status as BoardStatus)) known.push(it);
+    else ignored.push({ number: it.number, status });
+  }
+  const notes = ignored.map(
+    (i) =>
+      `#${i.number} sits in board status ${i.status ? JSON.stringify(i.status) : "(none)"}, which the loop does not drive ` +
+      `(known: ${BOARD_STATUSES.join(", ")}); ignoring it for this run.`
+  );
+  return { known, ignored, notes };
+}
+
 // Builds/refreshes the ticket snapshot from z-board list output plus fetched
 // issue bodies ({"<number>": "<body>"}), preserving lanes and claim-lost flags
 // from the previous state. Pure: assembling a snapshot is a JSON transform,
@@ -1245,18 +1280,20 @@ export function ingestBoardItems(
     contextTokens?: number; // #131: live orchestrator context reading, stored fresh
     contextTokenLimit?: number; // #131: context ceiling, captured once like the other knobs
   },
-  // #138: the ONLY input that removes a ticket (and its lane) from loop state.
-  // Each number here must have been PROVED absent by a single-ticket lookup
-  // (lib/board.ts `item`); absence from `items` proves nothing and never lands
-  // here. Default [] = no confirm pass ran, which degrades to pure carry-forward.
+  // #138: one of the two inputs that remove a ticket (and its lane) from loop
+  // state -- the other being an unknown board status (partitionKnownStatus
+  // above). Each number here must have been PROVED absent by a single-ticket
+  // lookup (lib/board.ts `item`); absence from `items` proves nothing and never
+  // lands here. Default [] = no confirm pass ran, which degrades to pure
+  // carry-forward.
   confirmedGone: number[] = []
 ): LoopState {
   const prevByNumber = new Map((prev?.tickets ?? []).map((t) => [t.number, t]));
-  const observed = items.map((it) => {
-    const status = String(it.fields["Status"] ?? "") as BoardStatus;
-    if (!BOARD_STATUSES.includes(status)) {
-      throw new ZError(`Issue #${it.number} has unknown Status ${JSON.stringify(it.fields["Status"])}.`);
-    }
+  // Every caller is protected here, not just the CLI: a status the loop does
+  // not drive can reach ingest from any read path.
+  const { known, ignored } = partitionKnownStatus(items);
+  const observed = known.map((it) => {
+    const status = it.fields["Status"] as BoardStatus;
     const t: TicketSnapshot = {
       number: it.number,
       title: it.title,
@@ -1284,8 +1321,10 @@ export function ingestBoardItems(
   // everything forward through this one merge path (and returns a fresh clone,
   // never `prev` by reference). The old H14 lane drop -- a lane whose ticket
   // vanished from the read -- is likewise gone; the ONLY removal is
-  // `confirmedGone`, a caller's positive proof from a single-ticket lookup.
-  const gone = new Set(confirmedGone);
+  // `confirmedGone`, a caller's positive proof from a single-ticket lookup --
+  // joined by the tickets positively observed in a status the loop does not
+  // drive, which is the same kind of evidence (see partitionKnownStatus).
+  const gone = new Set([...confirmedGone, ...ignored.map((i) => i.number)]);
   const merged = new Map<number, TicketSnapshot>();
   for (const t of prev?.tickets ?? []) merged.set(t.number, structuredClone(t));
   for (const t of observed) merged.set(t.number, t);
@@ -1741,6 +1780,9 @@ export function main(argv: string[]): number {
         confirmedGone = confirmed.confirmedGone;
         for (const note of confirmed.notes) console.error(note);
       }
+      // Same stderr channel, same reason: a human-added board column is not an
+      // error, but it must be visible that the loop is skipping those tickets.
+      for (const note of partitionKnownStatus(items).notes) console.error(note);
       const reviewerBelowThresholdAction = str(flags, "reviewer-below-threshold-action");
       if (
         reviewerBelowThresholdAction !== undefined &&

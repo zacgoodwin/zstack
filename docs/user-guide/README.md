@@ -53,6 +53,13 @@ One GitHub ProjectV2 per repo, titled after the repo, with nine statuses:
 | **Skipped** | Parked: dead worker or confusion | The loop |
 | **Done** | Merged and complete — left OPEN for you to review and close | The loop |
 
+These nine are the loop's whole state machine. You may add columns of your own —
+a staging queue, a triage lane — and the loop will ignore any ticket sitting in
+one, logging a line per ignored ticket so the skip is visible. Moving a ticket
+into a column of yours takes it out of the run, including mid-flight: its lane
+stops, exactly like moving it to a parked status. To hand such a ticket to the
+loop, move it back to Ready.
+
 And four custom fields per ticket:
 
 - **Model** (`haiku` / `sonnet` / `opus` / `fable`) — which model executes it.
