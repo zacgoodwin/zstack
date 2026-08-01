@@ -204,7 +204,8 @@ describe("Questions tickets", () => {
       ticket: 7,
       status: "Blocked",
       note: expect.stringContaining("#5 (Questions)"),
-      salvage: salvage(7),
+      // No lane, so no worktree, so no dump owed (#217 QA round 3) -- back to
+      // the exact shape this case asserted before #217.
     });
     const s2 = applyAction(s, a, 0);
     expect(nextAction(s2, 0)).toEqual({ kind: "drain-complete" });
@@ -1246,6 +1247,43 @@ describe("park salvage patch (#217)", () => {
     expect(nextAction(state([]), 0, { projectDir: P })).toEqual({ kind: "drain-complete" });
   });
 
+  // A park of a ticket that never had a LANE never had a worktree either, so it
+  // owes no dump. Attaching one made `apply` print "salvage SKIPPED: no worktree
+  // ... NO file exists at ..." and the SKILL's park row tells the orchestrator to
+  // copy that line onto the board -- a missing-patch warning on a ticket that
+  // held no work (#217 QA round 3).
+  test("a park of a never-claimed ticket carries no salvage", () => {
+    const P = "/tmp/p";
+    // Step 6: dependency deadlock (a cycle), all lanes idle, nothing claimable.
+    const cycle = nextAction(
+      state([ticket(8, "Ready", [9]), ticket(9, "Ready", [8])], []),
+      0,
+      { projectDir: P }
+    );
+    expect(cycle).toMatchObject({ kind: "park", ticket: 8, status: "Blocked" });
+    expect((cycle as Park).note).toContain("Dependency deadlock");
+    expect("salvage" in cycle).toBe(false);
+
+    // Step 4: an unclaimed dependent whose dependency already parked.
+    const deadDep = nextAction(
+      state([ticket(10, "Blocked"), ticket(11, "Ready", [10])], []),
+      0,
+      { projectDir: P }
+    );
+    expect(deadDep).toMatchObject({ kind: "park", ticket: 11, status: "Blocked" });
+    expect("salvage" in deadDep).toBe(false);
+
+    // ...while the SAME park kind for a ticket that DOES hold a lane still owes
+    // its dump: the discriminator is the lane, not the note.
+    const inLane = nextAction(
+      state([ticket(12, "Building")], [lane(12, "builder", { outcome: { kind: "needs-input", note: "?" } })]),
+      0,
+      { projectDir: P }
+    );
+    expect(inLane).toMatchObject({ kind: "park", ticket: 12 });
+    expect((inLane as Park).salvage).toEqual(salvage(12, P));
+  });
+
   // Production shape: a real LINKED worktree (`git worktree add`), where `.git`
   // is a FILE pointing at the parent repo, not a directory. Every other fixture
   // here git-inits a standalone repo, which is close enough for the diff but not
@@ -1291,6 +1329,52 @@ describe("park salvage patch (#217)", () => {
     }
   });
 
+  // #217 QA round 3, the loss the round-2 broadening opened: the canonical patch
+  // is ONE slot per ticket, and every lock-releasing action now dumps into it. A
+  // lane parks dirty (the dump is the save), reconcile prunes the worktree, a
+  // human returns the ticket to Ready, the rebuilt lane parks again with a CLEAN
+  // tree -- and the second dump replaced the only copy with 0 bytes.
+  test("a later dump never overwrites an earlier non-empty patch", () => {
+    const { projectDir, repoRoot, worktree, root } = parkWorld("dirty");
+    try {
+      writeFileSync(join(worktree, "new-test.ts"), "THE ONLY COPY OF A WEEK OF WORK\n");
+      const a = nextAction(parkedLane(DIRTY_NO_COMMIT), 0, { projectDir }) as Park;
+      const first = runSalvage(a.salvage!, undefined, repoRoot);
+      expect(first.bytes).toBeGreaterThan(0);
+      expect(first.preserved).toBeUndefined();
+
+      // The rebuilt lane: same ticket number, same patch path, clean tree.
+      rmSync(join(worktree, "new-test.ts"));
+      writeFileSync(join(worktree, "committed.txt"), "base\n");
+      const second = runSalvage(a.salvage!, undefined, repoRoot);
+
+      expect(second.bytes).toBe(0); // honest about THIS tree
+      const prev = `${a.salvage!.patch.replace(/\.patch$/, "")}.prev1.patch`;
+      expect(second.preserved).toBe(prev);
+      expect(readFileSync(prev, "utf8")).toContain("THE ONLY COPY OF A WEEK OF WORK");
+      expect(readFileSync(a.salvage!.patch, "utf8")).toBe("");
+      // The one line the orchestrator copies onto the board has to say where it went.
+      expect(second.note).toContain("preserved at");
+      expect(second.note).toContain(prev);
+
+      // A THIRD dump with new work preserves in order, and never reuses .prev1.
+      writeFileSync(join(worktree, "second-round.ts"), "the rebuild's own work\n");
+      const third = runSalvage(a.salvage!, undefined, repoRoot);
+      expect(third.bytes).toBeGreaterThan(0);
+      expect(third.preserved).toBeUndefined(); // the slot held an EMPTY patch: nothing to lose
+      expect(readFileSync(prev, "utf8")).toContain("THE ONLY COPY OF A WEEK OF WORK");
+      const fourth = runSalvage(a.salvage!, undefined, repoRoot);
+      expect(fourth.preserved).toBeUndefined(); // byte-identical re-run of `apply`: idempotent
+      expect(existsSync(`${a.salvage!.patch.replace(/\.patch$/, "")}.prev2.patch`)).toBe(false);
+      writeFileSync(join(worktree, "third-round.ts"), "and more\n");
+      const fifth = runSalvage(a.salvage!, undefined, repoRoot);
+      expect(fifth.preserved).toBe(`${a.salvage!.patch.replace(/\.patch$/, "")}.prev2.patch`);
+      expect(readFileSync(fifth.preserved!, "utf8")).toContain("second-round.ts");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   // The SKILL's park row is where an orchestrator learns what to do. It must now
   // say the dump is `apply`'s (code), and it must still carry the manual command
   // as the fallback + the assertion that the file is really there.
@@ -1312,6 +1396,20 @@ describe("park salvage patch (#217)", () => {
     // And the line that keeps a promised patch from outliving a dump that did
     // not happen: apply's own salvage line goes into the board comment.
     expect(has("`salvage:` line verbatim")).toBe(true);
+    // Step 0(c): the refusal's EXIT CODE is code and gate-tested, but the
+    // orchestrator's reaction to it lives here. Without this pin a future SKILL
+    // edit can drop the `||` branch and put the loop back to starting on top of
+    // an incomplete reconcile with nothing failing (#217 QA round 3).
+    const step0c = skill.slice(skill.indexOf("reconcile.ts\" apply"));
+    expect(step0c.slice(0, 400)).toContain("|| {");
+    expect(has("Reconcile is INCOMPLETE")).toBe(true);
+    expect(step0c.slice(0, 400)).toContain("locks.ts\" release");
+    expect(step0c.slice(0, 400)).toContain("exit 1");
+
+    // A re-dump preserves the earlier patch instead of replacing it, and the row
+    // says so -- a human who sees a 0-byte patch must know where the work went.
+    expect(has(".prev1.patch")).toBe(true);
+
     // And reconcile's half is documented where a human looks for it.
     const trouble = readFileSync(join(REPO_ROOT, "docs", "user-guide", "troubleshooting.md"), "utf8");
     expect(trouble).toContain("REFUSED to prune");

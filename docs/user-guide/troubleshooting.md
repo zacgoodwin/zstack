@@ -118,8 +118,8 @@ is, exits non-zero, and the loop does not start. Nothing was deleted.
 
 The sibling message — **"it has uncommitted work NEWER than the salvage patch
 at …"** — means the patch *is* on disk but predates the work in the worktree.
-Nothing ever deletes these patches, so one from an earlier park of the same
-ticket number survives indefinitely; it is a leftover, not this worktree's
+These patches outlive the worktrees they came from, so one from an earlier park
+of the same ticket number survives indefinitely; it is a leftover, not this worktree's
 salvage, and trusting it would discard the current work as silently as having no
 patch at all. Same fix either way: the dump command below overwrites it.
 
@@ -137,15 +137,27 @@ Pick one:
 git -C .worktrees/ticket-<N> add -A
 git -C .worktrees/ticket-<N> commit -m "wip: salvaged from a parked lane"
 
-# 2. Or dump the patch reconcile looked for, and re-run.
+# 2. Or dump the patch reconcile looked for, and re-run. If a LEFTOVER patch is
+#    already there (the "NEWER than the salvage patch" case), move it aside
+#    first — it may be an earlier park's only copy.
+P="$HOME/.zstack/projects/<slug>/reports/uncommitted-<N>.patch"
+[ -s "$P" ] && mv "$P" "${P%.patch}.prev1.patch"   # use the next free .prevN if taken
 git -C .worktrees/ticket-<N> add -A
-git -C .worktrees/ticket-<N> diff --cached --binary HEAD \
-  > "$HOME/.zstack/projects/<slug>/reports/uncommitted-<N>.patch"
+git -C .worktrees/ticket-<N> diff --cached --binary HEAD > "$P"
 ```
 
 Then `/z-loop --reconcile` again. Re-apply a dumped patch later with
 `git apply --index <patch>` in a fresh worktree. A 0-byte patch is legitimate: it
 means the tree held nothing uncommitted.
+
+**`uncommitted-<N>.prev1.patch`, `.prev2.patch`, … are earlier salvages of the
+same ticket.** The loop writes one canonical patch per ticket, and a later dump
+never overwrites a non-empty one — it moves the older copy to the next free
+`.prevN` and says so in the `salvage:` line on the board. Newest is the plain
+`.patch`; `.prev1` is the oldest preserved. So when a parked ticket goes back to
+Ready and its rebuilt lane parks again with a clean tree, the 0-byte dump you see
+is honest about the *new* worktree and the first lane's work is still beside it.
+Check `.prevN` before concluding a park saved nothing.
 
 Reaching this at all means a dump that was owed did not run or did not land.
 Every action that releases a lane lock while keeping its worktree — park, skip,

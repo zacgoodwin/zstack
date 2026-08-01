@@ -359,6 +359,18 @@ line: `salvage: wrote N byte(s)`, `salvage: wrote an EMPTY patch`,
 board comment** — it is what keeps a note that promises a patch from outliving a
 dump that did not happen. Then assert, before `lane-remove`:
 
+Only an action for a ticket that HOLDS A LANE carries a `salvage` block: a park
+of a never-claimed ticket (a dependency deadlock, a dead dependency) had no
+worktree, so there is nothing to dump and nothing to say about a patch.
+
+A dump never overwrites an earlier non-empty patch for the same ticket: the older
+one is moved to `uncommitted-<N>.prev1.patch` (`.prev2`, … in the order preserved,
+oldest first) and the `salvage:` line names where it went. The canonical name
+always holds the CURRENT tree's dump, because that is the file Step 0(c)'s
+staleness check measures against the worktree. This matters after a re-park: the
+ticket goes back to Ready, the rebuilt lane's tree is clean, and its 0-byte dump
+would otherwise replace the only copy of the first lane's work.
+
 ```bash
 SALVAGE_PATCH=$(jq -r '.salvage.patch // empty' action.json)
 if [ -n "$SALVAGE_PATCH" ] && [ ! -f "$SALVAGE_PATCH" ]; then

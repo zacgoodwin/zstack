@@ -24,6 +24,7 @@ import {
   loadConfig,
   reportsDir,
   salvagePatchName,
+  salvagePatchPrevPath,
 } from "./config.ts";
 import { defaultLocksDir, inspectLoopLock, listLaneLocks, type LaneLock } from "./locks.ts";
 import { BOARD_STATUSES, type BoardStatus, type LaneState, type TicketSnapshot } from "./loop.ts";
@@ -84,9 +85,11 @@ export interface SalvageProbe {
 
 // What one worktree holds, as the prune guard judges it.
 //
-// `newestChangeMs` is the whole of the staleness half: nothing ever deletes
-// reports/uncommitted-<N>.patch, so a patch dumped by a park weeks ago outlives
-// its worktree and would satisfy a filename-existence check forever. The next
+// `newestChangeMs` is the whole of the staleness half: reports/uncommitted-<N>.patch
+// is never deleted, and a later dump only ever REPLACES it (the older non-empty
+// copy is preserved beside it as .prevN.patch, lib/loop.ts's preserveExistingPatch),
+// so a patch dumped by a park weeks ago outlives its worktree and would satisfy
+// a filename-existence check forever. The next
 // time ticket N gets a worktree and leaves NEW uncommitted work in it, that
 // ancient file would wave the force-remove through and the loss would be silent
 // again -- the exact failure #217 exists to close, one re-park later. So the
@@ -363,9 +366,19 @@ export function refusalMessage(r: RefusePrune): string {
       : r.reason === "unreadable"
         ? `git could not read it, so whether it holds uncommitted work covered by ${r.patchPath} is unknowable`
         : `it has uncommitted work and no salvage patch at ${r.patchPath}`;
+  // The stale case is the ONE where the printed dump command would land on a file
+  // that already holds work: that leftover is an earlier park's salvage, and by
+  // now its worktree is long gone, so a bare `>` over it is the same silent loss
+  // from the other direction. `loop apply`'s own dump preserves it automatically
+  // (lib/loop.ts preserveExistingPatch); a human doing it by hand is told to.
+  const keepLeftover =
+    r.reason === "stale"
+      ? `    mv "${r.patchPath}" "${salvagePatchPrevPath(r.patchPath, 1)}"   # the leftover may be an EARLIER park's only copy (use the next free .prevN if taken)\n`
+      : "";
   return (
     `REFUSED to prune ${r.path}: ${why}.\n` +
     `  Force-removing it would discard the only copy (#217). Either:\n` +
+    keepLeftover +
     `    git -C "${r.path}" add -A && git -C "${r.path}" diff --cached --binary HEAD > "${r.patchPath}"\n` +
     `  (dump it, then re-run --reconcile), or commit the work onto the lane's branch and delete the worktree yourself.`
   );

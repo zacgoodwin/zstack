@@ -919,6 +919,9 @@ describe("#217: reconcile refuses to prune a dirty worktree with no salvage patc
     // The refusal tells the human which file was missing and how to make it.
     expect(refusalMessage(plan[0] as any)).toContain(w.patchPath);
     expect(refusalMessage(plan[0] as any)).toContain("diff --cached --binary HEAD");
+    // No patch on disk means nothing to move aside: the extra `mv` line belongs
+    // to the stale variant alone.
+    expect(refusalMessage(plan[0] as any)).not.toContain("mv ");
   });
 
   // A MODIFIED tracked file is the same refusal as an untracked one -- both are
@@ -998,6 +1001,12 @@ describe("#217: reconcile refuses to prune a dirty worktree with no salvage patc
     const msg = refusalMessage(plan[0] as any);
     expect(msg).toContain("NEWER than the salvage patch");
     expect(msg).toContain("leftover from an earlier park");
+    // ...and the dump command it prints must not tell a human to `>` over that
+    // leftover: its worktree is long gone, so it may be the only copy of an
+    // earlier park's work. Only the stale variant needs the move.
+    expect(msg).toContain(`mv "${patchPath}"`);
+    expect(msg).toContain(".prev1.patch");
+    expect(msg.indexOf("mv ")).toBeLessThan(msg.indexOf("diff --cached"));
 
     // ...and a re-dump (a patch newer than the work) clears it immediately.
     writeFileSync(patchPath, "diff --git a/new-test.ts b/new-test.ts\n");

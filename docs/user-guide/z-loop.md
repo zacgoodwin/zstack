@@ -112,6 +112,11 @@ records the result. It never re-derives a scheduling decision in prose.
   or commit/stash the worktree yourself **before** the next `/z-loop` run. An
   EMPTY (0-byte) patch is a real outcome, and the note says so — it means the
   worktree held nothing uncommitted and the failure was purely the missing commit.
+  A later dump for the same ticket never overwrites an earlier non-empty patch:
+  the older one is moved to `uncommitted-<N>.prev1.patch` (`.prev2`, … oldest
+  first) and the `salvage:` line in the board comment names where it went. That is
+  what makes returning a parked ticket to Ready safe — the rebuilt lane's clean
+  tree dumps 0 bytes, and the first lane's work is still on disk beside it.
   Belt and braces: if the patch is somehow missing, the next run's reconcile
   **refuses to force-remove** that worktree rather than discarding the work (see
   [--reconcile](#--reconcile-crash-recovery)). That retry has its own budget — "you forgot to commit" is
@@ -591,8 +596,8 @@ work and has no salvage patch at
 untouched, prints the patch path it looked for, and exits non-zero, so the loop
 does not start over the only copy of that work.
 A patch *older than the uncommitted work* in that tree does not count either —
-nothing ever deletes these files, so one from an earlier park of the same ticket
-number would otherwise wave the force-remove through forever. Salvage it (commit
+these files outlive the worktrees they came from, so one from an earlier park of
+the same ticket number would otherwise wave the force-remove through forever. Salvage it (commit
 it onto the lane's branch, or dump the patch by hand with the command reconcile
 prints) and re-run. A
 *crashed lane* — one that still has its lane lock — is unaffected: its worktree

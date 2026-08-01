@@ -261,6 +261,19 @@ export function salvagePatchName(ticket: number): string {
   return `uncommitted-${ticket}.patch`;
 }
 
+// #217: where an EARLIER salvage patch is moved when a later dump for the same
+// ticket would otherwise overwrite it. The canonical name above is a single slot
+// per ticket, and once reconcile has pruned the worktree that patch is the only
+// copy of the work -- so a re-park of the same ticket number (a human returns it
+// to Ready, the rebuilt lane parks again with a clean tree) used to replace a
+// week of work with a 0-byte file, silently. Derived from the canonical path so
+// the two spellings cannot drift; `n` counts up from 1 in the order preserved,
+// oldest first. Deliberately NOT the name reconcile looks for: the canonical
+// slot must keep covering the CURRENT tree or the staleness guard stops working.
+export function salvagePatchPrevPath(patchPath: string, n: number): string {
+  return patchPath.replace(/\.patch$/, `.prev${n}.patch`);
+}
+
 // Which project config to use, in order: explicit --slug, ZSTACK_SLUG, or (when
 // exactly one project is configured) that one. Ambiguity is an error, never a
 // silent guess.

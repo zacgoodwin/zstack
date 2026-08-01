@@ -6,7 +6,7 @@
 // applies the returned Action with applyAction -- it never re-derives a
 // scheduling or transition decision in prose. No Date.now() outside the CLI
 // edge; every pure function takes nowMs.
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { atomicWrite, handleCliError, parseFlags, readJson, str } from "./cli.ts";
 import {
@@ -26,6 +26,7 @@ import {
   projectsDir,
   resolveSlug,
   salvagePatchName,
+  salvagePatchPrevPath,
   ZError,
   type BoardStatus,
 } from "./config.ts";
@@ -524,8 +525,18 @@ function owesSalvage(a: Action): a is SalvageOwing {
   return SALVAGE_OWING.has(a.kind);
 }
 
-function withSalvage(action: Action, projectDir?: string): Action {
-  if (!owesSalvage(action)) return action;
+// The kind is only half the test: a lane is what created a worktree, so a ticket
+// with no lane has no tree to dump. Steps 4 and 6 of decideAction park UNCLAIMED
+// tickets (a dead dependency, a dependency deadlock) that were never built --
+// attaching a dump to those made `apply` print "salvage SKIPPED: no worktree at
+// .worktrees/ticket-N ... NO file exists at ...", which the SKILL's park row then
+// tells the orchestrator to copy verbatim onto the board. A human reading that
+// comment sees a missing-patch warning on a ticket that never held any work
+// (#217 QA round 3). Lane membership is the honest discriminator, and it fails
+// SAFE: a lane that exists but whose worktree does not still gets the block, and
+// runSalvage reports that skip truthfully.
+function withSalvage(action: Action, laneTickets: ReadonlySet<number>, projectDir?: string): Action {
+  if (!owesSalvage(action) || !laneTickets.has(action.ticket)) return action;
   const salvage: SalvageInstruction = {
     worktree: `.worktrees/ticket-${action.ticket}`,
     patch: salvagePatchPath(action.ticket, projectDir),
@@ -844,7 +855,11 @@ function withResync(action: Action, resyncStatus: Map<number, BoardStatus>): Act
 // ~/.zstack dir is -- resolved at the CLI edge so the reducer stays pure and
 // nothing in a state file can ever go stale against the real path.
 export function nextAction(state: LoopState, nowMs: number, opts: NextActionOptions = {}): Action {
-  return withSalvage(decideAction(state, nowMs, opts.projectDir), opts.projectDir);
+  return withSalvage(
+    decideAction(state, nowMs, opts.projectDir),
+    new Set(state.lanes.map((l) => l.ticket)),
+    opts.projectDir
+  );
 }
 
 function decideAction(state: LoopState, nowMs: number, projectDir?: string): Action {
@@ -1782,6 +1797,10 @@ function builderFactsFromFlags(
 // one line of orchestrator prose that a markerless exit or a distracted agent
 // simply never runs.
 //
+// Never overwrites a non-empty patch from an earlier dump (preserveExistingPatch
+// below moves it aside first): once reconcile has pruned the worktree, that file
+// is the only copy of the work.
+//
 // Always writes the file when git can produce a diff, including the 0-byte case:
 // a park whose worktree was clean is a real shape (#177's "no commit of its own"
 // half), the note explains what an empty patch means, and "the file the note
@@ -1806,6 +1825,41 @@ export interface SalvageResult {
   patch: string; // the path written (or the one that could not be resolved)
   bytes: number | null; // null = nothing was written; 0 = an honest empty patch
   note: string; // one operator-facing line, always printed by `apply`
+  preserved?: string; // #217: where the earlier non-empty patch was moved, if this dump would have replaced it
+}
+
+// #217 (QA round 3): the canonical patch is ONE slot per ticket, and by the time
+// a second dump for the same ticket happens the first patch is routinely the
+// only copy of that work -- the lane never committed it, and reconcile has
+// already force-removed the worktree. The observed loss: a lane parks dirty (the
+// dump saves it), reconcile prunes, a human returns the ticket to Ready, the
+// rebuilt lane parks again with a CLEAN tree, and the second dump replaces the
+// week of work with 0 bytes. Silent, and the exact class #217 exists to close.
+//
+// So a dump never overwrites a non-empty patch: the existing one is renamed to
+// the next free `.prevN.patch` first, and the note says where it went. The
+// canonical name keeps holding the CURRENT tree's dump, because that is the file
+// reconcile's staleness guard measures against the worktree -- pointing it at an
+// older patch would wave the next force-remove through.
+//
+// Two cases preserve nothing, on purpose: an existing EMPTY patch (there is
+// nothing to lose, and a re-park loop would otherwise litter the reports dir),
+// and a byte-identical dump (`apply` re-run on the same action is idempotent).
+//
+// Returns the path the old patch was moved to, or undefined if nothing was moved.
+// THROWS if the rename fails -- the caller turns that into a FAILED note and
+// does NOT write the new patch, so the existing copy always survives.
+function preserveExistingPatch(patch: string, next: Uint8Array): string | undefined {
+  if (!existsSync(patch)) return undefined;
+  const existing = readFileSync(patch);
+  if (existing.length === 0) return undefined;
+  if (existing.length === next.length && existing.every((b, i) => b === next[i])) return undefined;
+  for (let n = 1; ; n++) {
+    const prev = salvagePatchPrevPath(patch, n);
+    if (existsSync(prev)) continue;
+    renameSync(patch, prev);
+    return prev;
+  }
 }
 
 export function runSalvage(s: SalvageInstruction, projectDir?: string, cwd: string = process.cwd()): SalvageResult {
@@ -1858,16 +1912,37 @@ export function runSalvage(s: SalvageInstruction, projectDir?: string, cwd: stri
         note: `salvage FAILED: git diff in ${worktree} exited ${diff.exitCode} (${diff.stderr.toString().trim()}). Do NOT delete that worktree.`,
       };
     }
+    let preserved: string | undefined;
+    try {
+      preserved = preserveExistingPatch(patch, diff.stdout);
+    } catch (e) {
+      // Nothing is written when the older copy cannot be moved out of the way:
+      // that copy may be the only one left, and reconcile's staleness guard then
+      // refuses to prune this worktree, which is the right end state.
+      return {
+        patch,
+        bytes: null,
+        note:
+          `salvage FAILED: an earlier patch at ${patch} could not be preserved (${e instanceof Error ? e.message : String(e)}), ` +
+          `so the new dump was NOT written and that earlier copy survives untouched. Do NOT delete that worktree.`,
+      };
+    }
     writeFileSync(patch, diff.stdout);
     const bytes = diff.stdout.length;
     const addWarning = add.exitCode === 0 ? "" : ` (WARNING: git add -A exited ${add.exitCode}; untracked files may be missing)`;
+    // Said out loud in the one line the orchestrator copies into the board
+    // comment: a human who returns a ticket to Ready and sees a later 0-byte
+    // patch must be told where the earlier work went, or "the patch is empty"
+    // reads as "there was nothing to save".
+    const kept = preserved ? ` (the earlier patch was NOT overwritten -- preserved at ${preserved})` : "";
     return {
       patch,
       bytes,
+      preserved,
       note:
         bytes === 0
-          ? `salvage: wrote an EMPTY patch to ${patch} -- the worktree held nothing uncommitted${addWarning}`
-          : `salvage: wrote ${bytes} byte(s) to ${patch}${addWarning}`,
+          ? `salvage: wrote an EMPTY patch to ${patch} -- the worktree held nothing uncommitted${addWarning}${kept}`
+          : `salvage: wrote ${bytes} byte(s) to ${patch}${addWarning}${kept}`,
     };
   } finally {
     rmSync(indexFile, { force: true });
