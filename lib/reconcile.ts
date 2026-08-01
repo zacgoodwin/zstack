@@ -13,7 +13,13 @@ import { readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Board, ghExecutor, type ItemLookup } from "./board.ts";
 import { handleCliError, parseFlags, str } from "./cli.ts";
-import { DEFAULT_LOCK_STALENESS_MINUTES, TERMINAL_STATUSES, ZError, loadConfig } from "./config.ts";
+import {
+  DEFAULT_LOCK_STALENESS_MINUTES,
+  TERMINAL_STATUSES,
+  ZError,
+  loadConfig,
+  type BoardConfig,
+} from "./config.ts";
 import { defaultLocksDir, inspectLoopLock, listLaneLocks, type LaneLock } from "./locks.ts";
 import { BOARD_STATUSES, type BoardStatus, type LaneState, type TicketSnapshot } from "./loop.ts";
 
@@ -215,7 +221,9 @@ function assertObserved(o: { ticket: number; boardStatus?: BoardStatus; absence?
 //   * INFLIGHT: release the assignee, prune its worktree (if present), park it
 //     back to Ready, remove its lock -- the crash left it mid-build.
 // A lockless worktree is pruned, and also released+parked when the board still
-// thinks it in-flight. A Building ticket with no on-disk state is released+parked.
+// thinks it in-flight -- or released only, never parked, when it is confirmed
+// off-board (same reasoning as the crashed lane).
+// A Building ticket with no on-disk state is released+parked.
 export function reconcilePlan(orphans: Orphans): ReconcileAction[] {
   const actions: ReconcileAction[] = [];
   for (const c of orphans.crashedLanes) {
@@ -248,6 +256,16 @@ export function reconcilePlan(orphans: Orphans): ReconcileAction[] {
   for (const w of orphans.orphanWorktrees) {
     assertObserved(w);
     actions.push({ kind: "prune-worktree", ticket: w.ticket, path: w.worktreePath });
+    // Same off-board rule as a crashed lane above: the ISSUE still exists, so the
+    // dead session's assignee is real and stays on a live issue unless we release
+    // it. Only the park is illegal (board.move on an off-project issue throws).
+    // Gating this on boardStatus alone -- as this loop used to -- was always false
+    // for a confirmed absence, so a lockless worktree for a de-linked issue leaked
+    // the claim.
+    if (w.absence === "off-board") {
+      actions.push({ kind: "release-claim", ticket: w.ticket });
+      continue;
+    }
     if (w.boardStatus && INFLIGHT.includes(w.boardStatus)) {
       actions.push({ kind: "release-claim", ticket: w.ticket });
       actions.push({
@@ -328,7 +346,7 @@ function pruneWorktreeReal(path: string): void {
   Bun.spawnSync(["git", "worktree", "prune"], { stdout: "pipe", stderr: "pipe" });
 }
 
-function realEffects(board: Board): ReconcileEffects {
+function realEffects(board: ReconcileCliBoard): ReconcileEffects {
   return {
     removeLock: (p) => rmSync(p, { force: true }),
     pruneWorktree: (_t, p) => pruneWorktreeReal(p),
@@ -364,6 +382,22 @@ export interface ReconcileBoard {
   list(status?: string): Promise<{ number: number; fields?: Record<string, string | number> }[]>;
   item(n: number): Promise<ItemLookup>;
 }
+
+// The whole board surface the CLI needs: the scan's two reads plus the two
+// mutations realEffects performs. `Board` satisfies it structurally.
+export interface ReconcileCliBoard extends ReconcileBoard {
+  move(n: number, status: string): Promise<unknown>;
+  release(n: number): Promise<unknown>;
+}
+
+// How main() gets its board. Production builds the real one from the loaded
+// config; the gate tests pass a double so the AC cases run against the REAL
+// main() -- argv parsing, the confirm pass, the plan, the apply, and the
+// stdout/stderr split -- instead of one layer below it, where swapping the
+// confirm pass back out for a raw sweep would go unnoticed (#149 review).
+export type ReconcileBoardFactory = (cfg: BoardConfig) => ReconcileCliBoard;
+
+const productionBoard: ReconcileBoardFactory = (cfg) => new Board(cfg, ghExecutor());
 
 // Sweeps EVERY status, not just the in-flight ones (issue #14 C4): a crashed
 // lane's recovery hinges on whether its ticket is already terminal (Done/parked),
@@ -401,8 +435,9 @@ export function missingFromSweep(orphans: Orphans, snapshot: BoardTicketStatus[]
 //   * positively absent -> "off-board" (the issue survives, de-linked) or
 //     "issue-gone" (no such issue). The release/prune path may proceed; which
 //     board calls are still legal differs, hence the two answers.
-//   * lookup ERROR -> throw. Recovery must never proceed on a board it cannot
-//     read, and this runs before applyReconcile, so nothing has been mutated.
+//   * lookup ERROR, or an item on the board with NO Status value -> throw. Both
+//     are failures to observe, and recovery must never proceed on a board it
+//     cannot read. This runs before applyReconcile, so nothing has been mutated.
 export async function confirmMissing(
   board: Pick<ReconcileBoard, "item">,
   snapshot: BoardTicketStatus[],
@@ -440,12 +475,29 @@ export async function confirmMissing(
       );
       continue;
     }
-    const status = String(look.item.fields["Status"] ?? "");
+    // An UNSET Status is an absence, not an observation. `fields` only carries
+    // the values the item actually has, so a card sitting on the board in no
+    // column at all arrives here as `undefined` -- byte-identical, from this
+    // side, to a human's own column. Collapsing it to "" and reading that as
+    // "not-loop-driven" would let a MISSING FIELD drive the destructive on-disk
+    // half (prune the worktree, delete the lock), which is the exact
+    // act-on-absence pattern #149 exists to kill. Abort like a lookup error:
+    // loud, zero mutations, and trivially fixable by a human.
+    const raw = look.item.fields["Status"];
+    const status = typeof raw === "string" ? raw.trim() : raw === undefined ? "" : String(raw);
+    if (status === "") {
+      throw new ZError(
+        `Reconcile aborted on #${n}: the board sweep did not return it and its single-ticket lookup ` +
+          `found it on the board with NO Status value. An unset field is not a positive observation ` +
+          `-- crash recovery cannot tell it from a truncated read -- so nothing was released, parked, ` +
+          `pruned, or unlocked. Put #${n} in a Status column (or delete its lane lock) and re-run.`
+      );
+    }
     if (!BOARD_STATUSES.includes(status as BoardStatus)) {
       out.absent.set(n, "not-loop-driven");
       out.notes.push(
         `sweep missed #${n}; single-ticket lookup CONFIRMS it is on the board in status ` +
-          `${status ? JSON.stringify(status) : "(none)"}, which the loop does not drive -- ` +
+          `${JSON.stringify(status)}, which the loop does not drive -- ` +
           `clearing its on-disk state only, leaving the board untouched.`
       );
       continue;
@@ -503,7 +555,7 @@ export function assertNotReconcilingLiveLoop(
   );
 }
 
-export async function main(argv: string[]): Promise<number> {
+export async function main(argv: string[], makeBoard: ReconcileBoardFactory = productionBoard): Promise<number> {
   const cmd = argv[0];
   if (!cmd || cmd === "help" || cmd === "-h" || cmd === "--help") {
     console.log(USAGE);
@@ -517,7 +569,7 @@ export async function main(argv: string[]): Promise<number> {
     const { flags } = parseFlags(argv.slice(1));
     const nowMs = Number(str(flags, "now") ?? Date.now());
     const cfg = loadConfig(str(flags, "slug"));
-    const board = new Board(cfg, ghExecutor());
+    const board = makeBoard(cfg);
     const locksDir = str(flags, "dir") ?? defaultLocksDir(cfg.slug);
     const worktreesDir = str(flags, "worktrees") ?? join(process.cwd(), ".worktrees");
 

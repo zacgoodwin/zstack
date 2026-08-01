@@ -9,10 +9,12 @@
 //   4. Lane cap: 5 queued, on-disk locks never exceed 3          -> "lane cap"
 //   5. Quota exhaustion mid-loop: sweep pauses then resumes      -> "quota guard"
 //   6. Human moves a ticket mid-loop: the lane stops cleanly     -> "wave reconcile"
-import { test, expect, describe, afterEach } from "bun:test";
+import { test, expect, describe, afterEach, spyOn } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import * as os from "node:os";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   acquireLoopLock,
   confirmIdentity,
@@ -40,6 +42,7 @@ import {
   applyReconcile,
   assertNotReconcilingLiveLoop,
   hasOrphans,
+  main as reconcileMain,
   missingFromSweep,
   reconcileBoardMoves,
   reconcilePlan,
@@ -48,6 +51,7 @@ import {
   sweep,
   type ReconcileAction,
   type ReconcileBoard,
+  type ReconcileCliBoard,
   type ReconcileEffects,
 } from "../lib/reconcile.ts";
 import {
@@ -813,7 +817,13 @@ describe("control 2: orphan scan (crash recovery)", () => {
   // guarded elsewhere) but whose single-ticket lookups answer truthfully. An
   // answer is a Status string (present), `null` (de-linked but the issue lives),
   // or an explicit absence reason.
-  type ConfirmAnswer = string | null | { missing: "not-on-project" | "issue-not-found" };
+  // `{ fields }` is the on-the-board-but-no-Status-value case: an item whose
+  // fieldValues carry no Status at all.
+  type ConfirmAnswer =
+    | string
+    | null
+    | { missing: "not-on-project" | "issue-not-found" }
+    | { fields: Record<string, string | number> };
   function confirmBoard(answers: Record<number, ConfirmAnswer>, onItem?: (n: number) => void): ReconcileBoard {
     return {
       list: async () => [],
@@ -822,18 +832,86 @@ describe("control 2: orphan scan (crash recovery)", () => {
         const s = answers[n];
         if (s === undefined) throw new Error(`board double: unexpected lookup for #${n}`);
         if (s === null) return { number: n, present: false, reason: "not-on-project" };
-        if (typeof s === "object") return { number: n, present: false, reason: s.missing };
+        if (typeof s === "object" && "missing" in s) return { number: n, present: false, reason: s.missing };
+        const fields = typeof s === "object" ? s.fields : { Status: s };
         return {
           number: n,
           present: true,
-          item: { number: n, title: `t${n}`, url: `u${n}`, fields: { Status: s } },
+          item: { number: n, title: `t${n}`, url: `u${n}`, fields },
           body: "",
         };
       },
     };
   }
 
-  test("AC1: an empty sweep drives NOTHING -- each crashed lane is planned from its confirmed status", async () => {
+  // The same double plus the two mutations realEffects performs, so main()'s
+  // `apply` path runs end to end without a network call, and the test can assert
+  // on WHICH board calls the recovery made.
+  function cliBoard(answers: Record<number, ConfirmAnswer>, onItem?: (n: number) => void) {
+    const released: number[] = [];
+    const moved: { ticket: number; status: string }[] = [];
+    const board: ReconcileCliBoard = {
+      ...confirmBoard(answers, onItem),
+      move: async (n, status) => void moved.push({ ticket: n, status }),
+      release: async (n) => void released.push(n),
+    };
+    return { board, released, moved };
+  }
+
+  // A temp $HOME carrying a minimal, valid config.json for slug "demo": main()
+  // calls the REAL loadConfig, which must never resolve the operator's ~/.zstack.
+  function makeConfigHome(): string {
+    const home = tmp("zstack-safety-home-");
+    const dir = join(home, ".zstack", "projects", "demo");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "config.json"),
+      JSON.stringify({
+        slug: "demo",
+        owner: "acme",
+        repo: "demo",
+        projectNumber: 1,
+        projectId: "PVT_1",
+        repositoryId: "R_1",
+        statusField: {
+          id: "F_status",
+          dataType: "SINGLE_SELECT",
+          options: { Backlog: "o0", Ready: "o1", Questions: "o2", Building: "o3", QA: "o4", Review: "o5", Blocked: "o6", Skipped: "o7", Done: "o8" },
+        },
+        fields: {},
+      })
+    );
+    return home;
+  }
+
+  // Drives the REAL CLI entrypoint the ACs name -- argv parsing, loadConfig, the
+  // confirm pass, the plan, the apply, the exit status, and the stdout/stderr
+  // split are all production code. ONLY the board factory is swapped, which is
+  // the seam main() exposes for exactly this: asserting one layer below (on
+  // scanWithConfirm) let the whole confirm pass be unwired from main() with every
+  // test still green. loadConfig resolves the OS home through node:os homedir(),
+  // so it is spied for the duration of the call (same pattern as
+  // tests/throttle.test.ts).
+  async function runReconcileCli(
+    argv: string[],
+    board: ReconcileCliBoard
+  ): Promise<{ code: number; stdout: string; stderr: string }> {
+    const homeSpy = spyOn(os, "homedir").mockReturnValue(makeConfigHome());
+    const out: string[] = [];
+    const err: string[] = [];
+    const logSpy = spyOn(console, "log").mockImplementation((...a: unknown[]) => void out.push(a.join(" ")));
+    const errSpy = spyOn(console, "error").mockImplementation((...a: unknown[]) => void err.push(a.join(" ")));
+    try {
+      const code = await reconcileMain([...argv, "--slug", "demo"], () => board);
+      return { code, stdout: out.join("\n"), stderr: err.join("\n") };
+    } finally {
+      logSpy.mockRestore();
+      errSpy.mockRestore();
+      homeSpy.mockRestore();
+    }
+  }
+
+  test("AC1: an empty sweep drives NOTHING -- the scan plans each crashed lane from its confirmed status", async () => {
     const locksDir = tmp();
     const worktreesDir = tmp();
     // A crashed run: #5 had already reached Done, #7 was mid-build, #9's worktree
@@ -845,12 +923,17 @@ describe("control 2: orphan scan (crash recovery)", () => {
     mkdirSync(join(worktreesDir, "ticket-9"));
 
     const looked: number[] = [];
-    const board = confirmBoard({ 5: "Done", 7: "Building", 9: "QA" }, (n) => void looked.push(n));
-    const { orphans, notes } = await scanWithConfirm(board, locksDir, worktreesDir, 0);
+    const { board } = cliBoard({ 5: "Done", 7: "Building", 9: "QA" }, (n) => void looked.push(n));
+    // The Action the AC names: /z-loop --reconcile's scan (Step 0 of z-loop/SKILL.md).
+    const r = await runReconcileCli(["scan", "--dir", locksDir, "--worktrees", worktreesDir, "--now", "0"], board);
+    expect(r.code).toBe(0);
     expect(looked).toEqual([5, 7, 9]); // one targeted lookup per sweep-missing ticket
-    expect(orphans.crashedLanes.map((c) => c.boardStatus)).toEqual(["Done", "Building"]);
 
-    const plan = reconcilePlan(orphans);
+    const out = JSON.parse(r.stdout);
+    expect(out.hasOrphans).toBe(true);
+    expect(out.orphans.crashedLanes.map((c: any) => c.boardStatus)).toEqual(["Done", "Building"]);
+
+    const plan = out.plan as ReconcileAction[];
     // #5 is terminal: cleaned up, never reopened. Pre-#149 the empty sweep left it
     // boardStatus-undefined -> treated as in-flight -> released + parked, throwing
     // away a merged run.
@@ -858,7 +941,7 @@ describe("control 2: orphan scan (crash recovery)", () => {
     expect(byKind(plan, "release-claim")).toEqual([7, 9]);
     expect(byKind(plan, "prune-worktree")).toEqual([5, 7, 9]);
     expect(byKind(plan, "remove-lock")).toEqual([5, 7]);
-    expect(notes.join("\n")).toContain("CONFIRMS it is still on the board (Status: Done)");
+    expect(r.stderr).toContain("CONFIRMS it is still on the board (Status: Done)");
   });
 
   test("AC2: a sweep-missing ticket the lookup proves is OFF the board is released + pruned, and logged", async () => {
@@ -866,54 +949,59 @@ describe("control 2: orphan scan (crash recovery)", () => {
     const worktreesDir = tmp();
     writeLaneLock(locksDir, { ticket: 11, stage: "builder", session: "dead", claimedAt: 0 });
     mkdirSync(join(worktreesDir, "ticket-11"));
+    const lockPath = join(locksDir, "ticket-11.json");
+    const args = ["--dir", locksDir, "--worktrees", worktreesDir, "--now", "0"];
+    const { board, released, moved } = cliBoard({ 11: null });
 
-    const { orphans, notes } = await scanWithConfirm(confirmBoard({ 11: null }), locksDir, worktreesDir, 0);
-    expect(orphans.crashedLanes[0].absence).toBe("off-board");
-
-    const plan = reconcilePlan(orphans);
-    expect(byKind(plan, "release-claim")).toEqual([11]);
-    expect(byKind(plan, "prune-worktree")).toEqual([11]);
-    expect(byKind(plan, "remove-lock")).toEqual([11]);
+    const scan = await runReconcileCli(["scan", ...args], board);
+    expect(scan.code).toBe(0);
+    const out = JSON.parse(scan.stdout);
+    expect(out.orphans.crashedLanes[0].absence).toBe("off-board");
+    expect(byKind(out.plan, "release-claim")).toEqual([11]);
+    expect(byKind(out.plan, "prune-worktree")).toEqual([11]);
+    expect(byKind(out.plan, "remove-lock")).toEqual([11]);
     // Never park a ticket that is not on the project: board.move would throw and
     // abort the apply midway, stranding the remaining locks.
-    expect(byKind(plan, "park-ready")).toEqual([]);
-    expect(notes[0]).toContain("#11");
-    expect(notes[0]).toContain("CONFIRMS it is off the board (not-on-project)");
+    expect(byKind(out.plan, "park-ready")).toEqual([]);
+    // The AC's "the log states the positive confirmation", asserted on what the
+    // CLI actually emits -- not on a notes array a caller might never print.
+    expect(scan.stderr).toContain("#11");
+    expect(scan.stderr).toContain("CONFIRMS it is off the board (not-on-project)");
 
-    // ...and the apply half really runs it.
-    const lockPath = join(locksDir, "ticket-11.json");
-    const pruned: string[] = [];
-    const released: number[] = [];
-    await applyReconcile(plan, {
-      removeLock: (p) => rmSync(p, { force: true }),
-      pruneWorktree: (_t, p) => void pruned.push(p),
-      parkReady: () => expect.unreachable("a confirmed-gone ticket must never be parked"),
-      releaseClaim: (n) => void released.push(n),
-    });
-    expect(existsSync(lockPath)).toBe(false);
+    // ...and the apply really runs it, through main()'s own production effects.
+    const apply = await runReconcileCli(["apply", ...args], board);
+    expect(apply.code).toBe(0);
     expect(released).toEqual([11]);
-    expect(pruned[0]).toContain("ticket-11");
+    expect(moved).toEqual([]); // no park: board.move on an off-project issue throws
+    expect(existsSync(lockPath)).toBe(false);
+    expect(existsSync(join(worktreesDir, "ticket-11"))).toBe(false);
+    expect(apply.stderr).toContain("CONFIRMS it is off the board (not-on-project)");
   });
 
-  test("AC3: a failing lookup aborts the reconcile loudly, naming the ticket, with zero mutations", async () => {
+  test("AC3: a failing lookup aborts scan AND apply loudly, naming the ticket, with zero mutations", async () => {
     const locksDir = tmp();
     const worktreesDir = tmp();
     writeLaneLock(locksDir, { ticket: 13, stage: "builder", session: "dead", claimedAt: 0 });
     mkdirSync(join(worktreesDir, "ticket-13"));
     const lockPath = join(locksDir, "ticket-13.json");
 
-    const board: ReconcileBoard = {
+    const board: ReconcileCliBoard = {
       list: async () => [],
       item: async () => {
         throw new Error("GraphQL: 502 Bad Gateway");
       },
+      move: async () => expect.unreachable("an unreadable board must drive no move"),
+      release: async () => expect.unreachable("an unreadable board must drive no release"),
     };
-    await expect(scanWithConfirm(board, locksDir, worktreesDir, 0)).rejects.toThrow(
-      /Reconcile aborted on #13[\s\S]*502 Bad Gateway/
-    );
-    // Nothing was touched: the confirm pass runs before any effect.
-    expect(existsSync(lockPath)).toBe(true);
-    expect(existsSync(join(worktreesDir, "ticket-13"))).toBe(true);
+    for (const cmd of ["scan", "apply"]) {
+      const r = await runReconcileCli([cmd, "--dir", locksDir, "--worktrees", worktreesDir, "--now", "0"], board);
+      expect(r.code).toBe(1); // Step 0 checks this status and refuses to start lanes
+      expect(r.stdout).toBe(""); // nothing for `jq` to read as a successful scan
+      expect(r.stderr).toMatch(/Reconcile aborted on #13[\s\S]*502 Bad Gateway/);
+      // Nothing was touched: the confirm pass runs before any effect.
+      expect(existsSync(lockPath)).toBe(true);
+      expect(existsSync(join(worktreesDir, "ticket-13"))).toBe(true);
+    }
   });
 
   test("a ticket the lookup finds in a status the loop does not drive is cleaned up, board untouched", async () => {
@@ -1085,6 +1173,134 @@ describe("control 2: orphan scan (crash recovery)", () => {
     const snapshot = [{ number: 4, status: "Building" as const }, { number: 8, status: "Ready" as const }];
     const orphans = scanOrphans(locksDir, worktreesDir, snapshot, 0);
     expect(missingFromSweep(orphans, snapshot)).toEqual([6]); // #4 observed, #8 has no on-disk state
+  });
+
+  // -- #149 review bounce: the three defects the QA-fixed pass still shipped ----
+
+  test("an ORPHAN WORKTREE for a confirmed off-board issue releases the dead session's claim", async () => {
+    // Review finding 3. The crashed-lane branch releases an off-board claim
+    // (ConfirmedAbsence's own contract: "the issue is real and must be released").
+    // This loop gated release on `boardStatus && INFLIGHT.includes(...)`, which is
+    // ALWAYS false for a confirmed absence -- so a lockless worktree for a
+    // de-linked issue planned [prune-worktree] only and left a dead session
+    // assigned to a live issue forever.
+    const worktreesDir = tmp();
+    mkdirSync(join(worktreesDir, "ticket-41")); // off-board: issue lives, de-linked
+    mkdirSync(join(worktreesDir, "ticket-42")); // issue-gone: nothing to release
+    mkdirSync(join(worktreesDir, "ticket-43")); // human's own column: hands off
+    const args = ["--dir", tmp(), "--worktrees", worktreesDir, "--now", "0"];
+    const { board, released, moved } = cliBoard({
+      41: null,
+      42: { missing: "issue-not-found" },
+      43: "Icebox",
+    });
+
+    const scan = await runReconcileCli(["scan", ...args], board);
+    expect(scan.code).toBe(0);
+    const out = JSON.parse(scan.stdout);
+    expect(out.orphans.orphanWorktrees.map((w: any) => w.absence)).toEqual([
+      "off-board",
+      "issue-gone",
+      "not-loop-driven",
+    ]);
+    expect(byKind(out.plan, "prune-worktree")).toEqual([41, 42, 43]);
+    expect(byKind(out.plan, "release-claim")).toEqual([41]); // ONLY the one with a live issue
+    expect(byKind(out.plan, "park-ready")).toEqual([]); // move would throw for all three
+
+    const apply = await runReconcileCli(["apply", ...args], board);
+    expect(apply.code).toBe(0);
+    expect(released).toEqual([41]);
+    expect(moved).toEqual([]);
+    expect(existsSync(join(worktreesDir, "ticket-41"))).toBe(false);
+  });
+
+  test("an item on the board with NO Status value aborts -- a missing field is not an observation", async () => {
+    // Review finding 4. `String(fields["Status"] ?? "")` collapsed an unset field
+    // to "", which is not in BOARD_STATUSES, so it classified as "not-loop-driven"
+    // and drove the destructive on-disk half (prune the worktree, delete the lock)
+    // off a MISSING FIELD -- the exact act-on-absence pattern #149 exists to kill,
+    // and indistinguishable from a partial fieldValues read.
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    writeLaneLock(locksDir, { ticket: 51, stage: "builder", session: "dead", claimedAt: 0 });
+    mkdirSync(join(worktreesDir, "ticket-51"));
+    const args = ["--dir", locksDir, "--worktrees", worktreesDir, "--now", "0"];
+    const { board, released } = cliBoard({ 51: { fields: { Model: "opus" } } });
+
+    for (const cmd of ["scan", "apply"]) {
+      const r = await runReconcileCli([cmd, ...args], board);
+      expect(r.code).toBe(1);
+      expect(r.stdout).toBe("");
+      expect(r.stderr).toMatch(/Reconcile aborted on #51[\s\S]*NO Status value/);
+    }
+    expect(released).toEqual([]);
+    expect(existsSync(join(locksDir, "ticket-51.json"))).toBe(true);
+    expect(existsSync(join(worktreesDir, "ticket-51"))).toBe(true);
+
+    // The abort is scoped to the ABSENT field: a real column the loop does not
+    // drive is still a positive observation and still classifies.
+    const other = cliBoard({ 51: { fields: { Status: "Icebox" } } });
+    const ok = await runReconcileCli(["scan", ...args], other.board);
+    expect(ok.code).toBe(0);
+    expect(JSON.parse(ok.stdout).orphans.crashedLanes[0].absence).toBe("not-loop-driven");
+  });
+
+  // Review finding 2. The stdout-purity contract is a PROCESS-level fact -- Step 0
+  // of z-loop/SKILL.md pipes this stdout into `jq` -- so it is asserted on real
+  // file descriptors, not on which console method was called. The driver imports
+  // the same main() bin/z-reconcile runs and passes a board double, because a gate
+  // test has no `gh`; everything else (argv, config, notes, JSON, exit status) is
+  // the production path.
+  function runReconcileSubprocess(
+    answers: Record<number, string | null>,
+    argv: string[]
+  ): { exitCode: number; stdout: string; stderr: string } {
+    const home = makeConfigHome();
+    const driver = join(tmp(), "driver.ts");
+    writeFileSync(
+      driver,
+      `import { main } from ${JSON.stringify(pathToFileURL(join(REPO_ROOT, "lib", "reconcile.ts")).href)};
+const ANSWERS = ${JSON.stringify(answers)};
+const board = {
+  list: async () => [],
+  item: async (n) => {
+    const a = ANSWERS[String(n)];
+    if (a === undefined) throw new Error("transport blew up on #" + n);
+    if (a === null) return { number: n, present: false, reason: "not-on-project" };
+    return { number: n, present: true, item: { number: n, title: "t", url: "u", fields: { Status: a } }, body: "" };
+  },
+  move: async () => {},
+  release: async () => [],
+};
+main(process.argv.slice(2), () => board).then((c) => process.exit(c));
+`
+    );
+    const proc = Bun.spawnSync(["bun", driver, ...argv], {
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    return { exitCode: proc.exitCode, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
+  }
+
+  test("the CLI keeps stdout pure JSON and the confirm notes on stderr", () => {
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    writeLaneLock(locksDir, { ticket: 61, stage: "builder", session: "dead", claimedAt: 0 });
+    const argv = ["scan", "--slug", "demo", "--dir", locksDir, "--worktrees", worktreesDir, "--now", "0"];
+
+    const ok = runReconcileSubprocess({ 61: "Building" }, argv);
+    expect(ok.exitCode).toBe(0);
+    expect(ok.stderr).toContain("CONFIRMS it is still on the board (Status: Building)");
+    expect(JSON.parse(ok.stdout).hasOrphans).toBe(true); // jq's contract: stdout is JSON, nothing else
+    expect(ok.stdout).not.toContain("CONFIRMS");
+
+    // ...and an abort writes NOTHING to stdout, so Step 0's capture-then-check
+    // sees an empty SCAN and a non-zero status rather than a plausible answer.
+    const bad = runReconcileSubprocess({}, argv);
+    expect(bad.exitCode).toBe(1);
+    expect(bad.stdout.trim()).toBe("");
+    expect(bad.stderr).toContain("Reconcile aborted on #61");
   });
 
   test("no orphans -> empty plan, hasOrphans false", () => {

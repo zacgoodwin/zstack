@@ -792,8 +792,10 @@ sweep-missing ticket a lane lock or worktree points at gets ONE targeted
 `z-board item <N>` first, and the plan branches on that positive answer: still on
 the board → its real status; on the board in a column the loop does not drive, or
 no issue with that number at all → clear the on-disk state only, board untouched;
-de-linked but still an issue → release + prune, never park. If any of those
-lookups **errors**, `scan`/`apply` exit non-zero having mutated nothing. Step 0's
+de-linked but still an issue → release + prune, never park (a lockless worktree
+included: the assignee on that issue is real). If any of those lookups **errors**
+— or answers with an item carrying no Status value at all, which is an absent
+field, not an observation — `scan`/`apply` exit non-zero having mutated nothing. Step 0's
 snippet checks that exit status and refuses to start — never start lanes over
 crashed locks against a board the reconcile could not read.
 
