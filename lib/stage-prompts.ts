@@ -21,6 +21,13 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { handleCliError, parseFlags, str } from "./cli.ts";
 import { ADVERSARIAL_MODES, DEFAULT_ADVERSARIAL_MODE, ZError, type AdversarialMode } from "./config.ts";
+// Type-only: erased at build, so this cannot introduce a runtime cycle (and
+// lib/loop.ts imports nothing from here -- it only names this module in prose).
+import type { Stage } from "./loop.ts";
+
+// The four stages as a runtime list, for CLI validation. Kept beside the
+// type-only import so a change to the union fails typecheck here.
+export const STAGES: readonly Stage[] = ["builder", "qa", "reviewer", "merge"] as const;
 
 // Re-exported so importers of this module get the enum from the one file that
 // owns the prompt-side adversarial helpers (config.ts is the definitional home).
@@ -49,6 +56,43 @@ export const SPAWN_TAG_MARKER = "zstack-spawn:";
 // review ATTEMPT this is.
 function spawnStamp(tag: string | undefined): string {
   return tag ? `<!-- ${SPAWN_TAG_MARKER} ${tag} (orchestrator bookkeeping; ignore) -->\n` : "";
+}
+
+// -- spawn stub (Leak 3) -------------------------------------------------------
+
+// #57 made the stage prompt size-invariant to its PAYLOAD (ticketBody/diff/AC
+// live in input-<N>.json and the prompt only points at them). It did not make
+// the orchestrator's context size-invariant to the PROMPT: the orchestrator
+// still read prompt-<N>.txt back and re-sent all ~2.9 KB of it as the Agent
+// spawn's `prompt` param, so every stage's full instruction text landed in the
+// long-lived orchestrator window TWICE (once as the read result, once as the
+// tool-call param) and then rode in every later turn's cache read for the rest
+// of the drain. Measured over 35 real drains: 568 spawns x ~2,874 chars =
+// 1.63 MB of param text plus 302 KB of read-back, ~8% of all orchestrator input
+// tokens, for text the orchestrator never reasons about.
+//
+// The stub is the same pointer trick applied one level up: the orchestrator
+// sends only a path, and the worker reads its own instructions. The stub's
+// length depends on the stage name, the tag, and the path -- never on the
+// prompt -- which is the property the eval and gate test pin.
+//
+// The tag (#190) moves here BECAUSE the stub, not the prompt, is now the
+// worker's first user message, and lib/transcripts.ts finds a spawn by scanning
+// a bounded prefix of that opening line. Leaving it only on the prompt file
+// would silently orphan every stage transcript.
+//
+// The explicit BLOCKED fallback is the failure mode that matters: an unreadable
+// prompt file must surface as a parseable outcome recordOutcome already handles
+// (the lane bounces or parks, loudly), never as a worker improvising a build
+// with no instructions or stalling until the watchdog fires.
+export function spawnStub(stage: Stage, promptPath: string, tag?: string): string {
+  return `${spawnStamp(tag)}You are the ${stage.toUpperCase()} stage of the zstack dev loop, running UNATTENDED in a fresh context. No user is available.
+
+Read this file NOW, before anything else, and follow it exactly. It is your complete instructions -- workspace, ticket, discipline, and the exit contract your final message must satisfy:
+${promptPath}
+
+If you cannot read it, do nothing else and make your final message exactly:
+BLOCKED: could not read stage prompt at ${promptPath}`;
 }
 
 // -- builder ------------------------------------------------------------------
@@ -421,6 +465,13 @@ const USAGE = `stage-prompts <command> [args]
   ... [--spawn-tag <tag>]                           any stage: stamp an inert first line naming this spawn, so
                                                     \`transcripts collect\` can find the agent's own transcript
                                                     (\`transcripts tag\` prints the value). Omitted -> no stamp.
+  stub <builder|qa|reviewer|merge> <prompt.txt> [--spawn-tag <tag>]
+                                                    print the SPAWN STUB for a prompt already written by
+                                                    \`prompt\`: a ~450-byte pointer telling the worker to read
+                                                    that file. Pass THIS as the Agent spawn's prompt param, not
+                                                    the prompt itself -- the stub's size is independent of the
+                                                    prompt's, which keeps the orchestrator's context flat across
+                                                    a drain. Errors if the prompt file is unreadable.
   note <input.json>                                 print the completion note (CompletionNoteInput)
   plan-edges <edges.json>                           print the plan-time "Needs input" edges comment
                                                     (CompletionEdge[]); prints nothing for an empty list`;
@@ -500,6 +551,26 @@ export function main(argv: string[]): number {
       // The pointer prompt references this input file by ABSOLUTE path, so the
       // worker (a fresh Agent with its own CWD) resolves it unambiguously.
       console.log(build(input, resolve(path), spawnTagFlag));
+      return 0;
+    }
+    if (cmd === "stub") {
+      const stage = positionals[0] as Stage;
+      const promptPath = positionals[1];
+      if (!stage || !promptPath) throw new ZError("Usage: stage-prompts stub <builder|qa|reviewer|merge> <prompt.txt> [--spawn-tag <tag>]");
+      if (!STAGES.includes(stage)) throw new ZError(`Unknown stage "${stage}". Valid: ${STAGES.join(", ")}.`);
+      // Fail HERE, not in the worker. The stub's whole contract is "your
+      // instructions are at this path"; emitting one that points at nothing
+      // would trade an immediate, free CLI error for a burned agent spawn that
+      // can only report BLOCKED. statSync-by-read is enough -- the file is
+      // written by `prompt` moments earlier in the same step.
+      try {
+        readFileSync(promptPath, "utf8");
+      } catch (e) {
+        throw new ZError(`Cannot read stage prompt at ${promptPath}: ${(e as Error).message}`);
+      }
+      // ABSOLUTE, for the same reason the pointer prompt resolves inputPath: the
+      // worker is a fresh Agent with its own CWD.
+      console.log(spawnStub(stage, resolve(promptPath), str(flags, "spawn-tag")));
       return 0;
     }
     if (cmd === "note") {
