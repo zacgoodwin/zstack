@@ -10,12 +10,13 @@
 // deletion. It releases claims, parks tickets back to Ready, prunes worktrees,
 // and removes stale lane locks -- nothing that a human can't cheaply redo.
 import { readdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { Board, ghExecutor } from "./board.ts";
-import { handleCliError, parseFlags, str } from "./cli.ts";
+import { handleCliError, parseFlags, str, type ParsedArgs } from "./cli.ts";
 import { DEFAULT_LOCK_STALENESS_MINUTES, TERMINAL_STATUSES, ZError, loadConfig } from "./config.ts";
 import { defaultLocksDir, inspectLoopLock, listLaneLocks, type LaneLock } from "./locks.ts";
 import { BOARD_STATUSES, type BoardStatus, type LaneState, type TicketSnapshot } from "./loop.ts";
+import { liveAgentsIn, subagentsDirFor } from "./transcripts.ts";
 
 // -- orphan scan --------------------------------------------------------------
 
@@ -109,6 +110,59 @@ export function listThrowawayWorktrees(worktreesDir: string): { ticket: number; 
   return listWorktrees(worktreesDir)
     .filter((w) => w.throwaway)
     .map(({ ticket, path }) => ({ ticket, path }));
+}
+
+// Is this path one of the reviewer's throwaway checkouts? Used to hold those
+// prunes back while an agent of this session may still be inside one.
+export function isThrowawayWorktreePath(path: string): boolean {
+  return THROWAWAY_WORKTREE_RE.test(basename(path));
+}
+
+// What the review-worktree sweep may remove RIGHT NOW (#209).
+//
+// The removal itself is unconditional in the sense that a throwaway holds no
+// work -- but WHEN it may happen is the whole point of this ticket: `.worktrees/
+// review-<N>` is where the reviewer's skeptics execute, and they outlive the
+// parent that spawned them (the reviewer contract checks each skeptic at most
+// once and stops waiting, so returning with skeptics still running is the
+// DESIGNED case, not an anomaly). #66's review removed that worktree out from
+// under two live skeptics, and a sweep that ignores liveness is the same defect
+// with a different trigger: on the last lane, drain-complete fires minutes after
+// the reviewer returned.
+//
+// So the sweep is gated on the same evidence the in-stage teardown uses --
+// whether any agent of THIS session is still running (liveAgentsIn; parentage is
+// not needed and not available here, since a leftover directory carries no stage
+// tag). All-or-nothing rather than per-worktree, because a live agent's own
+// transcript does not say which checkout it is reading.
+//
+// The gate is what makes the two sanctioned call sites honest: Step 0, where the
+// session has spawned nothing yet (empty/absent subagents dir -> sweep proceeds,
+// and the loop lock it was just handed proves no OTHER loop is running), and
+// Step 7, where it now declines whenever anything is still live instead of
+// force-removing under it. Declining costs one leftover directory until the next
+// run's Step 0 -- the same cheap direction the in-stage gate fails in.
+// The same hold, applied to a reconcile plan: with anything of this session
+// still live, the throwaway prunes drop out and every other action still runs
+// (a wedged lane's recovery must not wait on a skeptic). Pure, so the rule is
+// gate-testable without a git worktree.
+export function holdLiveThrowawayPrunes(plan: ReconcileAction[], live: string[]): ReconcileAction[] {
+  if (live.length === 0) return plan;
+  return plan.filter((a) => !(a.kind === "prune-worktree" && isThrowawayWorktreePath(a.path)));
+}
+
+export function planReviewSweep(opts: {
+  worktreesDir: string;
+  // Undefined = no session transcript resolved for this cwd, i.e. no Claude Code
+  // session is running here to have spawned anything. Sweeps.
+  subagentsDir: string | undefined;
+  now?: number;
+  quietMs?: number;
+}): { paths: string[]; live: string[] } {
+  const live =
+    opts.subagentsDir === undefined ? [] : liveAgentsIn(opts.subagentsDir, { now: opts.now, quietMs: opts.quietMs });
+  const found = listThrowawayWorktrees(opts.worktreesDir).map((w) => w.path);
+  return { paths: live.length > 0 ? [] : found, live };
 }
 
 // Cross-references three sets -- lane locks (L), worktrees (W), and Building
@@ -308,10 +362,14 @@ const USAGE = `reconcile <command> [args] --slug S
 
   scan   [--now MS]   scan orphans + build the plan; print JSON {hasOrphans, orphans, plan}
   plan   [--now MS]   print the reconcile action list as JSON
-  sweep-review        remove leftover throwaway reviewer worktrees (.worktrees/review-<N>)
+  sweep-review [--project-dir D] [--subagents-dir D] [--quiet-ms MS]
+                      remove leftover throwaway reviewer worktrees (.worktrees/review-<N>)
                       and nothing else. No board read, no locks, no slug needed --
-                      z-loop/SKILL.md Step 7's batch cleanup, as a command instead of
+                      z-loop/SKILL.md Step 0 / Step 7 cleanup, as a command instead of
                       prose. Prints the paths removed, one per line, then a count.
+                      REMOVES NOTHING while any sub-agent of this session has not
+                      been observed finishing: the skeptics execute inside those
+                      worktrees and outlive the reviewer that spawned them (#209).
   apply  [--now MS] [--session ID]
                       execute the plan: release claims, park to Ready, prune worktrees,
                       remove stale locks (never deletes branches or comments).
@@ -354,6 +412,24 @@ export function assertNotReconcilingLiveLoop(
   );
 }
 
+// Where the liveness gate looks for this session's sub-agent transcripts.
+// --subagents-dir wins outright (the gate tests point it at a fixture);
+// otherwise it is derived from --project-dir / cwd by the same resolver
+// `transcripts collect` uses, so the two can never consult different sessions.
+function reviewSweepSubagentsDir(flags: ParsedArgs["flags"]): string | undefined {
+  return str(flags, "subagents-dir") ?? subagentsDirFor(str(flags, "project-dir") ?? process.cwd());
+}
+
+// --quiet-ms: the settling window, injected only by the gate tests (which need a
+// boundary they can pin). Production takes SUBTREE_QUIET_MS.
+function quietMsFlag(flags: ParsedArgs["flags"]): number | undefined {
+  const v = str(flags, "quiet-ms");
+  if (v === undefined) return undefined;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) throw new ZError(`--quiet-ms must be a non-negative number of milliseconds, got ${JSON.stringify(v)}.`);
+  return n;
+}
+
 export async function main(argv: string[]): Promise<number> {
   const cmd = argv[0];
   if (!cmd || cmd === "help" || cmd === "-h" || cmd === "--help") {
@@ -374,12 +450,30 @@ export async function main(argv: string[]): Promise<number> {
     // GraphQL quota or a missing project config.
     if (cmd === "sweep-review") {
       const dir = str(flags, "worktrees") ?? join(process.cwd(), ".worktrees");
-      const found = listThrowawayWorktrees(dir);
-      for (const w of found) {
-        pruneWorktreeReal(w.path);
-        console.log(w.path);
+      const { paths, live } = planReviewSweep({
+        worktreesDir: dir,
+        subagentsDir: reviewSweepSubagentsDir(flags),
+        now: nowMs,
+        quietMs: quietMsFlag(flags),
+      });
+      // Declining is a normal outcome, not an error: nothing waits on this sweep
+      // (a leftover scratch checkout is litter, never a wedge), and exiting
+      // non-zero here would fail a batch-end cleanup step for doing the safe
+      // thing. Say who is live so the operator can see why.
+      if (live.length > 0) {
+        console.log(
+          `swept 0 of ${listThrowawayWorktrees(dir).length} throwaway review worktree(s): ` +
+            `${live.length} agent(s) of this session have not been observed finishing (${live.join(", ")}), ` +
+            `and a skeptic still reading .worktrees/review-<N> must not have it removed underneath it (#209). ` +
+            `They are swept by the next run's Step 0, after the loop-lock acquire proves the session is quiet.`
+        );
+        return 0;
       }
-      console.log(`swept ${found.length} throwaway review worktree(s)`);
+      for (const p of paths) {
+        pruneWorktreeReal(p);
+        console.log(p);
+      }
+      console.log(`swept ${paths.length} throwaway review worktree(s)`);
       return 0;
     }
 
@@ -414,9 +508,27 @@ export async function main(argv: string[]): Promise<number> {
       console.log(JSON.stringify(plan, null, 2));
       return 0;
     }
-    await applyReconcile(plan, realEffects(board));
-    const counts = plan.reduce((m, a) => ((m[a.kind] = (m[a.kind] ?? 0) + 1), m), {} as Record<string, number>);
-    console.log(`reconciled: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(", ") || "nothing"}`);
+    // `apply` is the OTHER path that force-removes review worktrees, so it takes
+    // the same liveness hold as sweep-review (#209). Its own #198 guard proves no
+    // other loop is running, and the one sanctioned caller (Step 0, --session)
+    // has spawned nothing yet -- so in practice nothing is ever held here. That
+    // is the point of doing it anyway: the invariant is "no path removes a review
+    // worktree while an agent of this session might be inside one", and an
+    // invariant with one unchecked path is not one.
+    const live = planReviewSweep({
+      worktreesDir,
+      subagentsDir: reviewSweepSubagentsDir(flags),
+      now: nowMs,
+      quietMs: quietMsFlag(flags),
+    }).live;
+    const runnable = holdLiveThrowawayPrunes(plan, live);
+    await applyReconcile(runnable, realEffects(board));
+    const counts = runnable.reduce((m, a) => ((m[a.kind] = (m[a.kind] ?? 0) + 1), m), {} as Record<string, number>);
+    const held = plan.length - runnable.length;
+    console.log(
+      `reconciled: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(", ") || "nothing"}` +
+        (held > 0 ? ` (held ${held} review-worktree prune(s): ${live.length} agent(s) of this session still live)` : "")
+    );
     return 0;
   } catch (e) {
     return handleCliError(e);

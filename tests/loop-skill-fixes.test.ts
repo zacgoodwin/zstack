@@ -413,6 +413,21 @@ describe("Ticket #209: leftover review worktrees are swept by a command on every
     expect(sec).toContain("review-<N>");
   });
 
+  // Review finding 2: Step 7 justified its unconditional sweep with "every lane
+  // is finished by the time this runs, so a subtree that still reads live here is
+  // one that will never write again" -- which is the parent-returned-means-
+  // subtree-finished assumption #209 exists to refute. The reviewer returns while
+  // its skeptics execute BY DESIGN (it checks each at most once and stops
+  // waiting), and on the last lane drain-complete fires minutes later. The prose
+  // must not tell the orchestrator to retry or treat a deferral as a failure
+  // either, or the gate gets worked around in the shell.
+  test("Step 7 does not claim drain-complete proves the subtree finished", () => {
+    const step7 = section(zLoop(), "## Step 7 — Exit");
+    expect(step7).not.toContain("a subtree that still reads live here is one that will never write again");
+    expect(step7).toContain("liveness gate");
+    expect(step7).toMatch(/do not retry\s+it/i); // the prose wraps, so the gap is whitespace
+  });
+
   test("the teardown gate points at those sweeps, not at a habit", () => {
     // section() stops at the next "## " heading (Step 5), so Step 7's own sweep
     // cannot satisfy this.

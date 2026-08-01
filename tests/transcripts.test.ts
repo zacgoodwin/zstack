@@ -27,6 +27,7 @@ import {
   collectTranscripts,
   descendantsOf,
   findRootAgents,
+  liveAgentsIn,
   liveDescendants,
   main,
   readAgentMetas,
@@ -525,6 +526,67 @@ describe("subtree liveness (#209)", () => {
     expect(live(dir, "r1")).toEqual(["s1", "s2", "s3"]);
     // A descendant whose transcript file does not exist at all, same answer.
     expect(liveDescendants(dir, [{ agentId: "gone", parentAgentId: "ghost" }], "ghost", { now: NOW })).toEqual(["gone"]);
+  });
+
+  // The hole review found in the first cut, reproduced exactly: readAgentMetas
+  // SKIPS an unparseable sidecar, so descendantsOf never sees that child and the
+  // liveness walk never checked it -- one truncated meta and `subtreeDone` said
+  // TRUE with a skeptic 5 seconds into a tool call. The SKILL's gate is
+  // `[ "$(jq -r .subtreeDone ...)" = "true" ] && git worktree remove --force`, so
+  // that is #66's removal-under-a-live-skeptic with a new trigger, and a
+  // half-written meta is likeliest at SPAWN, when the child is youngest.
+  test("AC7: an unreadable meta hides a LIVE child, so the subtree is not done", () => {
+    const dir = mkTmp();
+    const tag = spawnTag("zstack", 66, "reviewer", 1);
+    writeAgent(dir, "r1", { prompt: stagePromptWithTag(tag) });
+    writeAgent(dir, "s1", { parent: "r1", meta: '{"agentType":"general-pur' }); // truncated mid-write
+    appendRunning(dir, "s1"); // last record is a tool_use written 5s ago
+    const r = collect(dir, tag, "reviewer-1");
+    expect(r.skippedMeta).toEqual(["agent-s1.meta.json"]);
+    expect(r.live).toEqual(["s1"]); // the evidence is in the same object, and used
+    expect(r.subtreeDone).toBe(false);
+  });
+
+  // ...but unknown parentage is not blanket-blocking: the child's OWN transcript
+  // is the same evidence agentFinished already reads, and one that has come to
+  // rest cannot be holding any worktree, whoever spawned it. Otherwise a single
+  // bad sidecar anywhere in a shared directory would wedge every teardown.
+  test("an unreadable meta whose agent has come to rest does not block removal", () => {
+    const dir = mkTmp();
+    const tag = spawnTag("zstack", 66, "reviewer", 1);
+    writeAgent(dir, "r1", { prompt: stagePromptWithTag(tag) });
+    writeAgent(dir, "s1", { parent: "r1", meta: "{oops" });
+    appendFinalAnswer(dir, "s1"); // returned, and quiet since
+    const r = collect(dir, tag, "reviewer-1");
+    expect(r.skippedMeta).toEqual(["agent-s1.meta.json"]);
+    expect(r.live).toEqual([]);
+    expect(r.subtreeDone).toBe(true);
+  });
+
+  // The batch sweep's question is different from collect's -- "could ANY agent of
+  // this session still be reading a review worktree", asked of a directory of
+  // leftover checkouts with no stage tag to trace back -- so it ignores parentage
+  // entirely, which also makes it immune to the sidecar hole above.
+  describe("liveAgentsIn", () => {
+    test("names every unfinished agent regardless of parentage, and none when all are quiet", () => {
+      const dir = mkTmp();
+      writeAgent(dir, "r1");
+      writeAgent(dir, "s1", { parent: "r1" });
+      writeAgent(dir, "s2", { parent: "r1", meta: "not json at all" });
+      appendFinalAnswer(dir, "r1");
+      appendRunning(dir, "s1"); // mid tool call
+      appendFinalAnswer(dir, "s2", RECENT); // returned, but only 5s ago
+      expect(liveAgentsIn(dir, { now: NOW })).toEqual(["s1", "s2"]);
+      appendFinalAnswer(dir, "s1");
+      appendFinalAnswer(dir, "s2");
+      expect(liveAgentsIn(dir, { now: NOW })).toEqual([]);
+    });
+
+    // Step 0's case: the harness creates `subagents/` when the session's first
+    // sub-agent spawns, so its absence is evidence of none, not a fail-open.
+    test("a missing sub-agent directory is no live agents", () => {
+      expect(liveAgentsIn(join(mkTmp(), "never-created"))).toEqual([]);
+    });
   });
 
   // The verdict is in code, but the REMOVAL is the SKILL's, so the ordering is

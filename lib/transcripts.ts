@@ -338,6 +338,79 @@ export function liveDescendants(
   return descendantsOf(metas, root).filter((id) => !agentFinished(subagentsDir, id, now, quietMs));
 }
 
+// The agent id a skipped meta FILENAME describes. readAgentMetas only ever
+// pushes names its own `agent-<id>.meta.json` pattern matched, so this always
+// resolves for those; anything else is not an agent meta at all.
+function agentIdFromMetaName(file: string): string | undefined {
+  return /^agent-(.+)\.meta\.json$/.exec(file)?.[1];
+}
+
+// Agents whose PARENTAGE is unknown because their meta could not be parsed, and
+// whose own transcript does not prove they finished.
+//
+// This is the hole a subtree-liveness answer would otherwise have. readAgentMetas
+// SKIPS an unparseable sidecar (it must -- one bad file cannot cost a whole stage
+// its cost attribution), so descendantsOf never sees that agent and the liveness
+// walk never checks it: an unreadable meta would report the subtree DONE and
+// force-remove the worktree out from under a running skeptic, which is #66's
+// failure exactly. A half-written meta is likeliest at SPAWN, i.e. when the child
+// is youngest and most certainly still executing.
+//
+// So unknown parentage fails toward LIVE, like every other unreadable input here.
+// Not blindly, though: the child's own transcript is the same evidence
+// agentFinished already reads, and one that has come to rest cannot be reading
+// any worktree, whoever its parent was. Only the ones that fail that test block.
+export function liveUnknownParentage(
+  subagentsDir: string,
+  skippedMeta: string[],
+  opts: { now?: number; quietMs?: number } = {}
+): string[] {
+  const now = opts.now ?? Date.now();
+  const quietMs = opts.quietMs ?? SUBTREE_QUIET_MS;
+  const ids = skippedMeta.map(agentIdFromMetaName).filter((id): id is string => id !== undefined);
+  return ids.filter((id) => !agentFinished(subagentsDir, id, now, quietMs)).sort();
+}
+
+// Every agent in the directory that has not been observed finishing, sorted --
+// parentage ignored entirely.
+//
+// The batch sweep's gate (lib/reconcile.ts sweep-review), which is a different
+// question from collect's: not "is THIS stage's subtree done" but "could ANY
+// agent of this session still be reading a review worktree". Parentage cannot
+// answer that one, because the sweep is handed a directory of leftover
+// `review-<N>` checkouts with no stage tag to trace back -- and it does not need
+// to: a session with nothing running has nobody to hurt, and that is checkable
+// without knowing who spawned whom (it also sidesteps unreadable metas by
+// construction, since no meta is read).
+//
+// A MISSING directory reads as no live agents, and that is evidence rather than a
+// fail-open: the harness creates `subagents/` when the session's first sub-agent
+// spawns, so its absence means this session has spawned none. That is precisely
+// the Step 0 case the unconditional sweep is for. (A second /z-loop in the SAME
+// session sees the first run's agents instead, and may well decline -- correct,
+// since those skeptics can still be executing; the leftovers just wait.)
+//
+// Cost is bounded and paid at most twice a run (Step 0, Step 7): one whole-file
+// read per sub-agent transcript in the session -- 174 files, ~650 KB at the
+// largest, in a real three-lane drain.
+export function liveAgentsIn(subagentsDir: string, opts: { now?: number; quietMs?: number } = {}): string[] {
+  const now = opts.now ?? Date.now();
+  const quietMs = opts.quietMs ?? SUBTREE_QUIET_MS;
+  let entries: string[];
+  try {
+    entries = readdirSync(subagentsDir);
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const f of entries) {
+    const m = /^agent-(.+)\.jsonl$/.exec(f);
+    if (!m) continue;
+    if (!agentFinished(subagentsDir, m[1], now, quietMs)) out.push(m[1]);
+  }
+  return out.sort();
+}
+
 // -- collection ----------------------------------------------------------------
 
 export interface CollectedFile {
@@ -353,8 +426,10 @@ export interface CollectResult {
   files: CollectedFile[];
   descendants: number;
   skippedMeta: string[];
-  // #209: descendants not observed finishing, and the teardown verdict derived
-  // from them. Collection already walks the subtree for the stage's Actual, so
+  // #209: agents not observed finishing -- descendants of this stage, plus any
+  // whose meta was unreadable (parentage unknown, so possibly one of them) --
+  // and the teardown verdict derived from them, which is `false` whenever the
+  // set is non-empty. Collection already walks the subtree for the Actual, so
   // the removal decision rides on that same walk instead of a second mechanism --
   // which is also what orders it correctly: teardown happens after collection.
   live: string[];
@@ -410,7 +485,19 @@ export function collectTranscripts(opts: {
     copyFileSync(join(opts.subagentsDir, `agent-${agentId}.jsonl`), join(opts.dest, file));
     files.push({ agentId, role, file });
   }
-  const live = liveDescendants(opts.subagentsDir, metas, root, { now: opts.now, quietMs: opts.quietMs });
+  // Two sources of "maybe still running", unioned: the descendants the parentage
+  // walk found, and the agents whose meta could not be parsed at all (see
+  // liveUnknownParentage -- an unreadable sidecar hides its agent from the walk,
+  // so it must not read as a finished subtree). The union is what `subtreeDone`
+  // answers, so the teardown gate can never be told DONE on evidence this object
+  // was already holding in `skippedMeta` and ignoring.
+  const window = { now: opts.now, quietMs: opts.quietMs };
+  const live = [
+    ...new Set([
+      ...liveDescendants(opts.subagentsDir, metas, root, window),
+      ...liveUnknownParentage(opts.subagentsDir, skipped, window),
+    ]),
+  ].sort();
   return {
     tag: opts.tag,
     root,

@@ -194,9 +194,16 @@ records the result. It never re-derives a scheduling decision in prose.
   `~/.zstack/projects/<slug>/reports/uncommitted-<N>.patch`, same salvage contract
   as the uncommitted-work park above. A worktree with nothing uncommitted in it is
   skipped exactly as before: there is nothing to recover, so no re-spawn is spent.
-  The reviewer is excluded (it executes in a throwaway worktree, and its blinded
+  So is one whose `git status` produced **no output at all** — that is what a
+  missing or broken worktree yields (git always prints its `## <branch>` header
+  when it runs), so there is provably nothing there and no fresh agent is briefed
+  about changes that do not exist. The reviewer is excluded (it executes in a
+  throwaway worktree, and its blinded
   four-key input has nowhere to put a briefing about a prior attempt), and a dead
-  merge lane keeps its own PR-state resolution.
+  merge lane keeps its own PR-state resolution. A ticket a **human** moved to a
+  stop status mid-run is never re-spawned either: that move is respected, so the
+  lane stops cleanly at the dead worker, spends nothing, and leaves the human's
+  own status and the worktree alone.
   Every stage prompt that runs the gauntlet now also states the other half: run
   verification in the FOREGROUND, because ending a turn with a background job
   still pending is parsed as CONFUSED.
@@ -251,17 +258,26 @@ records the result. It never re-derives a scheduling decision in prose.
   "launched successfully" acknowledgement written the instant it starts, and
   reading that as a result would remove the worktree at the exact moment #66 did.
   Anything unproven — an unreadable or half-written transcript, one still parked
-  on a tool call — counts as still running. That never stalls the drain: nothing
+  on a tool call, or a sub-agent whose **metadata sidecar** could not be parsed
+  (its parentage is unknown, so it may well be one of these skeptics, and a
+  half-written sidecar is likeliest at spawn when the child is youngest) — counts
+  as still running. That never stalls the drain: nothing
   waits on the flag, and a leftover directory is the cheap direction to be wrong
   in.
   Because a 15-minute settling window makes "leftover" the **usual** outcome
   rather than the exception, the sweep that collects them is a command
   (`bun lib/reconcile.ts sweep-review`, which touches `.worktrees/review-<N>` and
-  nothing else) and it runs on every exit path: at batch cleanup when the drain
-  completes, and at the start of the next run right after the loop lock is
-  acquired — that second one is what covers a context-clear pause or a crash,
-  which never reach batch cleanup. `--reconcile` prunes them too. They never block
-  startup, though: a scratch checkout nobody owns is litter, not a wedge, so it is
+  nothing else). It carries the same guard rather than working around it: it
+  removes nothing while **any** sub-agent of the session is still unproven, since
+  a reviewer returning with skeptics still executing is the designed case, not an
+  anomaly — the reviewer checks each skeptic at most once and stops waiting. So it
+  is called where it can actually do work: at batch cleanup when the drain
+  completes (sweeping if the session has genuinely gone quiet), and at the start
+  of the next run right after the loop lock is acquired — that second one both
+  covers the exits batch cleanup never reaches (a context-clear pause, a crash)
+  and is the point where nothing has been spawned yet, so it always sweeps.
+  `--reconcile` prunes them too, under the same hold. They never block
+  startup: a scratch checkout nobody owns is litter, not a wedge, so it is
   swept rather than reported as an orphan.
 - **Per-stage model routing.** The merge stage is mechanical (`gh pr create`, a
   conflict check, `gh pr merge`) and doesn't need the ticket's build-tier

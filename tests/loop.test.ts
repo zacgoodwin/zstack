@@ -1506,15 +1506,59 @@ describe("dead-worker re-spawn (#209)", () => {
     expect(nextAction(s, NOW).kind).toBe("skip");
   });
 
-  // The `> file` redirect creates the file BEFORE git runs, so a failed status
-  // leaves an EMPTY file. #177 refuses to read that as a clean tree; the same
-  // payload here must not read as "nothing to recover" and discard the work.
-  // Failing this direction costs at most one bounded re-spawn.
+  // Output with no `## <branch>` header is UNREADABLE, not clean -- it cannot
+  // prove an empty tree, and failing that direction costs at most one bounded
+  // re-spawn while the other direction discards finished work.
   test("an unreadable status payload buys the respawn rather than discarding the lane", () => {
-    expect(worktreeHoldsWork("")).toBe(true);
+    expect(worktreeHoldsWork("fatal: not a git repository\n")).toBe(true);
     expect(worktreeHoldsWork("## z/ticket-1\n")).toBe(false);
     expect(worktreeHoldsWork("## z/ticket-1\n?? tests/new.test.ts\n")).toBe(true); // untracked counts
-    expect(nextAction(deadLane(""), NOW).kind).toBe("respawn");
+    expect(nextAction(deadLane("fatal: not a git repository\n"), NOW).kind).toBe("respawn");
+  });
+
+  // ...but an EMPTY payload is a different fact, and review caught the first cut
+  // treating them as one. The `> file` redirect creates the file BEFORE git runs,
+  // and `git status --porcelain --branch` ALWAYS prints its header when it runs
+  // at all, so zero bytes means git failed outright -- which is exactly what a
+  // MISSING or broken worktree yields (exit 128, nothing on stdout). Re-spawning
+  // there spends a paid agent on a directory that is not present and briefs it
+  // that "its worktree still holds UNCOMMITTED changes", which is a falsehood.
+  // Reading it as no facts also means every re-spawn that DOES happen fires on a
+  // worktree git successfully read seconds earlier, which is what makes that
+  // briefing true.
+  test("an EMPTY status payload is no facts at all -- no re-spawn into a worktree that is gone", () => {
+    expect(worktreeHoldsWork("")).toBe(false);
+    expect(worktreeHoldsWork("   \n")).toBe(false);
+    const s = deadLane("");
+    expect(s.lanes[0].worktreeDirty).toBe(false);
+    const a = nextAction(s, NOW);
+    expect(a.kind).toBe("skip");
+    expect((a as { note: string }).note).toContain("worktree left for inspection");
+    expect((a as { note: string }).note).not.toContain("uncommitted work"); // nothing to salvage, so no patch promised
+  });
+
+  // Review finding 3: the human-park guard in step 1 only inspects lanes that
+  // RECORDED an outcome (`if (!lane.outcome) continue;`), and a worker that died
+  // silently has none by definition -- so a ticket a human dragged to Blocked
+  // mid-run fell straight through to the dead-worker branch and got a fresh paid
+  // builder spawned into it. The board move is respected instead: the lane stops,
+  // the human's status stands (no Skipped overwrite), and nothing is spent.
+  test("a human's mid-run park beats the re-spawn: stop the lane, spend nothing", () => {
+    for (const status of ["Blocked", "Questions"] as const) {
+      let s = deadLane(DIRTY);
+      s.tickets[0].status = status; // dragged on the board while the worker was dying
+      const a = nextAction(s, NOW);
+      expect(a.kind).toBe("stop-lane");
+      expect((a as { note: string }).note).toContain("a human");
+      expect((a as { note: string }).note).toContain("uncommitted work, kept for inspection");
+      s = applyAction(s, a, NOW);
+      expect(s.lanes).toEqual([]); // lane dropped...
+      expect(s.tickets[0].status).toBe(status); // ...and the human's status untouched
+    }
+    // The budget is not spent either: nothing was re-spawned.
+    const parked = deadLane(DIRTY);
+    parked.tickets[0].status = "Blocked";
+    expect(applyAction(parked, nextAction(parked, NOW), NOW).lanes).toHaveLength(0);
   });
 
   test("a QA lane recovers the same way; a reviewer lane never does", () => {

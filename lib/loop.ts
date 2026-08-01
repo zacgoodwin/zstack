@@ -413,16 +413,26 @@ function readPorcelain(porcelain: string): { statusRan: boolean; dirty: string[]
 // #209: does this worktree hold work that would be DISCARDED by skipping the
 // lane? True when git reported at least one dirty path (untracked included --
 // a test file the dead agent never `git add`ed is exactly the work at stake),
-// and true again when the payload has no `## <branch>` header at all.
+// and true again when git printed SOMETHING that carries no `## <branch>`
+// header -- a truncated or garbled status cannot prove the tree is clean, and
+// the two ways to be wrong there are not symmetric: reading it as clean SKIPS a
+// ticket whose finished work is sitting in the worktree (the exact loss this
+// ticket exists to stop), while reading it as dirty spends at most ONE re-spawn
+// (MAX_DEAD_RESPAWNS) on a lane that may have nothing in it -- and that agent is
+// told the prior work is unverified and may be dropped.
 //
-// That second case is the deliberate direction of failure. An unreadable status
-// cannot prove the tree is clean, and the two ways to be wrong are not
-// symmetric: reading it as clean SKIPS a ticket whose finished work is sitting
-// in the worktree (the exact loss this ticket exists to stop), while reading it
-// as dirty spends at most ONE re-spawn (MAX_DEAD_RESPAWNS) on a lane that may
-// have nothing in it -- and that agent is told the prior work is unverified and
-// may be dropped, so a worktree with nothing in it just gets built from scratch.
+// An EMPTY payload is the one case that is not a judgment call, and it is not
+// "unreadable": `git status --porcelain --branch` ALWAYS prints its header when
+// it runs at all, so zero bytes means git produced no output whatsoever. The way
+// that happens is the orchestrator's redirect creating the file and git then
+// failing outright (exit 128) -- which is exactly what a MISSING or broken
+// worktree yields. There is provably nothing there to recover, so this reports
+// no work rather than briefing a fresh agent that "its worktree still holds
+// uncommitted changes" and spawning it into a directory that does not exist.
+// It also means a re-spawn only ever happens on a worktree git successfully read
+// seconds earlier, which is what makes the briefing true.
 export function worktreeHoldsWork(porcelain: string): boolean {
+  if (porcelain.trim() === "") return false;
   const { statusRan, dirty } = readPorcelain(porcelain);
   return dirty.length > 0 || !statusRan;
 }
@@ -776,7 +786,7 @@ function deadRespawnNote(lane: LaneState): string {
 // A fresh SPAWN, never a resume: the no-SendMessage rule (z-loop/SKILL.md) is the
 // gate-tested guarantee that nothing latent travels between stages, and it is
 // worth more than the tokens a resume would save.
-function deadWorkerAction(lane: LaneState, wd: number): Action {
+function deadWorkerAction(lane: LaneState, wd: number, parkedByHuman: boolean): Action {
   // A dead MERGE worker is never blind-skipped (issue #14 H9): `gh pr merge` may
   // have landed the PR before the worker died, and skipping would lose it from
   // mergedThisRun (breaking a stacked child's step-18 retarget) and let batch-end
@@ -786,6 +796,26 @@ function deadWorkerAction(lane: LaneState, wd: number): Action {
   // human). So a dead merge lane holds at check-worker until an outcome is
   // recorded, never falling through to the skip or the re-spawn below.
   if (lane.stage === "merge") return { kind: "check-worker", ticket: lane.ticket };
+  // A human who moved this ticket to a stop status mid-run took it OUT of the
+  // loop, and that move is respected (docs/user-guide/z-loop.md) -- so the lane
+  // stops here and spends nothing. Step 1's stop-lane guard cannot catch this
+  // lane: it only considers lanes with a recorded outcome, and a worker that died
+  // silently has none by definition. Without this check the recovery would spawn
+  // a fresh paid agent into a ticket a human just dragged to Blocked/Questions,
+  // overriding the one instruction the board is guaranteed to carry. stop-lane
+  // rather than skip: the human already set the status, so it is not ours to
+  // overwrite with Skipped, and the worktree survives for them to look at.
+  if (parkedByHuman) {
+    return {
+      kind: "stop-lane",
+      ticket: lane.ticket,
+      note:
+        `Worker died mid-${lane.stage} (silent past the ${wd}-minute watchdog, not alive on probe), and a human ` +
+        `had already moved #${lane.ticket} to a stop status during the run; stopping its lane cleanly instead of ` +
+        `re-spawning or skipping${lane.worktreeDirty === true ? " -- its worktree still holds uncommitted work, kept for inspection" : ""} ` +
+        `(other lanes continue).`,
+    };
+  }
   // Per STAGE, not per lane: a builder that died silently is no evidence about the
   // QA agent that runs after it, so spending the builder's budget must not leave a
   // later QA death with nothing but the skip.
@@ -1139,9 +1169,10 @@ export function nextAction(state: LoopState, nowMs: number): Action {
   for (const lane of lanes) {
     if (lane.outcome) continue;
     if (!watchdogExpired(lane, nowMs, wd)) continue;
-    // A dead worker resolves to a merge-stage hold (H9), a same-stage re-spawn
+    // A dead worker resolves to a merge-stage hold (H9), a clean stop when a
+    // human already took the ticket off the board mid-run, a same-stage re-spawn
     // when its worktree still holds uncommitted work (#209), or the skip.
-    if (lane.workerDead) return deadWorkerAction(lane, wd);
+    if (lane.workerDead) return deadWorkerAction(lane, wd, parkedByHuman.has(lane.ticket));
     return { kind: "check-worker", ticket: lane.ticket };
   }
 

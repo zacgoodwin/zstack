@@ -136,7 +136,16 @@ to Ready.
 If you are seeing this on a run that predates the fix, or the skip note says
 `worktree left for inspection` with no patch path, the worktree facts were never
 collected — recover by hand from `.worktrees/ticket-<N>` immediately, before the
-next run's orphan scan prunes it.
+next run's orphan scan prunes it. The same note appears when `git status` in that
+worktree produced no output at all (a missing or broken checkout: git always
+prints its `## <branch>` header when it runs), which is treated as "nothing to
+recover" rather than re-spawning an agent into a directory that is not there.
+
+Two cases deliberately do **not** re-spawn even with changes in the worktree: a
+dead **merge** worker (its PR state is verified first, so it ends Merged or
+Blocked, never Skipped), and a ticket a human moved to Blocked/Questions during
+the run — that move is respected, so the lane just stops, keeps the human's status
+and its worktree, and spends nothing.
 
 If a stage keeps dying silently, the cause is usually upstream of the loop: check
 whether the ticket is large enough to exhaust the agent's context window, and
@@ -163,8 +172,12 @@ bun ~/.claude/skills/zstack/lib/reconcile.ts sweep-review
 ```
 
 It removes `.worktrees/review-<N>` (and the `-lead`/`-base` variants) and nothing
-else: no board read, no locks, no slug. Run it from the repo root, and not while a
-review stage is live — the loop's own copy runs only when no reviewer is running.
+else: no board read, no locks, no slug. Run it from the repo root. It is safe to
+run at any time: it checks the same liveness evidence the in-run gate does and
+removes **nothing** while any sub-agent of the current session is still unproven,
+printing who is live instead. If it reports `swept 0` for that reason and you are
+certain nothing is running, the leftovers are swept by the next `/z-loop`'s Step 0
+anyway — that runs in a fresh session, which by definition has spawned nothing.
 
 ## "Rates last checked … over the 14-day limit"
 
