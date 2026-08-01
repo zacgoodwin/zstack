@@ -11,7 +11,7 @@
 // and removes stale lane locks -- nothing that a human can't cheaply redo.
 import { readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { Board, ghExecutor } from "./board.ts";
+import { Board, ghExecutor, type ItemLookup } from "./board.ts";
 import { handleCliError, parseFlags, str } from "./cli.ts";
 import { DEFAULT_LOCK_STALENESS_MINUTES, TERMINAL_STATUSES, ZError, loadConfig } from "./config.ts";
 import { defaultLocksDir, inspectLoopLock, listLaneLocks, type LaneLock } from "./locks.ts";
@@ -33,6 +33,16 @@ const INFLIGHT: BoardStatus[] = ["Building", "QA", "Review"];
 
 export type BoardTicketStatus = Pick<TicketSnapshot, "number" | "status">;
 
+// #149: why a ticket is missing from the sweep, PROVED by a single-ticket lookup
+// (never inferred from the sweep's silence).
+//   * "gone"            -- the issue is positively not on this project (or no
+//                          longer exists). Its recovery may touch the board.
+//   * "not-loop-driven" -- it IS on the board, in a status the loop does not
+//                          drive (a human's own column, so the sweep's
+//                          per-known-status listing never returned it). Clean the
+//                          crashed run's on-disk state; never touch the board.
+export type ConfirmedAbsence = "gone" | "not-loop-driven";
+
 // A lane lock left behind by a crashed loop. How it is reconciled depends on the
 // ticket's current board status (issue #14 C4): an INFLIGHT lane is released +
 // parked to Ready + pruned + unlocked; a TERMINAL lane (the work already landed
@@ -44,6 +54,10 @@ export interface CrashedLane {
   ageMs: number;
   worktreePath?: string;
   boardStatus?: BoardStatus; // the ticket's status in the board snapshot, if present
+  // #149: set only when a single-ticket lookup PROVED the ticket is not in the
+  // snapshot for a reason recovery may act on. Exactly one of boardStatus /
+  // absence must be set, or reconcilePlan refuses to plan for this lane.
+  absence?: ConfirmedAbsence;
 }
 
 // A worktree with no backing lock. Pruned; also parked when the board still
@@ -52,6 +66,7 @@ export interface OrphanWorktree {
   ticket: number;
   worktreePath: string;
   boardStatus?: BoardStatus;
+  absence?: ConfirmedAbsence; // #149, as above
 }
 
 export interface Orphans {
@@ -87,7 +102,11 @@ export function scanOrphans(
   locksDir: string,
   worktreesDir: string,
   boardSnapshot: BoardTicketStatus[],
-  nowMs: number
+  nowMs: number,
+  // #149: the confirm pass's answers for the tickets the sweep did not return.
+  // Empty = no confirm pass ran, which leaves those lanes unplannable rather
+  // than acted on (reconcilePlan throws).
+  confirmedAbsent: ReadonlyMap<number, ConfirmedAbsence> = new Map()
 ): Orphans {
   const locks = listLaneLocks(locksDir);
   const worktrees = listWorktrees(worktreesDir);
@@ -102,11 +121,17 @@ export function scanOrphans(
     ageMs: nowMs - l.lock.claimedAt,
     worktreePath: wtByTicket.get(l.lock.ticket)?.path,
     boardStatus: statusByTicket.get(l.lock.ticket),
+    absence: statusByTicket.has(l.lock.ticket) ? undefined : confirmedAbsent.get(l.lock.ticket),
   }));
 
   const orphanWorktrees: OrphanWorktree[] = worktrees
     .filter((w) => !lockTickets.has(w.ticket))
-    .map((w) => ({ ticket: w.ticket, worktreePath: w.path, boardStatus: statusByTicket.get(w.ticket) }));
+    .map((w) => ({
+      ticket: w.ticket,
+      worktreePath: w.path,
+      boardStatus: statusByTicket.get(w.ticket),
+      absence: statusByTicket.has(w.ticket) ? undefined : confirmedAbsent.get(w.ticket),
+    }));
 
   const buildingWithoutState = boardSnapshot
     .filter((t) => t.status === "Building" && !lockTickets.has(t.number) && !wtByTicket.has(t.number))
@@ -128,20 +153,47 @@ export type ReconcileAction =
   | { kind: "prune-worktree"; ticket: number; path: string }
   | { kind: "remove-lock"; ticket: number; path: string };
 
+// #149: recovery never acts on absence. Every lane/worktree the plan touches must
+// carry either a status the sweep positively returned or a single-ticket lookup's
+// positive answer about why it was missing. `boardStatus: undefined` with no
+// confirmed absence is unreachable input from main()'s confirm pass -- reaching it
+// means someone wired a raw, unconfirmed sweep into the plan, and the old code
+// would have read that silence as "in flight" and released + parked the lane.
+function assertObserved(o: { ticket: number; boardStatus?: BoardStatus; absence?: ConfirmedAbsence }): void {
+  if (o.boardStatus !== undefined || o.absence !== undefined) return;
+  throw new ZError(
+    `Refusing to reconcile #${o.ticket}: the board read did not return it and no single-ticket ` +
+      `lookup confirmed why. Absence from a bulk read is never evidence (#138/#149), so recovery ` +
+      `cannot release, park, or prune this lane. Re-run the reconcile once the board is readable.`
+  );
+}
+
 // Pure: orphans in, ordered action list out. For each crashed lane the board
 // status decides the recovery (issue #14 C4):
 //   * TERMINAL (Done/Questions/Blocked/Skipped): the work already landed or a
 //     human parked it -- ONLY prune the worktree + remove the lock. Never release
 //     or park, which would reopen merged work or undo a human's decision.
-//   * INFLIGHT or unknown: release the assignee, prune its worktree (if present),
-//     park it back to Ready, remove its lock -- the crash left it mid-build.
+//   * "not-loop-driven" (#149): on the board in a column the loop does not drive.
+//     Same treatment as terminal -- a human owns that ticket now.
+//   * "gone" (#149): positively off the board. Release + prune + unlock, but NEVER
+//     park: `board.move` to Ready on an issue that is not on the project throws,
+//     which would abort the apply midway and strand the remaining locks.
+//   * INFLIGHT: release the assignee, prune its worktree (if present), park it
+//     back to Ready, remove its lock -- the crash left it mid-build.
 // A lockless worktree is pruned, and also released+parked when the board still
 // thinks it in-flight. A Building ticket with no on-disk state is released+parked.
 export function reconcilePlan(orphans: Orphans): ReconcileAction[] {
   const actions: ReconcileAction[] = [];
   for (const c of orphans.crashedLanes) {
-    if (c.boardStatus && TERMINAL_STATUSES.includes(c.boardStatus)) {
+    assertObserved(c);
+    if ((c.boardStatus && TERMINAL_STATUSES.includes(c.boardStatus)) || c.absence === "not-loop-driven") {
       // Terminal: leave the board alone; just clear the crashed run's on-disk state.
+      if (c.worktreePath) actions.push({ kind: "prune-worktree", ticket: c.ticket, path: c.worktreePath });
+      actions.push({ kind: "remove-lock", ticket: c.ticket, path: c.lockPath });
+      continue;
+    }
+    if (c.absence === "gone") {
+      actions.push({ kind: "release-claim", ticket: c.ticket });
       if (c.worktreePath) actions.push({ kind: "prune-worktree", ticket: c.ticket, path: c.worktreePath });
       actions.push({ kind: "remove-lock", ticket: c.ticket, path: c.lockPath });
       continue;
@@ -156,6 +208,7 @@ export function reconcilePlan(orphans: Orphans): ReconcileAction[] {
     actions.push({ kind: "remove-lock", ticket: c.ticket, path: c.lockPath });
   }
   for (const w of orphans.orphanWorktrees) {
+    assertObserved(w);
     actions.push({ kind: "prune-worktree", ticket: w.ticket, path: w.worktreePath });
     if (w.boardStatus && INFLIGHT.includes(w.boardStatus)) {
       actions.push({ kind: "release-claim", ticket: w.ticket });
@@ -267,15 +320,115 @@ const USAGE = `reconcile <command> [args] --slug S
   --dir / --worktrees override the locks + worktrees dirs (tests). Otherwise
   locks default to ~/.zstack/projects/<slug>/locks and worktrees to ./.worktrees.`;
 
+// The board surface crash recovery uses. Board satisfies it; tests inject a
+// double so the whole scan (sweep + confirm pass) runs without a network call.
+export interface ReconcileBoard {
+  list(status?: string): Promise<{ number: number; fields?: Record<string, string | number> }[]>;
+  item(n: number): Promise<ItemLookup>;
+}
+
 // Sweeps EVERY status, not just the in-flight ones (issue #14 C4): a crashed
 // lane's recovery hinges on whether its ticket is already terminal (Done/parked),
 // so the plan needs the full board picture, not only Building/QA/Review.
-export async function sweep(board: Board): Promise<BoardTicketStatus[]> {
+//
+// This is a plain paginated read, and #138's rule stands: a ticket missing from
+// it proves NOTHING. A short page and a real removal look identical here, so
+// confirmMissing below -- not this function -- decides what an absence means.
+export async function sweep(board: ReconcileBoard): Promise<BoardTicketStatus[]> {
   const out: BoardTicketStatus[] = [];
   for (const status of BOARD_STATUSES) {
     for (const it of await board.list(status)) out.push({ number: it.number, status });
   }
   return out;
+}
+
+// The tickets whose absence from the sweep would otherwise drive a destructive
+// action: every ticket named by a lane lock or an orphan worktree. Pure.
+export function missingFromSweep(orphans: Orphans, snapshot: BoardTicketStatus[]): number[] {
+  const seen = new Set(snapshot.map((t) => t.number));
+  const referenced = new Set([
+    ...orphans.crashedLanes.map((c) => c.ticket),
+    ...orphans.orphanWorktrees.map((w) => w.ticket),
+  ]);
+  return [...referenced].filter((n) => !seen.has(n)).sort((a, b) => a - b);
+}
+
+// #149's confirm pass: turn each sweep-missing ticket into a positive observation
+// with ONE unpaginated single-ticket lookup (lib/board.ts `item`, #138) before any
+// recovery decision is made about it.
+//   * present, in a status the loop drives -> spliced into the snapshot, so the
+//     plan branches on the ticket's REAL state (a Done lane stays pruned-only).
+//   * present, in a status the loop does not drive -> "not-loop-driven"; the sweep
+//     never lists that column, so this is not a hiccup and not the loop's ticket.
+//   * positively absent -> "gone"; the release/prune path may proceed.
+//   * lookup ERROR -> throw. Recovery must never proceed on a board it cannot
+//     read, and this runs before applyReconcile, so nothing has been mutated.
+export async function confirmMissing(
+  board: Pick<ReconcileBoard, "item">,
+  snapshot: BoardTicketStatus[],
+  targets: number[]
+): Promise<{ snapshot: BoardTicketStatus[]; absent: Map<number, ConfirmedAbsence>; notes: string[] }> {
+  const out = {
+    snapshot: [...snapshot],
+    absent: new Map<number, ConfirmedAbsence>(),
+    notes: [] as string[],
+  };
+  for (const n of targets) {
+    let look: ItemLookup;
+    try {
+      look = await board.item(n);
+    } catch (e) {
+      throw new ZError(
+        `Reconcile aborted on #${n}: the board sweep did not return it and its single-ticket lookup ` +
+          `failed (${e instanceof Error ? e.message : String(e)}). Nothing was released, parked, pruned, ` +
+          `or unlocked -- crash recovery never acts on a board it cannot read.`
+      );
+    }
+    if (!look.present) {
+      out.absent.set(n, "gone");
+      out.notes.push(
+        `sweep missed #${n}; single-ticket lookup CONFIRMS it is off the board (${look.reason}) -- ` +
+          `its crashed lane may be released and pruned.`
+      );
+      continue;
+    }
+    const status = String(look.item.fields["Status"] ?? "");
+    if (!BOARD_STATUSES.includes(status as BoardStatus)) {
+      out.absent.set(n, "not-loop-driven");
+      out.notes.push(
+        `sweep missed #${n}; single-ticket lookup CONFIRMS it is on the board in status ` +
+          `${status ? JSON.stringify(status) : "(none)"}, which the loop does not drive -- ` +
+          `clearing its on-disk state only, leaving the board untouched.`
+      );
+      continue;
+    }
+    out.snapshot.push({ number: n, status: status as BoardStatus });
+    out.notes.push(
+      `sweep missed #${n}; single-ticket lookup CONFIRMS it is still on the board (Status: ${status}) -- ` +
+        `planning against that status, not against its absence.`
+    );
+  }
+  return out;
+}
+
+// The full crash-recovery scan: sweep, confirm every sweep-missing ticket a lock
+// or worktree points at, then scan against the enriched snapshot. Exported whole
+// so the confirm pass is gate-testable against a board double (tests/safety.test.ts).
+export async function scanWithConfirm(
+  board: ReconcileBoard,
+  locksDir: string,
+  worktreesDir: string,
+  nowMs: number
+): Promise<{ orphans: Orphans; notes: string[] }> {
+  const swept = await sweep(board);
+  // A first pass purely to learn WHICH tickets the on-disk state points at; its
+  // statuses are never planned against (reconcilePlan is not called on it).
+  const referenced = scanOrphans(locksDir, worktreesDir, swept, nowMs);
+  const confirmed = await confirmMissing(board, swept, missingFromSweep(referenced, swept));
+  return {
+    orphans: scanOrphans(locksDir, worktreesDir, confirmed.snapshot, nowMs, confirmed.absent),
+    notes: confirmed.notes,
+  };
 }
 
 // Throws unless it is safe to reconcile: the loop lock must be free, stale, or
@@ -331,7 +484,14 @@ export async function main(argv: string[]): Promise<number> {
     // session and refuses on any live lock, which is the safe default.
     if (cmd === "apply") assertNotReconcilingLiveLoop(locksDir, nowMs, cfg, str(flags, "session"));
 
-    const orphans = scanOrphans(locksDir, worktreesDir, await sweep(board), nowMs);
+    // #149: the sweep is a paginated read, so a lock's ticket missing from it is
+    // undecidable -- and this runs at crash recovery, where reading that silence as
+    // "in flight" throws away the crashed run's real board state. Every
+    // sweep-missing ticket a lock or worktree points at gets one targeted lookup
+    // first; a lookup error aborts here, before any mutation.
+    const { orphans, notes } = await scanWithConfirm(board, locksDir, worktreesDir, nowMs);
+    // stderr: `scan`/`plan` stdout is JSON the z-loop skill pipes into jq.
+    for (const note of notes) console.error(note);
     const plan = reconcilePlan(orphans);
 
     if (cmd === "scan") {

@@ -40,11 +40,14 @@ import {
   applyReconcile,
   assertNotReconcilingLiveLoop,
   hasOrphans,
+  missingFromSweep,
   reconcileBoardMoves,
   reconcilePlan,
   scanOrphans,
+  scanWithConfirm,
   sweep,
   type ReconcileAction,
+  type ReconcileBoard,
   type ReconcileEffects,
 } from "../lib/reconcile.ts";
 import {
@@ -798,6 +801,157 @@ describe("control 2: orphan scan (crash recovery)", () => {
     expect(byKind(plan, "release-claim")).toEqual([]); // NEVER unassign it either
     expect(byKind(plan, "prune-worktree")).toEqual([5]); // just clear the crashed run's state
     expect(byKind(plan, "remove-lock")).toEqual([5]);
+  });
+
+  // -- #149: recovery never acts on absence -------------------------------------
+  // The sweep pages the board, so a lock's ticket missing from it is undecidable --
+  // and this is crash recovery, the worst possible moment to guess. Every
+  // sweep-missing ticket a lock or worktree points at gets ONE targeted
+  // `board.item(N)` before any release/park/prune decision about it.
+  //
+  // A board double whose sweep returns NOTHING (the transient empty read #127
+  // guarded elsewhere) but whose single-ticket lookups answer truthfully.
+  function confirmBoard(answers: Record<number, string | null>, onItem?: (n: number) => void): ReconcileBoard {
+    return {
+      list: async () => [],
+      item: async (n) => {
+        onItem?.(n);
+        const s = answers[n];
+        if (s === undefined) throw new Error(`board double: unexpected lookup for #${n}`);
+        if (s === null) return { number: n, present: false, reason: "not-on-project" };
+        return {
+          number: n,
+          present: true,
+          item: { number: n, title: `t${n}`, url: `u${n}`, fields: { Status: s } },
+          body: "",
+        };
+      },
+    };
+  }
+
+  test("AC1: an empty sweep drives NOTHING -- each crashed lane is planned from its confirmed status", async () => {
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    // A crashed run: #5 had already reached Done, #7 was mid-build, #9's worktree
+    // outlived its lock while the board still shows QA.
+    writeLaneLock(locksDir, { ticket: 5, stage: "merge", session: "dead", claimedAt: 0 });
+    writeLaneLock(locksDir, { ticket: 7, stage: "builder", session: "dead", claimedAt: 0 });
+    mkdirSync(join(worktreesDir, "ticket-5"));
+    mkdirSync(join(worktreesDir, "ticket-7"));
+    mkdirSync(join(worktreesDir, "ticket-9"));
+
+    const looked: number[] = [];
+    const board = confirmBoard({ 5: "Done", 7: "Building", 9: "QA" }, (n) => void looked.push(n));
+    const { orphans, notes } = await scanWithConfirm(board, locksDir, worktreesDir, 0);
+    expect(looked).toEqual([5, 7, 9]); // one targeted lookup per sweep-missing ticket
+    expect(orphans.crashedLanes.map((c) => c.boardStatus)).toEqual(["Done", "Building"]);
+
+    const plan = reconcilePlan(orphans);
+    // #5 is terminal: cleaned up, never reopened. Pre-#149 the empty sweep left it
+    // boardStatus-undefined -> treated as in-flight -> released + parked, throwing
+    // away a merged run.
+    expect(byKind(plan, "park-ready")).toEqual([7, 9]);
+    expect(byKind(plan, "release-claim")).toEqual([7, 9]);
+    expect(byKind(plan, "prune-worktree")).toEqual([5, 7, 9]);
+    expect(byKind(plan, "remove-lock")).toEqual([5, 7]);
+    expect(notes.join("\n")).toContain("CONFIRMS it is still on the board (Status: Done)");
+  });
+
+  test("AC2: a sweep-missing ticket the lookup proves is OFF the board is released + pruned, and logged", async () => {
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    writeLaneLock(locksDir, { ticket: 11, stage: "builder", session: "dead", claimedAt: 0 });
+    mkdirSync(join(worktreesDir, "ticket-11"));
+
+    const { orphans, notes } = await scanWithConfirm(confirmBoard({ 11: null }), locksDir, worktreesDir, 0);
+    expect(orphans.crashedLanes[0].absence).toBe("gone");
+
+    const plan = reconcilePlan(orphans);
+    expect(byKind(plan, "release-claim")).toEqual([11]);
+    expect(byKind(plan, "prune-worktree")).toEqual([11]);
+    expect(byKind(plan, "remove-lock")).toEqual([11]);
+    // Never park a ticket that is not on the project: board.move would throw and
+    // abort the apply midway, stranding the remaining locks.
+    expect(byKind(plan, "park-ready")).toEqual([]);
+    expect(notes[0]).toContain("#11");
+    expect(notes[0]).toContain("CONFIRMS it is off the board (not-on-project)");
+
+    // ...and the apply half really runs it.
+    const lockPath = join(locksDir, "ticket-11.json");
+    const pruned: string[] = [];
+    const released: number[] = [];
+    await applyReconcile(plan, {
+      removeLock: (p) => rmSync(p, { force: true }),
+      pruneWorktree: (_t, p) => void pruned.push(p),
+      parkReady: () => expect.unreachable("a confirmed-gone ticket must never be parked"),
+      releaseClaim: (n) => void released.push(n),
+    });
+    expect(existsSync(lockPath)).toBe(false);
+    expect(released).toEqual([11]);
+    expect(pruned[0]).toContain("ticket-11");
+  });
+
+  test("AC3: a failing lookup aborts the reconcile loudly, naming the ticket, with zero mutations", async () => {
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    writeLaneLock(locksDir, { ticket: 13, stage: "builder", session: "dead", claimedAt: 0 });
+    mkdirSync(join(worktreesDir, "ticket-13"));
+    const lockPath = join(locksDir, "ticket-13.json");
+
+    const board: ReconcileBoard = {
+      list: async () => [],
+      item: async () => {
+        throw new Error("GraphQL: 502 Bad Gateway");
+      },
+    };
+    await expect(scanWithConfirm(board, locksDir, worktreesDir, 0)).rejects.toThrow(
+      /Reconcile aborted on #13[\s\S]*502 Bad Gateway/
+    );
+    // Nothing was touched: the confirm pass runs before any effect.
+    expect(existsSync(lockPath)).toBe(true);
+    expect(existsSync(join(worktreesDir, "ticket-13"))).toBe(true);
+  });
+
+  test("a ticket the lookup finds in a status the loop does not drive is cleaned up, board untouched", async () => {
+    // A human dragged #15 into their own column, so the sweep's per-known-status
+    // listing never returns it. Parking it back to Ready would yank it out of that
+    // column; the safe recovery is the terminal one (prune + unlock only).
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    writeLaneLock(locksDir, { ticket: 15, stage: "qa", session: "dead", claimedAt: 0 });
+    mkdirSync(join(worktreesDir, "ticket-15"));
+
+    const { orphans, notes } = await scanWithConfirm(confirmBoard({ 15: "Icebox" }), locksDir, worktreesDir, 0);
+    expect(orphans.crashedLanes[0].absence).toBe("not-loop-driven");
+    const plan = reconcilePlan(orphans);
+    expect(byKind(plan, "prune-worktree")).toEqual([15]);
+    expect(byKind(plan, "remove-lock")).toEqual([15]);
+    expect(byKind(plan, "park-ready")).toEqual([]);
+    expect(byKind(plan, "release-claim")).toEqual([]);
+    expect(notes[0]).toContain('status "Icebox"');
+  });
+
+  test("reconcilePlan REFUSES an unconfirmed absence instead of treating it as in-flight", () => {
+    // The guard that makes the confirm pass mandatory: wire a raw sweep straight
+    // into the plan (what main() did before #149) and it throws rather than
+    // releasing + parking on silence.
+    const locksDir = tmp();
+    writeLaneLock(locksDir, { ticket: 21, stage: "builder", session: "dead", claimedAt: 0 });
+    expect(() => reconcilePlan(scanOrphans(locksDir, tmp(), [], 0))).toThrow(/Refusing to reconcile #21/);
+    // Same for a lockless worktree.
+    const worktreesDir = tmp();
+    mkdirSync(join(worktreesDir, "ticket-22"));
+    expect(() => reconcilePlan(scanOrphans(tmp(), worktreesDir, [], 0))).toThrow(/Refusing to reconcile #22/);
+  });
+
+  test("missingFromSweep names exactly the lock/worktree tickets the sweep did not return", () => {
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    writeLaneLock(locksDir, { ticket: 4, stage: "builder", session: "dead", claimedAt: 0 });
+    mkdirSync(join(worktreesDir, "ticket-6"));
+    const snapshot = [{ number: 4, status: "Building" as const }, { number: 8, status: "Ready" as const }];
+    const orphans = scanOrphans(locksDir, worktreesDir, snapshot, 0);
+    expect(missingFromSweep(orphans, snapshot)).toEqual([6]); // #4 observed, #8 has no on-disk state
   });
 
   test("no orphans -> empty plan, hasOrphans false", () => {
