@@ -20,6 +20,7 @@ import {
   markClaimLost,
   markHumanNeededNotified,
   countSuiteRuns,
+  detectGateScripts,
   foundNoTestFiles,
   mergeGate,
   MERGE_GATE_MAX_RUNS,
@@ -37,6 +38,7 @@ import {
   recordProbe,
   resolveStageModel,
   type Action,
+  type GateScripts,
   type LaneState,
   type LoopState,
   type Stage,
@@ -3107,7 +3109,7 @@ const suiteTail = (pass: number, fail: number) =>
 // Drives mergeGate over a scripted list of attempts. An attempt beyond the
 // script THROWS -- that is how "no retry happened" is proven, not by a count an
 // assertion could forget to check.
-function driveGate(runs: SuiteRun[]) {
+function driveGate(runs: SuiteRun[], scripts: GateScripts = { test: true, typecheck: true }) {
   const attempts: number[] = [];
   const waits: number[] = [];
   const verdict = mergeGate(
@@ -3117,7 +3119,9 @@ function driveGate(runs: SuiteRun[]) {
       if (!r) throw new Error(`gate ran attempt ${n}, only ${runs.length} scripted`);
       return r;
     },
-    (ms) => waits.push(ms)
+    (ms) => waits.push(ms),
+    MERGE_GATE_RETRY_WAIT_MS,
+    scripts
   );
   return { verdict, attempts, waits };
 }
@@ -3348,6 +3352,67 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
     });
   });
 
+  // -- AC4: a provably-absent script is skipped, both absent is a refusal -----
+  //
+  // Pinning both commands by name made the gate unpassable on any repo without
+  // a `typecheck` script: `bun run typecheck` exits 1 with `Script not found`,
+  // red is unbypassable, so every lane on such a repo parked Blocked forever.
+  // The amended plan skips only what `package.json` PROVES absent, keeps
+  // `bun test` mandatory wherever it is defined (so nothing above changes), and
+  // refuses outright when neither exists.
+  describe("the gauntlet runs only the scripts package.json defines (AC4)", () => {
+    test("detectGateScripts reads the two script names, and proves nothing on junk", () => {
+      expect(detectGateScripts('{"scripts":{"test":"bun test","typecheck":"tsc --noEmit"}}')).toEqual({ test: true, typecheck: true });
+      expect(detectGateScripts('{"scripts":{"test":"bun test"}}')).toEqual({ test: true, typecheck: false });
+      expect(detectGateScripts('{"scripts":{"typecheck":"tsc"}}')).toEqual({ test: false, typecheck: true });
+      expect(detectGateScripts('{"name":"x"}')).toEqual({ test: false, typecheck: false });
+      // No package.json (a Go checkout), unparseable JSON, and a non-string
+      // script value all mean "absent" -- which the gate turns into a REFUSAL,
+      // never a skip, so a broken manifest can never buy a merge.
+      expect(detectGateScripts(null)).toEqual({ test: false, typecheck: false });
+      expect(detectGateScripts("{not json")).toEqual({ test: false, typecheck: false });
+      expect(detectGateScripts('{"scripts":{"test":true,"typecheck":null}}')).toEqual({ test: false, typecheck: false });
+    });
+
+    test("`test` defined, `typecheck` absent: the suite alone reads GREEN", () => {
+      const { verdict, attempts, waits } = driveGate([{ exitCode: 0, output: suiteTail(1261, 0) }], { test: true, typecheck: false });
+      expect(verdict).toMatchObject({ green: true, attempts: 1, failCount: 0 });
+      expect(attempts).toEqual([1]); // no retry burned on a script that is simply not there
+      expect(waits).toEqual([]);
+    });
+
+    test("`test` defined, `typecheck` absent: a failing suite is still RED -- the skip is not a bypass", () => {
+      const { verdict } = driveGate([{ exitCode: 1, output: suiteTail(1252, 9) }], { test: true, typecheck: false });
+      expect(verdict).toMatchObject({ green: false, failCount: 9 });
+      expect(verdict.note).toContain("9 fail");
+    });
+
+    test("NEITHER script defined: refused before a single spawn, and never retried", () => {
+      // The scripted attempt list is EMPTY: driveGate throws if the gate runs
+      // anything at all, so "not run" is proven, not asserted about a counter.
+      const { verdict, attempts, waits } = driveGate([], { test: false, typecheck: false });
+      expect(verdict).toMatchObject({ green: false, attempts: 0, failCount: null });
+      expect(verdict.note).toContain("neither a `test` nor a `typecheck` script");
+      expect(verdict.note).toContain("refusing the merge");
+      expect(attempts).toEqual([]);
+      expect(waits).toEqual([]);
+    });
+
+    // `bun test` never ran, so there is no summary line, no banner and no fail
+    // count -- every check the suite path makes would read this as the "did not
+    // run" shape. The exit code is the whole verdict.
+    test("`typecheck` only: exit 0 is green, nonzero is red, on the exit code alone", () => {
+      const green = driveGate([{ exitCode: 0, output: "" }], { test: false, typecheck: true }).verdict;
+      expect(green).toMatchObject({ green: true, attempts: 1, failCount: null });
+      expect(green.note).toContain("no `test` script");
+      const tsErr = "lib/loop.ts(12,3): error TS2322: nope\n";
+      const red = driveGate([{ exitCode: 2, output: tsErr }, { exitCode: 2, output: tsErr }], { test: false, typecheck: true }).verdict;
+      expect(red).toMatchObject({ green: false, attempts: 2 });
+      expect(red.note).toContain("exited 2");
+      expect(red.note).toContain("refusing the merge");
+    });
+  });
+
   describe("parseSuiteFailCount reads the summary line only", () => {
     test("no summary line -> null", () => {
       expect(parseSuiteFailCount("error: EBUSY\nFAIL  merge-order\n(fail) something\n")).toBeNull();
@@ -3367,14 +3432,17 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
     const dir = mkdtempSync(join(tmpdir(), "zstack-merge-gate-"));
     afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
-    // A throwaway "worktree": one test file plus a typecheck script, so the
-    // gate's two real spawns stay well inside the gate budget. `typecheck`
-    // defaults to a no-op that always exits 0; a caller passing its own script
-    // is exercising the typecheck limb of the gauntlet.
-    function project(name: string, body: string, typecheck = "bun --version"): string {
+    // A throwaway "worktree": one test file plus the two scripts the gate now
+    // detects, so the gate's two real spawns stay well inside the gate budget.
+    // `typecheck` defaults to a no-op that always exits 0; a caller passing its
+    // own script is exercising the typecheck limb of the gauntlet. The scripts
+    // block is what runGauntlet keys off (#178 AC4) -- omitting `test` here
+    // would silently skip the suite limb in every case below, so it is
+    // explicit, and `scripts` overrides let the absent-script cases drop one.
+    function project(name: string, body: string, typecheck = "bun --version", scripts?: Record<string, string>): string {
       const p = join(dir, name);
       mkdirSync(p, { recursive: true });
-      writeFileSync(join(p, "package.json"), JSON.stringify({ name, scripts: { typecheck } }));
+      writeFileSync(join(p, "package.json"), JSON.stringify({ name, scripts: scripts ?? { test: "bun test", typecheck } }));
       writeFileSync(join(p, "x.test.ts"), body);
       return p;
     }
@@ -3418,6 +3486,46 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
       // 0 fail from the suite, nonzero from tsc: the exit code alone is the red.
       expect(verdict).toMatchObject({ green: false, failCount: 0, attempts: 2 });
       expect(verdict.note).toContain("exited 3");
+    });
+
+    // AC4, end to end on the real deployed path. QA's repro of the pinned
+    // gauntlet: `{"scripts":{"test":"bun test"}}` + a PASSING test returned
+    // {"green":false,"failCount":0,...gauntlet exited 1 with 0 fail...} because
+    // `bun run typecheck` on a missing script exits 1 with `Script not found`,
+    // so every lane on such a repo parked Blocked forever.
+    test("a passing suite with NO typecheck script is green -- the absent script is skipped, not run", () => {
+      const p = project("no-tc", PASSING, "", { test: "bun test" });
+      const proc = runGate(p, "--retry-wait-ms", "0");
+      expect(proc.exitCode).toBe(0);
+      const verdict = JSON.parse(proc.stdout.toString());
+      expect(verdict).toMatchObject({ green: true, attempts: 1, failCount: 0 });
+      // "not run": bun's `Script not found` never reaches the output the gate reads.
+      expect(verdict.note).not.toContain("Script not found");
+    });
+
+    test("a FAILING suite with no typecheck script is still red -- skipping typecheck is not a bypass", () => {
+      const proc = runGate(project("no-tc-red", FAILING, "", { test: "bun test" }), "--retry-wait-ms", "0");
+      expect(proc.exitCode).toBe(1);
+      expect(JSON.parse(proc.stdout.toString())).toMatchObject({ green: false, failCount: 1 });
+    });
+
+    test("a typecheck script with no test script gates on typecheck alone", () => {
+      expect(runGate(project("tc-only", PASSING, "", { typecheck: "bun --version" })).exitCode).toBe(0);
+      const p = project("tc-only-red", PASSING, "", { typecheck: "bun tc.ts" });
+      writeFileSync(join(p, "tc.ts"), "process.exit(3);\n");
+      const proc = runGate(p, "--retry-wait-ms", "0");
+      expect(proc.exitCode).toBe(1);
+      expect(JSON.parse(proc.stdout.toString()).note).toContain("exited 3");
+    });
+
+    test("NEITHER script defined -> refused, and a missing package.json refuses the same way", () => {
+      for (const p of [project("no-scripts", PASSING, "", {}), mkdtempSync(join(dir, "no-pkg-"))]) {
+        const proc = runGate(p, "--retry-wait-ms", "0");
+        expect(proc.exitCode).toBe(1);
+        const verdict = JSON.parse(proc.stdout.toString());
+        expect(verdict).toMatchObject({ green: false, attempts: 0, failCount: null });
+        expect(verdict.note).toContain("neither a `test` nor a `typecheck` script");
+      }
     });
 
     // QA finding 1, end to end on the real deployed path: `a.test.ts` fails,

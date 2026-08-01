@@ -187,10 +187,11 @@ bun "$PACK/lib/loop.ts" merge-gate .worktrees/ticket-<N> --state "$STATE" --tick
 
 What it does, in the lane's own worktree:
 
-1. Runs `bun test`, then `bun run typecheck` if the tests were clean — both with
-   color pinned off (`NO_COLOR=1`, `FORCE_COLOR=0`), because everything below
-   is read off those bytes and bun wraps its summary lines in escape codes the
-   moment the ambient environment asks for color.
+1. Runs `bun test`, then `bun run typecheck` if the tests were clean — whichever
+   of the two the worktree's own `package.json` defines (see *Which commands run*
+   below) — both with color pinned off (`NO_COLOR=1`, `FORCE_COLOR=0`), because
+   everything below is read off those bytes and bun wraps its summary lines in
+   escape codes the moment the ambient environment asks for color.
 2. Judges the result by two machine-readable facts only — the `N fail` count on
    the suite's **summary line** and the process **exit code**. Per-test `(fail)`
    lines and prose like `tests/e2e-check.test.ts`'s intentional
@@ -228,12 +229,34 @@ buried the cause. A genuine contention kill — bannerless, and with no such lin
 by construction: it can only reword a verdict that is already red, since green
 requires a summary line and this branch requires there be none.
 
-A repo with `bun test` but **no `typecheck` script** is red as well: `bun run
-typecheck` exits 1 with `Script not found`, and red is unbypassable by design.
-The gate's two commands are pinned by name, unlike the end-of-loop regression
-pass, which detects each gate from `package.json` and skips the ones that do not
-exist. On a target repo missing either command, every lane parks Blocked at the
-merge stage until it is added.
+### Which commands run
+
+The gauntlet's two limbs are detected from the merge worktree's own
+`package.json`, the same `HAS()` rule the end-of-loop regression pass uses —
+never assumed:
+
+| `scripts` in the worktree | What runs | Verdict read from |
+|---|---|---|
+| `test` **and** `typecheck` | both, typecheck only if the suite was clean | the suite summary + the exit code |
+| `test` only | `bun test` | the suite summary + the exit code |
+| `typecheck` only | `bun run typecheck` | the exit code alone (no suite ran, so `failCount` is `null`) |
+| neither, or no readable `package.json` | **nothing** | refused before the first spawn |
+
+Pinning both by name made the gate unpassable on any repo without a `typecheck`
+script: `bun run typecheck` on a missing script exits 1 with `Script not found`,
+red is unbypassable by design, and so every lane on such a repo parked Blocked
+at the merge stage forever. Only a **provably absent** script is skipped — it is
+not run and not counted red — and `bun test` stays mandatory wherever it is
+defined, so everything above about the summary line is untouched. Skipping is
+never a bypass: a failing suite on a repo with no `typecheck` script is still
+red, and a missing or unparseable `package.json` proves nothing, so it refuses
+rather than skips.
+
+Two limits are deliberate and unchanged. A checkout with no `package.json` at
+all (a Go repo, say) has no gate to detect and parks Blocked. And where a `test`
+script exists the gate runs `bun test`, not that script, so a vitest/jest repo
+has its `*.test.ts` run under bun — reading the summary line is the whole
+mechanism here, and replacing it is a different job.
 
 ### Who runs it, and why it cannot be skipped
 

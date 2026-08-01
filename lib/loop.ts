@@ -7,6 +7,7 @@
 // scheduling or transition decision in prose. No Date.now() outside the CLI
 // edge; every pure function takes nowMs.
 import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { atomicWrite, handleCliError, parseFlags, readJson, str } from "./cli.ts";
 import {
   BOARD_STATUSES,
@@ -1510,6 +1511,47 @@ export interface SuiteRun {
   output: string; // their combined stdout+stderr
 }
 
+// Which of the gauntlet's two commands the merge worktree actually defines.
+// Pinning both by name made every lane on a repo without a `typecheck` script
+// park Blocked forever: `bun run typecheck` on a missing script exits 1 with
+// `Script not found`, and red is unbypassable by design. Detection here is the
+// same `HAS()` rule the end-of-loop regression pass already uses (SKILL.md Step
+// 7a, "never assumed") -- a provably-absent script is skipped, never run and
+// never counted red. What it is NOT is a bypass: skipping needs proof of
+// absence from `package.json`, and with neither script defined there is no gate
+// left to run, so the gate refuses.
+export interface GateScripts {
+  test: boolean;
+  typecheck: boolean;
+}
+
+// Both true is the fail-closed default: a caller that cannot say what exists
+// gets the full gauntlet, not a skip.
+export const ALL_GATE_SCRIPTS: GateScripts = { test: true, typecheck: true };
+
+// `package.json`'s `scripts` as the gate reads it. Unreadable, unparseable, or
+// absent all mean "no scripts proven present", which the gate turns into a
+// refusal rather than a skip -- exactly the reading a Go checkout gets.
+export function detectGateScripts(packageJsonText: string | null): GateScripts {
+  let scripts: unknown;
+  try {
+    scripts = packageJsonText === null ? undefined : (JSON.parse(packageJsonText) as { scripts?: unknown }).scripts;
+  } catch {
+    scripts = undefined;
+  }
+  const has = (name: string): boolean =>
+    typeof scripts === "object" && scripts !== null && typeof (scripts as Record<string, unknown>)[name] === "string";
+  return { test: has("test"), typecheck: has("typecheck") };
+}
+
+export function readGateScripts(worktree: string): GateScripts {
+  try {
+    return detectGateScripts(readFileSync(join(worktree, "package.json"), "utf8"));
+  } catch {
+    return detectGateScripts(null);
+  }
+}
+
 export interface MergeGateVerdict {
   green: boolean;
   attempts: number; // 1 or 2 -- exactly one retry is allowed, for contention
@@ -1596,8 +1638,23 @@ export function parseSuiteFailCount(output: string): number | null {
 // actually started, a summary line to read a count off, and as many runs
 // finished as started (so that count is THIS run's verdict and not a nested
 // run's). Anything else refuses the merge.
-function judgeSuiteRun(run: SuiteRun, attempt: number): MergeGateVerdict {
+function judgeSuiteRun(run: SuiteRun, attempt: number, scripts: GateScripts = ALL_GATE_SCRIPTS): MergeGateVerdict {
   const failCount = parseSuiteFailCount(run.output);
+  // No `test` script: `bun test` was never spawned, so there is no summary line,
+  // no banner and no fail count to demand -- every check below would read the
+  // absent suite as the "did not run" shape and refuse a repo the amended plan
+  // says to gate on `bun run typecheck` alone. The exit code is the whole
+  // verdict here, and `failCount: null` keeps the JSON honest about it.
+  if (!scripts.test) {
+    return run.exitCode === 0
+      ? { green: true, attempts: attempt, failCount: null, note: `merge gate GREEN on attempt ${attempt}: exit 0 (typecheck only -- no \`test\` script in package.json)` }
+      : {
+          green: false,
+          attempts: attempt,
+          failCount: null,
+          note: `merge gate RED on attempt ${attempt}: \`bun run typecheck\` exited ${run.exitCode} (no \`test\` script in package.json, so typecheck is the whole gate) -- refusing the merge`,
+        };
+  }
   const red = (why: string): MergeGateVerdict => ({ green: false, attempts: attempt, failCount, note: `${why} -- refusing the merge` });
   // Names which of the two it is instead of the blanket "the suite did not run"
   // or "gauntlet exited N": this gate shells `bun test` then `bun run
@@ -1654,12 +1711,24 @@ function judgeSuiteRun(run: SuiteRun, attempt: number): MergeGateVerdict {
 export function mergeGate(
   runAttempt: (attempt: number) => SuiteRun,
   sleep: (ms: number) => void,
-  retryWaitMs: number = MERGE_GATE_RETRY_WAIT_MS
+  retryWaitMs: number = MERGE_GATE_RETRY_WAIT_MS,
+  scripts: GateScripts = ALL_GATE_SCRIPTS
 ): MergeGateVerdict {
-  const first = judgeSuiteRun(runAttempt(1), 1);
+  // Neither command defined: nothing to run, so nothing to vouch for. Refused
+  // before the first attempt and never retried -- a missing script is a fact
+  // about the checkout, not contention, and 15s does not make one appear.
+  if (!scripts.test && !scripts.typecheck) {
+    return {
+      green: false,
+      attempts: 0,
+      failCount: null,
+      note: "merge gate RED: the worktree's package.json defines neither a `test` nor a `typecheck` script (or has no readable package.json), so the gate has nothing to run -- refusing the merge",
+    };
+  }
+  const first = judgeSuiteRun(runAttempt(1), 1, scripts);
   if (first.green || (first.failCount !== null && first.failCount > 0)) return first;
   sleep(retryWaitMs);
-  return judgeSuiteRun(runAttempt(2), 2);
+  return judgeSuiteRun(runAttempt(2), 2, scripts);
 }
 
 // The real attempt: `bun test` then, only if that is clean, `bun run typecheck`
@@ -1671,12 +1740,18 @@ export function mergeGate(
 // under FORCE_COLOR: without this the verdict would depend on whichever tool
 // happened to launch the orchestrator (measured: a passing project reads
 // `{"green":false,...,"failCount":null}` under FORCE_COLOR=1).
-function runGauntlet(cwd: string): SuiteRun {
+// Only the limbs `scripts` proves exist are spawned; mergeGate has already
+// refused the both-absent case, so at least one always runs.
+function runGauntlet(cwd: string, scripts: GateScripts = ALL_GATE_SCRIPTS): SuiteRun {
   const dec = (b: unknown): string => (b instanceof Uint8Array ? new TextDecoder().decode(b) : "");
   const env = { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" };
-  const test = Bun.spawnSync([process.execPath, "test"], { cwd, stdout: "pipe", stderr: "pipe", env });
-  const testOut = dec(test.stdout) + dec(test.stderr);
-  if (test.exitCode !== 0) return { exitCode: test.exitCode, output: testOut };
+  let testOut = "";
+  if (scripts.test) {
+    const test = Bun.spawnSync([process.execPath, "test"], { cwd, stdout: "pipe", stderr: "pipe", env });
+    testOut = dec(test.stdout) + dec(test.stderr);
+    if (test.exitCode !== 0) return { exitCode: test.exitCode, output: testOut };
+  }
+  if (!scripts.typecheck) return { exitCode: 0, output: testOut };
   const tc = Bun.spawnSync([process.execPath, "run", "typecheck"], { cwd, stdout: "pipe", stderr: "pipe", env });
   return { exitCode: tc.exitCode, output: testOut + dec(tc.stdout) + dec(tc.stderr) };
 }
@@ -1698,8 +1773,9 @@ const USAGE = `loop <command> [args]
                                                      print the resolved model name for that stage
                                                      (config stageModels override, else ticketModel)
   merge-gate <worktreePath> [--state <state.json> --ticket <N>] [--retry-wait-ms N]
-                                                     run the pre-merge gauntlet (bun test + typecheck) in
-                                                     that worktree and print the verdict JSON; exit 0 ONLY
+                                                     run the pre-merge gauntlet (bun test + typecheck, whichever
+                                                     of the two that worktree's package.json defines; neither
+                                                     defined is a refusal) and print the verdict JSON; exit 0 ONLY
                                                      when green (#178) -- nothing merges on a nonzero exit.
                                                      With --state/--ticket, stamps the verdict on that lane:
                                                      "next" will not advance a lane to merge without a green one
@@ -1890,9 +1966,17 @@ export function main(argv: string[]): number {
       let verdict: MergeGateVerdict;
       try {
         if (!existsSync(worktree)) throw new ZError(`Merge gate: worktree ${worktree} does not exist.`);
+        // Which limbs to run is read off the worktree's own package.json, once,
+        // before any spawn -- the same detection the end-of-loop regression pass
+        // does, so an absent script is skipped instead of exiting 1 and parking
+        // every lane on that repo forever.
+        const gateScripts = readGateScripts(worktree);
         // The sha is captured AFTER the gauntlet, from the tree the gauntlet
         // actually ran on, so a verdict never names a commit it did not test.
-        verdict = { ...mergeGate(() => runGauntlet(worktree), (ms) => Bun.sleepSync(ms), retryWaitMs), commit: gitHead(worktree) };
+        verdict = {
+          ...mergeGate(() => runGauntlet(worktree, gateScripts), (ms) => Bun.sleepSync(ms), retryWaitMs, gateScripts),
+          commit: gitHead(worktree),
+        };
       } catch (e) {
         // Standalone (a merge agent's own run): keep the loud CLI error. Stamping
         // (the loop's own run): a gate that cannot RUN is a red gate, not a
