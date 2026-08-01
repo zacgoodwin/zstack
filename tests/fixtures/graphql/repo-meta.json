@@ -13,5 +13,6 @@
         { "id": "LBL_feat", "name": "feature" }
       ]
     }
-  }
+  },
+  "rateLimit": { "remaining": 5000, "resetAt": "2026-07-19T00:00:00Z" }
 }

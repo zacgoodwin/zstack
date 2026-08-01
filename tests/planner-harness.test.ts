@@ -666,6 +666,10 @@ describe("board-double: handleGh", () => {
     expect(nodes).toHaveLength(1);
     expect(nodes[0].content.number).toBe(501);
     expect(nodes[0].fieldValues.nodes[0]).toMatchObject({ name: "Backlog", field: { name: "Status" } });
+    // #153: lib/board.ts reads its quota from the block riding each QUERY
+    // response and throws if it is absent. Without this the paid eval would
+    // die on its first board read instead of here.
+    expect(body.data.rateLimit.remaining).toBeGreaterThan(200);
   });
 
   test("an unexpected write mutation fails loudly instead of faking a silent success", () => {

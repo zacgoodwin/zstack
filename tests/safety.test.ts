@@ -773,6 +773,8 @@ describe("control 2: orphan scan (crash recovery)", () => {
       if (op === "RateLimit") return { rateLimit: { remaining: 5000, resetAt: "2026-07-19T00:00:00Z" } };
       if (op === "ProjectItems")
         return {
+          // #153: every query response carries the piggybacked reading.
+          rateLimit: { remaining: 5000, resetAt: "2026-07-19T00:00:00Z" },
           node: {
             items: {
               // Real responses always carry pageInfo (selected in the query);
@@ -847,14 +849,17 @@ function opName(query: string): string {
 function claimBackend(initial: string[] = []): GraphQLExecutor {
   const assignees = [...initial];
   const login = (userId: string) => userId.replace(/^U_/, "");
+  // #153: QUERY responses carry the piggybacked reading (rateLimit is a field
+  // of GitHub's Query root); mutation responses never do.
+  const RL = { remaining: 5000, resetAt: "2026-07-19T00:00:00Z" };
   return async (query, vars: any) => {
     switch (opName(query)) {
       case "RateLimit":
-        return { rateLimit: { remaining: 5000, resetAt: "2026-07-19T00:00:00Z" } };
+        return { rateLimit: RL };
       case "IssueLookup":
-        return { repository: { issue: { id: "I_9", number: 9, title: "t", body: "", assignees: { nodes: assignees.map((l) => ({ login: l })) }, projectItems: { nodes: [{ id: "PVTI_9", project: { number: 1 } }] } } } };
+        return { rateLimit: RL, repository: { issue: { id: "I_9", number: 9, title: "t", body: "", assignees: { nodes: assignees.map((l) => ({ login: l })) }, projectItems: { nodes: [{ id: "PVTI_9", project: { number: 1 } }] } } } };
       case "UserId":
-        return { user: { id: `U_${vars.login}` } };
+        return { rateLimit: RL, user: { id: `U_${vars.login}` } };
       case "AddAssignees": {
         const l = login(vars.user);
         if (!assignees.includes(l)) assignees.push(l);
@@ -866,7 +871,7 @@ function claimBackend(initial: string[] = []): GraphQLExecutor {
         return { removeAssigneesFromAssignable: { clientMutationId: null } };
       }
       case "IssueAssignees":
-        return { repository: { issue: { assignees: { nodes: assignees.map((l) => ({ login: l })) } } } };
+        return { rateLimit: RL, repository: { issue: { assignees: { nodes: assignees.map((l) => ({ login: l })) } } } };
       default:
         throw new Error(`claimBackend: unexpected op ${opName(query)}`);
     }
@@ -990,18 +995,46 @@ describe("control 5: quota guard (pause/resume, no bypass)", () => {
   const LOW: GraphQLData = { rateLimit: { remaining: 150, resetAt: "2026-07-18T23:30:00Z" } };
   const HEALTHY: GraphQLData = { rateLimit: { remaining: 5000, resetAt: "2026-07-19T00:00:00Z" } };
 
-  // Executor for a loop board sweep: RateLimit responses come from a queue (low
-  // first, then healthy = the window reset); list ops return empty item sets.
-  function sweepExecutor(rateLimits: GraphQLData[], calls: string[]): GraphQLExecutor {
+  // Executor for a loop board sweep: readings come from a queue (low first,
+  // then healthy = the window reset); list ops return empty item sets. #153:
+  // the queue feeds the piggybacked block on every QUERY response too, since
+  // that is where the guard now gets most of its readings. `docs` records the
+  // exact document each call sent, so a test can prove WHAT went out.
+  function sweepExecutor(rateLimits: GraphQLData[], calls: string[], docs: string[] = []): GraphQLExecutor {
     let i = 0;
+    const next = () => rateLimits[Math.min(i++, rateLimits.length - 1)];
     return async (query) => {
       const op = opName(query);
       calls.push(op);
-      if (op === "RateLimit") return rateLimits[Math.min(i++, rateLimits.length - 1)];
-      if (op === "ProjectItems") return { node: { items: { nodes: [] } } };
+      docs.push(query);
+      if (op === "RateLimit") return next();
+      if (op === "ProjectItems") return { ...next(), node: { items: { nodes: [] } } };
+      if (op === "IssueLookup")
+        return {
+          ...next(),
+          repository: {
+            issue: {
+              id: "I_1",
+              number: 1,
+              title: "t",
+              body: "",
+              assignees: { nodes: [] },
+              projectItems: { pageInfo: { hasNextPage: false }, nodes: [{ id: "PVTI_1", project: { number: 1 } }] },
+            },
+          },
+        };
+      // A mutation reaching the executor is the FAILURE the guard tests below
+      // watch for, so it must succeed rather than throw -- an unguarded write
+      // has to show up as an extra entry in `calls`, not as an error that could
+      // be mistaken for the guard firing.
+      if (op === "SetSingleSelect") return { updateProjectV2ItemFieldValue: { clientMutationId: null } };
       throw new Error(`unexpected op ${op}`);
     };
   }
+  // Same board, abort mode: the guard firing is directly observable as a throw
+  // BEFORE the guarded op goes out, which is what makes the proofs below
+  // runtime proofs rather than shape checks.
+  const ABORT_CFG: BoardConfig = { ...CFG, quota: { threshold: 200, mode: "abort" } };
 
   test("remaining < threshold mid-sweep sleeps until reset, then resumes", async () => {
     const slept: number[] = [];
@@ -1019,16 +1052,59 @@ describe("control 5: quota guard (pause/resume, no bypass)", () => {
     expect(slept).toEqual([at("2026-07-18T23:30:00Z") - at("2026-07-18T23:00:00Z")]); // paused exactly once, 30 min
   });
 
+  // #153 moved WHERE the reading comes from (the previous response, not a probe
+  // before every call) without moving the guard itself. The invariant this
+  // proves is unchanged and it is proved the same way as before -- by watching
+  // the guard FIRE: in abort mode a low reading must stop the guarded op before
+  // it reaches the executor, so anything that shows up in `calls` after a low
+  // reading arrived got there unguarded. A shape check on the outgoing document
+  // cannot prove this: piggybackRateLimit() rewrites the query whether or not
+  // enforceQuota() ran.
   test("no code path reaches the executor without the guard (runtime proof)", async () => {
+    // 1. Cold: the process-start probe reads low. The list query never goes out.
+    const cold: string[] = [];
+    const coldBoard = new Board(ABORT_CFG, sweepExecutor([LOW], cold), async () => {});
+    await expect(coldBoard.list("Building")).rejects.toThrow(/quota exhausted/);
+    expect(cold).toEqual(["RateLimit"]);
+
+    // 2. Warm, query path: the reading rode the PREVIOUS response. The guard has
+    // to re-run on it -- a guard that ran once per process and then trusted its
+    // cache forever would let this second list straight through.
+    const warm: string[] = [];
+    const warmBoard = new Board(ABORT_CFG, sweepExecutor([HEALTHY, LOW], warm), async () => {});
+    await warmBoard.list("Building"); // probe HEALTHY; this response piggybacks LOW
+    await expect(warmBoard.list("QA")).rejects.toThrow(/quota exhausted/);
+    expect(warm).toEqual(["RateLimit", "ProjectItems"]); // the second list never went out
+
+    // 3. Warm, mutation path: a mutation carries no reading of its own, so it is
+    // judged entirely by the one that rode the preceding query. The write must
+    // not reach the executor.
+    const write: string[] = [];
+    const writeBoard = new Board(ABORT_CFG, sweepExecutor([HEALTHY, LOW], write), async () => {});
+    await expect(writeBoard.move(1, "Ready")).rejects.toThrow(/quota exhausted/);
+    expect(write).toEqual(["RateLimit", "IssueLookup"]); // SetSingleSelect never went out
+  });
+
+  // The #153 request-count claim, stated as the invariant production actually
+  // holds: WITHIN one process the probe is spent once and every query after it
+  // carries its own reading. Mutations carry none -- rateLimit is a field of
+  // GitHub's Query root, and appending it to a mutation is a validation error --
+  // so they ride the freshest query reading. (They are NOT always preceded by a
+  // query: create() issues CreateIssue then AddProjectItem back to back.)
+  test("within one process the probe is spent once and every query carries its own reading", async () => {
     const calls: string[] = [];
-    const board = new Board(CFG, sweepExecutor([HEALTHY], calls), async () => {});
+    const docs: string[] = [];
+    const board = new Board(CFG, sweepExecutor([HEALTHY], calls, docs), async () => {});
     await board.list("Building");
-    await board.move(0, "Ready").catch(() => {}); // move probes too; item lookup may 404, fine
-    // Every real backend op is immediately preceded by a RateLimit probe.
-    for (let i = 0; i < calls.length; i++) {
-      if (calls[i] !== "RateLimit") expect(calls[i - 1]).toBe("RateLimit");
+    await board.move(1, "Ready");
+    const carries = (doc: string) => /rateLimit \{ remaining resetAt \}/.test(doc);
+
+    expect(calls[0]).toBe("RateLimit"); // first call of the process: no reading to ride yet
+    expect(calls.filter((c) => c === "RateLimit").length).toBe(1); // ...and never again
+    for (let i = 1; i < calls.length; i++) {
+      expect(carries(docs[i])).toBe(!/^\s*mutation\b/.test(docs[i]));
     }
-    expect(calls.filter((c) => c === "ProjectItems").length).toBeGreaterThan(0);
+    expect(calls).toEqual(["RateLimit", "ProjectItems", "IssueLookup", "SetSingleSelect"]);
   });
 
   test("no code path reaches the executor without the guard (structural proof)", () => {
@@ -1037,9 +1113,15 @@ describe("control 5: quota guard (pause/resume, no bypass)", () => {
     // the zero-cost rate-limit probe. There is exactly ONE dynamic exec, so no
     // subcommand can pass an arbitrary query to the backend except through gql.
     const execArgs = [...src.matchAll(/this\.exec\((\w+)/g)].map((m) => m[1]);
-    expect(execArgs.filter((a) => a !== "Q_RATE_LIMIT")).toEqual(["query"]);
-    // ...and that single funnel is guarded: enforceQuota runs immediately before it.
-    expect(src).toMatch(/enforceQuota\(\);\s*return this\.exec\(query, variables\);/);
+    expect(execArgs.filter((a) => a !== "Q_RATE_LIMIT")).toEqual(["doc"]);
+    // ...and that single funnel is guarded: enforceQuota runs immediately
+    // before it, on a reading that is validated immediately after it (#153) --
+    // so a response that silently loses the block throws rather than leaving
+    // the next call to run on nothing.
+    expect(src).toMatch(
+      /enforceQuota\(\);\s*const doc = piggybackRateLimit\(query\);\s*const data = await this\.exec\(doc, variables\);/
+    );
+    expect(src).toMatch(/this\.lastQuota = readRateLimit\(data\.rateLimit,/);
     // Real operations go through gql (the guarded funnel), many of them.
     expect([...src.matchAll(/this\.gql\(/g)].length).toBeGreaterThan(5);
   });

@@ -78,15 +78,19 @@ function projectItemsData(fx: BoardDoubleFixture): unknown {
   };
 }
 
+// Healthy quota, far in the future: Step 0's `z-board quota` precondition and
+// the guard inside every gql() call both pass with no sleep/abort. #153: this
+// rides every QUERY response as well, exactly as GitHub returns it, since the
+// guard now reads it from there instead of probing before each call.
+const HEALTHY_RATE_LIMIT = { remaining: 5000, resetAt: "2099-01-01T00:00:00Z" };
+
 function routeGraphQL(query: string, fx: BoardDoubleFixture): unknown {
   const op = opName(query);
   switch (op) {
     case "RateLimit":
-      // Healthy quota, far in the future: Step 0's `z-board quota` precondition
-      // and the guard inside every gql() call both pass with no sleep/abort.
-      return { rateLimit: { remaining: 5000, resetAt: "2099-01-01T00:00:00Z" } };
+      return { rateLimit: HEALTHY_RATE_LIMIT };
     case "ProjectItems":
-      return projectItemsData(fx);
+      return { rateLimit: HEALTHY_RATE_LIMIT, ...(projectItemsData(fx) as object) };
     default:
       // A read-only --dry-run --backlog pass never issues a write mutation
       // (SetSingleSelect/SetNumber/SetText/AddComment/UpdateIssueBody) -- one
