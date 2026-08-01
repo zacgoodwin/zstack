@@ -27,10 +27,13 @@ import {
   parseStageResult,
   partitionKnownStatus,
   MAX_COMMIT_RETRIES,
+  MAX_DEAD_RESPAWNS,
   MAX_QUORUM_RETRIES,
   recordOutcome,
   recordProbe,
   resolveStageModel,
+  stageAttempt,
+  worktreeHoldsWork,
   type Action,
   type LaneState,
   type LoopState,
@@ -51,6 +54,7 @@ import {
   watchdogExpired,
 } from "../lib/lanes.ts";
 import type { BoardStatus } from "../lib/loop.ts";
+import { ALLOWED_LANE_KEYS } from "../evals/e2e/assertions.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 
@@ -920,7 +924,8 @@ describe("built guard: clean tree + moved HEAD (#177)", () => {
     expect(skill).toMatch(/from `builder`[^|]*`commitNotes`/);
     // Without commitRetries in the attempt count, the re-spawned builder's
     // transcript overwrites its predecessor's -- a silent Actual undercount.
-    expect(skill).toContain("qaBounces + reviewBounces + commitRetries + 1");
+    // (#209 moved the count itself into `loop.ts attempt` and added respawns.)
+    expect(skill).toContain("qaBounces + reviewBounces + commitRetries + respawns.builder + 1");
     const docs = readFileSync(join(REPO_ROOT, "docs", "user-guide", "z-loop.md"), "utf8");
     expect(docs).toMatch(/`git status --porcelain --branch` must report a clean tree/);
     expect(docs).toMatch(/`HEAD` must have moved off the base branch/);
@@ -1394,6 +1399,347 @@ describe("dead merge worker path", () => {
   });
 });
 
+// -- #209: a stage that died without a marker, holding finished work ----------
+//
+// Run 11's #170 builder addressed both reviewer findings, backgrounded its own
+// `bun test`, and ended its turn waiting on it. A markerless final message parses
+// as CONFUSED, and the only answer the machine had was `skip` -- discarding
+// `lib/cost.ts` + `tests/cost.test.ts` sitting uncommitted in the worktree along
+// with the $2.11 that spawn had already spent. The recovery is a bounded
+// re-spawn at the SAME stage; the cap is what keeps it from becoming the
+// unbounded retry loop the straight-to-skip design was avoiding.
+
+describe("dead-worker re-spawn (#209)", () => {
+  const MIN = 60_000;
+  const NOW = 11 * MIN; // past the 10-minute watchdog
+  // The exact shape run 11 left behind, and its counterpart.
+  const DIRTY = "## z/ticket-1\n M lib/cost.ts\n M tests/cost.test.ts\n";
+  const CLEAN = "## z/ticket-1...origin/main\n";
+
+  // A lane whose worker went silent and probed dead, with the worktree facts the
+  // orchestrator collected at probe time (omitted entirely = a pre-#209 probe).
+  function deadLane(porcelain: string | undefined, over: Partial<LaneState> = {}, stage: Stage = "builder"): LoopState {
+    const status = stage === "builder" ? "Building" : stage === "qa" ? "QA" : "Review";
+    const s = state([ticket(1, status)], [lane(1, stage, { lastActivityMs: 0, ...over })]);
+    return recordProbe(s, 1, false, NOW, porcelain);
+  }
+
+  test("AC2: dead with no marker + a dirty worktree -> respawn at the same stage, next attempt", () => {
+    let s = deadLane(DIRTY);
+    expect(s.lanes[0].worktreeDirty).toBe(true);
+    const a = nextAction(s, NOW);
+    expect(a.kind).toBe("respawn");
+    const r = a as { ticket: number; stage: Stage; attempt: number; note: string };
+    expect(r.ticket).toBe(1);
+    expect(r.stage).toBe("builder"); // SAME stage -- not a rebuild from Ready
+    // The dead spawn was attempt 1; re-using its tag makes `transcripts collect`
+    // refuse and re-using its <stage>-<attempt> name overwrites its transcript.
+    expect(r.attempt).toBe(2);
+    s = applyAction(s, a, NOW);
+    expect(s.lanes[0].stage).toBe("builder");
+    expect(s.tickets[0].status).toBe("Building"); // no board move: it never left
+    expect(s.lanes[0].respawns).toEqual({ builder: 1 }); // spent against THIS stage
+
+    expect(s.lanes[0].workerDead).toBeUndefined(); // fresh agent, fresh probe state
+    expect(s.lanes[0].worktreeDirty).toBeUndefined();
+    expect(s.lanes[0].lastActivityMs).toBe(NOW); // watchdog baseline restarts
+    // The action's attempt and the CLI's post-apply reading are the same number.
+    expect(stageAttempt(s.lanes[0])).toBe(r.attempt);
+  });
+
+  test("AC3: a second silent death spends no further respawn -- the cap holds", () => {
+    const s = deadLane(DIRTY, { respawns: { builder: MAX_DEAD_RESPAWNS } });
+    const a = nextAction(s, NOW);
+    expect(a.kind).toBe("skip");
+    expect((a as { note: string }).note).toContain("not a slip");
+  });
+
+  // The Plan's words are "a hard cap -- one respawn per stage per lane", and the
+  // difference is not cosmetic: a builder that died silently is no evidence at all
+  // about the QA agent that runs after it, so a lane-wide counter would spend QA's
+  // only recovery on the builder's failure and skip a ticket whose QA worktree
+  // holds real work. Driven through the reducer, because the budget is only
+  // per-stage if applyAction keys it that way.
+  describe("the cap is per (stage, lane), not per lane", () => {
+    test("a spent builder re-spawn still leaves QA its own", () => {
+      let s = deadLane(DIRTY);
+      s = applyAction(s, nextAction(s, NOW), NOW); // builder's one re-spawn, spent
+      expect(s.lanes[0].respawns).toEqual({ builder: 1 });
+      // ...the fresh builder succeeds and the lane moves on to QA...
+      s = applyAction(s, { kind: "advance", ticket: 1, to: "qa" }, NOW);
+      // ...where the QA agent dies exactly the same way.
+      s = recordProbe(s, 1, false, 2 * NOW, DIRTY);
+      const a = nextAction(s, 2 * NOW);
+      expect(a.kind).toBe("respawn"); // NOT skip: builder's budget was not QA's
+      expect((a as { stage: Stage }).stage).toBe("qa");
+      s = applyAction(s, a, 2 * NOW);
+      expect(s.lanes[0].respawns).toEqual({ builder: 1, qa: 1 });
+      // Each stage's own budget is now spent, and each holds independently.
+      s = recordProbe(s, 1, false, 3 * NOW, DIRTY);
+      expect(nextAction(s, 3 * NOW).kind).toBe("skip");
+    });
+
+    test("a builder re-spawn does not shift QA's attempt numbering", () => {
+      let s = deadLane(DIRTY);
+      s = applyAction(s, nextAction(s, NOW), NOW);
+      expect(stageAttempt(s.lanes[0])).toBe(2); // builder's SECOND spawn
+      s = applyAction(s, { kind: "advance", ticket: 1, to: "qa" }, NOW);
+      expect(stageAttempt(s.lanes[0])).toBe(1); // QA's FIRST, not its second
+    });
+  });
+
+  test("AC4: dead with a CLEAN worktree still skips, with the pre-#209 note verbatim", () => {
+    const s = deadLane(CLEAN);
+    expect(s.lanes[0].worktreeDirty).toBe(false);
+    expect(nextAction(s, NOW)).toEqual({
+      kind: "skip",
+      ticket: 1,
+      note: "Worker died mid-builder: silent past the 10-minute watchdog and not alive on probe. Skipped per the PROCESS.md no-token-burn rule; worktree left for inspection.",
+    });
+  });
+
+  // A state file written before this ticket (or an orchestrator that skipped the
+  // status collection) carries no worktree facts at all: unchanged behavior.
+  test("no worktree facts at all -> the old skip, no respawn spent", () => {
+    const s = deadLane(undefined);
+    expect(s.lanes[0].worktreeDirty).toBeUndefined();
+    expect(nextAction(s, NOW).kind).toBe("skip");
+  });
+
+  // The `> file` redirect creates the file BEFORE git runs, so a failed status
+  // leaves an EMPTY file. #177 refuses to read that as a clean tree; the same
+  // payload here must not read as "nothing to recover" and discard the work.
+  // Failing this direction costs at most one bounded re-spawn.
+  test("an unreadable status payload buys the respawn rather than discarding the lane", () => {
+    expect(worktreeHoldsWork("")).toBe(true);
+    expect(worktreeHoldsWork("## z/ticket-1\n")).toBe(false);
+    expect(worktreeHoldsWork("## z/ticket-1\n?? tests/new.test.ts\n")).toBe(true); // untracked counts
+    expect(nextAction(deadLane(""), NOW).kind).toBe("respawn");
+  });
+
+  test("a QA lane recovers the same way; a reviewer lane never does", () => {
+    expect(nextAction(deadLane(DIRTY, {}, "qa"), NOW).kind).toBe("respawn");
+    // The reviewer executes in a THROWAWAY worktree, so a dirty lane worktree is
+    // not its work -- and its four-key blinded input has nowhere to put a "your
+    // predecessor left this" briefing. A thin review is #191's retry, not this.
+    expect(nextAction(deadLane(DIRTY, {}, "reviewer"), NOW).kind).toBe("skip");
+  });
+
+  test("a dead MERGE lane is still held at check-worker, dirty worktree or not (H9)", () => {
+    const s = state([ticket(1, "Review")], [lane(1, "merge", { lastActivityMs: 0 })]);
+    const probed = recordProbe(s, 1, false, NOW, DIRTY);
+    expect(nextAction(probed, NOW)).toEqual({ kind: "check-worker", ticket: 1 });
+  });
+
+  // Four failures, four budgets: a worker dying silently must not consume the
+  // rebuild a QA bug, a reviewer finding, or a missed commit is holding.
+  test("a respawn spends only respawns, and the other three counters stay put", () => {
+    let s = deadLane(DIRTY, { qaBounces: 1, reviewBounces: 1, commitRetries: 1 });
+    s = applyAction(s, nextAction(s, NOW), NOW);
+    expect(s.lanes[0].respawns).toEqual({ builder: 1 });
+    expect(s.lanes[0].qaBounces).toBe(1);
+    expect(s.lanes[0].reviewBounces).toBe(1);
+    expect(s.lanes[0].commitRetries).toBe(1);
+    // Every re-spawn route counts toward the attempt, so no two spawns of this
+    // lane's builder can mint the same tag: 1 + 1 + 1 + 1 + 1.
+    expect(stageAttempt(s.lanes[0])).toBe(5);
+  });
+
+  // This stage's ONE re-spawn, then the skip -- driven end to end, because without
+  // applyAction's increment `spent` never grows and a lane whose environment
+  // keeps killing workers re-spawns forever on the loop's money.
+  test("the sequence converges: respawn once, then Skipped", () => {
+    let s = deadLane(DIRTY);
+    s = applyAction(s, nextAction(s, NOW), NOW);
+    s = recordProbe(s, 1, false, 2 * NOW, DIRTY); // dies the same way again
+    const a = nextAction(s, 2 * NOW);
+    expect(a.kind).toBe("skip");
+    s = applyAction(s, a, 2 * NOW);
+    expect(s.tickets[0].status).toBe("Skipped");
+    expect(s.lanes).toEqual([]);
+  });
+
+  // Skipping removes the lane lock, and a lockless worktree is force-removed by
+  // the next run's reconcile scan -- so a skip note promising "worktree left for
+  // inspection" would be pointing the human at a directory the loop deletes.
+  // Same salvage contract as #177's park, keyed on the same phrase.
+  test("the cap-exhausted skip names a durable salvage patch, and the SKILL dumps it", () => {
+    const s = deadLane(DIRTY, { respawns: { builder: MAX_DEAD_RESPAWNS } });
+    const note = (nextAction(s, NOW) as { note: string }).note;
+    expect(note.startsWith("Worker died mid-")).toBe(true); // the SKILL's Notify key
+    expect(note).toContain("uncommitted work"); // the SKILL's salvage-dump key
+    expect(note).toContain("reports/uncommitted-1.patch");
+    expect(note).toContain("git apply");
+    expect(note).toContain("force-removes it");
+    expect(note).not.toContain("worktree left for inspection");
+    const skill = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
+    const has = (x: string) => skill.includes(x); // booleans: a miss must not dump 60KB
+    expect(has(`git -C ".worktrees/ticket-<N>" add -A`)).toBe(true);
+    expect(has(`diff --cached --binary HEAD > "$HOME/.zstack/projects/$SLUG/reports/uncommitted-<N>.patch"`)).toBe(true);
+  });
+
+  test("an alive probe clears a stale worktree reading", () => {
+    let s = deadLane(DIRTY);
+    s = recordProbe(s, 1, true, NOW);
+    expect(s.lanes[0].workerDead).toBeUndefined();
+    expect(s.lanes[0].worktreeDirty).toBeUndefined();
+    expect(nextAction(s, NOW)).toEqual({ kind: "wait" });
+  });
+
+  // worktreeDirty describes ONE probe of ONE stage's leftovers. Every route that
+  // ends a stage or takes a fresh probe must therefore re-establish it, because a
+  // reading that outlives its stage is a fact about a worktree nobody looked at:
+  // it buys a paid re-spawn on evidence that does not exist, and makes `loop
+  // probe`'s own stdout assert a status it never collected.
+  describe("the worktree reading never outlives the probe that took it", () => {
+    test("an advance to the next stage drops it", () => {
+      let s = deadLane(DIRTY);
+      expect(s.lanes[0].worktreeDirty).toBe(true);
+      s = applyAction(s, { kind: "advance", ticket: 1, to: "qa" }, NOW);
+      expect(s.lanes[0].worktreeDirty).toBeUndefined();
+      // ...so a later death at QA with no facts collected skips, as documented.
+      s = recordProbe(s, 1, false, 2 * NOW);
+      expect(nextAction(s, 2 * NOW).kind).toBe("skip");
+    });
+
+    test("a second dead probe with no facts drops the first probe's reading", () => {
+      let s = deadLane(DIRTY);
+      s = recordProbe(s, 1, false, NOW); // probed again, status never collected
+      expect(s.lanes[0].worktreeDirty).toBeUndefined();
+      expect(nextAction(s, NOW).kind).toBe("skip");
+    });
+
+    test("a second dead probe that DOES collect facts overwrites the first", () => {
+      let s = deadLane(DIRTY);
+      s = recordProbe(s, 1, false, NOW, CLEAN); // the work got committed meanwhile
+      expect(s.lanes[0].worktreeDirty).toBe(false);
+      expect(nextAction(s, NOW).kind).toBe("skip");
+    });
+  });
+
+  test("the respawn note hands the fresh agent the keep/fix/drop call", () => {
+    const note = (nextAction(deadLane(DIRTY), NOW) as { note: string }).note;
+    expect(note).toContain("UNCOMMITTED");
+    expect(note).toContain("unverified");
+    expect(note).toContain("keep, fix, or drop");
+    expect(note).toContain("never emitted an exit marker");
+    // It must name the budget it just spent honestly: the STAGE's, not the lane's,
+    // or the agent reads "one shot for this whole ticket" and it is not true.
+    expect(note).toContain("This lane's builder stage has ONE re-spawn");
+    expect((nextAction(deadLane(DIRTY, {}, "qa"), NOW) as { note: string }).note).toContain("This lane's qa stage has ONE re-spawn");
+  });
+
+  // stageAttempt is the one definition of a spawn's <attempt>; a route that
+  // re-spawns a stage without counting here mints a duplicate tag.
+  test("stageAttempt counts every re-spawn route, per stage", () => {
+    expect(stageAttempt(lane(1, "builder"))).toBe(1);
+    expect(stageAttempt(lane(1, "builder", { qaBounces: 2, reviewBounces: 1, commitRetries: 1, respawns: { builder: 1 } }))).toBe(6);
+    // A reviewer bounce sends the lane back through the builder and into QA a
+    // SECOND time, so reviewBounces counts here as well as at builder.
+    expect(stageAttempt(lane(1, "qa", { qaBounces: 2, reviewBounces: 1, respawns: { qa: 1 } }))).toBe(5);
+    // #191's quorum retry re-spawns the REVIEWER at the same stage, so it counts
+    // here too -- the SKILL's old prose formula omitted it.
+    expect(stageAttempt(lane(1, "reviewer", { reviewBounces: 1, quorumRetries: 1 }))).toBe(3);
+    expect(stageAttempt(lane(1, "merge"))).toBe(1);
+    // Per-stage: another stage's re-spawn is not this one's.
+    expect(stageAttempt(lane(1, "qa", { respawns: { builder: 1, reviewer: 1, merge: 1 } }))).toBe(1);
+  });
+
+  // Finding-2 regression, driven through the REAL reducer rather than by handing
+  // stageAttempt a fixture: the reviewer-bounce path advances straight from
+  // `built` to qa (resolveOutcome) without touching qaBounces, so a formula
+  // missing reviewBounces gave a lane's first and second QA spawns the SAME
+  // number. Both then stamp spawnTag(slug, N, "qa", 1), `transcripts collect`
+  // refuses ("matches 2 orchestrator-spawned agents"), and BOTH QA spawns' tokens
+  // go uncounted -- the #190 undercount this machinery exists to prevent.
+  // Reachable on any ticket that takes a single reviewer bounce.
+  test("a reviewer bounce does not make the lane's two QA spawns share an attempt", () => {
+    let s = state([ticket(1, "Ready")], []);
+    s = applyAction(s, nextAction(s, 0), 0); // claim -> builder
+    const attempts: number[] = [];
+    const finish = (msg: string) => {
+      s = recordOutcome(s, 1, msg, 0);
+      s = applyAction(s, nextAction(s, 0), 0);
+      if (s.lanes[0]?.stage === "qa") attempts.push(stageAttempt(s.lanes[0]));
+    };
+    finish(HAPPY.builder); // -> qa (first QA spawn)
+    finish(HAPPY.qa); // -> reviewer
+    finish("REVIEW-FINDINGS: 1) AC3 is not covered"); // -> builder, reviewBounces 1
+    expect(s.lanes[0].qaBounces).toBe(0); // the reviewer bounce never touches it
+    finish(HAPPY.builder); // -> qa AGAIN (second QA spawn)
+    expect(attempts).toEqual([1, 2]);
+  });
+
+  // The invariant stageAttempt exists for, checked over the whole machine instead
+  // of one route at a time: walk every arrow that can re-spawn a stage and assert
+  // no stage ever repeats an attempt number on one lane. Three duplicate-tag
+  // defects have already come out of this formula (quorumRetries, a builder
+  // re-spawn shifting QA, and the reviewer-bounce qa case), so the guard is the
+  // property, not the three examples.
+  test("no lane ever mints the same (stage, attempt) twice, over every re-spawn route", () => {
+    const seen = new Set<string>();
+    const record = (l: LaneState) => {
+      const key = `${l.stage}-${stageAttempt(l)}`;
+      expect(seen.has(key)).toBe(false); // a duplicate tag: `collect` would refuse
+      seen.add(key);
+    };
+    let s = state([ticket(1, "Ready")], []);
+    s.minSkepticQuorum = 2; // arms #191's reviewer -> reviewer self-advance below
+    s = applyAction(s, nextAction(s, 0), 0);
+    record(s.lanes[0]); // builder 1
+    // #177's guard failure: a BUILT whose worktree is dirty and whose HEAD never
+    // moved off the base -- the route that re-spawns the builder onto itself.
+    const SHIPPED_NOTHING = { porcelain: DIRTY, headSha: "a".repeat(40), baseSha: "a".repeat(40) };
+    const step = (msg: string, git?: typeof SHIPPED_NOTHING) => {
+      s = recordOutcome(s, 1, msg, 0, git);
+      s = applyAction(s, nextAction(s, 0), 0);
+      record(s.lanes[0]);
+    };
+    const dieDirty = () => {
+      s = recordProbe(s, 1, false, 11 * MIN, DIRTY);
+      const a = nextAction(s, 11 * MIN);
+      expect(a.kind).toBe("respawn");
+      s = applyAction(s, a, 11 * MIN);
+      s.lanes[0].lastActivityMs = 0; // the fresh agent's own watchdog baseline
+      record(s.lanes[0]);
+    };
+    dieDirty(); // builder 2 (#209 re-spawn)
+    step(HAPPY.builder, SHIPPED_NOTHING); // builder 3 (#177 commit re-spawn)
+    step(HAPPY.builder); // qa 1
+    dieDirty(); // qa 2 (#209 re-spawn -- QA's OWN budget, builder's is spent)
+    step("QA-BUGS: 1) save button 500s"); // builder 4 (QA bounce)
+    step(HAPPY.builder); // qa 3
+    step(HAPPY.qa); // reviewer 1
+    step("REVIEW-APPROVE: confidence=100 skeptics=0/3"); // reviewer 2 (#191 quorum)
+    step("REVIEW-FINDINGS: 1) AC3 is not covered"); // builder 5 (reviewer bounce)
+    step(HAPPY.builder); // qa 4 -- the finding-2 case, inside the walk
+    step(HAPPY.qa); // reviewer 3
+    expect(seen.size).toBe(12);
+  });
+
+  // The transition only helps if the orchestrator collects the facts, spawns the
+  // right stage with the note, and tags it with the action's own attempt -- all
+  // of which live in the SKILL. Same doc-canary discipline as #177's.
+  test("the SKILL and the user docs carry the recovery contract", () => {
+    const skill = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
+    const has = (x: string) => skill.includes(x);
+    expect(has("`respawn N at S`")).toBe(true);
+    expect(has("respawnNotes")).toBe(true);
+    // The dead probe must carry the worktree facts, with --branch for the same
+    // fail-closed reason the BUILT verification needs it.
+    expect(has(`probe "$STATE" <N> dead --porcelain "$TMP/porcelain-<N>.txt"`)).toBe(true);
+    expect(has(`git -C ".worktrees/ticket-<N>" status --porcelain --branch > "$TMP/porcelain-<N>.txt"`)).toBe(true);
+    // The attempt is computed, never re-derived in prose.
+    expect(has(`bun "$PACK/lib/loop.ts" attempt "$STATE" <N>`)).toBe(true);
+    expect(has("qaBounces + reviewBounces + commitRetries + respawns.builder + 1")).toBe(true);
+    const docs = readFileSync(join(REPO_ROOT, "docs", "user-guide", "z-loop.md"), "utf8");
+    expect(docs).toContain("died without ever reporting");
+    expect(docs).toContain("uncommitted-<N>.patch");
+    const trouble = readFileSync(join(REPO_ROOT, "docs", "user-guide", "troubleshooting.md"), "utf8");
+    expect(trouble).toContain("dead-worker note but its worktree has real uncommitted changes");
+  });
+});
+
 // -- #138: positive-evidence ingest ------------------------------------------
 // The rule this replaces H14 (issue #14) with: the board affects loop state ONLY
 // through positive observations. A ticket absent from a PAGINATED bulk read is a
@@ -1687,29 +2033,37 @@ describe("ingest preserves state on a transient empty snapshot (#127)", () => {
 // -- fresh-stage guarantee (AC4): lane state carries no conversation id -------
 
 describe("fresh-stage lane state", () => {
-  test("LaneState carries exactly its ten scheduling fields and no session/conversation id", () => {
+  test("LaneState carries exactly its twelve scheduling fields and no session/conversation id", () => {
     // Compile-time half: this constant stops typechecking if LaneState's key
-    // set ever drifts from the ten named here (issue #76 added reviewBounces,
+    // set ever drifts from the twelve named here (issue #76 added reviewBounces,
     // mirroring qaBounces; #125 added lastWroteStatus, the resync origin marker;
     // #191 added quorumRetries, a budget deliberately separate from
-    // reviewBounces; #177 added commitRetries, separate for the same reason).
-    // Every addition must be a deliberate edit here -- this gate
-    // is what keeps a conversation/session id from ever riding between stages.
+    // reviewBounces; #177 added commitRetries, separate for the same reason;
+    // #209 added respawns -- a fourth separate budget -- and worktreeDirty, the
+    // probe-time git fact its transition reads). Every addition must be a
+    // deliberate edit here -- this gate is what keeps a conversation/session id
+    // from ever riding between stages.
     type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
     const _laneKeysExact: Exact<
       keyof LaneState,
-      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "quorumRetries" | "commitRetries" | "workerDead" | "outcome" | "lastWroteStatus"
+      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "quorumRetries" | "commitRetries" | "respawns" | "workerDead" | "worktreeDirty" | "outcome" | "lastWroteStatus"
     > = true;
     void _laneKeysExact;
     // Runtime half: a fully-populated lane exposes exactly those keys, and none
     // of them smells like a carried conversation.
     const full: Required<LaneState> = {
-      ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, quorumRetries: 0, commitRetries: 0, workerDead: false, outcome: { kind: "built" }, lastWroteStatus: "Building",
+      ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, quorumRetries: 0, commitRetries: 0, respawns: { builder: 0 }, workerDead: false, worktreeDirty: false, outcome: { kind: "built" }, lastWroteStatus: "Building",
     };
-    expect(Object.keys(full).sort()).toEqual(["commitRetries", "lastActivityMs", "lastWroteStatus", "outcome", "qaBounces", "quorumRetries", "reviewBounces", "stage", "ticket", "workerDead"]);
+    expect(Object.keys(full).sort()).toEqual(["commitRetries", "lastActivityMs", "lastWroteStatus", "outcome", "qaBounces", "quorumRetries", "respawns", "reviewBounces", "stage", "ticket", "workerDead", "worktreeDirty"]);
     for (const k of Object.keys(full)) {
       expect(k).not.toMatch(/conversation|session|context|transcript|agent/i);
     }
+    // The e2e eval's fresh-context oracle keeps a SECOND copy of this set, and it
+    // is the copy that gets forgotten (#177 and #191 updated it; #209 did not).
+    // Nothing fails while the happy path never populates a retry counter -- and
+    // then the first unhappy run reports a scheduling field as leaked state. Same
+    // fact, one gate.
+    expect([...ALLOWED_LANE_KEYS].sort()).toEqual(Object.keys(full).sort());
   });
 
   test("advancing a stage clears the previous stage's outcome and probe state", () => {
@@ -2831,6 +3185,84 @@ describe("loop CLI", () => {
       const r = runOutcome(statePath, "MERGED: https://github.com/x/y/pull/1\n", []);
       expect(r.exitCode).toBe(0);
       expect(JSON.parse(r.stdout)).toEqual({ kind: "merged", note: "https://github.com/x/y/pull/1" });
+    });
+  });
+
+  // -- #209: the probe carries the worktree facts, and attempt is computed -----
+  describe("probe --porcelain / attempt (#209)", () => {
+    function run(args: string[]) {
+      const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), ...args], { stdout: "pipe", stderr: "pipe" });
+      return { exitCode: proc.exitCode, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
+    }
+
+    test("a dead probe with a dirty worktree records the fact, and next returns respawn", () => {
+      const statePath = join(dir, "probe-dirty.json");
+      writeFileSync(statePath, JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder")])));
+      const porcelain = join(dir, "probe-porcelain-dirty.txt");
+      writeFileSync(porcelain, "## z/ticket-1\n M lib/cost.ts\n");
+      const p = run(["probe", statePath, "1", "dead", "--porcelain", porcelain, "--now", "0"]);
+      expect(p.exitCode).toBe(0);
+      expect(p.stdout).toContain("uncommitted work");
+      expect((JSON.parse(readFileSync(statePath, "utf8")) as LoopState).lanes[0].worktreeDirty).toBe(true);
+      const next = run(["next", statePath, "--now", String(11 * 60_000)]);
+      expect(JSON.parse(next.stdout)).toMatchObject({ kind: "respawn", ticket: 1, stage: "builder", attempt: 2 });
+    });
+
+    test("a dead probe with no --porcelain records no facts at all (pre-#209 behavior)", () => {
+      const statePath = join(dir, "probe-nofacts.json");
+      writeFileSync(statePath, JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder")])));
+      expect(run(["probe", statePath, "1", "dead", "--now", "0"]).exitCode).toBe(0);
+      expect((JSON.parse(readFileSync(statePath, "utf8")) as LoopState).lanes[0].worktreeDirty).toBeUndefined();
+      expect(JSON.parse(run(["next", statePath, "--now", String(11 * 60_000)]).stdout).kind).toBe("skip");
+    });
+
+    // The whole sequence through the real CLI: a builder dies dirty, is recovered,
+    // ships, advances -- and then the QA worker dies with no status collected. The
+    // builder's reading must not still be standing to buy that lane a re-spawn, and
+    // the probe line must not report a worktree it never opened.
+    test("the builder's reading cannot vouch for a later stage's death", () => {
+      const statePath = join(dir, "probe-carryover.json");
+      writeFileSync(statePath, JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder")])));
+      const dirty = join(dir, "carryover-dirty.txt");
+      writeFileSync(dirty, "## z/ticket-1\n M lib/cost.ts\n");
+      expect(run(["probe", statePath, "1", "dead", "--porcelain", dirty, "--now", "0"]).exitCode).toBe(0);
+
+      const msg = join(dir, "carryover-msg.txt");
+      writeFileSync(msg, "BUILT: shipped\n");
+      const clean = join(dir, "carryover-clean.txt");
+      writeFileSync(clean, "## z/ticket-1...origin/main\n");
+      const out = run([
+        "outcome", statePath, "1", msg, "--porcelain", clean,
+        "--head-sha", "a".repeat(40), "--base-sha", "b".repeat(40), "--now", "1000",
+      ]);
+      expect(out.exitCode).toBe(0);
+      const adv = join(dir, "carryover-advance.json");
+      writeFileSync(adv, run(["next", statePath, "--now", "2000"]).stdout);
+      expect(run(["apply", statePath, adv, "--now", "2000"]).exitCode).toBe(0);
+      const advanced = JSON.parse(readFileSync(statePath, "utf8")) as LoopState;
+      expect(advanced.lanes[0].stage).toBe("qa");
+      expect(advanced.lanes[0].worktreeDirty).toBeUndefined();
+
+      const p = run(["probe", statePath, "1", "dead", "--now", "2000"]);
+      expect(p.stdout).not.toContain("uncommitted work"); // nothing was read to say that
+      expect(JSON.parse(run(["next", statePath, "--now", String(12 * 60_000)]).stdout).kind).toBe("skip");
+    });
+
+    // The spawn tag's <attempt> is arithmetic over five counters; the SKILL reads
+    // it from here instead of re-deriving it, so a re-spawn can never collide
+    // with the transcript it replaced.
+    test("attempt prints the lane's spawn count for its current stage", () => {
+      const statePath = join(dir, "attempt.json");
+      writeFileSync(
+        statePath,
+        JSON.stringify(state([ticket(1, "Building")], [lane(1, "builder", { qaBounces: 1, respawns: { builder: 1, qa: 1 } })]))
+      );
+      const r = run(["attempt", statePath, "1"]);
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout.trim()).toBe("3"); // qaBounces 1 + respawns.builder 1 + 1; qa's is not builder's
+      const missing = run(["attempt", statePath, "99"]);
+      expect(missing.exitCode).toBe(1);
+      expect(missing.stderr).toContain("No lane holds #99");
     });
   });
 

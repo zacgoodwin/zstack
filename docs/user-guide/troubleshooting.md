@@ -107,6 +107,43 @@ rebuilds fresh), and clears the stale lock, then starts normally. It never delet
 a branch, never removes a board comment, and never touches a ticket that still has
 a live lane.
 
+## A ticket was Skipped with a dead-worker note but its worktree has real uncommitted changes
+
+The stage agent died without emitting an exit marker. That parses as CONFUSED,
+which skips the ticket — the right answer when the agent could not do the job, the
+wrong one when it simply never said it did (a builder that backgrounds its own test
+run and stops to wait for it is the case that started this).
+
+What the loop does now: the dead-worker probe collects the lane worktree's
+`git status --porcelain --branch`, and a lane whose worker died holding uncommitted
+changes re-spawns that stage **once** — a fresh agent, told the prior attempt's
+changes are uncommitted and UNVERIFIED and that keeping, fixing, or dropping them
+is its own call. The budget is one re-spawn **per stage, per lane**, so a ticket
+whose builder was recovered this way still has a re-spawn left if its QA agent later
+dies the same way. Only after that stage's one re-spawn is spent does the skip
+apply, and that skip dumps the worktree's uncommitted state first:
+
+```bash
+git apply ~/.zstack/projects/<slug>/reports/uncommitted-<N>.patch   # in a fresh worktree
+```
+
+Do that **before** the next `/z-loop` run. Skipping releases the lane lock, and a
+lockless worktree is an orphan the next run's reconcile scan force-removes
+(`git worktree remove --force`, uncommitted work discarded) before the loop will
+start — so the patch, not the worktree, is the durable copy. Then return the ticket
+to Ready.
+
+If you are seeing this on a run that predates the fix, or the skip note says
+`worktree left for inspection` with no patch path, the worktree facts were never
+collected — recover by hand from `.worktrees/ticket-<N>` immediately, before the
+next run's orphan scan prunes it.
+
+If a stage keeps dying silently, the cause is usually upstream of the loop: check
+whether the ticket is large enough to exhaust the agent's context window, and
+whether the stage prompt's foreground rule is being honored (verification must
+finish before the final message — a backgrounded gate can never report back,
+because the loop sends each stage agent exactly one message by design).
+
 ## "Rates last checked … over the 14-day limit"
 
 `bin/z-estimate` / `bin/z-cost` warn when `references/rates.json`'s `checked_at`

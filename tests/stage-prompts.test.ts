@@ -486,6 +486,38 @@ describe("builder prompt", () => {
     expect(p).toContain("git status --porcelain` empty");
     expect(p).toContain(`HEAD off ${BUILDER_INPUT.baseBranch}`);
   });
+
+  // #209 AC1. Run 11's #170 builder fixed both reviewer findings, backgrounded
+  // `bun test`, and ended its turn waiting on it -- and the loop sends a stage
+  // agent exactly one message by design, so nothing could ever wake it. The
+  // prompt told it to run the gauntlet and never said the run must FINISH first.
+  test("AC1: the builder is told verification runs in the foreground and a pending job is CONFUSED", () => {
+    const p = builderPrompt(BUILDER_INPUT, INPUT_PATH);
+    expect(p).toContain("FOREGROUND");
+    expect(p).toContain("Never background a gate and end your turn waiting on it");
+    expect(p).toContain("Ending your turn with a background job still pending is parsed as CONFUSED");
+    expect(p).toContain("skips this ticket");
+  });
+
+  // #209 AC5. The re-spawned agent must be told the prior attempt's work is
+  // UNVERIFIED and that keeping/fixing/dropping it is its own call: carrying it
+  // forward as trusted would defeat the fresh-agent guarantee, and dropping it
+  // silently is the waste the re-spawn exists to prevent.
+  test("AC5: the dead-worker re-spawn hands over unverified work and the keep/fix/drop call", () => {
+    const p = builderPrompt({ ...BUILDER_INPUT, respawnNotes: "predecessor died silent" }, INPUT_PATH);
+    expect(p).toContain("died without reporting");
+    expect(p).toContain("`respawnNotes`");
+    expect(p).toContain(INPUT_PATH);
+    expect(p).not.toContain("predecessor died silent"); // payload lives in the input file
+    expect(p).toContain("UNCOMMITTED and UNVERIFIED");
+    expect(p).toContain("whether to keep, fix, or drop them");
+    expect(p).toContain("That call is yours");
+    // Absent on every other spawn, so a first-pass builder prompt is unchanged.
+    expect(builderPrompt(BUILDER_INPUT, INPUT_PATH)).not.toContain("respawnNotes");
+    // And it is not the #177 commit re-spawn, which tells the builder to KEEP and
+    // commit what is there -- a different predecessor and a different judgment.
+    expect(p).not.toContain("COMMIT whatever is already there");
+  });
 });
 
 // -- QA prompt ----------------------------------------------------------------
@@ -507,6 +539,20 @@ describe("qa prompt", () => {
 
   test("web targets are told to drive gstack /qa", () => {
     expect(qaPrompt({ ...QA_INPUT, webTarget: true }, INPUT_PATH)).toContain("gstack /qa");
+  });
+
+  // #209: QA runs the same gauntlet, so it carries the same foreground rule and
+  // the same re-spawn briefing (a QA agent that did leave uncommitted changes
+  // left exactly the same unverified state a fresh one must judge).
+  test("QA carries the foreground rule, and a re-spawn briefing when it is one", () => {
+    const p = qaPrompt(QA_INPUT, INPUT_PATH);
+    expect(p).toContain("FOREGROUND");
+    expect(p).toContain("Ending your turn with a background job still pending is parsed as CONFUSED");
+    expect(p).not.toContain("respawnNotes");
+    const r = qaPrompt({ ...QA_INPUT, respawnNotes: "predecessor died silent" }, INPUT_PATH);
+    expect(r).toContain("`respawnNotes`");
+    expect(r).toContain("UNCOMMITTED and UNVERIFIED");
+    expect(r).not.toContain("predecessor died silent");
   });
 });
 

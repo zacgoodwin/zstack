@@ -95,6 +95,37 @@ If you cannot read it, do nothing else and make your final message exactly:
 BLOCKED: could not read stage prompt at ${promptPath}`;
 }
 
+// -- shared stage rules --------------------------------------------------------
+
+// #209, gap 2. The stage prompts told the worker to run the gauntlet and never
+// said the run must FINISH before the marker, and the loop sends a stage agent
+// exactly one message by design ("One fresh agent per stage. Never reuse or
+// SendMessage a previous stage's agent") -- so an agent that backgrounds `bun
+// test` and stops to wait can never be woken. Run 11's #170 builder did exactly
+// that: it fixed both reviewer findings, backgrounded the suite, and ended its
+// turn saying it would finalize once the run landed. A markerless final message
+// parses as CONFUSED, so that lane was one recorded outcome away from being
+// skipped with the finished diff sitting uncommitted in its worktree.
+//
+// Shared verbatim by the builder and QA prompts (the two stages that run the
+// gauntlet). The reviewer's own version of this rule is inside #191's super-truth
+// block, where the thing being waited on is a skeptic rather than a test run, and
+// the single-pass reviewer prompt stays byte-identical (its golden file).
+const FOREGROUND_RULE = `## Verification runs in the FOREGROUND
+Every command you verify with -- the test suite, typecheck, build, anything you would cite as evidence -- must run to completion IN THE FOREGROUND before your final message. Never background a gate and end your turn waiting on it: no one will wake you (this loop sends a stage agent exactly one message, by design), so the run's result reaches nobody. Ending your turn with a background job still pending is parsed as CONFUSED, the same as any final message with no marker, and CONFUSED skips this ticket -- the worst outcome available to you. If a check is too slow to finish, report what you actually ran and what you did not.`;
+
+// #209: the briefing a stage gets when it is a RE-SPAWN of a worker that died
+// without ever reporting. Its predecessor's changes are still in the worktree,
+// and the judgment call is handed over explicitly: carrying them forward as
+// trusted would defeat the fresh-agent guarantee (nothing verified them), and
+// dropping them silently is the waste the re-spawn exists to prevent. The note
+// itself lives in the input file, same pointer discipline as every other bounce.
+function respawnSection(respawnNotes: string | undefined, inputPath: string): string {
+  return respawnNotes
+    ? `\n## Your predecessor on this lane died without reporting\n\nRead what it left behind from \`respawnNotes\` in ${inputPath}. Its changes are still in this worktree, UNCOMMITTED and UNVERIFIED -- no stage ever confirmed them, and no transcript of that attempt reaches you. Look before you act (\`git status\`, \`git diff\`, \`git log\`), then decide for yourself whether to keep, fix, or drop them. That call is yours; so is this stage's outcome either way.\n`
+    : "";
+}
+
 // -- builder ------------------------------------------------------------------
 
 export interface BuilderPromptInput {
@@ -107,6 +138,7 @@ export interface BuilderPromptInput {
   qaNotes?: string; // present on a QA bounce-back
   reviewNotes?: string; // present on a reviewer bounce-back
   commitNotes?: string; // #177: present on a builder->builder re-spawn (BUILT shipped nothing)
+  respawnNotes?: string; // #209: present on a re-spawn of a worker that died with no exit marker
   investigateFirst?: boolean; // second QA bounce: root-cause before touching code
 }
 
@@ -127,6 +159,7 @@ export function builderPrompt(i: BuilderPromptInput, inputPath: string, tag?: st
   const commit = i.commitNotes
     ? `\n## Your predecessor on this lane shipped nothing\n\nRead what the pre-advance guard found from \`commitNotes\` in ${inputPath}. Start by inspecting the worktree (\`git status\`, \`git log ${i.baseBranch}..HEAD\`): finish and COMMIT whatever is already there rather than rebuilding it, and only build from scratch if the worktree is genuinely empty. A BUILT is not accepted until the tree is clean and the branch carries at least one commit.\n`
     : "";
+  const respawn = respawnSection(i.respawnNotes, inputPath);
   return `${spawnStamp(tag)}You are the BUILDER for ticket #${i.ticketNumber}: "${i.ticketTitle}", running UNATTENDED inside the zstack dev loop. No user is available -- never ask a question, never wait for input; decide or exit via the contract below.
 
 ## Workspace
@@ -135,7 +168,7 @@ export function builderPrompt(i: BuilderPromptInput, inputPath: string, tag?: st
 
 ## Ticket
 Read your full ticket body (Context, Plan, Acceptance Criteria, Tests + evals, Docs pages touched, Out of scope) from ${inputPath} -- field \`ticketBody\` -- before doing anything else. That body is the contract for this build.
-${bounce}${review}${commit}
+${bounce}${review}${commit}${respawn}
 ## Discipline
 - Ponytail ladder before writing any code: does it need to exist at all; does this codebase already have it; does the stdlib/platform/an installed dep cover it; can it be one line -- only then write the minimum that works. Smallest correct diff, full scope.
 - If the ticket has a \`## Files\` section, it is the map -- start from those paths instead of searching.
@@ -144,6 +177,8 @@ ${bounce}${review}${commit}
 - Deterministic work (arithmetic, parsing, transforms, lookups) goes in scripts with tests, never in your prose.
 - Fix root causes, not symptoms: grep every caller of anything you change.
 - Do not edit the issue body, comment on issues, close issues, or expand scope beyond the ticket.
+
+${FOREGROUND_RULE}
 
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
 BUILT: <one-line summary>            all acceptance criteria pass, tests green in the worktree, work committed on ${i.branch} -- VERIFIED before the lane advances: \`git status --porcelain\` empty AND HEAD off ${i.baseBranch}. A BUILT with work still uncommitted sends this lane straight back to you.
@@ -161,6 +196,7 @@ export interface QaPromptInput {
   branch: string;
   qaPass: number; // 1-based; pass 3 finding bugs blocks the ticket
   webTarget: boolean; // drive gstack /qa against a running site
+  respawnNotes?: string; // #209: present on a re-spawn of a QA worker that died with no exit marker
 }
 
 // PROCESS.md steps 11-16: functional + technical, as a fresh context that
@@ -176,10 +212,12 @@ export function qaPrompt(i: QaPromptInput, inputPath: string, tag?: string): str
 
 ## Ticket
 Read the ticket body -- Context, Plan, and especially every "### Acceptance Criteria" case -- from ${inputPath}, field \`ticketBody\`, before you start.
-
+${respawnSection(i.respawnNotes, inputPath)}
 ## Check BOTH, in this order
 1. Functional: exercise the built behavior end to end as a user would. Verify every "### Acceptance Criteria" case (setup -> action -> expected outcome) AS WRITTEN -- a case the diff quietly weakened counts as a bug.${web}
 2. Technical: typecheck, the full test suite, and the build all green in this worktree; tests + evals + docs the ticket demanded actually present in the diff; the repo's programming principles respected.
+
+${FOREGROUND_RULE}
 
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
 QA-PASS: <one-line evidence summary>       everything above verified green

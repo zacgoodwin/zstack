@@ -180,7 +180,28 @@ export interface LaneState {
   // not a QA bug or a reviewer finding, so it must not consume a rebuild those
   // caps are holding, nor park the ticket under their notes.
   commitRetries?: number;
+  // #209: SAME-stage re-spawns this lane has spent on a worker that died without
+  // ever emitting an exit marker while its worktree still held uncommitted work,
+  // capped by MAX_DEAD_RESPAWNS. Optional so pre-#209 state files load unchanged
+  // (absent reads as 0), and its own budget for the same reason quorumRetries and
+  // commitRetries have theirs: "the agent forgot to say it was done" is not a QA
+  // bug, not a reviewer finding, and not a builder that skipped committing, so it
+  // must not consume a rebuild those caps are holding nor park under their notes.
+  //
+  // Keyed BY STAGE, not a single lane-wide number: the budget is one re-spawn per
+  // stage per lane. A builder that died silently says nothing about the QA agent
+  // that runs after it, so spending the builder's re-spawn must not leave a later
+  // QA death with no recovery -- that is one lane-wide retry wearing the name of a
+  // per-stage one. It also keeps stageAttempt honest: a builder re-spawn is not a
+  // qa spawn, so it must not shift qa's attempt numbering (see stageAttempt).
+  respawns?: Partial<Record<Stage, number>>;
   workerDead?: boolean; // set by the orchestrator after an aliveness probe
+  // #209: did the lane worktree still hold uncommitted changes when the DEAD
+  // probe was recorded? Set by recordProbe from the worktree's own
+  // `git status --porcelain --branch` payload, never by a judgment call. Absent
+  // means the orchestrator supplied no worktree facts, which reads as "nothing to
+  // recover" and skips exactly as it did before this ticket.
+  worktreeDirty?: boolean;
   outcome?: StageOutcome; // set when the stage agent's final message is parsed
   // #125: the board status the loop itself last wrote for this lane (set by
   // applyAction's claim/advance). It is the ORIGIN marker the one-hop desync
@@ -379,10 +400,35 @@ function sameCommit(a: string, b: string): boolean {
 // `## <branch>` header cannot prove a clean tree, and an absent/short SHA cannot
 // prove a commit exists. A git call that returned nothing must never be the reason
 // a no-commit build walks to QA.
+// The two facts a `git status --porcelain --branch` payload carries: whether git
+// ran at all (its `## <branch>` header is present -- see BuilderCommitFacts.porcelain
+// for why an empty file is NOT a clean tree) and the dirty paths it reported.
+// One parse, shared by #177's BUILT guard and #209's dead-worker recovery, so the
+// two can never disagree about what "dirty" means.
+function readPorcelain(porcelain: string): { statusRan: boolean; dirty: string[] } {
+  const lines = porcelain.split(/\r?\n/).filter((l) => l.trim() !== "");
+  return { statusRan: lines.some((l) => l.startsWith("## ")), dirty: lines.filter((l) => !l.startsWith("## ")) };
+}
+
+// #209: does this worktree hold work that would be DISCARDED by skipping the
+// lane? True when git reported at least one dirty path (untracked included --
+// a test file the dead agent never `git add`ed is exactly the work at stake),
+// and true again when the payload has no `## <branch>` header at all.
+//
+// That second case is the deliberate direction of failure. An unreadable status
+// cannot prove the tree is clean, and the two ways to be wrong are not
+// symmetric: reading it as clean SKIPS a ticket whose finished work is sitting
+// in the worktree (the exact loss this ticket exists to stop), while reading it
+// as dirty spends at most ONE re-spawn (MAX_DEAD_RESPAWNS) on a lane that may
+// have nothing in it -- and that agent is told the prior work is unverified and
+// may be dropped, so a worktree with nothing in it just gets built from scratch.
+export function worktreeHoldsWork(porcelain: string): boolean {
+  const { statusRan, dirty } = readPorcelain(porcelain);
+  return dirty.length > 0 || !statusRan;
+}
+
 export function builtGuardFailure(facts: BuilderCommitFacts): string | null {
-  const lines = facts.porcelain.split(/\r?\n/).filter((l) => l.trim() !== "");
-  const statusRan = lines.some((l) => l.startsWith("## ")); // see BuilderCommitFacts.porcelain
-  const dirty = lines.filter((l) => !l.startsWith("## "));
+  const { statusRan, dirty } = readPorcelain(facts.porcelain);
   const head = facts.headSha.trim();
   const base = facts.baseSha.trim();
   const readable = head.length >= MIN_SHA_LENGTH && base.length >= MIN_SHA_LENGTH;
@@ -489,6 +535,12 @@ export type Action =
       stackedOn?: number[];
       resyncStatus?: BoardStatus; // #116: correct a one-hop-lagged board status before this advance's setStatus, bypassing canTransition -- see the nextAction desync guard for why this is safe
     }
+  // #209: re-spawn THIS lane's current stage after its worker died without an
+  // exit marker while the worktree still held uncommitted work. Carries the
+  // attempt number the fresh spawn must be tagged with (the dead spawn already
+  // used the previous one, and a re-used spawn tag makes `transcripts collect`
+  // refuse to guess), and the note the fresh agent is briefed with.
+  | { kind: "respawn"; ticket: number; stage: Stage; attempt: number; note: string }
   | { kind: "park"; ticket: number; status: "Questions" | "Blocked"; note: string }
   | { kind: "skip"; ticket: number; note: string }
   | { kind: "stop-lane"; ticket: number; note: string }
@@ -532,6 +584,39 @@ export const MAX_QUORUM_RETRIES = 1;
 // nothing committed is not going to be fixed by a third paid pass.
 export const MAX_COMMIT_RETRIES = 1;
 
+// #209: how many times ONE lane may re-spawn ONE stage after a worker died
+// without an exit marker while its worktree held uncommitted work. Fixed at 1,
+// for the same reason the two caps above are: the failure being recovered from is
+// "the agent forgot to say it finished", and one fresh agent handed the
+// half-finished worktree is the whole value of retrying. A second silent death at
+// the same stage is a pattern (a wedged environment, a ticket that keeps blowing a
+// context window), and a third paid pass will not fix it -- which is exactly why
+// the pre-#209 machine went straight to skip. The cap, not the absence of the
+// transition, is what keeps this bounded.
+//
+// The budget is per (lane, stage): LaneState.respawns is keyed by stage, so a
+// builder that burned this lane's builder re-spawn leaves QA's intact. A lane-wide
+// counter would bound the whole lane at 1, which is a strictly smaller recovery for
+// no extra safety -- the worst case is still one wasted spawn per stage, and the
+// stages are at most four.
+export const MAX_DEAD_RESPAWNS = 1;
+
+// Which stages a dead worker may be re-spawned into (#209). The lane worktree is
+// the BUILDER's workspace, and QA's own prompt tells it to report rather than fix,
+// so builder is the case that actually recovers work -- but a QA agent that DID
+// leave uncommitted changes left exactly the same unverified state, and its prompt
+// can carry the same briefing, so it takes the same path.
+//
+// `reviewer` is excluded on purpose, and not because reviewers never die (run 11's
+// markerless exits were mostly reviewers): the reviewer executes in a THROWAWAY
+// worktree, so a dirty lane worktree is never its work, and its input is pinned to
+// exactly four blinded keys (lib/stage-prompts.ts assertReviewerInput) -- there is
+// no way to tell a fresh reviewer "your predecessor left this behind" without
+// breaking the blindness contract, which is worth more than this recovery. A short
+// review is #191's quorum retry, not this one. `merge` never reaches here at all:
+// H9's check-worker hold above returns first.
+const RESPAWN_STAGES: readonly Stage[] = ["builder", "qa"];
+
 // #177's guard failure, resolved: re-spawn THIS lane's builder to commit its work
 // (a self-advance -- the lane is already at builder, the board already shows
 // Building, so the move is a no-op), and once the retry is spent, park Blocked
@@ -571,6 +656,182 @@ function commitRetryAction(lane: LaneState, detail: string): Action {
     };
   }
   return { kind: "advance", ticket: lane.ticket, to: "builder", note: detail };
+}
+
+// Re-spawns this lane has spent AT ONE STAGE (#209). Absent reads as 0, which is
+// both the pre-#209 state file and every stage that has never re-spawned.
+export function respawnsAt(lane: LaneState, stage: Stage): number {
+  return lane.respawns?.[stage] ?? 0;
+}
+
+// The 1-based number of times this lane has spawned an agent at its CURRENT
+// stage, counting every route that re-spawns that stage (#209). It is the
+// `<attempt>` half of a spawn tag (lib/transcripts.ts spawnTag) and of the
+// `<stage>-<attempt>.jsonl` transcript name, so two spawns of one stage on one
+// lane must never compute the same value: a re-used tag makes `collect` refuse
+// (it cannot tell the two spawns' spend apart) and a re-used name overwrites the
+// predecessor's transcript, silently undercounting the ticket's Actual.
+//
+// It lives here rather than in the SKILL's prose because it is arithmetic over
+// five counters that grows every time a re-spawn route is added -- exactly the
+// kind of derivation PRINCIPLES.md keeps out of a model reply. Read AFTER the
+// action is applied (the counters are spent by applyAction), which is where the
+// orchestrator spawns from anyway.
+//
+// DERIVATION, exhaustive over the machine's spawn routes rather than patched per
+// bug -- three separate duplicate-tag defects have already come out of guessing at
+// this sum. There are exactly three action kinds that put an agent at a stage
+// (`claim`, `advance`, `respawn`), so enumerate every arrow into each stage and
+// name the counter applyAction spends on it. The requirement is UNIQUENESS, not
+// density: the count must strictly increase between any two spawns of one stage
+// on one lane. Gaps are harmless (a lane claimed straight into Review and bounced
+// back reaches QA for the first time at attempt 2 -- an unused number, never a
+// collision).
+//
+//   builder  <- claim (Ready/Building)              base 1
+//              qa -> builder      (qa bugs)         qaBounces++
+//              reviewer -> builder(findings/retry)  reviewBounces++
+//              builder -> builder (#177 no commit)  commitRetries++
+//              respawn @builder   (#209)            respawns.builder++
+//   qa       <- claim (QA)                          base 1
+//              builder -> qa      (verified BUILT)  see below
+//              respawn @qa        (#209)            respawns.qa++
+//   reviewer <- claim (Review)                      base 1
+//              qa -> reviewer     (QA pass)         see below
+//              builder -> reviewer(#130 skip-qa)    see below
+//              reviewer -> reviewer(#191 quorum)    quorumRetries++
+//              respawn @reviewer                    respawns.reviewer++ (see RESPAWN_STAGES)
+//   merge    <- reviewer -> merge (the merge gate)  base 1
+//              respawn @merge                       respawns.merge++ (see RESPAWN_STAGES)
+//
+// The two "see below" arrows are the ones that have no counter of their own, and
+// they are why the sums below are not one term per arrow:
+//   * builder -> qa fires once per verified BUILT, and the lane can only be back
+//     at builder to produce another one by having spent a qaBounces (qa->builder)
+//     or a reviewBounces (reviewer->builder). So the number of qa arrivals is
+//     qaBounces + reviewBounces + 1. commitRetries and respawns.builder do NOT
+//     belong: they re-spawn the builder without adding a builder->qa arrow.
+//     Missing reviewBounces here is the collision QA reproduced -- BUILT, qa(1),
+//     QA-PASS, findings, builder, BUILT, qa(1) again.
+//   * qa -> reviewer / builder -> reviewer likewise: after a review the lane can
+//     only return to the reviewer through reviewer->builder, so those arrows total
+//     reviewBounces + 1 on skip-qa and non-skip-qa lanes alike (of the
+//     qaBounces + reviewBounces + 1 qa arrivals, exactly qaBounces bounce).
+//     qaBounces does NOT belong: a QA bounce reaches the reviewer no more often.
+//   * merge has no arrow back into it at all: `merged` completes the lane, a dead
+//     merge worker holds at check-worker (H9), and every other merge outcome parks
+//     or skips. So merge is spawned at most once per lane.
+//
+// The respawn terms are per-stage (LaneState.respawns) precisely so each stage's
+// sum sees only its own -- and each stage carries its term even where
+// RESPAWN_STAGES currently makes it structurally 0, so adding a stage to that list
+// cannot silently reintroduce a duplicate tag.
+//
+// Scope of the invariant: ONE LANE. A lane destroyed by park/skip/complete or by a
+// reconcile takes its counters with it, so a ticket re-claimed in a later run
+// starts over at attempt 1. That is safe because a tag is only ever resolved
+// against the CURRENT orchestrator session's sub-agent directory (transcripts
+// collect), which a new run does not share.
+export function stageAttempt(lane: LaneState): number {
+  const respawns = respawnsAt(lane, lane.stage);
+  switch (lane.stage) {
+    case "builder":
+      return lane.qaBounces + lane.reviewBounces + (lane.commitRetries ?? 0) + respawns + 1;
+    case "qa":
+      return lane.qaBounces + lane.reviewBounces + respawns + 1;
+    case "reviewer":
+      return lane.reviewBounces + (lane.quorumRetries ?? 0) + respawns + 1;
+    case "merge":
+      return respawns + 1;
+  }
+}
+
+// What the fresh agent of a #209 re-spawn is told. The judgment call is handed to
+// it explicitly: carrying the dead attempt's work forward as trusted would defeat
+// the fresh-agent guarantee (nothing latent travels between stages, and nothing
+// verified this), while discarding it silently is the waste this whole transition
+// exists to stop. So the note states what is there, states that NOTHING confirmed
+// it, and puts keep/fix/drop on the agent that can actually look.
+function deadRespawnNote(lane: LaneState): string {
+  return (
+    `Your predecessor on this lane died without reporting: it went silent past the watchdog, was not ` +
+    `alive on probe, and never emitted an exit marker -- so nothing it did was verified by anyone. Its ` +
+    `worktree still holds UNCOMMITTED changes. Treat them as unverified work in progress, not as a head ` +
+    `start you must keep: look first (\`git status\`, \`git diff\`, \`git log\`), then decide for yourself ` +
+    `whether to keep, fix, or drop them -- that call is yours, and so is this stage's outcome either way. ` +
+    `This lane's ${lane.stage} stage has ONE re-spawn and it is now spent; a second silent death here skips the ticket.`
+  );
+}
+
+// A lane whose worker is silent past the watchdog AND not alive on probe (#209).
+//
+// Before this, the machine's only answer was `skip` -- correct when the agent
+// could not do the job, wrong when it simply never said it did. Run 11's #170
+// builder addressed both reviewer findings, backgrounded its own `bun test`, and
+// stopped waiting for it; the finished diff was sitting uncommitted in the
+// worktree, and recording that outcome would have skipped the ticket and thrown
+// away every dollar already spent on it. So a dead worker whose worktree still
+// holds uncommitted work buys one fresh agent at the SAME stage instead.
+//
+// A fresh SPAWN, never a resume: the no-SendMessage rule (z-loop/SKILL.md) is the
+// gate-tested guarantee that nothing latent travels between stages, and it is
+// worth more than the tokens a resume would save.
+function deadWorkerAction(lane: LaneState, wd: number): Action {
+  // A dead MERGE worker is never blind-skipped (issue #14 H9): `gh pr merge` may
+  // have landed the PR before the worker died, and skipping would lose it from
+  // mergedThisRun (breaking a stacked child's step-18 retarget) and let batch-end
+  // branch deletion close the dependent PR. The SKILL must verify PR state via
+  // `gh pr view` and record an outcome -- `merged` (-> complete, counted in
+  // mergedThisRun) if it landed, else `stage-blocked` (-> park Blocked for a
+  // human). So a dead merge lane holds at check-worker until an outcome is
+  // recorded, never falling through to the skip or the re-spawn below.
+  if (lane.stage === "merge") return { kind: "check-worker", ticket: lane.ticket };
+  // Per STAGE, not per lane: a builder that died silently is no evidence about the
+  // QA agent that runs after it, so spending the builder's budget must not leave a
+  // later QA death with nothing but the skip.
+  const spent = respawnsAt(lane, lane.stage);
+  const dirty = lane.worktreeDirty === true;
+  if (dirty && RESPAWN_STAGES.includes(lane.stage) && spent < MAX_DEAD_RESPAWNS) {
+    // stageAttempt reads the counters BEFORE applyAction spends this re-spawn, so
+    // the fresh spawn's attempt is the next one up. applyAction's increment then
+    // makes a later `loop attempt` read agree with this number exactly.
+    return {
+      kind: "respawn",
+      ticket: lane.ticket,
+      stage: lane.stage,
+      attempt: stageAttempt(lane) + 1,
+      note: deadRespawnNote(lane),
+    };
+  }
+  const base = `Worker died mid-${lane.stage}: silent past the ${wd}-minute watchdog and not alive on probe.`;
+  // No uncommitted work (or no worktree facts collected at all): byte-identical to
+  // the pre-#209 note -- there is nothing to recover, so no re-spawn is spent.
+  if (!dirty) {
+    return {
+      kind: "skip",
+      ticket: lane.ticket,
+      note: `${base} Skipped per the PROCESS.md no-token-burn rule; worktree left for inspection.`,
+    };
+  }
+  // Work IS sitting there and the lane has no re-spawn left. Skipping removes the
+  // lane lock, and a LOCKLESS worktree is an orphan to the next run's reconcile
+  // scan whatever the board says -- it is force-removed (uncommitted work
+  // discarded) before the loop will start. Same salvage contract as #177's park:
+  // the note names the patch the orchestrator dumps first (z-loop/SKILL.md
+  // `skip N`), keyed on the `uncommitted work` phrase, so the note is true.
+  return {
+    kind: "skip",
+    ticket: lane.ticket,
+    note:
+      `${base} ${spent > 0 ? `A re-spawned ${lane.stage} died the same way (${spent + 1} attempt(s)), so this is not a slip. ` : ""}` +
+      `Its worktree still holds uncommitted work, which was dumped to ` +
+      `\`~/.zstack/projects/<slug>/reports/uncommitted-${lane.ticket}.patch\` ` +
+      `(re-apply it in a fresh worktree with \`git apply\`) because the lane worktree does NOT survive: ` +
+      `skipping released its lane lock, so the next run's reconcile scan force-removes it ` +
+      `(\`git worktree remove --force\` -- uncommitted work discarded) before the loop will start. ` +
+      `Salvage it BEFORE the next /z-loop run, then return the ticket to Ready. ` +
+      `Skipped per the PROCESS.md no-token-burn rule.`,
+  };
 }
 
 // Reviewer->builder bounce cap (issue #76): both routes that send a ticket
@@ -878,18 +1139,9 @@ export function nextAction(state: LoopState, nowMs: number): Action {
   for (const lane of lanes) {
     if (lane.outcome) continue;
     if (!watchdogExpired(lane, nowMs, wd)) continue;
-    if (lane.workerDead) {
-      // A dead MERGE worker is never blind-skipped (issue #14 H9): `gh pr merge`
-      // may have landed the PR before the worker died, and skipping would lose it
-      // from mergedThisRun (breaking a stacked child's step-18 retarget) and let
-      // batch-end branch deletion close the dependent PR. The SKILL must verify PR
-      // state via `gh pr view` and record an outcome -- `merged` (-> complete,
-      // counted in mergedThisRun) if it landed, else `stage-blocked` (-> park
-      // Blocked for a human). So a dead merge lane holds at check-worker until an
-      // outcome is recorded, never falling through to skip.
-      if (lane.stage === "merge") return { kind: "check-worker", ticket: lane.ticket };
-      return { kind: "skip", ticket: lane.ticket, note: `Worker died mid-${lane.stage}: silent past the ${wd}-minute watchdog and not alive on probe. Skipped per the PROCESS.md no-token-burn rule; worktree left for inspection.` };
-    }
+    // A dead worker resolves to a merge-stage hold (H9), a same-stage re-spawn
+    // when its worktree still holds uncommitted work (#209), or the skip.
+    if (lane.workerDead) return deadWorkerAction(lane, wd);
     return { kind: "check-worker", ticket: lane.ticket };
   }
 
@@ -1100,6 +1352,12 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
       lane.lastActivityMs = nowMs;
       delete lane.outcome;
       delete lane.workerDead;
+      // #209: worktreeDirty describes ONE probe of ONE stage's leftovers, so it
+      // dies with the stage it was read for -- same rule the respawn case and
+      // recordProbe follow. Leaving it behind would let a builder-stage reading
+      // vouch for a later QA-stage death the orchestrator never collected facts
+      // for, buying a re-spawn the evidence does not support.
+      delete lane.worktreeDirty;
       // #125: this advance writes STATUS_FOR_STAGE[to] below; record it as the
       // lane's origin marker so a lagged board write can be told from a human
       // move-back on the next tick (ingest clears it once the board shows it land).
@@ -1115,6 +1373,23 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
         t.status = action.resyncStatus;
       }
       setStatus(t, STATUS_FOR_STAGE[action.to]);
+      return next;
+    }
+    // #209: same lane, same stage, fresh agent. The counter MUST be spent here or
+    // deadWorkerAction's `spent` never grows and a lane whose environment keeps
+    // killing workers re-spawns forever -- a paid infinite loop, the exact thing
+    // the no-token-burn rule forbids. No board write and no lastWroteStatus touch:
+    // the ticket already shows STATUS_FOR_STAGE[stage] (the lane never left it),
+    // so inventing an in-flight write marker here would tell the next tick's
+    // desync guard to resync a lag that does not exist.
+    case "respawn": {
+      const lane = next.lanes.find((l) => l.ticket === action.ticket);
+      if (!lane) throw new ZError(`No lane holds #${action.ticket} to re-spawn.`);
+      lane.respawns = { ...lane.respawns, [lane.stage]: respawnsAt(lane, lane.stage) + 1 };
+      lane.lastActivityMs = nowMs;
+      delete lane.outcome;
+      delete lane.workerDead;
+      delete lane.worktreeDirty;
       return next;
     }
     case "park": {
@@ -1182,16 +1457,42 @@ export function recordOutcome(
 }
 
 // Records an aliveness probe: alive refreshes the watchdog baseline, dead marks
-// the lane so the next nextAction() returns the skip (pure).
-export function recordProbe(state: LoopState, ticket: number, alive: boolean, nowMs: number): LoopState {
+// the lane so the next nextAction() resolves it (pure).
+//
+// #209: `porcelain` is the lane worktree's own `git status --porcelain --branch`
+// payload, collected by the orchestrator at probe time and judged here rather
+// than in prose. It is what tells a worker that died holding finished work from
+// one that died holding nothing -- the first buys a re-spawn, the second is the
+// skip that has always happened. Optional, and its absence records no facts at
+// all (byte-identical to pre-#209 behavior): unlike #177's BUILT verification,
+// omitting it can only cost recovery, never let unverified work advance, and a
+// lane whose worktree is already gone has no status to collect.
+export function recordProbe(
+  state: LoopState,
+  ticket: number,
+  alive: boolean,
+  nowMs: number,
+  porcelain?: string
+): LoopState {
   const next = structuredClone(state);
   const lane = next.lanes.find((l) => l.ticket === ticket);
   if (!lane) throw new ZError(`No lane holds #${ticket} to probe.`);
   if (alive) {
     lane.lastActivityMs = nowMs;
     delete lane.workerDead;
+    // The worktree reading only ever describes a DEAD worker's leftovers; a live
+    // one is still writing, so a stale flag must not survive to its next probe.
+    delete lane.worktreeDirty;
   } else {
     lane.workerDead = true;
+    // Set it or clear it -- never leave the previous probe's reading standing.
+    // The flag's contract is "the facts THIS probe collected", so a dead probe
+    // that collected none must read as none: absent (-> skip), not whatever the
+    // last probe happened to see. Otherwise one dirty reading vouches for every
+    // later death on the lane, and `loop probe`'s own stdout line would report a
+    // worktree it never opened.
+    if (porcelain === undefined) delete lane.worktreeDirty;
+    else lane.worktreeDirty = worktreeHoldsWork(porcelain);
   }
   return next;
 }
@@ -1552,6 +1853,12 @@ const USAGE = `loop <command> [args]
           --branch) --head-sha <sha> (git rev-parse HEAD) --base-sha <sha>
           (git merge-base <baseBranch> HEAD)
   probe <state.json> <ticket> <alive|dead> [--now <ms>] record an aliveness probe
+          a DEAD probe should also carry the lane worktree's dirtiness (#209),
+          which is what lets a stage that died holding finished work be re-spawned
+          instead of skipped: --porcelain <file> (git status --porcelain --branch)
+  attempt <state.json> <ticket>                      print the lane's 1-based spawn count for its CURRENT
+                                                     stage -- the <attempt> for "transcripts tag" and the
+                                                     <stage>-<attempt> transcript name. Read it AFTER apply.
   claim-lost <state.json> <ticket>                   mark a ticket claimed by another session
   human-needed <state.json>                          print the breakdown + tripped/alreadyNotified (no writes)
   human-needed-ack <state.json>                       mark the mid-run notification as sent (fire-once flag)
@@ -1730,8 +2037,24 @@ export function main(argv: string[]): number {
         throw new ZError("Usage: loop probe <state.json> <ticket> <alive|dead> [--now <ms>]");
       }
       const state = readJson(statePath) as LoopState;
-      atomicWrite(statePath, JSON.stringify(recordProbe(state, ticket, verdict === "alive", nowMs), null, 2));
-      console.log(`#${ticket} ${verdict}`);
+      // #209: only a DEAD probe has leftovers to judge, so the flag is read only
+      // there -- passing it with `alive` would be recording a fact about a
+      // worktree the live worker is still writing.
+      const porcelainFlag = str(flags, "porcelain");
+      const porcelain = verdict === "dead" && porcelainFlag !== undefined ? readText(porcelainFlag) : undefined;
+      const nextState = recordProbe(state, ticket, verdict === "alive", nowMs, porcelain);
+      atomicWrite(statePath, JSON.stringify(nextState, null, 2));
+      const dirty = nextState.lanes.find((l) => l.ticket === ticket)?.worktreeDirty;
+      console.log(`#${ticket} ${verdict}${dirty === undefined ? "" : dirty ? " (worktree holds uncommitted work)" : " (worktree clean)"}`);
+      return 0;
+    }
+    if (cmd === "attempt") {
+      const ticket = Number(positionals[1]);
+      if (!Number.isInteger(ticket)) throw new ZError("Usage: loop attempt <state.json> <ticket>");
+      const state = readJson(statePath) as LoopState;
+      const lane = state.lanes?.find((l) => l.ticket === ticket);
+      if (!lane) throw new ZError(`No lane holds #${ticket}, so it has no stage to count spawns for.`);
+      console.log(stageAttempt(lane));
       return 0;
     }
     if (cmd === "claim-lost") {
