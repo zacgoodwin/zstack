@@ -1069,26 +1069,33 @@ function dropLane(state: LoopState, n: number): void {
   state.lanes = state.lanes.filter((l) => l.ticket !== n);
 }
 
-// The board write the orchestrator OWES for this action -- the half applyAction
+// The board write this action's SKILL row performs -- the half applyAction
 // cannot do. The reducer is pure and lib/board.ts is the pack's sole gh caller,
-// so applying a `claim`/`advance` can only RECORD the intent: it stamps the new
-// status on the state file and stamps lane.lastWroteStatus (#125's origin
-// marker), then the orchestrator must actually move the board. Undefined for
-// every other action kind -- park/skip/complete carry their own literal target
-// status in the action, and their SKILL rows write it directly; these two are
-// the only ones whose target is DERIVED from STATUS_FOR_STAGE, which is exactly
-// why the derivation belongs here and not in prose.
+// so applying a `claim`/`advance` can only RECORD the transition: it stamps the
+// new status on the state file and stamps lane.lastWroteStatus (#125's origin
+// marker). Undefined for every other action kind -- park/skip/complete carry
+// their own literal target status in the action, and their SKILL rows write it
+// directly; these two are the only ones whose target is DERIVED from
+// STATUS_FOR_STAGE, which is exactly why the derivation belongs here and not in
+// prose.
 //
-// #205: the `advance` row left that obligation to prose alone and never named a
-// move, so after every stage transition the board sat a stage behind the lane,
-// the marker never cleared, and a crashed run -- whose resume path picks the
-// stage from the BOARD status (lanes.ts claimStage) -- re-claimed a QA lane as a
-// builder and rebuilt finished, committed work. `loop apply` prints this so the
-// obligation is visible in the tick output, and evals/e2e's residual-marker
-// assertion drives it so a marker the orchestrator can never clear fails a check
-// instead of costing a rebuild. INVARIANT: every action kind applyAction sets
-// lastWroteStatus for must return a write here.
-export function owedBoardWrite(action: Action): { ticket: number; status: BoardStatus } | undefined {
+// #205: the `advance` row named no move at all, so after every stage transition
+// the board sat a stage behind the lane, the marker never cleared, and a run
+// that resumed off the BOARD status (lanes.ts claimStage) re-claimed a QA lane
+// as a builder and rebuilt finished, committed work. Both rows now move the
+// board BEFORE their apply, mirroring each other: the marker is then never
+// stamped for a write that was never issued, and #138's `moved:false` recovery
+// (apply a stop-lane INSTEAD OF the transition) stays possible, which it is not
+// once the transition is already applied. `loop apply` prints the resulting
+// status as the post-condition to check, and evals/e2e's board-writes assertion
+// drives this derivation over a whole run.
+//
+// INVARIANT: every action kind applyAction stamps lastWroteStatus for must
+// return the SAME status here -- a marker no board write can match is a marker
+// ingest can never clear, which is this bug in code rather than in prose. Held
+// by tests/loop.test.ts's exhaustive `Record<Action["kind"], Action>` case (it
+// drives applyAction for every kind in the union), not by this comment.
+export function boardWriteFor(action: Action): { ticket: number; status: BoardStatus } | undefined {
   switch (action.kind) {
     case "claim":
       return { ticket: action.ticket, status: STATUS_FOR_STAGE[action.stage] };
@@ -1097,6 +1104,20 @@ export function owedBoardWrite(action: Action): { ticket: number; status: BoardS
     default:
       return undefined;
   }
+}
+
+// The project slug a loop state path belongs to. State files live at
+// ~/.zstack/projects/<slug>/loop/state.json (z-loop Step 0), so the slug is in
+// the path the caller already passed -- no config read, no guess. Falls back to
+// ZSTACK_SLUG (which the loop exports) for a non-standard path.
+//
+// Load-bearing for the `apply` print below: lib/config.ts resolveSlug THROWS
+// "Multiple zstack projects configured" whenever ~/.zstack/projects holds more
+// than one project, so a printed `z-board move` without `--slug` is not runnable
+// on the machines the loop actually runs on.
+export function slugFromStatePath(statePath: string, env: Record<string, string | undefined> = process.env): string | undefined {
+  const m = statePath.replace(/\\/g, "/").match(/\/projects\/([^/]+)\/loop\//);
+  return m ? m[1] : env.ZSTACK_SLUG || undefined;
 }
 
 // Applies an Action to the loop state, returning the new state (pure -- input
@@ -1742,11 +1763,22 @@ export function main(argv: string[]): number {
       atomicWrite(statePath, JSON.stringify(applyAction(state, action, nowMs), null, 2));
       console.log(`applied ${action.kind}${"ticket" in action ? ` #${action.ticket}` : ""}`);
       // #205: the state file now says the new stage's status and the lane carries
-      // the in-flight-write marker; the board does NOT until the orchestrator
-      // moves it. Print the owed move so the obligation rides the tick output
-      // instead of living only in the SKILL row that used to omit it.
-      const owed = owedBoardWrite(action);
-      if (owed) console.log(`board write owed: z-board move ${owed.ticket} ${owed.status} --if-present`);
+      // the in-flight-write marker, so the board MUST already read that status --
+      // the claim/advance rows both move it before this apply. Printing the
+      // post-condition puts the derived status (STATUS_FOR_STAGE, computed here,
+      // never re-derived by a reader) in the tick output, so a row that skipped
+      // its move is visible on the spot instead of surfacing a stage later as a
+      // rebuild. The repair line carries --slug because resolveSlug throws on a
+      // multi-project machine, and it is `--if-present` and idempotent, so
+      // running it when the board already agrees costs one no-op call.
+      const write = boardWriteFor(action);
+      if (write) {
+        const slug = slugFromStatePath(statePath);
+        console.log(
+          `board must now read #${write.ticket} = ${write.status} -- this action's row moves it; repair a mismatch with: ` +
+            `z-board move ${write.ticket} ${write.status} --if-present${slug ? ` --slug ${slug}` : ""}`
+        );
+      }
       return 0;
     }
     if (cmd === "outcome") {

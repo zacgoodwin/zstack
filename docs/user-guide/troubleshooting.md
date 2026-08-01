@@ -141,12 +141,13 @@ closes them. If you want them to auto-close, that fights the loop — leave the
 ## The board says Building for a ticket the loop is actually QA-ing or reviewing
 
 A stage transition skipped its board write. Every `advance` is two writes — the
-reducer stamps `state.json` and the orchestrator moves the ticket to the new
-stage's status — and `bun lib/loop.ts apply` prints the one it owes:
+orchestrator moves the ticket to the new stage's status, then the apply stamps
+`state.json` — and `bun lib/loop.ts apply` prints the status the board must now
+read:
 
 ```text
 applied advance #168
-board write owed: z-board move 168 QA --if-present
+board must now read #168 = QA -- this action's row moves it; repair a mismatch with: z-board move 168 QA --if-present --slug <slug>
 ```
 
 If that move never ran, the board keeps showing the previous stage. Confirm it
@@ -170,19 +171,29 @@ read shows that status land.
 
 ## A resumed run rebuilt work that was already committed
 
-The symptom above is what costs money. A crashed loop resumes off the **board**:
-`/z-loop` re-reads each ticket's status and re-claims it at the stage that status
-names (Building → builder, QA → qa, Review → reviewer). So a lane that had
-advanced to QA while the board still said Building comes back as a *builder*,
-spawns a fresh build agent on a branch whose work is already committed, and pays
-for it again.
+The symptom above is what costs money. A ticket is always claimed at the stage
+its **board** status names (Building → builder, QA → qa, Review → reviewer;
+`lanes.ts` `claimStage`), so a lane that had reached QA while the board still
+said Building comes back as a *builder*, spawns a fresh build agent on a branch
+whose work is already committed, and pays for it again.
 
-Two things to check before re-running a crashed loop:
+Which recovery a dead run gets depends on whether it left a lane lock behind:
 
-1. Every in-flight ticket's board status matches the stage its lane reached
-   (`jq '.lanes' …/state.json` against `/z-status`). Move any that disagree.
-2. `/z-loop --reconcile` if the crash left lane locks or orphan worktrees — it
-   parks affected tickets back to Ready rather than guessing a stage.
+- **Lock left behind** (the usual hard crash): startup refuses to run until you
+  pass `/z-loop --reconcile`, which releases the claim, prunes the worktree, and
+  parks the ticket back to **Ready**. That is a deliberate rebuild — reconcile
+  will not guess a stage from a lock whose worker is gone — and a correct board
+  status does not change it.
+- **No lock** (the lane was dropped cleanly by a `stop-lane`, a previous
+  `--reconcile` already pruned it, or the lock was cleared by hand): nothing
+  marks the ticket as crashed, so the next tick simply claims it at the stage its
+  board status names. This is the path a stale board turns into a rebuild, and it
+  is the one the board write protects.
+
+So before re-running: check that every in-flight ticket's board status matches
+the stage its lane reached (`jq '.lanes' …/state.json` against `/z-status`) and
+move any that disagree; then pass `--reconcile` if the crash left lane locks or
+orphan worktrees.
 
 If a rebuild already happened, the branch is intact (the loop never deletes
 branches) and the duplicate work is in the same worktree; the cost is the wasted

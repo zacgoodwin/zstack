@@ -22,7 +22,7 @@ import {
   markClaimLost,
   markHumanNeededNotified,
   nextAction,
-  owedBoardWrite,
+  boardWriteFor,
   parseReviewerConfidence,
   parseSkepticQuorum,
   parseStageResult,
@@ -32,6 +32,7 @@ import {
   recordOutcome,
   recordProbe,
   resolveStageModel,
+  slugFromStatePath,
   STATUS_FOR_STAGE,
   type Action,
   type LaneState,
@@ -1955,76 +1956,127 @@ describe("one-hop resync: lagged write vs genuine move-back by origin (#125)", (
   });
 });
 
-// -- #205: every stage transition owes a board write --------------------------
+// -- #205: every stage transition writes the board ----------------------------
 // applyAction can only RECORD a transition -- the reducer is pure and
-// lib/board.ts is the pack's sole gh caller -- so a claim/advance leaves the
-// ORCHESTRATOR owing the board move, and `owedBoardWrite` is the one place that
-// derives it. The `advance` row used to name no move at all, so the board sat a
-// stage behind its lane forever: the #125 marker never cleared (the "transient"
-// lag became permanent), /z-status lied, and -- the expensive one -- a crashed
-// run resumes off the BOARD status, so a lane at qa whose board still read
-// Building came back as a BUILDER and rebuilt finished, committed work.
-describe("#205: every stage transition owes a board write", () => {
+// lib/board.ts is the pack's sole gh caller -- so the board move belongs to the
+// ORCHESTRATOR, and `boardWriteFor` is the one place that derives which one. The
+// `advance` row named no move at all, so the board sat a stage behind its lane
+// forever: the #125 marker never cleared (the "transient" lag became permanent),
+// /z-status lied, and -- the expensive one -- every later claim of that ticket
+// reads the BOARD for its stage, so a lane that had reached qa came back as a
+// BUILDER and rebuilt finished, committed work.
+describe("#205: every stage transition writes the board", () => {
   const STAGES: Stage[] = ["builder", "qa", "reviewer", "merge"];
 
-  test("owedBoardWrite derives STATUS_FOR_STAGE for claim and advance, at every stage", () => {
+  // The board a simulated orchestrator keeps: it moves ONLY when boardWriteFor
+  // names a write, which is what makes a dropped derivation visible downstream
+  // instead of silently agreeing with the state file.
+  function performRow(board: Map<number, BoardStatus>, action: Action): void {
+    const write = boardWriteFor(action);
+    if (write) board.set(write.ticket, write.status);
+  }
+  const asItems = (board: Map<number, BoardStatus>) =>
+    [...board].map(([number, Status]) => ({ number, title: `Ticket ${number}`, fields: { Status } }));
+
+  // The printed repair line is only useful if it runs as printed, and
+  // resolveSlug throws on a multi-project machine, so the slug is read off the
+  // state path the caller already passed (~/.zstack/projects/<slug>/loop/...).
+  test("slugFromStatePath reads the slug out of the state path, on both separators, with a ZSTACK_SLUG fallback", () => {
+    expect(slugFromStatePath("/home/z/.zstack/projects/zstack/loop/state.json", {})).toBe("zstack");
+    expect(slugFromStatePath("C:\\Users\\z\\.zstack\\projects\\my-app\\loop\\state.json", {})).toBe("my-app");
+    // a path that is not a project state file falls back to the env the loop exports
+    expect(slugFromStatePath("/tmp/scratch/state.json", { ZSTACK_SLUG: "from-env" })).toBe("from-env");
+    // and with neither, no slug is invented
+    expect(slugFromStatePath("/tmp/scratch/state.json", {})).toBeUndefined();
+    expect(slugFromStatePath("/tmp/scratch/state.json", { ZSTACK_SLUG: "" })).toBeUndefined();
+    // the path wins over a stale env var pointing at another project
+    expect(slugFromStatePath("/home/z/.zstack/projects/zstack/loop/state.json", { ZSTACK_SLUG: "other" })).toBe("zstack");
+  });
+
+  test("boardWriteFor derives STATUS_FOR_STAGE for claim and advance, at every stage", () => {
     for (const stage of STAGES) {
-      expect(owedBoardWrite({ kind: "claim", ticket: 7, stage })).toEqual({ ticket: 7, status: STATUS_FOR_STAGE[stage] });
-      expect(owedBoardWrite({ kind: "advance", ticket: 7, to: stage })).toEqual({ ticket: 7, status: STATUS_FOR_STAGE[stage] });
+      expect(boardWriteFor({ kind: "claim", ticket: 7, stage })).toEqual({ ticket: 7, status: STATUS_FOR_STAGE[stage] });
+      expect(boardWriteFor({ kind: "advance", ticket: 7, to: stage })).toEqual({ ticket: 7, status: STATUS_FOR_STAGE[stage] });
     }
     // Named explicitly because merge has no column of its own -- it runs under
     // Review (Done means the PR landed), so advancing to merge re-writes Review.
-    expect(owedBoardWrite({ kind: "advance", ticket: 7, to: "merge" })).toEqual({ ticket: 7, status: "Review" });
+    expect(boardWriteFor({ kind: "advance", ticket: 7, to: "merge" })).toEqual({ ticket: 7, status: "Review" });
   });
 
-  // The coupling that makes the marker clearable at all: if a reducer branch ever
-  // stamps lastWroteStatus without owedBoardWrite naming the same status, that
-  // lane's marker can never be cleared by any write the orchestrator is told to
-  // make -- exactly the #205 failure, in code rather than prose.
-  test("INVARIANT: every action that stamps lastWroteStatus has an owed write, and the two agree", () => {
-    const cases: { before: LoopState; action: Action }[] = [
-      { before: state([ticket(1, "Ready")]), action: { kind: "claim", ticket: 1, stage: "builder" } },
-      { before: state([ticket(1, "QA")]), action: { kind: "claim", ticket: 1, stage: "qa" } },
-      { before: state([ticket(1, "Building")], [lane(1, "builder", { outcome: { kind: "built" } })]), action: { kind: "advance", ticket: 1, to: "qa" } },
-      { before: state([ticket(1, "QA")], [lane(1, "qa", { outcome: { kind: "qa-pass" } })]), action: { kind: "advance", ticket: 1, to: "reviewer" } },
-      { before: state([ticket(1, "Review")], [lane(1, "reviewer", { outcome: approve(100) })]), action: { kind: "advance", ticket: 1, to: "merge" } },
-      { before: state([ticket(1, "QA")], [lane(1, "qa", { outcome: { kind: "qa-bugs", note: "x" } })]), action: { kind: "advance", ticket: 1, to: "builder" } },
-    ];
-    for (const { before, action } of cases) {
-      const after = applyAction(before, action, 0);
-      const marker = after.lanes.find((l) => l.ticket === 1)!.lastWroteStatus;
-      const owed = owedBoardWrite(action);
-      expect(owed).toBeDefined();
-      expect(marker).toBe(owed!.status);
-      // and the state file agrees with what the orchestrator is told to write
-      expect(after.tickets[0].status).toBe(owed!.status);
+  // The coupling that makes a marker clearable at all, as a biconditional driven
+  // through the REAL reducer for every kind in the Action union: applying an
+  // action leaves a lane carrying `lastWroteStatus` IF AND ONLY IF boardWriteFor
+  // names a write of that same status for that same ticket. A branch that stamps
+  // a marker nothing is told to write leaves a lane no board read can ever clear
+  // -- #205 in code rather than in prose -- and a branch that names a write it
+  // never stamps re-arms the resync guard behind a write nobody made.
+  //
+  // `Record<Action["kind"], ...>` is what keeps this total: add a kind to the
+  // union and this file stops typechecking until the new branch is covered here.
+  test("INVARIANT: applying an action leaves a marker iff boardWriteFor names that exact write (every Action kind)", () => {
+    const withLane = (s: TicketSnapshot["status"], stage: Stage, over: Partial<LaneState> = {}) =>
+      state([ticket(1, s)], [lane(1, stage, over)]);
+    const CASES: Record<Action["kind"], { before: LoopState; action: Action }[]> = {
+      claim: [
+        { before: state([ticket(1, "Ready")]), action: { kind: "claim", ticket: 1, stage: "builder" } },
+        { before: state([ticket(1, "QA")]), action: { kind: "claim", ticket: 1, stage: "qa" } },
+        { before: state([ticket(1, "Review")]), action: { kind: "claim", ticket: 1, stage: "reviewer" } },
+      ],
+      advance: [
+        { before: withLane("Building", "builder", { outcome: { kind: "built" } }), action: { kind: "advance", ticket: 1, to: "qa" } },
+        { before: withLane("QA", "qa", { outcome: { kind: "qa-pass" } }), action: { kind: "advance", ticket: 1, to: "reviewer" } },
+        { before: withLane("Review", "reviewer", { outcome: approve(100) }), action: { kind: "advance", ticket: 1, to: "merge" } },
+        { before: withLane("QA", "qa", { outcome: { kind: "qa-bugs", note: "x" } }), action: { kind: "advance", ticket: 1, to: "builder" } },
+        { before: withLane("Review", "reviewer", { outcome: { kind: "review-findings", note: "x" } }), action: { kind: "advance", ticket: 1, to: "builder" } },
+      ],
+      park: [
+        { before: withLane("Building", "builder"), action: { kind: "park", ticket: 1, status: "Questions", note: "q" } },
+        { before: withLane("QA", "qa"), action: { kind: "park", ticket: 1, status: "Blocked", note: "b" } },
+      ],
+      skip: [{ before: withLane("Building", "builder"), action: { kind: "skip", ticket: 1, note: "s" } }],
+      "stop-lane": [{ before: withLane("QA", "qa"), action: { kind: "stop-lane", ticket: 1, note: "gone" } }],
+      complete: [{ before: withLane("Review", "merge", { outcome: { kind: "merged", note: "pr" } }), action: { kind: "complete", ticket: 1, note: "pr" } }],
+      // The four no-ops KEEP their lane, so a stamping branch added to any of
+      // them is visible here (park/skip/stop-lane/complete drop the lane, which
+      // is itself why they own no derived write -- nothing survives to clear).
+      "check-worker": [{ before: withLane("Building", "builder"), action: { kind: "check-worker", ticket: 1 } }],
+      wait: [{ before: withLane("Building", "builder"), action: { kind: "wait" } }],
+      "context-clear": [{ before: withLane("Building", "builder"), action: { kind: "context-clear" } }],
+      "drain-complete": [{ before: state([ticket(1, "Done")]), action: { kind: "drain-complete" } }],
+    };
+
+    for (const cases of Object.values(CASES)) {
+      expect(cases.length).toBeGreaterThan(0);
+      for (const { before, action } of cases) {
+        // the fixture itself must start clean, or the assertion below is bogus
+        expect(before.lanes.every((l) => l.lastWroteStatus === undefined)).toBe(true);
+        const after = applyAction(before, action, 0);
+        const write = boardWriteFor(action);
+        const marked = after.lanes.filter((l) => l.lastWroteStatus !== undefined).map((l) => [l.ticket, l.lastWroteStatus]);
+        if (write) {
+          expect(marked).toEqual([[write.ticket, write.status]]);
+          // and the state file records the same status the orchestrator wrote
+          expect(after.tickets.find((t) => t.number === write.ticket)!.status).toBe(write.status);
+        } else {
+          expect(marked).toEqual([]);
+        }
+      }
     }
   });
 
-  test("actions that own no stage status owe no write, and stamp no marker", () => {
-    const noWrite: Action[] = [
-      { kind: "park", ticket: 1, status: "Questions", note: "q" },
-      { kind: "skip", ticket: 1, note: "s" },
-      { kind: "complete", ticket: 1, note: "m" },
-      { kind: "stop-lane", ticket: 1, note: "gone" },
-      { kind: "wait" },
-      { kind: "drain-complete" },
-    ];
-    for (const action of noWrite) expect(owedBoardWrite(action)).toBeUndefined();
-  });
-
-  // AC1/AC2: the advance stamps QA, the orchestrator performs the owed move, and
-  // the NEXT tick's ingest clears the marker. Skip the move and it is permanent.
-  test("AC1+AC2: advance to qa owes `QA`; once written, the next ingest clears the marker -- skipped, it survives every tick", () => {
+  // AC1/AC2: the advance stamps QA, the orchestrator's row writes QA, and the
+  // NEXT tick's ingest clears the marker. Skip the write and it is permanent.
+  test("AC1+AC2: advance to qa writes `QA`; once written, the next ingest clears the marker -- skipped, it survives every tick", () => {
+    const board = new Map<number, BoardStatus>([[1, "Building"]]);
     let s = state([ticket(1, "Building")], [lane(1, "builder", { outcome: { kind: "built" } })]);
     const action: Action = { kind: "advance", ticket: 1, to: "qa" };
+    performRow(board, action); // the row moves the board BEFORE the apply
     s = applyAction(s, action, 0);
     expect(s.lanes[0].lastWroteStatus).toBe("QA");
+    expect(board.get(1)).toBe("QA"); // AC1
 
-    // The orchestrator performs `z-board move 1 QA`; the next tick reads it back.
-    const owed = owedBoardWrite(action)!;
-    expect(owed.status).toBe("QA");
-    const written = ingestBoardItems(s, [{ number: 1, title: "t", fields: { Status: owed.status } }], { "1": "" });
+    // AC2: the next tick reads the board back and the marker is gone.
+    const written = ingestBoardItems(s, asItems(board), { "1": "" });
     expect(written.lanes[0].lastWroteStatus).toBeUndefined();
 
     // On the pre-#205 row the move never happened: the board stays Building and
@@ -2038,20 +2090,42 @@ describe("#205: every stage transition owes a board write", () => {
     expect(skipped.lanes[0].lastWroteStatus).toBe("QA");
   });
 
-  // AC3: the resume path. A new invocation holds no lanes -- Step 3's ingest
-  // rebuilds loop state from the board -- so the board status IS the stage.
-  test("AC3: a crashed lane resumes at the stage the board names -- QA resumes at qa, a board left at Building rebuilds", () => {
-    expect(nextAction(state([ticket(1, "QA")]), 0)).toEqual({ kind: "claim", ticket: 1, stage: "qa" });
+  // AC3, driven end to end so it FAILS if the write is dropped: the whole point
+  // of this ticket is that the resume stage comes from the board, so the test
+  // has to run the transition through the same simulated orchestrator and read
+  // the resume off the board it produced. Delete the `advance` case from
+  // boardWriteFor and this board never reaches QA, so the resume claims builder.
+  //
+  // Scope of "the process dies": this is the ticket whose lane lock is already
+  // gone (a stop-lane'd lane, or one a previous --reconcile pruned), so nothing
+  // marks it as crashed and the fresh invocation just ingests the board and
+  // claims. A ticket that still holds its lock takes the --reconcile path
+  // instead, which parks it back to Ready by design (lib/reconcile.ts).
+  test("AC3: a lane advanced to qa, then killed, resumes at `qa` -- because the advance wrote the board", () => {
+    const board = new Map<number, BoardStatus>([[1, "Building"]]);
+    let live = state([ticket(1, "Building")], [lane(1, "builder", { outcome: { kind: "built" } })]);
+    const action: Action = { kind: "advance", ticket: 1, to: "qa" };
+    performRow(board, action);
+    live = applyAction(live, action, 0);
+    expect(live.lanes[0].stage).toBe("qa");
+
+    // ...the process dies here. A new invocation holds no lanes; Step 3's ingest
+    // rebuilds loop state from the board alone, and Step 4 asks for an action.
+    const resumed = ingestBoardItems(null, asItems(board), { "1": "" });
+    expect(resumed.lanes).toEqual([]);
+    expect(nextAction(resumed, 0)).toEqual({ kind: "claim", ticket: 1, stage: "qa" });
     expect(claimStage("QA")).toBe("qa");
 
-    // The same crash after an advance whose board write was skipped: the board
-    // still reads Building, so the resume re-claims it as a BUILDER and the
-    // finished, committed build is paid for twice (#164 burned $5.33 this way).
-    expect(nextAction(state([ticket(1, "Building")]), 0)).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
-    expect(claimStage("Building")).toBe("builder");
+    // The same crash on pre-#205 main, where the row wrote nothing: the board
+    // still reads Building, so the resume re-claims a finished build and pays
+    // for it twice (#164's rebuild burned $5.33 / 98 requests this way).
+    const stale = ingestBoardItems(null, [{ number: 1, title: "Ticket 1", fields: { Status: "Building" } }], { "1": "" });
+    expect(nextAction(stale, 0)).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
 
-    // Review resumes at the reviewer for the same reason.
-    expect(nextAction(state([ticket(1, "Review")]), 0)).toEqual({ kind: "claim", ticket: 1, stage: "reviewer" });
+    // A reviewer lane resumes at the reviewer for the same reason.
+    const rBoard = new Map<number, BoardStatus>([[2, "QA"]]);
+    performRow(rBoard, { kind: "advance", ticket: 2, to: "reviewer" });
+    expect(nextAction(ingestBoardItems(null, asItems(rBoard), { "2": "" }), 0)).toEqual({ kind: "claim", ticket: 2, stage: "reviewer" });
   });
 });
 
@@ -2754,33 +2828,51 @@ describe("loop CLI", () => {
     expect(JSON.parse(proc.stdout.toString())).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
   });
 
-  // #205: `apply` prints the board write the orchestrator still owes, so a
-  // transition that forgot one is visible in the tick output instead of living
-  // only in a SKILL row a reader can skim past.
-  function runApply(name: string, s: LoopState, action: Action): { exitCode: number | null; stdout: string } {
-    const statePath = join(dir, `${name}-state.json`);
-    const actionPath = join(dir, `${name}-action.json`);
+  // #205: `apply` prints the status the board must now read, derived in code
+  // from STATUS_FOR_STAGE, so a row that skipped its move is visible in the tick
+  // output instead of living only in a SKILL row a reader can skim past.
+  function runApply(name: string, s: LoopState, action: Action, subdir = ""): { exitCode: number | null; stdout: string } {
+    const base = subdir ? join(dir, subdir) : dir;
+    mkdirSync(base, { recursive: true });
+    const statePath = join(base, `${name}-state.json`);
+    const actionPath = join(base, `${name}-action.json`);
     writeFileSync(statePath, JSON.stringify(s));
     writeFileSync(actionPath, JSON.stringify(action));
-    const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "apply", statePath, actionPath, "--now", "0"], { stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "apply", statePath, actionPath, "--now", "0"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, ZSTACK_SLUG: "" },
+    });
     return { exitCode: proc.exitCode, stdout: proc.stdout.toString() };
   }
 
-  test("apply prints the owed board write for an advance (#205)", () => {
+  test("apply prints the board post-condition for an advance (#205)", () => {
     const s = state([ticket(1, "Building")], [lane(1, "builder", { outcome: { kind: "built" } })]);
     const { exitCode, stdout } = runApply("advance", s, { kind: "advance", ticket: 1, to: "qa" });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("applied advance #1");
-    expect(stdout).toContain("board write owed: z-board move 1 QA --if-present");
+    expect(stdout).toContain("board must now read #1 = QA");
+    expect(stdout).toContain("z-board move 1 QA --if-present");
   });
 
-  test("apply prints the owed board write for a claim, and nothing for an action that owes none (#205)", () => {
+  // The repair line has to be runnable as printed: lib/config.ts resolveSlug
+  // THROWS "Multiple zstack projects configured" on a machine with more than one
+  // project, which is the machine the loop runs on, so a slug-less command line
+  // is dead on arrival. The slug comes from the state path the caller passed --
+  // ~/.zstack/projects/<slug>/loop/state.json -- so nothing has to remember it.
+  test("apply's printed repair line carries --slug, derived from the state path (#205)", () => {
+    const s = state([ticket(1, "Building")], [lane(1, "builder", { outcome: { kind: "built" } })]);
+    const { stdout } = runApply("advance", s, { kind: "advance", ticket: 1, to: "qa" }, join("projects", "acme-app", "loop"));
+    expect(stdout).toContain("z-board move 1 QA --if-present --slug acme-app");
+  });
+
+  test("apply prints the post-condition for a claim, and nothing for an action that owns no stage status (#205)", () => {
     const claimed = runApply("claim", state([ticket(1, "Ready")]), { kind: "claim", ticket: 1, stage: "builder" });
-    expect(claimed.stdout).toContain("board write owed: z-board move 1 Building --if-present");
+    expect(claimed.stdout).toContain("board must now read #1 = Building");
 
     const parked = runApply("park", state([ticket(1, "Building")], [lane(1, "builder")]), { kind: "park", ticket: 1, status: "Questions", note: "q" });
     expect(parked.exitCode).toBe(0);
-    expect(parked.stdout).not.toContain("board write owed");
+    expect(parked.stdout).not.toContain("board must now read");
   });
 
   // -- fix 7: ingest must not treat a corrupt state as a first ingest ---------

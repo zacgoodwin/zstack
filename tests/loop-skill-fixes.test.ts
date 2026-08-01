@@ -7,7 +7,7 @@ import { test, expect, describe } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveSlug } from "../lib/config.ts";
-import { applyAction, owedBoardWrite, type LoopState } from "../lib/loop.ts";
+import { applyAction, boardWriteFor, type LoopState } from "../lib/loop.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const zLoop = () => readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
@@ -319,10 +319,13 @@ describe("Ticket #205: the advance row moves the board to the new stage's status
     return row ?? "";
   }
 
-  test("AC1: the row performs `z-board move <N> <status>` mirroring STATUS_FOR_STAGE, --if-present like every other lane move", () => {
+  test("AC1: the row performs `z-board move <N> <status>` mirroring STATUS_FOR_STAGE, --if-present --slug like every other lane move", () => {
     const row = advanceRow();
     expect(row).not.toBe("");
-    expect(row).toContain('"$Z_BOARD" move <N> <status> --if-present');
+    // --slug is not decoration: resolveSlug throws on a machine with more than
+    // one project under ~/.zstack/projects, so a slug-less move is unrunnable
+    // there. Every other lane move in this table carries it.
+    expect(row).toContain('"$Z_BOARD" move <N> <status> --if-present --slug "$SLUG"');
     expect(row).toContain("STATUS_FOR_STAGE[S]");
     for (const pair of ["`builder`→`Building`", "`qa`→`QA`", "`reviewer`→`Review`"]) expect(row).toContain(pair);
   });
@@ -333,16 +336,36 @@ describe("Ticket #205: the advance row moves the board to the new stage's status
     expect(row).toMatch(/merge has no status of its own/);
   });
 
-  test("order: lane lock -> apply -> board move -> spawn (the marker must exist before the write)", () => {
+  // The move goes BEFORE the apply, mirroring the `claim` row. Two reasons, both
+  // load-bearing: the apply stamps lastWroteStatus, and a marker stamped for a
+  // write that was never issued is a lie the next tick's resync guard believes;
+  // and #138's `moved:false` recovery is to apply a stop-lane INSTEAD OF the
+  // transition, which is impossible once the transition is already applied.
+  test("order: lane lock -> board move -> apply -> spawn, same as the claim row", () => {
     const row = advanceRow();
     const lock = row.indexOf("lane-write");
-    const apply = row.indexOf("2. Apply");
     const move = row.indexOf("move <N> <status>");
+    const apply = row.indexOf("3. Apply");
     const spawn = row.indexOf("4. Spawn stage S fresh");
     expect(lock).toBeGreaterThanOrEqual(0);
-    expect(lock).toBeLessThan(apply);
-    expect(apply).toBeLessThan(move);
-    expect(move).toBeLessThan(spawn);
+    expect(lock).toBeLessThan(move);
+    expect(move).toBeLessThan(apply);
+    expect(apply).toBeLessThan(spawn);
+
+    const claimRow = zLoop().split("\n").find((l) => l.startsWith("| `claim N` |")) ?? "";
+    expect(claimRow.indexOf("move <N> <status>")).toBeLessThan(claimRow.indexOf("5. Apply"));
+  });
+
+  // #138: on `moved:false` the ticket left the board, and the recovery is a
+  // stop-lane INSTEAD OF the transition. Applying the advance first would leave
+  // the state file at the new stage's status with no lane and no board item --
+  // the next tick then claims a ticket that is not on the board.
+  test("moved:false applies a stop-lane INSTEAD OF the advance, and spawns nothing", () => {
+    const row = advanceRow();
+    expect(row).toMatch(/`moved:false`/);
+    expect(row).toContain('"kind":"stop-lane"');
+    expect(row).toMatch(/\*\*instead of\*\* the advance/i);
+    expect(row).toMatch(/spawn nothing/i);
   });
 
   test("the row states the cost of skipping it, so it cannot be read as optional bookkeeping", () => {
@@ -353,11 +376,11 @@ describe("Ticket #205: the advance row moves the board to the new stage's status
 
   // The lib half: `apply` cannot make the write (pure reducer, board.ts is the
   // sole gh caller) but it derives and PRINTS it, so the row and the tool agree.
-  test("owedBoardWrite derives exactly the statuses the row names", () => {
-    expect(owedBoardWrite({ kind: "advance", ticket: 5, to: "builder" })).toEqual({ ticket: 5, status: "Building" });
-    expect(owedBoardWrite({ kind: "advance", ticket: 5, to: "qa" })).toEqual({ ticket: 5, status: "QA" });
-    expect(owedBoardWrite({ kind: "advance", ticket: 5, to: "reviewer" })).toEqual({ ticket: 5, status: "Review" });
-    expect(owedBoardWrite({ kind: "advance", ticket: 5, to: "merge" })).toEqual({ ticket: 5, status: "Review" });
+  test("boardWriteFor derives exactly the statuses the row names", () => {
+    expect(boardWriteFor({ kind: "advance", ticket: 5, to: "builder" })).toEqual({ ticket: 5, status: "Building" });
+    expect(boardWriteFor({ kind: "advance", ticket: 5, to: "qa" })).toEqual({ ticket: 5, status: "QA" });
+    expect(boardWriteFor({ kind: "advance", ticket: 5, to: "reviewer" })).toEqual({ ticket: 5, status: "Review" });
+    expect(boardWriteFor({ kind: "advance", ticket: 5, to: "merge" })).toEqual({ ticket: 5, status: "Review" });
   });
 
   test("docs/user-guide keeps the user-facing contract in step with the row", () => {
@@ -368,6 +391,24 @@ describe("Ticket #205: the advance row moves the board to the new stage's status
     const trouble = readFileSync(join(REPO_ROOT, "docs", "user-guide", "troubleshooting.md"), "utf8");
     expect(trouble).toMatch(/board says Building for a ticket the loop is actually QA-ing or reviewing/i);
     expect(trouble).toMatch(/resumed run rebuilt work that was already committed/i);
-    expect(trouble).toContain("board write owed: z-board move 168 QA --if-present");
+    expect(trouble).toContain("board must now read #168 = QA");
+    expect(trouble).toContain("z-board move 168 QA --if-present --slug");
+  });
+
+  // The two pages have to tell the SAME crash story. reconcile.ts parks a
+  // crashed lane that still holds its lock back to Ready (it refuses to guess a
+  // stage), so "a crash resumes at the board's stage" is true only for a ticket
+  // with no lock left -- a stop-lane'd lane, an already-pruned one. Saying it
+  // flatly on one page and contradicting it on the other is how the last reader
+  // got misled.
+  test("both pages qualify the resume story the same way: no lock -> board decides, lock -> --reconcile parks to Ready", () => {
+    const zloopDoc = readFileSync(join(REPO_ROOT, "docs", "user-guide", "z-loop.md"), "utf8");
+    const trouble = readFileSync(join(REPO_ROOT, "docs", "user-guide", "troubleshooting.md"), "utf8");
+    for (const page of [zloopDoc, trouble]) {
+      expect(page).toMatch(/lane lock|its lock|no lane lock|no lock/i);
+      expect(page).toMatch(/--reconcile/);
+      expect(page).toMatch(/back to \*{0,2}Ready/i);
+      expect(page).toMatch(/guess(ing)? a stage|will not guess/i);
+    }
   });
 });

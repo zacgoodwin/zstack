@@ -219,10 +219,12 @@ describe("mutated runs: the checker catches the specific break", () => {
 
 // ============================================================================
 // #205 -- board-writes: a stage transition that moves the state file and forgets
-// the board leaves a permanent in-flight-write marker. The derivation performs
-// exactly the writes `owedBoardWrite` names, so this assertion is the coupling
-// gate between the reducer's marker and the orchestrator's obligation. The break
-// it catches is a CODE break, not a fixture one, so it is exercised directly.
+// the board leaves a permanent in-flight-write marker. The derivation plays the
+// orchestrator by performing exactly the writes `boardWriteFor` names, so this
+// assertion gates the CODE-side coupling over a whole run -- every claim/advance
+// the walk makes names a write matching the marker it stamps. It cannot see a
+// SKILL row skipping a move the code names correctly (nothing that performs the
+// writes itself can); that half is `tests/loop-skill-fixes.test.ts`.
 // ============================================================================
 describe("#205: board-writes catches a stage transition that skipped its board write", () => {
   const initial = JSON.parse(readFileSync(join(SAMPLE_RUN, "state-initial.json"), "utf8"));

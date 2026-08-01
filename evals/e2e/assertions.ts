@@ -17,7 +17,7 @@ import { join } from "node:path";
 import {
   applyAction,
   nextAction,
-  owedBoardWrite,
+  boardWriteFor,
   recordOutcome,
   type Action,
   type BoardStatus,
@@ -100,9 +100,9 @@ export interface SimTrace {
   completionOrder: number[];
   finalState: LoopState;
   laneKeySets: Set<string>;
-  // #205: the board writes the orchestrator owed and performed during the
-  // derivation, and every lane snapshot whose in-flight-write marker no such
-  // write could ever match (see assertBoardWrites).
+  // #205: the board writes the derivation performed as the orchestrator, and
+  // every lane snapshot whose in-flight-write marker no such write could ever
+  // match (see assertBoardWrites for what that does and does not prove).
   boardWrites: number;
   residualMarkers: string[];
 }
@@ -118,8 +118,8 @@ export function deriveRun(initial: LoopState, oracle = happyOutcome): SimTrace {
   let maxObservedLanes = 0;
   let now = 0;
   // #205: the BOARD, kept separately from state.tickets. The reducer only ever
-  // records what the orchestrator must write; this map moves only when an owed
-  // write is actually performed, which is what makes a skipped write visible.
+  // records the transition; this map moves only when the write the action names
+  // is actually performed, which is what makes a missing one visible.
   const board = new Map<number, BoardStatus>();
   const residualMarkers: string[] = [];
   let boardWrites = 0;
@@ -147,14 +147,16 @@ export function deriveRun(initial: LoopState, oracle = happyOutcome): SimTrace {
       throw new Error(`Happy-path derivation hit an unexpected "${action.kind}" -- the recorded run is not the clean success this checker models.`);
     }
     if (action.kind === "complete") completionOrder.push(action.ticket);
-    state = applyAction(state, action, now);
-    // The orchestrator's half of the transition (#205): perform the write the
-    // action owes, then look for any lane the accumulated writes leave stranded.
-    const owed = owedBoardWrite(action);
-    if (owed) {
-      board.set(owed.ticket, owed.status);
+    // The orchestrator's half of the transition (#205), in the order the SKILL
+    // rows perform it: move the board FIRST, then apply -- so a marker is never
+    // stamped for a write that was never sent. Then look for any lane the
+    // accumulated writes leave stranded.
+    const write = boardWriteFor(action);
+    if (write) {
+      board.set(write.ticket, write.status);
       boardWrites += 1;
     }
+    state = applyAction(state, action, now);
     for (const l of state.lanes) {
       if (l.lastWroteStatus !== undefined && board.get(l.ticket) !== l.lastWroteStatus) {
         residualMarkers.push(
@@ -232,22 +234,29 @@ export function assertFreshContext(trace: SimTrace): AssertionResult {
   return ok("fresh-context", `lane state carried only ${[...ALLOWED_LANE_KEYS].join("/")} across every stage -- nothing latent travels`);
 }
 
-// #205: no drained lane may end a transition with a residual in-flight-write
-// marker. `lastWroteStatus` means "the loop wrote this status and has not seen it
-// land"; ingest clears it the moment a board read shows it. A marker no board
-// write the orchestrator owes could ever match is therefore permanent -- the
-// fingerprint of a stage transition that moved the state file and forgot the
-// board, which leaves `/z-status` lying and makes a crashed run resume off a
-// stale status and rebuild committed work. The derivation performs exactly the
-// writes `owedBoardWrite` names, so this fails the instant an action that stamps
-// the marker stops owing a write.
+// #205: over a whole drained run, no lane may end a transition carrying an
+// in-flight-write marker the board writes could not match. `lastWroteStatus`
+// means "the loop wrote this status and has not seen it land"; ingest clears it
+// the moment a board read shows it, so a marker no write can ever match is
+// permanent -- `/z-status` lies, and a later claim reads a stale stage and
+// rebuilds committed work.
+//
+// SCOPE, precisely: the derivation plays the orchestrator by performing exactly
+// the writes `boardWriteFor` names, so what this proves is the CODE-side
+// coupling across every transition a real run makes -- that each action stamping
+// a marker also names a board write, for the same status, at every stage the
+// walk reaches. Mutate `boardWriteFor` to skip `advance` and this goes red with
+// nine stranded markers. What it can NOT see is a human orchestrator (the
+// z-loop SKILL row) skipping a move the code correctly names -- no derivation
+// can, since it is the derivation that performs them. That half is held by the
+// SKILL row itself and by `tests/loop-skill-fixes.test.ts`.
 export function assertBoardWrites(trace: SimTrace): AssertionResult {
   if (trace.boardWrites === 0) {
-    return fail("board-writes", "the derivation performed no board writes at all -- every stage transition owes one, so this check would be vacuous");
+    return fail("board-writes", "the derivation performed no board writes at all -- every claim/advance names one, so this check would be vacuous");
   }
   return trace.residualMarkers.length
     ? fail("board-writes", `a stage transition left the board behind its lane: ${trace.residualMarkers.join("; ")}`)
-    : ok("board-writes", `every stage transition wrote the board (${trace.boardWrites} writes, no lane kept a residual lastWroteStatus)`);
+    : ok("board-writes", `every stage transition named a board write matching the marker it stamped (${trace.boardWrites} writes, no lane kept a residual lastWroteStatus)`);
 }
 
 // The reviewer-blindness gate as an e2e check: every recorded reviewer input is

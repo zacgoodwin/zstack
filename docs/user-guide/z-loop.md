@@ -74,20 +74,21 @@ records the result. It never re-derives a scheduling decision in prose.
   merge is still recorded even though the board can no longer show it, so a
   stacked child's PR retarget survives.
 - **Every stage transition writes the board.** A lane moving builder → QA →
-  Review → merge is two writes, not one: the reducer stamps the new status on
-  `state.json` and records it as the lane's in-flight-write marker, and the
-  orchestrator then moves the ticket on the board to `STATUS_FOR_STAGE[stage]` —
-  `builder`→Building, `qa`→QA, `reviewer`→Review, and `merge`→Review as well
-  (merge has no column of its own; Done means the PR landed). `loop apply` prints
-  the move it owes, so a transition that forgot one is visible in the tick output
-  rather than silent. It matters beyond the dashboard being honest: the **resume**
-  path reads the BOARD to pick a crashed ticket's stage, so a lane at QA whose
-  board still said Building would be re-claimed as a *builder* and would rebuild
-  finished, committed work. The write is deliberately performed AFTER the apply —
-  the marker the apply stamps is what lets the next tick tell this not-yet-landed
-  write of ours from a human's move-back, so a crash in that window resyncs
-  instead of stopping the lane, and the marker clears the moment a board read
-  shows the status land.
+  Review → merge is two writes, not one: the orchestrator moves the ticket on the
+  board to `STATUS_FOR_STAGE[stage]` — `builder`→Building, `qa`→QA,
+  `reviewer`→Review, and `merge`→Review as well (merge has no column of its own;
+  Done means the PR landed) — and the apply then stamps that same status on
+  `state.json` and records it as the lane's in-flight-write marker, which the
+  next board read clears. The move comes first, so the marker never names a write
+  that was never sent. `loop apply` prints the status the board must now read, so
+  a transition that skipped its move shows up in the tick output instead of
+  silently. It matters beyond an honest dashboard: a ticket is claimed at the
+  stage its **board** status names (Building → builder, QA → qa, Review →
+  reviewer), so a lane that had reached QA while the board still said Building is
+  re-claimed as a *builder* and rebuilds finished, committed work. That is what a
+  restarted run does with any ticket the dead run left no lane lock for; a ticket
+  that still holds its lock takes the `--reconcile` path instead, which parks it
+  back to Ready rather than guessing a stage.
 - **A board status the loop does not know is evidence, not an error.** The nine
   canonical statuses are the whole state machine, but the board is yours: add a
   staging queue or a triage column and the loop ignores any ticket sitting in
