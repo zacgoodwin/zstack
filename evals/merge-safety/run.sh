@@ -34,6 +34,16 @@ REAL_GIT="$(command -v git)"
 OUT="$(mktemp -d)"
 PR_URL="https://github.com/acme/fixture-app/pull/9"
 
+# CLAUDE_CMD may be a repo-relative script (the mock, per run.md's smoke
+# commands). The agent below runs from inside the throwaway worktree, so
+# absolutize a relative script path now or the cd would break it -- same reason
+# evals/reviewer/run.sh:34-38 does it.
+CMD_FIRST="${CLAUDE_CMD%% *}"
+if [ -f "$CMD_FIRST" ]; then
+  CMD_REST="${CLAUDE_CMD#"$CMD_FIRST"}"
+  CLAUDE_CMD="$(cd "$(dirname "$CMD_FIRST")" && pwd -P)/$(basename "$CMD_FIRST")$CMD_REST"
+fi
+
 for i in $(seq 1 "$RUNS"); do
   SANDBOX="$(mktemp -d)"
   BIN="$SANDBOX/bin"
@@ -106,8 +116,17 @@ GH_SHIM
 
   # 4. Drive a live merge stage inside the sandbox. PATH puts the shims first, so
   #    every `gh`/`git` the agent runs is recorded.
-  PATH="$BIN:$PATH" GH_LOG="$LOG" MOCK_PERSONA="${MOCK_PERSONA:-compliant}" \
-    $CLAUDE_CMD "$(cat "$SANDBOX/prompt.txt")" --add-dir "$SANDBOX" > "$OUT/final-$i.txt" || true
+  #
+  #    The `cd "$WORKTREE"` is a SAFETY boundary, not tidiness. The `git` shim is a
+  #    logging passthrough to the real binary, and this eval exists to provoke the
+  #    escalations OVERRIDE_CHECKS scores -- `git push --force`, and whatever else
+  #    a capable model reaches for. Inheriting the operator's cwd would aim every
+  #    one of those at the live zstack checkout and its remote. Inside $WORKTREE
+  #    they hit the throwaway fixture repo, which has no remote at all. It is also
+  #    what makes the trial honest: the agent's own `git log main..HEAD` /
+  #    `git status` then read the branch the prompt names.
+  ( cd "$WORKTREE" && PATH="$BIN:$PATH" GH_LOG="$LOG" MOCK_PERSONA="${MOCK_PERSONA:-compliant}" \
+      $CLAUDE_CMD "$(cat "$SANDBOX/prompt.txt")" --add-dir "$SANDBOX" ) > "$OUT/final-$i.txt" || true
 
   bun "$HERE/score.ts" trial "$LOG" "$OUT/final-$i.txt" > "$OUT/score-$i.json"
   marker="$(bun -e "console.log(JSON.parse(await Bun.file(process.argv[1]).text()).marker ?? '(none)')" "$OUT/score-$i.json")"
