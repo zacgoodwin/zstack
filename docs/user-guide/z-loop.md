@@ -201,7 +201,12 @@ records the result. It never re-derives a scheduling decision in prose.
   verification in the FOREGROUND, because ending a turn with a background job
   still pending is parsed as CONFUSED.
 - **Actual per ticket.** After each stage the ticket's transcripts are priced with
-  `bin/z-cost` (dedup by requestId) and written to the Actual field.
+  `bin/z-cost` (dedup by requestId) and written to the Actual field. A stage that
+  died without reporting is priced too, at the moment it is found dead and before
+  its replacement is spawned — that is the last instant its transcript can be
+  located, since the spawn tag is keyed on the attempt number and the re-spawn
+  moves that number on. So a ticket recovered by a re-spawn carries the cost of
+  **both** spawns, not just the one that finished.
 - **Per-stage transcript layout.** Each stage's copy lands at
   `~/.zstack/projects/<slug>/state/transcripts/ticket-<N>/<stage>-<attempt>.jsonl`
   — `<stage>` is `builder`/`qa`/`reviewer`/`merge`, `<attempt>` is that lane's
@@ -247,8 +252,17 @@ records the result. It never re-derives a scheduling decision in prose.
   reading that as a result would remove the worktree at the exact moment #66 did.
   Anything unproven — an unreadable or half-written transcript, one still parked
   on a tool call — counts as still running. That never stalls the drain: nothing
-  waits on the flag, and the batch-end cleanup sweeps whatever is left once every
-  lane is finished.
+  waits on the flag, and a leftover directory is the cheap direction to be wrong
+  in.
+  Because a 15-minute settling window makes "leftover" the **usual** outcome
+  rather than the exception, the sweep that collects them is a command
+  (`bun lib/reconcile.ts sweep-review`, which touches `.worktrees/review-<N>` and
+  nothing else) and it runs on every exit path: at batch cleanup when the drain
+  completes, and at the start of the next run right after the loop lock is
+  acquired — that second one is what covers a context-clear pause or a crash,
+  which never reach batch cleanup. `--reconcile` prunes them too. They never block
+  startup, though: a scratch checkout nobody owns is litter, not a wedge, so it is
+  swept rather than reported as an orphan.
 - **Per-stage model routing.** The merge stage is mechanical (`gh pr create`, a
   conflict check, `gh pr merge`) and doesn't need the ticket's build-tier
   model; the `stageModels` config knob (default `{"merge": "haiku"}`)
@@ -740,6 +754,11 @@ on any orphan (or names the live session if a loop is genuinely running).
 prunes worktrees, and clears the stale lock — then starts. It never deletes a
 branch, never touches a ticket with a live lane. A running loop's lock is never
 cleared: you cannot reconcile over a live loop.
+
+Leftover throwaway review worktrees (`.worktrees/review-<N>` and its
+`-lead`/`-base` variants) are pruned too, but they are never an orphan that
+refuses startup — they hold no work and belong to no lane, and every run sweeps
+them at Step 0 anyway.
 
 Mid-run, dragging a Building/QA ticket to Blocked or Questions on the board is
 respected: the loop stops that one lane cleanly at its next stage boundary and

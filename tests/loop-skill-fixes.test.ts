@@ -347,4 +347,78 @@ describe("Ticket #209: the respawn action and the input-field table agree on res
     // Order: read the worktree, THEN probe -- a probe without it can only skip.
     expect(r.indexOf("status --porcelain --branch")).toBeLessThan(r.indexOf('probe "$STATE" <N> dead'));
   });
+
+  // A dead spawn still spent money, and the ONLY window in which its spend is
+  // reachable is before the respawn is applied: the spawn tag is a digest of
+  // <attempt>, and applying the respawn spends respawns[<stage>] so `loop attempt`
+  // returns the NEXT number forever after. Miss it and a recovered ticket goes
+  // Done with an Actual covering only the spawn that survived -- the same silent
+  // undercount #190 exists to prevent, and the one the Plan's "the prior spend is
+  // still priced" promises against.
+  test("check-worker prices the dead spawn BEFORE probing, and the respawn row does not re-collect", () => {
+    const md = zLoop();
+    const cw = row(md, "| `check-worker N` |");
+    expect(cw).toContain("collect --tag");
+    // Pricing comes first: before the porcelain read, before the probe.
+    expect(cw.indexOf("collect --tag")).toBeLessThan(cw.indexOf("status --porcelain --branch"));
+    expect(cw.indexOf("collect --tag")).toBeLessThan(cw.indexOf('probe "$STATE" <N> dead'));
+    // And it names why this is the last chance.
+    expect(cw).toMatch(/loop attempt.{0,120}dead spawn's number|dead spawn's number/);
+
+    // The respawn row must not tell the orchestrator to collect again after apply:
+    // the attempt has moved on, so that tag names the spawn about to be made.
+    const rs = row(md, "| `respawn N at S` |");
+    expect(rs).toContain("already priced");
+    expect(rs).not.toContain("collect --tag");
+  });
+
+  // The Per-stage Actual block is the one place that copies transcripts, so it has
+  // to admit the dead-worker caller or the check-worker row above points at prose
+  // that only covers a clean finish.
+  test("the Per-stage Actual block covers a dead stage agent, not only a finished one", () => {
+    expect(section(zLoop(), "**Per-stage Actual")).toMatch(/found DEAD at `check-worker`/);
+  });
+});
+
+// ============================================================================
+// Ticket #209 (QA finding 2) -- the throwaway review worktree sweep is a
+// COMMAND, not prose. #209 gated in-run removal on the reviewer's whole spawn
+// subtree going quiet, which makes a leftover `.worktrees/review-<N>` the norm
+// rather than the exception; the only sweep it leaned on was a Step 7 sentence
+// with nothing to run, skipped by `context-clear` and by any crash. Nine
+// leftovers had accumulated in this repo by the time anyone counted.
+// ============================================================================
+describe("Ticket #209: leftover review worktrees are swept by a command on every exit path", () => {
+  test("Step 7's batch cleanup runs reconcile sweep-review", () => {
+    const step7 = section(zLoop(), "## Step 7 — Exit");
+    expect(step7).not.toBe("");
+    expect(step7).toContain('lib/reconcile.ts" sweep-review');
+  });
+
+  test("Step 0 sweeps too -- after the lock acquire, covering context-clear and crash exits", () => {
+    const md = zLoop();
+    const step0 = section(md, "## Step 0");
+    expect(step0).not.toBe("");
+    expect(step0).toContain('lib/reconcile.ts" sweep-review');
+    // Only safe once the acquire proved no other loop is running.
+    expect(step0.indexOf('locks.ts" acquire')).toBeLessThan(step0.indexOf('reconcile.ts" sweep-review'));
+    // And it is NOT part of the orphan refusal gate below it.
+    expect(step0.indexOf('reconcile.ts" sweep-review')).toBeLessThan(step0.indexOf("HAS_ORPHANS"));
+  });
+
+  test("the --reconcile contract lists throwaway review worktrees among what it prunes", () => {
+    const sec = section(zLoop(), "## `--reconcile` and the safety locks");
+    expect(sec).not.toBe("");
+    expect(sec).toMatch(/throwaway review worktrees/);
+    expect(sec).toContain("review-<N>");
+  });
+
+  test("the teardown gate points at those sweeps, not at a habit", () => {
+    // section() stops at the next "## " heading (Step 5), so Step 7's own sweep
+    // cannot satisfy this.
+    const block = section(zLoop(), "**Worktree teardown is gated");
+    expect(block).not.toBe("");
+    expect(block).toContain("sweep-review");
+    expect(block).not.toContain("Step 7's batch cleanup sweeps leftover review worktrees"); // the old prose-only promise
+  });
 });

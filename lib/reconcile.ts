@@ -57,25 +57,58 @@ export interface OrphanWorktree {
 export interface Orphans {
   crashedLanes: CrashedLane[];
   orphanWorktrees: OrphanWorktree[];
+  throwawayWorktrees: OrphanWorktree[]; // leftover `review-<N>` reviewer scratch checkouts (#209)
   buildingWithoutState: number[]; // Building on the board with neither lock nor worktree
 }
 
-// Worktree directories, one per `ticket-<N>`. Tolerates a missing dir.
-function listWorktrees(worktreesDir: string): { ticket: number; path: string }[] {
+// A lane's own worktree: exactly `ticket-<N>`.
+const LANE_WORKTREE_RE = /^ticket-(\d+)$/;
+
+// The reviewer's throwaway checkout (#209). `.worktrees/review-<N>`, plus the
+// suffixed variants a fanned-out review adds (`review-<N>-lead`, `-base`). It
+// belongs to no lane and holds no work -- it is a detached checkout of the head
+// commit the reviewer and its skeptics read -- so it is ALWAYS pruned and NEVER
+// parked or released: the number in the name is the ticket the review was for,
+// not a lane to recover.
+//
+// Reconcile owns these because #209 gated their in-run removal on the whole
+// reviewer subtree going quiet, which makes "left behind" the ordinary outcome
+// rather than the exception. The only other sweep is z-loop/SKILL.md Step 7's
+// batch cleanup, which a `context-clear` pause or any crash skips by design, and
+// before this scan matched nothing but `ticket-<N>` they were invisible here too
+// -- so they accumulated across runs (nine were sitting in this repo when #209's
+// QA looked).
+const THROWAWAY_WORKTREE_RE = /^review-(\d+)(?:-[A-Za-z0-9._-]+)?$/;
+
+// Worktree directories: the lanes' own `ticket-<N>` plus the reviewer's
+// throwaway `review-<N>` scratch checkouts. Tolerates a missing dir.
+function listWorktrees(worktreesDir: string): { ticket: number; path: string; throwaway: boolean }[] {
   let entries: import("node:fs").Dirent[];
   try {
     entries = readdirSync(worktreesDir, { withFileTypes: true });
   } catch {
     return [];
   }
-  const out: { ticket: number; path: string }[] = [];
+  const out: { ticket: number; path: string; throwaway: boolean }[] = [];
   for (const e of entries) {
     if (!e.isDirectory()) continue;
-    const m = e.name.match(/^ticket-(\d+)$/);
+    const lane = e.name.match(LANE_WORKTREE_RE);
+    const throwaway = lane ? null : e.name.match(THROWAWAY_WORKTREE_RE);
+    const m = lane ?? throwaway;
     if (!m) continue;
-    out.push({ ticket: Number(m[1]), path: join(worktreesDir, e.name) });
+    out.push({ ticket: Number(m[1]), path: join(worktreesDir, e.name), throwaway: throwaway !== null });
   }
-  return out.sort((a, b) => a.ticket - b.ticket);
+  // Two throwaways can share a ticket (`review-9`, `review-9-lead`), so the path
+  // breaks the tie and the order stays deterministic.
+  return out.sort((a, b) => a.ticket - b.ticket || a.path.localeCompare(b.path));
+}
+
+// The leftover reviewer scratch checkouts alone, for the batch-end sweep that
+// runs without a board snapshot (CLI `sweep-review`).
+export function listThrowawayWorktrees(worktreesDir: string): { ticket: number; path: string }[] {
+  return listWorktrees(worktreesDir)
+    .filter((w) => w.throwaway)
+    .map(({ ticket, path }) => ({ ticket, path }));
 }
 
 // Cross-references three sets -- lane locks (L), worktrees (W), and Building
@@ -90,7 +123,8 @@ export function scanOrphans(
   nowMs: number
 ): Orphans {
   const locks = listLaneLocks(locksDir);
-  const worktrees = listWorktrees(worktreesDir);
+  const all = listWorktrees(worktreesDir);
+  const worktrees = all.filter((w) => !w.throwaway);
   const lockTickets = new Set(locks.map((l) => l.lock.ticket));
   const wtByTicket = new Map(worktrees.map((w) => [w.ticket, w]));
   const statusByTicket = new Map(boardSnapshot.map((t) => [t.number, t.status]));
@@ -108,14 +142,26 @@ export function scanOrphans(
     .filter((w) => !lockTickets.has(w.ticket))
     .map((w) => ({ ticket: w.ticket, worktreePath: w.path, boardStatus: statusByTicket.get(w.ticket) }));
 
+  // No lock lookup and no board status: a throwaway has neither by construction.
+  const throwawayWorktrees: OrphanWorktree[] = all
+    .filter((w) => w.throwaway)
+    .map((w) => ({ ticket: w.ticket, worktreePath: w.path }));
+
   const buildingWithoutState = boardSnapshot
     .filter((t) => t.status === "Building" && !lockTickets.has(t.number) && !wtByTicket.has(t.number))
     .map((t) => t.number)
     .sort((a, b) => a - b);
 
-  return { crashedLanes, orphanWorktrees, buildingWithoutState };
+  return { crashedLanes, orphanWorktrees, throwawayWorktrees, buildingWithoutState };
 }
 
+// Deliberately does NOT count throwawayWorktrees. hasOrphans is the startup
+// REFUSAL gate (z-loop/SKILL.md Step 0b: orphans + no --reconcile => refuse), and
+// a leftover `review-<N>` is not a wedge -- it is a scratch checkout nobody owns.
+// Since #209 made leftovers the ordinary outcome, counting them here would refuse
+// to start the loop after almost every run. They are still pruned by the plan
+// below whenever reconcile does run, and swept unconditionally by Step 0's
+// `sweep-review` and Step 7's batch cleanup.
 export function hasOrphans(o: Orphans): boolean {
   return o.crashedLanes.length > 0 || o.orphanWorktrees.length > 0 || o.buildingWithoutState.length > 0;
 }
@@ -165,6 +211,12 @@ export function reconcilePlan(orphans: Orphans): ReconcileAction[] {
         note: `Worktree without a lock while the board showed ${w.boardStatus}; returned to Ready.`,
       });
     }
+  }
+  // Throwaway reviewer checkouts: prune only. Never release or park -- the number
+  // in `review-<N>` names the ticket the review was for, and that ticket may well
+  // be Done (merged) by now; parking it back to Ready would rebuild landed work.
+  for (const w of orphans.throwawayWorktrees) {
+    actions.push({ kind: "prune-worktree", ticket: w.ticket, path: w.worktreePath });
   }
   for (const n of orphans.buildingWithoutState) {
     actions.push({ kind: "release-claim", ticket: n });
@@ -256,6 +308,10 @@ const USAGE = `reconcile <command> [args] --slug S
 
   scan   [--now MS]   scan orphans + build the plan; print JSON {hasOrphans, orphans, plan}
   plan   [--now MS]   print the reconcile action list as JSON
+  sweep-review        remove leftover throwaway reviewer worktrees (.worktrees/review-<N>)
+                      and nothing else. No board read, no locks, no slug needed --
+                      z-loop/SKILL.md Step 7's batch cleanup, as a command instead of
+                      prose. Prints the paths removed, one per line, then a count.
   apply  [--now MS] [--session ID]
                       execute the plan: release claims, park to Ready, prune worktrees,
                       remove stale locks (never deletes branches or comments).
@@ -304,13 +360,29 @@ export async function main(argv: string[]): Promise<number> {
     console.log(USAGE);
     return cmd ? 0 : 1;
   }
-  if (!["scan", "plan", "apply"].includes(cmd)) {
+  if (!["scan", "plan", "apply", "sweep-review"].includes(cmd)) {
     console.error(`Unknown command "${cmd}".\n\n${USAGE}`);
     return 1;
   }
   try {
     const { flags } = parseFlags(argv.slice(1));
     const nowMs = Number(str(flags, "now") ?? Date.now());
+
+    // sweep-review touches nothing but throwaway reviewer checkouts, so it runs
+    // before the config load and the board client: Step 7 calls it with the loop
+    // lock still held, and a batch-end cleanup must not be able to fail on a
+    // GraphQL quota or a missing project config.
+    if (cmd === "sweep-review") {
+      const dir = str(flags, "worktrees") ?? join(process.cwd(), ".worktrees");
+      const found = listThrowawayWorktrees(dir);
+      for (const w of found) {
+        pruneWorktreeReal(w.path);
+        console.log(w.path);
+      }
+      console.log(`swept ${found.length} throwaway review worktree(s)`);
+      return 0;
+    }
+
     const cfg = loadConfig(str(flags, "slug"));
     const board = new Board(cfg, ghExecutor());
     const locksDir = str(flags, "dir") ?? defaultLocksDir(cfg.slug);

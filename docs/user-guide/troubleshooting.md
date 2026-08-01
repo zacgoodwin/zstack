@@ -144,6 +144,28 @@ whether the stage prompt's foreground rule is being honored (verification must
 finish before the final message — a backgrounded gate can never report back,
 because the loop sends each stage agent exactly one message by design).
 
+## `git worktree list` is full of leftover `review-*` worktrees
+
+Those are the reviewer's throwaway checkouts. They hold no work — each is a
+detached checkout of the head commit the reviewer and its skeptics read — so
+removing them is always safe.
+
+They pile up because in-run removal waits for the reviewer's whole spawn subtree
+to go quiet (the skeptics execute inside the worktree and outlive their parent;
+removing it under a live one is what #66 hit), and that settling window is 15
+minutes, so the reviewer almost always returns first. The loop sweeps them with a
+command on every exit path — batch cleanup on drain-complete, and Step 0 of the
+next run for the exits that never reach it — but a pack older than that fix, or a
+directory the loop no longer scans, can leave a backlog. Clear it by hand:
+
+```bash
+bun ~/.claude/skills/zstack/lib/reconcile.ts sweep-review
+```
+
+It removes `.worktrees/review-<N>` (and the `-lead`/`-base` variants) and nothing
+else: no board read, no locks, no slug. Run it from the repo root, and not while a
+review stage is live — the loop's own copy runs only when no reviewer is running.
+
 ## "Rates last checked … over the 14-day limit"
 
 `bin/z-estimate` / `bin/z-cost` warn when `references/rates.json`'s `checked_at`

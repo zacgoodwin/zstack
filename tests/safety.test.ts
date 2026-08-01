@@ -40,6 +40,8 @@ import {
   applyReconcile,
   assertNotReconcilingLiveLoop,
   hasOrphans,
+  listThrowawayWorktrees,
+  main as reconcileMain,
   reconcileBoardMoves,
   reconcilePlan,
   scanOrphans,
@@ -834,6 +836,76 @@ describe("control 2: orphan scan (crash recovery)", () => {
     expect(parked).toEqual([5]);
     expect(released).toEqual([5]);
     expect(pruned[0]).toContain("ticket-5");
+  });
+
+  // -- #209: the reviewer's throwaway checkouts are reconcile's to clean up ------
+  // #209 gated in-run removal of `.worktrees/review-<N>` on the reviewer's whole
+  // spawn subtree going quiet (the skeptics execute inside it and outlive their
+  // parent), which makes "left behind" the ordinary outcome. Before this the scan
+  // matched nothing but `ticket-<N>`, so nothing but a prose sentence in Step 7
+  // ever removed them and they accumulated across runs.
+  test("leftover `review-<N>` worktrees are scanned and pruned -- never parked or released", () => {
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    mkdirSync(join(worktreesDir, "review-42"));
+    mkdirSync(join(worktreesDir, "review-42-lead")); // a fanned-out review's variants
+    mkdirSync(join(worktreesDir, "review-7-base"));
+
+    // #42 is Done (merged, the ordinary case) and #7 is still in Review.
+    const orphans = scanOrphans(locksDir, worktreesDir, [{ number: 42, status: "Done" }, { number: 7, status: "Review" }], 0);
+    expect(orphans.throwawayWorktrees.map((w) => w.ticket)).toEqual([7, 42, 42]);
+    expect(orphans.orphanWorktrees).toEqual([]); // never counted as a lane's worktree
+    expect(listThrowawayWorktrees(worktreesDir).map((w) => w.path)).toEqual([
+      join(worktreesDir, "review-7-base"),
+      join(worktreesDir, "review-42"),
+      join(worktreesDir, "review-42-lead"),
+    ]);
+
+    const plan = reconcilePlan(orphans);
+    expect(plan.every((a) => a.kind === "prune-worktree")).toBe(true);
+    expect(plan.map((a) => (a as any).path).sort()).toEqual(
+      [join(worktreesDir, "review-42"), join(worktreesDir, "review-42-lead"), join(worktreesDir, "review-7-base")].sort()
+    );
+    // Never park or release: the number names the ticket the review was FOR, and
+    // #42 is merged -- reopening it would rebuild landed work.
+    expect(byKind(plan, "park-ready")).toEqual([]);
+    expect(byKind(plan, "release-claim")).toEqual([]);
+  });
+
+  // hasOrphans is the STARTUP REFUSAL gate. A leftover scratch checkout is litter,
+  // not a wedge, and since #209 made leftovers the norm, counting them here would
+  // refuse to start the loop after almost every run.
+  test("a leftover review worktree alone does NOT trip hasOrphans (the startup refusal gate)", () => {
+    const worktreesDir = tmp();
+    mkdirSync(join(worktreesDir, "review-42"));
+    const orphans = scanOrphans(tmp(), worktreesDir, [{ number: 42, status: "Done" }], 0);
+    expect(orphans.throwawayWorktrees).toHaveLength(1);
+    expect(hasOrphans(orphans)).toBe(false); // startup proceeds
+    expect(reconcilePlan(orphans)).toHaveLength(1); // but reconcile still prunes it
+
+    // Contrast: a real lane worktree with no lock IS a wedge.
+    mkdirSync(join(worktreesDir, "ticket-42"));
+    expect(hasOrphans(scanOrphans(tmp(), worktreesDir, [{ number: 42, status: "Done" }], 0))).toBe(true);
+  });
+
+  // The CLI branch Step 0 and Step 7 call. It must run BEFORE loadConfig and the
+  // Board client: batch cleanup holds the loop lock and must not be able to fail
+  // on a missing project config or a GraphQL quota. No slug is passed here, so a
+  // non-zero exit would prove that ordering regressed.
+  test("`sweep-review` needs no slug, no board, and no locks dir", async () => {
+    expect(await reconcileMain(["sweep-review", "--worktrees", tmp()])).toBe(0);
+  });
+
+  // The name is matched, not merely prefixed: an unrelated directory must not be
+  // force-removed by the sweep.
+  test("only `review-<N>` shapes are throwaway; unrelated directories are ignored entirely", () => {
+    const worktreesDir = tmp();
+    for (const name of ["review", "reviews-3", "review-abc", "notes", "ticket-3x"]) mkdirSync(join(worktreesDir, name));
+    const orphans = scanOrphans(tmp(), worktreesDir, [], 0);
+    expect(orphans.throwawayWorktrees).toEqual([]);
+    expect(orphans.orphanWorktrees).toEqual([]);
+    expect(listThrowawayWorktrees(worktreesDir)).toEqual([]);
+    expect(reconcilePlan(orphans)).toEqual([]);
   });
 });
 
