@@ -320,6 +320,27 @@ describe("stage transitions", () => {
     });
   });
 
+  // #225: a merge the base branch's protection refused is a HUMAN action away
+  // from done, not a failure. Questions (and its `human-pause` page), never
+  // Blocked -- the ticket's own note has to read as an approval request, or the
+  // next merge stage learns that a refusal is something to be solved.
+  test("a protection-refused merge parks to Questions naming the PR, not Blocked", () => {
+    let s = state([ticket(1, "Review")], [lane(1, "merge")]);
+    s = recordOutcome(s, 1, "MERGE-NEEDS-APPROVAL: https://github.com/o/r/pull/9 -- 1 approving review required", 0);
+    const a = nextAction(s, 0);
+    expect(a).toMatchObject({ kind: "park", ticket: 1, status: "Questions" });
+    const note = (a as { note: string }).note;
+    expect(note).toContain("https://github.com/o/r/pull/9");
+    expect(note).toContain("approving review");
+    expect(note).toContain("The loop will not override a protection rule.");
+    expect(note).toContain("1 approving review required"); // the stage's own reason survives
+    s = applyAction(s, a, 0);
+    expect(s.tickets[0].status).toBe("Questions");
+    expect(s.lanes).toEqual([]);
+    // The merge never landed, so nothing is recorded as merged this run.
+    expect(s.mergedThisRun).toEqual([]);
+  });
+
   test("reviewer findings bounce to a fresh builder", () => {
     let s = state([ticket(1, "Review")], [lane(1, "reviewer")]);
     s = recordOutcome(s, 1, "REVIEW-FINDINGS: 1) AC3 assertion weakened in tests/x.test.ts:12", 0);
@@ -1744,6 +1765,45 @@ describe("parseStageResult", () => {
     expect(parseStageResult("merge", "MERGED: https://pr/9")).toEqual({ kind: "merged", note: "https://pr/9" });
     expect(parseStageResult("merge", "BLOCKED: conflict gauntlet failed")).toEqual({ kind: "stage-blocked", note: "conflict gauntlet failed" });
   });
+  // #225 AC3: branch protection refusing the merge gets its OWN outcome kind.
+  // Before this, a merge stage told not to override had only BLOCKED (reads as a
+  // broken environment, pages `ticket-parked`) or an unmarked message (CONFUSED
+  // -> the ticket is SKIPPED) for a PR that is finished, green, and waiting on a
+  // human's approving review.
+  test("MERGE-NEEDS-APPROVAL parses to its own kind carrying the PR URL", () => {
+    const o = parseStageResult("merge", "MERGE-NEEDS-APPROVAL: https://github.com/o/r/pull/9");
+    expect(o.kind).toBe("merge-needs-approval");
+    expect(o.kind).not.toBe("stage-blocked");
+    expect(o.kind).not.toBe("confused");
+    expect(o).toEqual({
+      kind: "merge-needs-approval",
+      prUrl: "https://github.com/o/r/pull/9",
+      note: "https://github.com/o/r/pull/9",
+    });
+  });
+
+  test("the URL is extracted from prose, and an absent one is null rather than a throw", () => {
+    const withReason = parseStageResult(
+      "merge",
+      "MERGE-NEEDS-APPROVAL: https://github.com/o/r/pull/9 -- ruleset 19184288 requires 1 approving review.\nPR is green; not overriding."
+    );
+    expect(withReason).toMatchObject({ kind: "merge-needs-approval", prUrl: "https://github.com/o/r/pull/9" });
+    // The whole note is kept for the park, not just the URL.
+    expect((withReason as { note: string }).note).toContain("requires 1 approving review");
+    // A note with no URL in it must still park cleanly.
+    expect(parseStageResult("merge", "MERGE-NEEDS-APPROVAL: protection refused the merge")).toEqual({
+      kind: "merge-needs-approval",
+      prUrl: null,
+      note: "protection refused the merge",
+    });
+  });
+
+  test("the marker is merge-only: no other stage may claim protection refused it", () => {
+    for (const stage of ["builder", "qa", "reviewer"] as Stage[]) {
+      expect(parseStageResult(stage, "MERGE-NEEDS-APPROVAL: https://github.com/o/r/pull/9").kind).toBe("confused");
+    }
+  });
+
   test("a marker from the wrong stage, an unknown marker, or no marker is CONFUSED", () => {
     expect(parseStageResult("builder", "QA-PASS: nope").kind).toBe("confused");
     expect(parseStageResult("qa", "ALL-DONE: what").kind).toBe("confused");

@@ -7,6 +7,8 @@ Read `ticketBody`, `acceptanceCriteria`, and `diff` from /loop/tmp/input-42.json
 /tmp/review-throwaway-42
 Run the typecheck and the tests this diff touches here. Nothing you do in it lands anywhere; discard it when done.
 
+Repository protections are a boundary, not an obstacle. Never pass --admin to any gh command; never force a merge, a review, or a status through `gh api`; never create, edit, delete, or add a bypass to a ruleset or branch-protection rule; never approve a pull request (this loop's or anyone's); never force-push. A protection rule that refuses you ENDS your stage -- report it and exit by the contract below. Routing around it is a safety violation, not a fix, even when you are certain the change is good.
+
 ## Hunt for
 - Acceptance criteria silently weakened, skipped, or asserted less strictly than written.
 - Paths the diff adds but no test exercises; tests that pass without the change.

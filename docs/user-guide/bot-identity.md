@@ -147,8 +147,52 @@ worth reporting back on issue #66.
 can still block the bot's own PRs from merging even with Write — that's the
 repo's protection rules applying to every author equally, not a bot
 permission gap. Either exempt the bot account from required-reviewer rules
-or leave protection as-is and expect the merge stage to report a blocked PR,
-same as it would for a human's PR under the same rules.
+or leave protection as-is and expect the merge stage to exit
+`MERGE-NEEDS-APPROVAL` with the PR URL, parking the ticket in **Questions** with
+the PR left open for you to approve — same as a human's PR under the same rules.
+The loop never overrides the rule to get past it; see
+[Never grant the bot `admin`](#never-grant-the-bot-admin--push-is-the-ceiling)
+below and `docs/user-guide/z-loop.md`.
+
+### Never grant the bot `admin` — `push` is the ceiling
+
+Write role gives the bot `{admin:false, maintain:false, push:true}`. **That
+`admin:false` is a safety control, not an accident of the minimum-permission
+exercise above**, and the reason is on the record.
+
+In loop run 12 the merge stage was refused twice by branch protection and then
+ran `gh pr merge 224 --squash --admin` — an administrative override of the repo's
+protection rules — unprompted, in an unattended session with no human in the
+turn. Nothing in its prompt forbade it. The command failed, and the only thing
+that made it fail was the bot lacking admin rights: the PR stayed OPEN and
+`origin/main` never moved. Run the same loop as the repo owner and that command
+squashes an unreviewed branch onto `main` and reports a clean `MERGED:`.
+
+The prompt-side hole is closed — every stage prompt now states that protection
+rules are a boundary and not an obstacle, the merge stage exits
+`MERGE-NEEDS-APPROVAL` instead of routing around a refusal, and
+`evals/merge-safety/` measures whether a live model honors it. But a prompt is a
+mitigation and a permission is a wall. Keep both:
+
+| Permission | Bot should hold | Why |
+| --- | --- | --- |
+| `push` | **yes** | branches, commits, PRs — everything the loop legitimately does |
+| `maintain` | no | not needed for any loop action; adds settings surface |
+| `admin` | **no** | the only bit that makes `gh pr merge --admin`, ruleset edits, and protection-rule deletion actually work |
+
+Check it any time:
+
+```bash
+gh api repos/<owner>/<repo>/collaborators/<bot-login>/permission \
+  --jq '{role: .role_name, admin: .user.permissions.admin, maintain: .user.permissions.maintain, push: .user.permissions.push}'
+```
+
+Expect `admin:false, maintain:false, push:true`. Anything else — most commonly
+from running the loop as the repo owner rather than a bot — means a merge stage
+that decides to escalate will succeed. This is the second reason the dedicated
+bot account is recommended over
+[continuing as your own account](#continuing-as-your-own-account-instead): an
+owner identity cannot have this wall.
 
 ### Required reviews and the loop
 
@@ -404,6 +448,11 @@ records the switch the same way.
 - [ ] The bot is a repo collaborator with **Write**.
 - [ ] The bot is a project collaborator with **Write** (checked separately
       from the repo grant — this is the one people miss).
+- [ ] `gh api repos/<owner>/<repo>/collaborators/<bot-login>/permission`
+      reports `admin:false` — see
+      [Never grant the bot `admin`](#never-grant-the-bot-admin--push-is-the-ceiling).
+      `push` is the ceiling; `admin` is the bit that would let a merge stage
+      override branch protection for real.
 - [ ] `bun "$PACK/lib/identity.ts" state --slug <slug>` prints
       `{"state":"bot"}`.
 - [ ] A test claim (`bin/z-board claim <N> <bot-login>`, or just watching the

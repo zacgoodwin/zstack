@@ -18,6 +18,7 @@ import {
   reviewerPrompt,
   shSingleQuote,
   ADVERSARIAL_TRIGGER_LABELS,
+  PROTECTION_BOUNDARY,
   REVIEWER_INPUT_KEYS,
   SPAWN_TAG_MARKER,
   type BuilderPromptInput,
@@ -549,6 +550,67 @@ describe("merge prompt", () => {
     expect(p).toContain(`--title ${shSingleQuote(evil)}`);
     // ...and NOT via JSON.stringify, whose double quotes let bash expand $()/backticks.
     expect(p).not.toContain(`--title ${JSON.stringify(evil)}`);
+  });
+});
+
+// -- repository-protection boundary (#225) ------------------------------------
+
+// Run 12's merge stage ran `gh pr merge 224 --squash --admin` unprompted, after
+// branch protection refused two ordinary merge attempts. Nothing in the prompt
+// forbade it; only the loop account's missing admin right stopped it. This block
+// is the gate for the prompt-side fix, and doubles as the mutation canary the
+// ticket asks for: the sentence lives in ONE exported constant, so deleting or
+// gutting it in lib/stage-prompts.ts fails these cases, each naming its stage.
+describe("protection boundary in every stage prompt (#225)", () => {
+  const STAGES: [string, () => string][] = [
+    ["builder", () => builderPrompt(BUILDER_INPUT, INPUT_PATH)],
+    ["qa", () => qaPrompt(QA_INPUT, INPUT_PATH)],
+    ["reviewer (single pass)", () => reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false)],
+    ["reviewer (adversarial)", () => reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true)],
+    ["merge", () => mergePrompt(MERGE_INPUT, INPUT_PATH)],
+    ["merge (stacked chain)", () => mergePrompt({ ...MERGE_INPUT, stackedOn: [40, 41] }, INPUT_PATH)],
+  ];
+
+  for (const [name, build] of STAGES) {
+    // AC4: every stage prompt carries the boundary. A builder or QA agent can
+    // reach for `--admin` just as easily as the merge stage can.
+    test(`AC4: the ${name} prompt carries the no-override sentence verbatim`, () => {
+      expect(build()).toContain(PROTECTION_BOUNDARY);
+    });
+  }
+
+  // The `toContain(PROTECTION_BOUNDARY)` cases above are satisfied by ANY value
+  // of the constant -- every string contains "" -- so the substance is asserted
+  // against literal phrases here. AC1: the shipped merge prompt names --admin as
+  // forbidden and states that a protection refusal ends the stage.
+  test("AC1: the merge prompt forbids every override path and makes a refusal terminal", () => {
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    expect(p).toContain("Never pass --admin");
+    expect(p).toContain("gh api"); // no forcing a merge/review/status through the API
+    expect(p).toContain("branch-protection rule"); // no editing/deleting/bypassing the rules
+    expect(p).toMatch(/never approve a pull request/i); // no self-approval
+    expect(p).toContain("never force-push");
+    // The refusal is the END of the stage, not an obstacle to route around.
+    expect(p).toContain("ENDS your stage");
+    expect(p).toContain("TERMINAL and EXPECTED end to this stage");
+    expect(p).toContain("MERGE-NEEDS-APPROVAL");
+  });
+
+  test("AC1: the boundary constant itself still forbids each escalation path", () => {
+    for (const phrase of ["--admin", "gh api", "ruleset", "branch-protection rule", "force-push", "ENDS your stage"]) {
+      expect(PROTECTION_BOUNDARY).toContain(phrase);
+    }
+  });
+
+  // The merge stage needs somewhere to GO when protection refuses it, or the
+  // prohibition just pushes it into BLOCKED (reads as a broken environment) --
+  // #226 reads this marker off the park.
+  test("the merge exit contract offers the approval marker beside MERGED", () => {
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const contract = p.slice(p.indexOf("## Exit contract"));
+    expect(contract).not.toBe("");
+    expect(contract).toContain("MERGED: <the PR URL>");
+    expect(contract).toContain("MERGE-NEEDS-APPROVAL: <the PR URL>");
   });
 });
 

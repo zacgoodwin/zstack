@@ -1,0 +1,8 @@
+{
+  "ticketNumber": 42,
+  "prTitle": "Add CSV export",
+  "branch": "z/ticket-42-add-csv-export",
+  "baseBranch": "main",
+  "worktreePath": "<filled in by run.sh -- a real throwaway git worktree>",
+  "stackedOn": []
+}

@@ -51,6 +51,27 @@ function spawnStamp(tag: string | undefined): string {
   return tag ? `<!-- ${SPAWN_TAG_MARKER} ${tag} (orchestrator bookkeeping; ignore) -->\n` : "";
 }
 
+// -- repository-protection boundary (#225) -------------------------------------
+
+// Loop run 12's merge stage, refused twice by branch protection, reached for
+// `gh pr merge --squash --admin` on its own initiative. Nothing in the prompt
+// forbade it; the only thing that stopped it was the loop account lacking admin
+// rights. Under the previous identity (the repo owner) the same command would
+// have squashed an unreviewed branch onto main and reported a clean `MERGED:`.
+//
+// The gap was that "land the branch cleanly" reads, to a capable model, as
+// licence to escalate: the prompt named exactly one forbidden flag
+// (--delete-branch) and it was forbidden for a stacked-chain reason, not a
+// safety one. So the boundary is now stated outright, in EVERY stage prompt --
+// nothing stops a builder or a QA agent reaching for the same flag either.
+//
+// ONE exported constant, interpolated into all four constructors, so the wording
+// cannot drift between stages and the gate lint has a single string to assert
+// (tests/stage-prompts.test.ts, "every stage prompt carries the protection
+// boundary"). Deleting or weakening this sentence fails that lint.
+export const PROTECTION_BOUNDARY =
+  "Repository protections are a boundary, not an obstacle. Never pass --admin to any gh command; never force a merge, a review, or a status through `gh api`; never create, edit, delete, or add a bypass to a ruleset or branch-protection rule; never approve a pull request (this loop's or anyone's); never force-push. A protection rule that refuses you ENDS your stage -- report it and exit by the contract below. Routing around it is a safety violation, not a fix, even when you are certain the change is good.";
+
 // -- builder ------------------------------------------------------------------
 
 export interface BuilderPromptInput {
@@ -100,6 +121,7 @@ ${bounce}${review}${commit}
 - Deterministic work (arithmetic, parsing, transforms, lookups) goes in scripts with tests, never in your prose.
 - Fix root causes, not symptoms: grep every caller of anything you change.
 - Do not edit the issue body, comment on issues, close issues, or expand scope beyond the ticket.
+- ${PROTECTION_BOUNDARY}
 
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
 BUILT: <one-line summary>            all acceptance criteria pass, tests green in the worktree, work committed on ${i.branch} -- VERIFIED before the lane advances: \`git status --porcelain\` empty AND HEAD off ${i.baseBranch}. A BUILT with work still uncommitted sends this lane straight back to you.
@@ -129,6 +151,7 @@ export function qaPrompt(i: QaPromptInput, inputPath: string, tag?: string): str
 
 ## Workspace
 - Worktree: ${i.worktreePath}, branch ${i.branch}. Execute here freely. Do NOT fix anything -- report; the rebuild is the builder's job in a fresh spawn.
+- ${PROTECTION_BOUNDARY}
 
 ## Ticket
 Read the ticket body -- Context, Plan, and especially every "### Acceptance Criteria" case -- from ${inputPath}, field \`ticketBody\`, before you start.
@@ -284,6 +307,8 @@ Read \`ticketBody\`, \`acceptanceCriteria\`, and \`diff\` from ${inputPath}. Tha
 ${input.worktreePath}
 Run the typecheck and the tests this diff touches here. Nothing you do in it lands anywhere; discard it when done.
 
+${PROTECTION_BOUNDARY}
+
 ## Hunt for
 - Acceptance criteria silently weakened, skipped, or asserted less strictly than written.
 - Paths the diff adds but no test exercises; tests that pass without the change.
@@ -336,10 +361,12 @@ ${stacked}
 1. Open the PR: gh pr create --base ${i.baseBranch} --head ${i.branch} --title ${shSingleQuote(i.prTitle)} with a body that links the ticket and summarizes what shipped.
 2. If ${i.branch} conflicts with ${i.baseBranch}: resolve ON the branch, then rerun the full gauntlet (typecheck + full test suite) before merging. Never resolve in the merge commit blind.
 3. Merge with gh pr merge only when everything is green. Never pass --delete-branch: branch cleanup happens once at batch end, after every dependent PR has landed.
-4. Do not close the ticket issue and do not comment on it -- the orchestrator posts the completion note.
+4. ${PROTECTION_BOUNDARY} Concretely, at this stage: if gh pr merge is refused because the base branch requires an approving review, a status check you cannot satisfy, or any other rule, that is a TERMINAL and EXPECTED end to this stage, not a problem to solve. Leave the PR open, change nothing about the repository's rules, and exit MERGE-NEEDS-APPROVAL with the PR URL. A human approves it; the loop parks the ticket to wait.
+5. Do not close the ticket issue and do not comment on it -- the orchestrator posts the completion note.
 
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
 MERGED: <the PR URL>
+MERGE-NEEDS-APPROVAL: <the PR URL>   the PR is open and green, and only branch protection stands between it and the base branch -- state which rule refused it after the URL
 NEEDS-HUMAN: <the judgment call>
 BLOCKED: <reason -- what failed and what you tried>
 CONFUSED: <what makes no sense>`;

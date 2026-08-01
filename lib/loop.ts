@@ -276,6 +276,14 @@ export type StageOutcome =
   | { kind: "human-question"; note: string }
   | { kind: "stage-blocked"; note: string }
   | { kind: "confused"; note: string }
+  // #225: branch protection refused the merge. A distinct kind because the two
+  // outcomes it used to be squeezed into both say the wrong thing: BLOCKED
+  // (`stage-blocked`) reads as a broken environment and pages `ticket-parked`,
+  // and CONFUSED skips the ticket -- while the PR is finished, green, and merely
+  // waiting on a human's approving review. `prUrl` is carried separately from
+  // the note so the park can name the PR without re-parsing prose (#226 owns the
+  // wait-for-approval flow that reads it).
+  | { kind: "merge-needs-approval"; prUrl: string | null; note: string }
   | { kind: "merged"; note: string };
 
 // Confidence token off a REVIEW-APPROVE marker note: `confidence=NN` where NN
@@ -313,6 +321,20 @@ export function parseSkepticQuorum(note: string): { received: number; of: number
   const of = Number(m[2]);
   if (of < 1 || received > of) return null;
   return { received, of };
+}
+
+// The PR URL off a MERGE-NEEDS-APPROVAL marker note (#225). The marker's note is
+// model-authored prose ("<url> -- ruleset 19184288 requires 1 approving review"),
+// so the URL is extracted rather than assumed to be the whole note. Same
+// no-throw contract as the other two note parsers above: an unparseable note
+// yields null and the park falls back to naming the branch instead of the PR --
+// a missing URL must never crash the tick or turn a clean park into a failure.
+//
+// `\S*?` is lazy up to the literal `/pull/<digits>`, so trailing punctuation, a
+// `#issuecomment` fragment, or following prose never join the match.
+export function parsePrUrl(note: string): string | null {
+  const m = note.match(/https?:\/\/\S*?\/pull\/\d+/);
+  return m ? m[0] : null;
 }
 
 // The three git facts a BUILT claim is checked against (#177), read from the
@@ -453,6 +475,7 @@ const MARKERS: Record<Stage, Record<string, (note: string) => StageOutcome>> = {
   },
   merge: {
     "MERGED": (note) => ({ kind: "merged", note }),
+    "MERGE-NEEDS-APPROVAL": (note) => ({ kind: "merge-needs-approval", prUrl: parsePrUrl(note), note }),
     "NEEDS-HUMAN": (note) => ({ kind: "human-question", note }),
     "BLOCKED": (note) => ({ kind: "stage-blocked", note }),
     "CONFUSED": (note) => ({ kind: "confused", note }),
@@ -701,6 +724,23 @@ function resolveOutcome(lane: LaneState, qaLimits: QaBounceLimits, reviewerGate:
       // a single pass and never blocks here (that case is #62's floor's job).
       return quorumAction(lane, reviewerGate, o.skeptics);
     }
+    // #225: Questions, not Blocked. The distinction is the whole point of the
+    // marker -- the work is finished and the only missing thing is a human
+    // action, which is exactly what Questions (and its `human-pause` page)
+    // means. Parking it Blocked would page `ticket-parked` and read as
+    // something broken, which is how a merge stage talks itself into
+    // `--admin` next time.
+    case "merge-needs-approval":
+      return {
+        kind: "park",
+        ticket,
+        status: "Questions",
+        note:
+          `Waiting on an approving review: ${o.prUrl ?? "the merge stage's PR"} is open and green, and branch protection ` +
+          `will not let the loop merge it. Nothing is wrong with the diff and nothing is broken -- approve and merge the PR ` +
+          `yourself (or relax the rule; see docs/user-guide/bot-identity.md), then move this ticket back to Ready if it needs ` +
+          `anything more. The loop will not override a protection rule.\n\n${o.note}`,
+      };
     case "merged":
       return { kind: "complete", ticket, note: o.note };
   }

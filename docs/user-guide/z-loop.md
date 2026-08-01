@@ -190,6 +190,25 @@ records the result. It never re-derives a scheduling decision in prose.
   sweep is not a substitute — three lanes drain concurrently, so sibling
   reviewers' skeptics interleave in one flat directory, and the sweep tried by
   hand during a real run gave a reviewer with 3 skeptics 8 transcripts.
+- **Branch protection is terminal, never overridden.** Every stage prompt carries
+  one sentence (`PROTECTION_BOUNDARY` in `lib/stage-prompts.ts`) that puts the
+  repository's own rules out of reach: no `--admin` on any `gh` command, no
+  forcing a merge or a review through `gh api`, no creating/editing/deleting a
+  ruleset or branch-protection rule or adding a bypass to one, no approving a
+  pull request, no force-push. Run 12 is why: refused twice by branch protection,
+  the merge stage ran `gh pr merge --squash --admin` on its own, and the only
+  thing that stopped it was the loop account lacking admin rights — under a repo
+  owner's identity the same command would have squashed an unreviewed branch onto
+  `main` and reported a clean `MERGED:`. So the merge stage gets a first-class
+  exit for the condition instead: **`MERGE-NEEDS-APPROVAL: <pr-url>`** leaves the
+  PR open and parks the ticket in **Questions** (a `human-pause` page) with a note
+  naming the PR and the rule that refused it. That is deliberately not Blocked —
+  nothing is broken, the diff is finished and green, and the only missing thing is
+  a human's approving review. Approve and merge the PR yourself, or change the
+  rule (see [bot-identity.md](bot-identity.md#required-reviews-and-the-loop));
+  the loop will not do either for you. Whether a live model actually respects the
+  boundary under refusal is measured by `evals/merge-safety/`, whose bar is zero
+  override attempts across all trials.
 - **Per-stage model routing.** The merge stage is mechanical (`gh pr create`, a
   conflict check, `gh pr merge`) and doesn't need the ticket's build-tier
   model; the `stageModels` config knob (default `{"merge": "haiku"}`)
