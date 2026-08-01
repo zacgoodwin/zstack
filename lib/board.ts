@@ -24,6 +24,48 @@ export type GraphQLExecutor = (
 ) => Promise<GraphQLData>;
 export type Sleep = (ms: number) => Promise<void>;
 
+// One entry of a GraphQL response's top-level `errors` array, as GitHub returns
+// it. `type` + `path` are the API's own classification of the failure; the
+// message is prose and must never be pattern-matched.
+export interface GraphQLErrorEntry {
+  type?: string;
+  path?: (string | number)[];
+  message?: string;
+}
+
+// What ghExecutor throws when the response body carried an `errors` array. A
+// plain ZError flattens every failure into one string, which leaves a caller
+// unable to tell a FACT about the data ("no issue has that number") from a
+// failure of the call itself (auth, rate limit, transport). Carrying the entries
+// lets exactly one caller -- `Board.item` -- discriminate; everything else keeps
+// catching ZError and behaves as before.
+export class GraphQLResponseError extends ZError {
+  constructor(
+    message: string,
+    readonly errors: GraphQLErrorEntry[]
+  ) {
+    super(message);
+  }
+}
+
+// GitHub answers `repository.issue(number:)` for a number that is not an issue
+// -- deleted, never created, or a PULL REQUEST number -- with
+// `{"data":{"repository":{"issue":null}},"errors":[{"type":"NOT_FOUND",
+// "path":["repository","issue"],...}]}`: HTTP 200, data present, plus an error.
+// ghExecutor rightly throws on any `errors` array, which made `item`'s
+// `issue-not-found` branch dead against the real API and turned the likeliest
+// way a ticket leaves the board into an unrecoverable reconcile abort (#149).
+// A NOT_FOUND scoped to EXACTLY `repository.issue` is the positive answer we
+// want: that number is not an issue in this repo, so it is certainly not on this
+// board. `every` (not `some`) is deliberate -- a response mixing NOT_FOUND with
+// a real failure is not evidence, and still throws.
+function isIssueNotFound(errors: GraphQLErrorEntry[]): boolean {
+  return (
+    errors.length > 0 &&
+    errors.every((e) => e.type === "NOT_FOUND" && (e.path ?? []).join(".") === "repository.issue")
+  );
+}
+
 const defaultSleep: Sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // #127: a transient GitHub read can return 0 items for a board that really has
@@ -477,11 +519,23 @@ export class Board {
   // look identical. This resolves the issue directly to its project item, so
   // "not on this project" is a fact, not an inference from silence.
   async item(n: number): Promise<ItemLookup> {
-    const data = await this.gql(Q_ITEM_LOOKUP, {
-      owner: this.cfg.owner,
-      repo: this.cfg.repo,
-      number: n,
-    });
+    let data: GraphQLData;
+    try {
+      data = await this.gql(Q_ITEM_LOOKUP, {
+        owner: this.cfg.owner,
+        repo: this.cfg.repo,
+        number: n,
+      });
+    } catch (e) {
+      // "#n is not an issue here" arrives as a thrown NOT_FOUND, not as a null
+      // in the data (see isIssueNotFound). That is still a positive observation,
+      // so answer it instead of failing -- otherwise a lane lock pointing at a
+      // deleted issue wedges crash recovery forever (#149).
+      if (e instanceof GraphQLResponseError && isIssueNotFound(e.errors)) {
+        return { number: n, present: false, reason: "issue-not-found" };
+      }
+      throw e;
+    }
     // A null REPOSITORY is a config/permission failure, not evidence about #n --
     // reading it as "gone" would release every lane on the next tick. Fail loud.
     if (!data.repository) {
@@ -493,6 +547,9 @@ export class Board {
     const issue = data.repository.issue;
     // A deleted issue is as positively absent as a de-linked one, and its number
     // can never come back; both are safe to confirm, with the reason recorded.
+    // Against real GitHub this arrives via the catch above (data + errors, not
+    // data alone); this branch covers an executor that reports the null without
+    // throwing.
     if (!issue) return { number: n, present: false, reason: "issue-not-found" };
     assertSinglePage(issue.projectItems, `projectItems for issue #${n} (ceiling: 20 boards per issue)`);
     const node = (issue.projectItems?.nodes ?? []).find(
@@ -984,7 +1041,10 @@ export function ghExecutor(spawn: GhSpawn = defaultGhSpawn): GraphQLExecutor {
     if (Array.isArray(out.errors) && out.errors.length > 0) {
       const e = out.errors[0];
       const where = Array.isArray(e?.path) && e.path.length > 0 ? ` (path: ${e.path.join(".")})` : "";
-      throw new ZError(`GraphQL error: ${e?.message ?? JSON.stringify(e)}${where}`);
+      throw new GraphQLResponseError(
+        `GraphQL error: ${e?.message ?? JSON.stringify(e)}${where}`,
+        out.errors as GraphQLErrorEntry[]
+      );
     }
     return out.data;
   };

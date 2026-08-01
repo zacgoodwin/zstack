@@ -34,14 +34,20 @@ const INFLIGHT: BoardStatus[] = ["Building", "QA", "Review"];
 export type BoardTicketStatus = Pick<TicketSnapshot, "number" | "status">;
 
 // #149: why a ticket is missing from the sweep, PROVED by a single-ticket lookup
-// (never inferred from the sweep's silence).
-//   * "gone"            -- the issue is positively not on this project (or no
-//                          longer exists). Its recovery may touch the board.
+// (never inferred from the sweep's silence). The three cases differ in HOW MUCH
+// of the ticket still exists to act on, which is what decides the safe recovery:
+//   * "off-board"       -- the ISSUE still exists but is positively not on this
+//                          project. Its assignee is real and must be released;
+//                          its Status is not, so it can never be parked.
+//   * "issue-gone"      -- no issue carries that number at all (deleted, never
+//                          created, or the number belongs to a PR). Nothing on
+//                          GitHub to release, park, or comment on -- every board
+//                          call would throw. On-disk cleanup only.
 //   * "not-loop-driven" -- it IS on the board, in a status the loop does not
 //                          drive (a human's own column, so the sweep's
 //                          per-known-status listing never returned it). Clean the
 //                          crashed run's on-disk state; never touch the board.
-export type ConfirmedAbsence = "gone" | "not-loop-driven";
+export type ConfirmedAbsence = "off-board" | "issue-gone" | "not-loop-driven";
 
 // A lane lock left behind by a crashed loop. How it is reconciled depends on the
 // ticket's current board status (issue #14 C4): an INFLIGHT lane is released +
@@ -93,6 +99,21 @@ function listWorktrees(worktreesDir: string): { ticket: number; path: string }[]
   return out.sort((a, b) => a.ticket - b.ticket);
 }
 
+// The on-disk half of a scan, read as ONE snapshot. #149: scanWithConfirm needs
+// two cross-references (one to learn which tickets to look up, one to plan
+// against the confirmed answers), and re-reading the filesystem between them
+// opened a TOCTOU window -- a lane lock created while the lookups were in flight
+// landed in neither the board snapshot nor the confirmed-absent map, and
+// assertObserved turned that benign race into a hard refusal. Read once, use twice.
+export interface OnDiskState {
+  locks: { path: string; lock: LaneLock }[];
+  worktrees: { ticket: number; path: string }[];
+}
+
+export function readOnDiskState(locksDir: string, worktreesDir: string): OnDiskState {
+  return { locks: listLaneLocks(locksDir), worktrees: listWorktrees(worktreesDir) };
+}
+
 // Cross-references three sets -- lane locks (L), worktrees (W), and Building
 // tickets (B) -- into the three orphan categories (issue #2): locks without a
 // live lane, worktrees without a lock, and Building tickets without either.
@@ -108,8 +129,17 @@ export function scanOrphans(
   // than acted on (reconcilePlan throws).
   confirmedAbsent: ReadonlyMap<number, ConfirmedAbsence> = new Map()
 ): Orphans {
-  const locks = listLaneLocks(locksDir);
-  const worktrees = listWorktrees(worktreesDir);
+  return scanOrphansFrom(readOnDiskState(locksDir, worktreesDir), boardSnapshot, nowMs, confirmedAbsent);
+}
+
+// Same cross-reference against an already-read OnDiskState. Pure.
+export function scanOrphansFrom(
+  state: OnDiskState,
+  boardSnapshot: BoardTicketStatus[],
+  nowMs: number,
+  confirmedAbsent: ReadonlyMap<number, ConfirmedAbsence> = new Map()
+): Orphans {
+  const { locks, worktrees } = state;
   const lockTickets = new Set(locks.map((l) => l.lock.ticket));
   const wtByTicket = new Map(worktrees.map((w) => [w.ticket, w]));
   const statusByTicket = new Map(boardSnapshot.map((t) => [t.number, t.status]));
@@ -175,9 +205,13 @@ function assertObserved(o: { ticket: number; boardStatus?: BoardStatus; absence?
 //     or park, which would reopen merged work or undo a human's decision.
 //   * "not-loop-driven" (#149): on the board in a column the loop does not drive.
 //     Same treatment as terminal -- a human owns that ticket now.
-//   * "gone" (#149): positively off the board. Release + prune + unlock, but NEVER
-//     park: `board.move` to Ready on an issue that is not on the project throws,
+//   * "issue-gone" (#149): no issue carries that number. Same treatment again,
+//     for the opposite reason -- there is no issue left to release or park, and
+//     every board call for it throws (Board.release -> lookup -> "not found"),
 //     which would abort the apply midway and strand the remaining locks.
+//   * "off-board" (#149): the issue exists but is not on this project. Release
+//     the real assignee + prune + unlock, but NEVER park: `board.move` to Ready
+//     on an issue that is not on the project throws, same stranding.
 //   * INFLIGHT: release the assignee, prune its worktree (if present), park it
 //     back to Ready, remove its lock -- the crash left it mid-build.
 // A lockless worktree is pruned, and also released+parked when the board still
@@ -186,13 +220,17 @@ export function reconcilePlan(orphans: Orphans): ReconcileAction[] {
   const actions: ReconcileAction[] = [];
   for (const c of orphans.crashedLanes) {
     assertObserved(c);
-    if ((c.boardStatus && TERMINAL_STATUSES.includes(c.boardStatus)) || c.absence === "not-loop-driven") {
-      // Terminal: leave the board alone; just clear the crashed run's on-disk state.
+    const onDiskOnly =
+      (c.boardStatus && TERMINAL_STATUSES.includes(c.boardStatus)) ||
+      c.absence === "not-loop-driven" ||
+      c.absence === "issue-gone";
+    if (onDiskOnly) {
+      // Leave the board alone; just clear the crashed run's on-disk state.
       if (c.worktreePath) actions.push({ kind: "prune-worktree", ticket: c.ticket, path: c.worktreePath });
       actions.push({ kind: "remove-lock", ticket: c.ticket, path: c.lockPath });
       continue;
     }
-    if (c.absence === "gone") {
+    if (c.absence === "off-board") {
       actions.push({ kind: "release-claim", ticket: c.ticket });
       if (c.worktreePath) actions.push({ kind: "prune-worktree", ticket: c.ticket, path: c.worktreePath });
       actions.push({ kind: "remove-lock", ticket: c.ticket, path: c.lockPath });
@@ -360,7 +398,9 @@ export function missingFromSweep(orphans: Orphans, snapshot: BoardTicketStatus[]
 //     plan branches on the ticket's REAL state (a Done lane stays pruned-only).
 //   * present, in a status the loop does not drive -> "not-loop-driven"; the sweep
 //     never lists that column, so this is not a hiccup and not the loop's ticket.
-//   * positively absent -> "gone"; the release/prune path may proceed.
+//   * positively absent -> "off-board" (the issue survives, de-linked) or
+//     "issue-gone" (no such issue). The release/prune path may proceed; which
+//     board calls are still legal differs, hence the two answers.
 //   * lookup ERROR -> throw. Recovery must never proceed on a board it cannot
 //     read, and this runs before applyReconcile, so nothing has been mutated.
 export async function confirmMissing(
@@ -385,10 +425,18 @@ export async function confirmMissing(
       );
     }
     if (!look.present) {
-      out.absent.set(n, "gone");
+      // "issue-not-found" means the number resolves to no issue at all, so every
+      // board call for it throws; only "not-on-project" leaves a real issue whose
+      // assignee the crashed lane still holds.
+      const absence: ConfirmedAbsence = look.reason === "issue-not-found" ? "issue-gone" : "off-board";
+      out.absent.set(n, absence);
       out.notes.push(
-        `sweep missed #${n}; single-ticket lookup CONFIRMS it is off the board (${look.reason}) -- ` +
-          `its crashed lane may be released and pruned.`
+        absence === "issue-gone"
+          ? `sweep missed #${n}; single-ticket lookup CONFIRMS no issue carries that number ` +
+            `(${look.reason}) -- clearing its crashed lane's on-disk state only, since there is ` +
+            `nothing left on GitHub to release or park.`
+          : `sweep missed #${n}; single-ticket lookup CONFIRMS it is off the board (${look.reason}) -- ` +
+            `its crashed lane may be released and pruned.`
       );
       continue;
     }
@@ -420,13 +468,17 @@ export async function scanWithConfirm(
   worktreesDir: string,
   nowMs: number
 ): Promise<{ orphans: Orphans; notes: string[] }> {
+  // ONE filesystem read for both cross-references: a lock appearing between them
+  // would be in neither the snapshot nor the confirmed set, and assertObserved
+  // would refuse the whole reconcile over a benign race.
+  const state = readOnDiskState(locksDir, worktreesDir);
   const swept = await sweep(board);
   // A first pass purely to learn WHICH tickets the on-disk state points at; its
   // statuses are never planned against (reconcilePlan is not called on it).
-  const referenced = scanOrphans(locksDir, worktreesDir, swept, nowMs);
+  const referenced = scanOrphansFrom(state, swept, nowMs);
   const confirmed = await confirmMissing(board, swept, missingFromSweep(referenced, swept));
   return {
-    orphans: scanOrphans(locksDir, worktreesDir, confirmed.snapshot, nowMs, confirmed.absent),
+    orphans: scanOrphansFrom(state, confirmed.snapshot, nowMs, confirmed.absent),
     notes: confirmed.notes,
   };
 }

@@ -116,14 +116,34 @@ bun "$PACK/lib/locks.ts" acquire --slug "$SLUG" --session "$SESSION" ${RECONCILE
   || exit 1   # the CLI already printed which session holds it and what to do
 
 # b) Orphan scan: refuse if orphans exist and --reconcile was not passed.
-HAS_ORPHANS=$(bun "$PACK/lib/reconcile.ts" scan --slug "$SLUG" | jq -r .hasOrphans)
+#    Capture FIRST, then jq. `scan` exits non-zero when it cannot confirm a lock's
+#    ticket against the board (#149) and prints nothing on stdout; piping it
+#    straight into jq swallowed that -- jq on empty input prints nothing and exits
+#    0, so HAS_ORPHANS came back empty, the refusal below was skipped, and the loop
+#    started lanes over crashed locks against a board it had just declared
+#    unreadable. Command substitution without a pipe propagates the exit status.
+if ! SCAN=$(bun "$PACK/lib/reconcile.ts" scan --slug "$SLUG"); then
+  echo "Orphan scan FAILED (reason printed above) -- refusing to start: crash recovery"
+  echo "never proceeds on a board it cannot read. Fix the board access and re-run."
+  bun "$PACK/lib/locks.ts" release --slug "$SLUG"   # don't hold the lock while refusing
+  exit 1
+fi
+HAS_ORPHANS=$(printf '%s' "$SCAN" | jq -r .hasOrphans)
 if [ "$HAS_ORPHANS" = "true" ] && [ -z "$RECONCILE" ]; then
   echo "Orphans present (crashed lanes / stray worktrees / Building tickets with no state)."
   echo "Re-run /z-loop with --reconcile to release claims, park them to Ready, and prune."
   bun "$PACK/lib/locks.ts" release --slug "$SLUG"   # don't hold the lock while refusing
   exit 1
 fi
-[ -n "$RECONCILE" ] && bun "$PACK/lib/reconcile.ts" apply --slug "$SLUG" --session "$SESSION"
+# Same rule for the apply: a half-finished or aborted reconcile must stop the loop,
+# never fall through to Step 1 with the crashed run's locks still on disk.
+if [ -n "$RECONCILE" ]; then
+  if ! bun "$PACK/lib/reconcile.ts" apply --slug "$SLUG" --session "$SESSION"; then
+    echo "Reconcile apply FAILED (reason printed above) -- refusing to start lanes."
+    bun "$PACK/lib/locks.ts" release --slug "$SLUG"
+    exit 1
+  fi
+fi
 ```
 
 Set `RECONCILE=1` when the human invoked `/z-loop --reconcile`; leave it empty
@@ -764,6 +784,18 @@ first clears the wedge, then the loop starts normally. Reconcile:
 Reconcile **never**: deletes a branch, deletes a board comment, or touches a
 ticket that has a live lane. It only undoes the parts of a crashed run that a
 human would otherwise have to unwind by hand.
+
+**Reconcile never acts on absence, and a failed reconcile stops the loop (#149).**
+The startup sweep pages the board per status, so a lock's ticket missing from it
+proves nothing — a short page and a real removal look identical. Every
+sweep-missing ticket a lane lock or worktree points at gets ONE targeted
+`z-board item <N>` first, and the plan branches on that positive answer: still on
+the board → its real status; on the board in a column the loop does not drive, or
+no issue with that number at all → clear the on-disk state only, board untouched;
+de-linked but still an issue → release + prune, never park. If any of those
+lookups **errors**, `scan`/`apply` exit non-zero having mutated nothing. Step 0's
+snippet checks that exit status and refuses to start — never start lanes over
+crashed locks against a board the reconcile could not read.
 
 **Mid-loop human moves (wave reconciliation).** The board is re-read (ingest)
 before every stage transition, so a human who drags a Building/QA ticket to

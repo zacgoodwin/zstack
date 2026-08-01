@@ -60,7 +60,7 @@ import {
   type Stage,
   type TicketSnapshot,
 } from "../lib/loop.ts";
-import { Board, type GraphQLData, type GraphQLExecutor } from "../lib/board.ts";
+import { Board, ghExecutor, type GraphQLData, type GraphQLExecutor } from "../lib/board.ts";
 import type { BoardConfig } from "../lib/config.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
@@ -810,8 +810,11 @@ describe("control 2: orphan scan (crash recovery)", () => {
   // `board.item(N)` before any release/park/prune decision about it.
   //
   // A board double whose sweep returns NOTHING (the transient empty read #127
-  // guarded elsewhere) but whose single-ticket lookups answer truthfully.
-  function confirmBoard(answers: Record<number, string | null>, onItem?: (n: number) => void): ReconcileBoard {
+  // guarded elsewhere) but whose single-ticket lookups answer truthfully. An
+  // answer is a Status string (present), `null` (de-linked but the issue lives),
+  // or an explicit absence reason.
+  type ConfirmAnswer = string | null | { missing: "not-on-project" | "issue-not-found" };
+  function confirmBoard(answers: Record<number, ConfirmAnswer>, onItem?: (n: number) => void): ReconcileBoard {
     return {
       list: async () => [],
       item: async (n) => {
@@ -819,6 +822,7 @@ describe("control 2: orphan scan (crash recovery)", () => {
         const s = answers[n];
         if (s === undefined) throw new Error(`board double: unexpected lookup for #${n}`);
         if (s === null) return { number: n, present: false, reason: "not-on-project" };
+        if (typeof s === "object") return { number: n, present: false, reason: s.missing };
         return {
           number: n,
           present: true,
@@ -864,7 +868,7 @@ describe("control 2: orphan scan (crash recovery)", () => {
     mkdirSync(join(worktreesDir, "ticket-11"));
 
     const { orphans, notes } = await scanWithConfirm(confirmBoard({ 11: null }), locksDir, worktreesDir, 0);
-    expect(orphans.crashedLanes[0].absence).toBe("gone");
+    expect(orphans.crashedLanes[0].absence).toBe("off-board");
 
     const plan = reconcilePlan(orphans);
     expect(byKind(plan, "release-claim")).toEqual([11]);
@@ -942,6 +946,135 @@ describe("control 2: orphan scan (crash recovery)", () => {
     const worktreesDir = tmp();
     mkdirSync(join(worktreesDir, "ticket-22"));
     expect(() => reconcilePlan(scanOrphans(tmp(), worktreesDir, [], 0))).toThrow(/Refusing to reconcile #22/);
+  });
+
+  // -- #149 QA bounce: the four defects the first pass shipped ------------------
+
+  // QA finding 2 (MEDIUM). `Board.item`'s `issue-not-found` branch was DEAD against
+  // real GitHub: a query for a number that is not an issue answers HTTP 200 with
+  // data {repository:{issue:null}} AND a NOT_FOUND errors entry, and ghExecutor
+  // throws on any errors array -- so the lookup landed in confirmMissing's catch
+  // and every scan AND apply aborted identically. A lane lock pointing at a
+  // deleted issue (or a PR number) could never be cleared without a human deleting
+  // the lock by hand. The body below is the response recorded live from
+  // `gh api /graphql` on 2026-07-31 for a number no issue carries.
+  const NOT_FOUND_BODY = JSON.stringify({
+    data: { repository: { issue: null } },
+    errors: [
+      {
+        type: "NOT_FOUND",
+        path: ["repository", "issue"],
+        locations: [{ line: 1, column: 86 }],
+        message: "Could not resolve to an Issue with the number of 99321.",
+      },
+    ],
+  });
+
+  // A Board wired through the REAL ghExecutor over a fake `gh` process, so the
+  // errors-array throw is genuinely in the path. The quota probe is answered
+  // separately (Board.gql enforces it before every call).
+  const RATE_LIMIT_BODY = JSON.stringify({
+    data: { rateLimit: { remaining: 5000, resetAt: "2026-07-31T00:00:00Z" } },
+  });
+  function spawningBoard(stdout: string): Board {
+    const spawn = (_cmd: string[], stdin: string) => ({
+      exitCode: 0,
+      stdout: stdin.includes("rateLimit") ? RATE_LIMIT_BODY : stdout,
+      stderr: "",
+    });
+    return new Board(CFG, ghExecutor(spawn), async () => {}, () => 0);
+  }
+
+  test("board.item answers a real GitHub NOT_FOUND as a positive 'issue-not-found', not an error", async () => {
+    // Through the REAL ghExecutor, so the errors-array throw is in the path.
+    const look = await spawningBoard(NOT_FOUND_BODY).item(99321);
+    expect(look).toEqual({ number: 99321, present: false, reason: "issue-not-found" });
+  });
+
+  test("board.item still THROWS on an error that is not evidence about the issue", async () => {
+    // Same shape, different classification: a permission/transport failure says
+    // nothing about #99321, and reading it as "gone" would release a live lane.
+    const body = JSON.stringify({
+      data: null,
+      errors: [{ type: "FORBIDDEN", path: ["repository", "issue"], message: "Resource not accessible" }],
+    });
+    await expect(spawningBoard(body).item(99321)).rejects.toThrow(/Resource not accessible/);
+    // ...and a NOT_FOUND mixed with a real failure is not a clean answer either.
+    const mixed = JSON.stringify({
+      data: { repository: { issue: null } },
+      errors: [
+        { type: "NOT_FOUND", path: ["repository", "issue"], message: "no such issue" },
+        { type: "RATE_LIMITED", path: ["repository"], message: "API rate limit exceeded" },
+      ],
+    });
+    await expect(spawningBoard(mixed).item(99321)).rejects.toThrow(/no such issue/);
+  });
+
+  test("a lock pointing at a nonexistent issue clears with ZERO board calls", async () => {
+    // QA finding 3 (LOW). The old single "gone" bucket emitted release-claim for
+    // every absence, and Board.release -> lookup throws "Issue #N not found" on an
+    // issue that does not exist -- the FIRST action for that lane, so the apply
+    // aborted and stranded its worktree + lock (and every later lane's). An
+    // issue-gone lane must be on-disk cleanup only.
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    writeLaneLock(locksDir, { ticket: 99321, stage: "builder", session: "dead", claimedAt: 0 });
+    mkdirSync(join(worktreesDir, "ticket-99321"));
+
+    const board = confirmBoard({ 99321: { missing: "issue-not-found" } });
+    const { orphans, notes } = await scanWithConfirm(board, locksDir, worktreesDir, 0);
+    expect(orphans.crashedLanes[0].absence).toBe("issue-gone");
+
+    const plan = reconcilePlan(orphans);
+    expect(byKind(plan, "prune-worktree")).toEqual([99321]);
+    expect(byKind(plan, "remove-lock")).toEqual([99321]);
+    expect(byKind(plan, "release-claim")).toEqual([]); // would throw: no such issue
+    expect(byKind(plan, "park-ready")).toEqual([]); // would throw too
+    expect(notes[0]).toContain("no issue carries that number");
+
+    // The lane really clears, and the apply makes no board call at all.
+    const lockPath = join(locksDir, "ticket-99321.json");
+    await applyReconcile(plan, {
+      removeLock: (p) => rmSync(p, { force: true }),
+      pruneWorktree: () => {},
+      parkReady: () => expect.unreachable("a nonexistent issue must never be parked"),
+      releaseClaim: () => expect.unreachable("a nonexistent issue must never be released"),
+    });
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("a lane lock appearing DURING the confirm lookups does not abort the reconcile", async () => {
+    // QA finding 4 (LOW). scanWithConfirm cross-references twice; when it re-read
+    // the filesystem after the network round-trips, a lock written in that window
+    // was in neither the snapshot nor the confirmed-absent map, and assertObserved
+    // turned a benign race into "Refusing to reconcile #N". One read, used twice.
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    writeLaneLock(locksDir, { ticket: 31, stage: "builder", session: "dead", claimedAt: 0 });
+
+    const board = confirmBoard({ 31: "Building" }, () => {
+      // A concurrent loop claims a new lane mid-lookup.
+      writeLaneLock(locksDir, { ticket: 32, stage: "builder", session: "other", claimedAt: 0 });
+    });
+    const { orphans } = await scanWithConfirm(board, locksDir, worktreesDir, 0);
+    expect(orphans.crashedLanes.map((c) => c.ticket)).toEqual([31]); // #32 is next run's problem
+    expect(() => reconcilePlan(orphans)).not.toThrow();
+  });
+
+  test("z-loop Step 0 honors the scan's exit status instead of piping it into jq", () => {
+    // QA finding 1 (HIGH). The abort was loud on the CLI and SILENT to its only
+    // caller: `HAS_ORPHANS=$(... scan | jq -r .hasOrphans)` exits 0 on the abort
+    // (jq on empty stdin prints nothing and succeeds), HAS_ORPHANS came back empty,
+    // the refusal branch was skipped, and the loop started lanes over crashed locks
+    // against the board the reconcile had just declared unreadable.
+    const md = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
+    // The scan's output is captured on its own -- a pipe would discard its status.
+    expect(md).not.toMatch(/reconcile\.ts" scan[^\n]*\|\s*jq/);
+    expect(md).toContain(`if ! SCAN=$(bun "$PACK/lib/reconcile.ts" scan --slug "$SLUG"); then`);
+    expect(md).toContain(`HAS_ORPHANS=$(printf '%s' "$SCAN" | jq -r .hasOrphans)`);
+    // ...and the apply's failure stops the loop too, rather than falling through.
+    expect(md).toContain(`if ! bun "$PACK/lib/reconcile.ts" apply --slug "$SLUG" --session "$SESSION"; then`);
+    expect(md).not.toMatch(/^\[ -n "\$RECONCILE" \] && bun/m);
   });
 
   test("missingFromSweep names exactly the lock/worktree tickets the sweep did not return", () => {
