@@ -567,6 +567,58 @@ event; see
 [z-setup.md → Config knobs](z-setup.md#config-knobs-hand-edit-configjson-after-setup)
 for the `humanNeededPercent` knob itself.
 
+## Context audit (where the orchestrator's tokens went)
+
+`z-cost` answers what a drain cost in dollars. The context ceiling
+(`contextTokenLimit`) answers how full the window is right now. Neither answers
+the question that decides what to optimize: **of the tokens the orchestrator
+paid for, which content was responsible.**
+
+```bash
+bin/z-context-audit audit                       # this session (resolved from cwd)
+bin/z-context-audit audit path/to/*.jsonl       # specific transcripts
+bin/z-context-audit audit --drain-only          # loop steady-state only
+bin/z-context-audit audit --json                # machine-readable
+```
+
+The orchestrator is where the money is: measured over 35 real drains on this
+repo it was **90% of the loop's billed input tokens** (3.23B, against 354M for
+every lane subagent combined). It is one long session that re-sends its whole
+window every turn, so a byte entering early is paid for again on every later
+turn. The audit weights each block by the turns it rides in, which is why its
+ranking differs sharply from a naive byte count.
+
+### Drain vs dev
+
+Output is split by phase and the two are never blended:
+
+- **drain** — commands the loop itself issues (`z-loop-tick`, `bun lib/*.ts`,
+  `z-board`/`z-cost`, Agent spawns and returns, `git`/`gh` scoped to a lane
+  worktree).
+- **dev** — everything else in the same session, i.e. an operator debugging the
+  pack in the window that happened to run a drain.
+
+Only the drain figure is a claim about `/z-loop`. This distinction is not
+cosmetic: across the corpus, **all** `Read` cost and most `Bash` cost landed in
+`dev`. Tool results looked like 22.7% of orchestrator spend blended, but the
+loop's own share is **6.6%**. Optimizing the blended number would have been
+optimizing someone's debugging session.
+
+### How to read the numbers
+
+`totalBilled`, the static floor, and total accretion are real tokenizer
+readings from billed usage. The split *between* components is a `chars/4`
+estimate normalized onto real accretion, so a single component's absolute
+number carries whatever bias `chars/4` has for that content type. **Read the
+ranking, not the absolute values.**
+
+Every audit asserts `staticFloor + sum(components) == totalBilled`. That check
+exists because the ad-hoc script this replaced reported tool results at 41% —
+it had omitted tool-call parameters from its pool, which silently inflated every
+other component by ~1.9x. A component set that fails to reconcile is a bug in
+`lib/context-audit.ts`, never a finding about the loop, and it throws rather
+than printing.
+
 ## --reconcile (crash recovery)
 
 A crashed loop leaves lane locks, stray worktrees, or Building tickets with no
