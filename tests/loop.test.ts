@@ -25,6 +25,7 @@ import {
   parseReviewerConfidence,
   parseSkepticQuorum,
   parseStageResult,
+  partitionKnownStatus,
   MAX_COMMIT_RETRIES,
   MAX_QUORUM_RETRIES,
   recordOutcome,
@@ -2074,8 +2075,74 @@ describe("ingestBoardItems", () => {
     expect(s.watchdogMinutes).toBe(7);
   });
 
-  test("an unknown board status fails loudly", () => {
-    expect(() => ingestBoardItems(null, [{ number: 1, title: "x", fields: { Status: "Doing" } }], {})).toThrow(ZError);
+  // #226 follow-up. A human adding a board column (a staging queue, a triage
+  // lane) used to throw out of ingest and kill every tick. The loop now ignores
+  // what it cannot drive -- and ignoring means REMOVING, because #138's
+  // carry-forward would otherwise hold the ticket's last workable status.
+  describe("board statuses the loop does not drive (#226)", () => {
+    const staged = (n: number) => ({ number: n, title: `t${n}`, fields: { Status: "Stage" } });
+
+    test("a ticket in an unknown status is ignored instead of crashing ingest", () => {
+      const s = ingestBoardItems(
+        null,
+        [staged(1), { number: 2, title: "t2", fields: { Status: "Ready" } }],
+        { "1": "", "2": "" }
+      );
+      expect(s.tickets.map((t) => t.number)).toEqual([2]);
+    });
+
+    test("an item with no Status field is ignored, not crashed on", () => {
+      const s = ingestBoardItems(null, [{ number: 1, title: "t1", fields: {} }], { "1": "" });
+      expect(s.tickets).toEqual([]);
+    });
+
+    test("it is never claimed, never counted in the batch, and never blocks drain-complete", () => {
+      const s = ingestBoardItems(null, [staged(1)], { "1": "" }, { ticketLimit: 5 });
+      expect(s.tickets).toEqual([]);
+      expect(s.batchTickets ?? []).not.toContain(1);
+      expect(drainComplete(s.tickets, s.lanes, s.batchTickets)).toBe(true);
+      expect(nextAction(s, 0).kind).toBe("drain-complete");
+    });
+
+    // The failure a plain skip would leave behind: carry-forward keeps the old
+    // status, so the loop would still see Ready and claim a ticket the human
+    // deliberately moved out of the queue.
+    test("moving a Ready ticket into an unknown status removes it, not just skips it", () => {
+      const prev: LoopState = { tickets: [ticket(1, "Ready")], lanes: [], maxLanes: 2, watchdogMinutes: 7 };
+      const s = ingestBoardItems(prev, [staged(1)], { "1": "" });
+      expect(s.tickets).toEqual([]);
+      expect(nextAction(s, 0).kind).not.toBe("claim");
+    });
+
+    test("a laned ticket moved to an unknown status drops its lane (a human stop)", () => {
+      const prev: LoopState = { tickets: [ticket(1, "QA")], lanes: [lane(1, "qa")], maxLanes: 2, watchdogMinutes: 7 };
+      const s = ingestBoardItems(prev, [staged(1)], { "1": "" });
+      expect(s.tickets).toEqual([]);
+      expect(s.lanes).toEqual([]);
+    });
+
+    test("a known-status ticket in the same read is unaffected", () => {
+      const prev: LoopState = { tickets: [ticket(2, "Ready")], lanes: [], maxLanes: 2, watchdogMinutes: 7 };
+      const withStage = ingestBoardItems(prev, [staged(1), { number: 2, title: "t2", fields: { Status: "Ready" } }], {
+        "1": "",
+        "2": "",
+      });
+      const without = ingestBoardItems(prev, [{ number: 2, title: "t2", fields: { Status: "Ready" } }], { "2": "" });
+      expect(JSON.stringify(withStage.tickets)).toBe(JSON.stringify(without.tickets));
+    });
+
+    test("partitionKnownStatus names the issue and the status in one note per ignored ticket", () => {
+      const p = partitionKnownStatus([staged(1), { number: 2, title: "t2", fields: { Status: "Ready" } }, { number: 3, title: "t3", fields: {} }]);
+      expect(p.known.map((i) => i.number)).toEqual([2]);
+      expect(p.ignored).toEqual([
+        { number: 1, status: "Stage" },
+        { number: 3, status: "" },
+      ]);
+      expect(p.notes).toHaveLength(2);
+      expect(p.notes[0]).toContain("#1");
+      expect(p.notes[0]).toContain('"Stage"');
+      expect(p.notes[1]).toContain("(none)");
+    });
   });
 
   test("reads the skip-qa label into skipQa; an item without it leaves skipQa falsy (#130)", () => {
@@ -2597,6 +2664,21 @@ describe("loop CLI", () => {
     const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "ingest", statePath, itemsPath, bodiesPath], { stdout: "pipe", stderr: "pipe" });
     return { exitCode: proc.exitCode, stderr: proc.stderr.toString() };
   }
+
+  // #226: ignoring a human's board column must be visible, not silent. Same
+  // stderr channel the #138 confirm notes use; stdout stays the tick's summary.
+  test("ingest warns on stderr for a status the loop does not drive, and still succeeds", () => {
+    const statePath = join(dir, "unknown-status-state.json");
+    const itemsPath = join(dir, "unknown-items.json");
+    const bodiesPath = join(dir, "unknown-bodies.json");
+    writeFileSync(itemsPath, JSON.stringify([{ number: 7, title: "staged", fields: { Status: "Stage" } }]));
+    writeFileSync(bodiesPath, JSON.stringify({ "7": "no deps" }));
+    const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "ingest", statePath, itemsPath, bodiesPath], { stdout: "pipe", stderr: "pipe" });
+    expect(proc.exitCode).toBe(0);
+    expect(proc.stderr.toString()).toContain("#7");
+    expect(proc.stderr.toString()).toContain("does not drive");
+    expect(JSON.parse(readFileSync(statePath, "utf8")).tickets).toEqual([]);
+  });
 
   test("ingest on a corrupt state.json exits non-zero and does NOT silently reset it", () => {
     const statePath = join(dir, "corrupt-state.json");

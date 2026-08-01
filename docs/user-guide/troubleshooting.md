@@ -138,6 +138,17 @@ OPEN with a completion note so a human validates the edges the note names, then
 closes them. If you want them to auto-close, that fights the loop — leave the
 "close issue on Done" workflow OFF (see `/z-setup` Step 4).
 
+## "#N sits in board status …, which the loop does not drive; ignoring it"
+
+You added a column to the board that is not one of the canonical nine, and a
+ticket is sitting in it. The line is informational: the loop skips that ticket
+for the whole run and touches nothing else. If the ticket was mid-flight when
+you moved it, its lane also stops — that is the intended way to pull a ticket
+out of a running batch by hand. Move it back to Ready to hand it to the loop.
+
+If you did not expect the message, check the ticket's Status field for a typo or
+a renamed column: the loop matches status names exactly.
+
 ## setup: "already exists as a separate install; skipping" — and its uninstall mirror
 
 Both ends of install honor one rule: **never touch a directory we did not

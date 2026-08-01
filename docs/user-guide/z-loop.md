@@ -73,6 +73,17 @@ records the result. It never re-derives a scheduling decision in prose.
   instead of the drain wedging — including on the final move to Done, where the
   merge is still recorded even though the board can no longer show it, so a
   stacked child's PR retarget survives.
+- **A board status the loop does not know is evidence, not an error.** The nine
+  canonical statuses are the whole state machine, but the board is yours: add a
+  staging queue or a triage column and the loop ignores any ticket sitting in
+  one, logging `#N sits in board status "X", which the loop does not drive` per
+  ignored ticket. That skip is a *removal*, not a pass — the ticket is dropped
+  from loop state rather than carried forward, because the read positively
+  observed where it sits, and carrying its last known status forward would leave
+  the loop still seeing a Ready ticket a human deliberately moved out. Same rule
+  as above, not an exception to it: a positive observation wins, an absence
+  proves nothing. Moving a ticket into a column of your own therefore pulls it
+  out of a running batch, lane and all.
 - **A `BUILT` that shipped nothing does not reach QA.** `BUILT` is a claim, and
   the loop verifies it against the lane worktree's own git facts before the lane
   advances: `git status --porcelain --branch` must report a clean tree, untracked
