@@ -656,7 +656,10 @@ describe("skeptic quorum gate (issue #191)", () => {
   test("a pre-#191 persisted outcome with no skeptics key does not crash the tick", () => {
     const s = state([ticket(1, "Review")], [lane(1, "reviewer", { mergeGate: GREEN_GATE })]);
     // Exactly what the old code wrote: no `skeptics` key at all, not null.
-    (s.lanes[0] as { outcome: unknown }).outcome = approve(100);
+    // Written as a literal on purpose -- `approve(100)` sets `skeptics: null`,
+    // which is a DIFFERENT shape and stops this test from covering the
+    // `skeptics == null` (loose) read it exists to pin.
+    (s.lanes[0] as { outcome: unknown }).outcome = { kind: "review-approve", confidence: 100 };
     s.minSkepticQuorum = 2;
     expect(nextAction(s, 0)).toMatchObject({ kind: "advance", ticket: 1, to: "merge" });
   });
@@ -3256,6 +3259,42 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
       expect(countSuiteRuns(`${SUITE_BANNER}Ran 1 test across 1 file. [24.00ms]\n`).finished).toBe(1);
     });
 
+    // Review finding 4: the `^` anchors were the fix for a false green, and
+    // dropping either of them left the suite green -- in the FAIL-OPEN
+    // direction. A stray mid-line match raises `finished`, equalises it with
+    // `started`, and re-opens the nested-run hole the started/finished check
+    // exists to close. bun writes both of these lines at column 0; anything
+    // indented or trailing other text is a test talking ABOUT them.
+    describe("the summary parses are anchored to the line start", () => {
+      // A `(pass)` line whose test NAME quotes the summary format -- exactly what
+      // this very file's fixtures print when a nested suite echoes them.
+      const MID_LINE_SUMMARY = `${SUITE_BANNER}${SUITE_BANNER} 1 pass\n 0 fail\n(pass) parse > reads Ran 1 test across 1 file. off the tail\n`;
+
+      test("a mid-line `Ran N tests across M files.` is not a finished run", () => {
+        expect(countSuiteRuns(MID_LINE_SUMMARY)).toEqual({ started: 2, finished: 0 });
+      });
+
+      // The behavioural half: two runs started, the finish line only quoted, so
+      // the fail count on the summary belongs to a run that never reported.
+      // Unanchored, `finished` reads 1 -- still short of 2, so pair it with the
+      // one-banner shape where the stray match would make started === finished.
+      test("a quoted finish line cannot green-light a run that died without reporting", () => {
+        const out = `${SUITE_BANNER}${SUITE_BANNER} 1 pass\n 0 fail\nRan 1 test across 1 file. [9.00ms]\n(pass) parse > reads Ran 1 test across 1 file. off the tail\n`;
+        const { verdict } = driveGate([
+          { exitCode: 0, output: out },
+          { exitCode: 0, output: out },
+        ]);
+        expect(countSuiteRuns(out)).toEqual({ started: 2, finished: 1 });
+        expect(verdict.green).toBe(false);
+        expect(verdict.note).toContain("only 1 finished");
+      });
+
+      test("a mid-line `error: 0 test files matching` is not bun saying so", () => {
+        expect(foundNoTestFiles(`${SUITE_BANNER}(pass) gate > error: 0 test files matching is detected\n`)).toBe(false);
+        expect(foundNoTestFiles(`${SUITE_BANNER}  error: 0 test files matching **{.test}.{ts}\n`)).toBe(false);
+      });
+    });
+
     // Finding 7's readable half: on a project that is not a bun project the
     // gauntlet runs no tests at all, and the note has to say that rather than
     // "the suite did not run", which reads like a broken suite.
@@ -3439,11 +3478,13 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
     // block is what runGauntlet keys off (#178 AC4) -- omitting `test` here
     // would silently skip the suite limb in every case below, so it is
     // explicit, and `scripts` overrides let the absent-script cases drop one.
-    function project(name: string, body: string, typecheck = "bun --version", scripts?: Record<string, string>): string {
+    // A `null` body writes NO test file at all, which is the only way to tell a
+    // skipped `bun test` from a spawned one on a typecheck-only worktree.
+    function project(name: string, body: string | null, typecheck = "bun --version", scripts?: Record<string, string>): string {
       const p = join(dir, name);
       mkdirSync(p, { recursive: true });
       writeFileSync(join(p, "package.json"), JSON.stringify({ name, scripts: scripts ?? { test: "bun test", typecheck } }));
-      writeFileSync(join(p, "x.test.ts"), body);
+      if (body !== null) writeFileSync(join(p, "x.test.ts"), body);
       return p;
     }
 
@@ -3507,6 +3548,22 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
       const proc = runGate(project("no-tc-red", FAILING, "", { test: "bun test" }), "--retry-wait-ms", "0");
       expect(proc.exitCode).toBe(1);
       expect(JSON.parse(proc.stdout.toString())).toMatchObject({ green: false, failCount: 1 });
+    });
+
+    // Review finding 2: AC4's mirror branch. Every tc-only case here shipped a
+    // PASSING x.test.ts, so mutating runGauntlet's `if (scripts.test)` to
+    // always-spawn left the whole suite green while a real typecheck-only
+    // worktree flipped to {"green":false,...} -- the "every lane parks Blocked
+    // forever" failure AC4 exists to prevent. With no test file on disk, a
+    // `bun test` the gate must not spawn exits 1 with `0 test files matching`.
+    test("a typecheck-only worktree with NO test files is green -- `bun test` is never spawned", () => {
+      const proc = runGate(project("tc-only-no-tests", null, "", { typecheck: "bun --version" }), "--retry-wait-ms", "0");
+      expect(proc.exitCode).toBe(0);
+      const verdict = JSON.parse(proc.stdout.toString());
+      expect(verdict).toMatchObject({ green: true, attempts: 1, failCount: null });
+      // Proof the suite limb never ran: bun's own "no test files" line is absent.
+      expect(verdict.note).not.toContain("0 test files");
+      expect(verdict.note).toContain("typecheck only");
     });
 
     test("a typecheck script with no test script gates on typecheck alone", () => {
@@ -3695,6 +3752,11 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
     // (a command timeout shorter than the suite) stamps no verdict, so the
     // action simply repeats -- but it must not repeat forever.
     test("gate runs that never return a verdict park the lane after MERGE_GATE_MAX_RUNS, never spin", () => {
+      // Pinned to the literal, like MERGE_GATE_RETRY_WAIT_MS: the loop below is
+      // written in terms of the constant, so without this line the bound is
+      // asserted against itself and 2 -> 99 stays green. This budget is the only
+      // thing between a gate whose process keeps dying and an endless drain.
+      expect(MERGE_GATE_MAX_RUNS).toBe(2);
       let s = approved();
       for (let i = 1; i <= MERGE_GATE_MAX_RUNS; i++) {
         expect(nextAction(s, 0)).toEqual({ kind: "merge-gate", ticket: 7 });

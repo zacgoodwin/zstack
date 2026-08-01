@@ -119,20 +119,25 @@ export function atomicWrite(
   // Test-only seam for simulating transient rename failures; callers never pass it.
   rename: (from: string, to: string) => void = renameSync,
 ): void {
-  // Root cause, not the ".": Bun's mkdirSync THROWS on a directory that already
-  // exists even under `recursive` (Node's is a no-op there). dirname() hands it
-  // exactly those every day -- "." for a bare `state.json`, ".." for
-  // `../up.json` (EEXIST), "C:\" for a drive-root path (EPERM) -- so every CLI
-  // taking a state/lock path used to die with a raw stack before writing
-  // anything. An existing directory needs nothing created; resolve() first so
-  // the check reads the same path mkdirSync would.
+  // Root cause, not the ".": Bun's mkdirSync throws on some already-existing
+  // directories even under `recursive`, where Node's is always a no-op.
+  // Measured (bun 1.3.14, Windows): the RELATIVE forms dirname() hands it every
+  // day throw EEXIST -- "." for a bare `state.json`, ".." for `../up.json` --
+  // and a drive root throws EPERM whether or not it is resolved. An existing
+  // absolute non-root directory is a no-op, which is why this only ever bit
+  // CLIs invoked with a bare or relative state/lock path, and bit them with a
+  // raw stack before anything was written. Two defences, both load-bearing:
+  // resolve() normalises "."/".." into the absolute form bun accepts, and the
+  // existsSync guard covers the drive root, which resolve() cannot help.
   const dir = resolve(dirname(path));
   if (!existsSync(dir)) {
     try {
       mkdirSync(dir, { recursive: true });
     } catch (e: any) {
-      // Lost the race to a concurrent writer -- which, per the above, throws
-      // here rather than no-op'ing. Only a genuinely absent dir is fatal.
+      // Lost the race to a concurrent writer between the existsSync and here.
+      // Cheap insurance rather than an observed throw (bun no-ops on an
+      // existing absolute dir), and the one shape that must never be fatal:
+      // only a dir that is still genuinely absent is a real failure.
       if (e?.code !== "EEXIST" || !existsSync(dir)) throw e;
     }
   }
