@@ -133,4 +133,6 @@ if [ "$(jq -r .tripped "$TMP/human-needed.json")" = "true" ] && [ "$(jq -r .alre
   [ "$SENT" = "sent" ] && bun "$PACK/lib/loop.ts" human-needed-ack "$STATE" >/dev/null || true
 fi
 # 3. Next: print exactly one Action JSON line -- the only thing the caller reads.
-bun "$PACK/lib/loop.ts" next "$STATE"
+#    --slug is what lets a park name its salvage patch by its REAL path (#217);
+#    without it the note would fall back to a path relative to the project dir.
+bun "$PACK/lib/loop.ts" next "$STATE" --slug "$SLUG"

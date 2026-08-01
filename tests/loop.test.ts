@@ -6,7 +6,7 @@
 // Questions never claimable (AC6), plus dependency-order claiming, merge
 // ordering with a stacked chain, and drain-complete detection.
 import { test, expect, describe, afterAll } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -28,9 +28,11 @@ import {
   partitionKnownStatus,
   MAX_COMMIT_RETRIES,
   MAX_QUORUM_RETRIES,
+  main as loopMain,
   recordOutcome,
   recordProbe,
   resolveStageModel,
+  runSalvage,
   type Action,
   type LaneState,
   type LoopState,
@@ -953,6 +955,217 @@ describe("built guard: clean tree + moved HEAD (#177)", () => {
   test("this repo's own mandatory graphify scratch output is gitignored", () => {
     const p = Bun.spawnSync(["git", "check-ignore", "-q", "graphify-out/graph.json"], { cwd: REPO_ROOT, stdout: "pipe", stderr: "pipe" });
     expect(p.exitCode).toBe(0); // 0 = ignored, 1 = would show up as `??` in the guard
+  });
+});
+
+// ============================================================================
+// #217 -- the park's salvage patch is produced by CODE, not orchestrator prose
+// ============================================================================
+// #177's park note states as fact that the work "was dumped to
+// reports/uncommitted-<N>.patch", but the dump was one bash line in the SKILL's
+// `park N Blocked` row while the thing that destroys the work (reconcile's
+// force-remove of the now-lockless worktree) ran unconditionally in code. These
+// cases pin the fix: the park action CARRIES the dump, `loop apply` performs it,
+// and the path the note names is the real one -- no literal `<slug>`.
+describe("park salvage patch (#217)", () => {
+  const BASE = "1111111111111111111111111111111111111111";
+  const HEADER = "## z/ticket-7-thing...origin/main\n";
+  const DIRTY_NO_COMMIT = { porcelain: `${HEADER}M  lib/loop.ts\n?? tests/new.test.ts\n`, headSha: BASE, baseSha: BASE };
+  // #177's other failure shape: nothing uncommitted, but no commit of its own.
+  const CLEAN_NO_COMMIT = { porcelain: HEADER, headSha: BASE, baseSha: BASE };
+
+  // A world with the two dirs the park path touches: the project dir whose
+  // reports/ the patch goes to, and the repo root holding the lane worktree.
+  // The worktree is a REAL git repo -- the dump shells git, so a fake would
+  // prove nothing about the patch that ends up on disk.
+  function parkWorld(dirt: "clean" | "dirty"): { projectDir: string; repoRoot: string; worktree: string; root: string } {
+    const root = mkdtempSync(join(tmpdir(), "zstack-217-"));
+    const projectDir = join(root, "projects", "my-real-slug");
+    mkdirSync(projectDir, { recursive: true });
+    const worktree = join(root, "repo", ".worktrees", "ticket-7");
+    mkdirSync(worktree, { recursive: true });
+    const git = (...args: string[]) => {
+      const p = Bun.spawnSync(["git", "-C", worktree, ...args], { stdout: "pipe", stderr: "pipe" });
+      if (p.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${p.stderr.toString()}`);
+    };
+    git("init", "-q", "-b", "main");
+    git("config", "user.email", "t@t.t");
+    git("config", "user.name", "t");
+    writeFileSync(join(worktree, "committed.txt"), "base\n");
+    git("add", "-A");
+    git("commit", "-qm", "base");
+    if (dirt === "dirty") {
+      writeFileSync(join(worktree, "committed.txt"), "edited but never committed\n");
+      writeFileSync(join(worktree, "new-test.ts"), "the test the builder never git-added\n");
+    }
+    return { projectDir, repoRoot: join(root, "repo"), worktree, root };
+  }
+
+  // The exhausted-commit-retry lane, ready to park.
+  function parkedLane(facts: { porcelain: string; headSha: string; baseSha: string }): LoopState {
+    let s = state([ticket(7, "Building")], [lane(7, "builder", { commitRetries: MAX_COMMIT_RETRIES })]);
+    return recordOutcome(s, 7, "BUILT: done", 0, facts);
+  }
+
+  type Park = Extract<Action, { kind: "park" }>;
+
+  // AC1: run the park path against a dirty worktree -> the patch exists at the
+  // exact path the note names, and that path carries the REAL slug.
+  test("AC1: the park writes the patch at the exact path its note names, with the real slug", () => {
+    const { projectDir, repoRoot, root } = parkWorld("dirty");
+    try {
+      const a = nextAction(parkedLane(DIRTY_NO_COMMIT), 0, { projectDir }) as Park;
+      expect(a.kind).toBe("park");
+      expect(a.status).toBe("Blocked");
+      // The promise: the note names one path, and it is the real one.
+      expect(a.note).toContain("my-real-slug");
+      expect(a.note).not.toContain("<slug>");
+      expect(a.salvage).toBeDefined();
+      expect(a.salvage!.patch).toBe(`${projectDir.replace(/\\/g, "/")}/reports/uncommitted-7.patch`);
+      expect(a.note).toContain(a.salvage!.patch); // note and instruction, one string
+      expect(a.salvage!.worktree).toBe(".worktrees/ticket-7");
+
+      // The production: the same layer performs it. (cwd is injected -- the
+      // instruction's worktree is relative to the orchestrator's repo root.)
+      const r = runSalvage(a.salvage!, undefined, repoRoot);
+      expect(existsSync(a.salvage!.patch)).toBe(true);
+      expect(r.patch).toBe(a.salvage!.patch);
+      expect(r.bytes).toBeGreaterThan(0);
+      const patch = readFileSync(a.salvage!.patch, "utf8");
+      expect(patch).toContain("new-test.ts"); // `add -A`: untracked work is in there
+      expect(patch).toContain("edited but never committed");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // The dump is worthless if it cannot be replayed, so the round trip is the
+  // assertion: apply the patch into a fresh clone of the same base commit.
+  test("the patch re-applies with `git apply --index` in a fresh worktree", () => {
+    const { projectDir, repoRoot, worktree, root } = parkWorld("dirty");
+    try {
+      const a = nextAction(parkedLane(DIRTY_NO_COMMIT), 0, { projectDir }) as Park;
+      runSalvage(a.salvage!, undefined, repoRoot);
+      const fresh = join(root, "fresh");
+      const clone = Bun.spawnSync(["git", "clone", "-q", worktree, fresh], { stdout: "pipe", stderr: "pipe" });
+      expect(clone.exitCode).toBe(0);
+      // The clone carries only the base commit; the dumped work is not in it.
+      expect(existsSync(join(fresh, "new-test.ts"))).toBe(false);
+      const applied = Bun.spawnSync(["git", "-C", fresh, "apply", "--index", a.salvage!.patch], { stdout: "pipe", stderr: "pipe" });
+      expect(applied.stderr.toString()).toBe("");
+      expect(applied.exitCode).toBe(0);
+      expect(readFileSync(join(fresh, "new-test.ts"), "utf8")).toContain("never git-added");
+      expect(readFileSync(join(fresh, "committed.txt"), "utf8")).toContain("edited but never committed");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // AC5: the clean-tree / no-commit park. The note and the reports dir must
+  // agree -- an empty patch IS written, and the note says what empty means.
+  test("AC5: a clean-tree park writes an EMPTY patch and the note says so", () => {
+    const { projectDir, repoRoot, root } = parkWorld("clean");
+    try {
+      const a = nextAction(parkedLane(CLEAN_NO_COMMIT), 0, { projectDir }) as Park;
+      expect(a.kind).toBe("park");
+      expect(a.note).toContain("EMPTY patch");
+      const r = runSalvage(a.salvage!, undefined, repoRoot);
+      // On-disk reality matches the note: the file exists and is 0 bytes.
+      expect(existsSync(a.salvage!.patch)).toBe(true);
+      expect(statSync(a.salvage!.patch).size).toBe(0);
+      expect(r.bytes).toBe(0);
+      expect(r.note).toContain("EMPTY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // The wiring, through the real CLI: `loop apply` is what the orchestrator runs
+  // for EVERY action, so a park that carries a salvage dumps the patch there --
+  // no extra step for an orchestrator to skip. Absolute paths, so this never
+  // resolves (or touches) the developer's own ~/.zstack or repo.
+  test("`loop apply` performs the dump and still applies the park to the state file", () => {
+    const { projectDir, worktree, root } = parkWorld("dirty");
+    try {
+      const s = parkedLane(DIRTY_NO_COMMIT);
+      const a = nextAction(s, 0, { projectDir }) as Park;
+      const statePath = join(root, "state.json");
+      const actionPath = join(root, "action.json");
+      writeFileSync(statePath, JSON.stringify(s));
+      // The instruction as the orchestrator would hand it back, but with the
+      // worktree resolved -- `loop apply` runs from the repo root in production.
+      writeFileSync(actionPath, JSON.stringify({ ...a, salvage: { ...a.salvage!, worktree } }));
+      expect(loopMain(["apply", statePath, actionPath, "--now", "0"])).toBe(0);
+      expect(existsSync(a.salvage!.patch)).toBe(true);
+      const after = JSON.parse(readFileSync(statePath, "utf8")) as LoopState;
+      expect(after.tickets[0].status).toBe("Blocked");
+      expect(after.lanes).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // A missing worktree (already pruned, or a markerless exit that lost it) must
+  // not crash the park -- the lane still has to reach Blocked, and the operator
+  // gets a line saying no dump happened.
+  test("a missing worktree skips the dump loudly instead of throwing", () => {
+    const { projectDir, root } = parkWorld("dirty");
+    try {
+      const a = nextAction(parkedLane(DIRTY_NO_COMMIT), 0, { projectDir }) as Park;
+      const r = runSalvage(a.salvage!, undefined, join(root, "no-such-repo"));
+      expect(r.bytes).toBeNull();
+      expect(r.note).toContain("SKIPPED");
+      expect(existsSync(a.salvage!.patch)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // No project dir resolved (no --slug, no ZSTACK_SLUG, ambiguous projects): the
+  // note must still never print a placeholder, and the dump degrades to a
+  // reported skip -- which reconcile's guard then catches from the other end.
+  test("an unresolved project dir yields a relative path, never a `<slug>` placeholder", () => {
+    const a = nextAction(parkedLane(DIRTY_NO_COMMIT), 0) as Park;
+    expect(a.salvage!.patch).toBe("reports/uncommitted-7.patch");
+    expect(a.note).toContain("reports/uncommitted-7.patch");
+    expect(a.note).not.toContain("<slug>");
+    const r = runSalvage(a.salvage!, undefined, tmpdir());
+    expect(r.bytes).toBeNull();
+    expect(r.note).toContain("SKIPPED");
+  });
+
+  // Only this park owes a dump. Every other park/skip carries no salvage, so
+  // `loop apply` stays byte-identical for them.
+  test("no other park carries a salvage instruction", () => {
+    const q = nextAction(
+      state([ticket(3, "Building")], [lane(3, "builder", { outcome: { kind: "needs-input", note: "which schema?" } })]),
+      0,
+      { projectDir: "/tmp/p" }
+    ) as Park;
+    expect(q.status).toBe("Questions");
+    expect(q.salvage).toBeUndefined();
+    // ...and the FIRST commit-retry is an advance, not a park -- nothing to dump.
+    let s = state([ticket(7, "Building")], [lane(7, "builder")]);
+    s = recordOutcome(s, 7, "BUILT: done", 0, DIRTY_NO_COMMIT);
+    expect(nextAction(s, 0, { projectDir: "/tmp/p" })).toMatchObject({ kind: "advance", to: "builder" });
+  });
+
+  // The SKILL's park row is where an orchestrator learns what to do. It must now
+  // say the dump is `apply`'s (code), and it must still carry the manual command
+  // as the fallback + the assertion that the file is really there.
+  test("the SKILL's park row hands the dump to `apply` and asserts the file exists", () => {
+    const skill = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
+    const has = (s: string) => skill.includes(s); // never dump 60KB into a failure
+    expect(has("`salvage` block")).toBe(true);
+    expect(has("apply FIRST")).toBe(true);
+    // The assertion the plan asked for: the orchestrator verifies, never assumes.
+    expect(has("$SALVAGE_PATCH")).toBe(true);
+    // And reconcile's half is documented where a human looks for it.
+    const trouble = readFileSync(join(REPO_ROOT, "docs", "user-guide", "troubleshooting.md"), "utf8");
+    expect(trouble).toContain("REFUSED to prune");
+    expect(trouble).toContain("uncommitted-<N>.patch");
+    const guide = readFileSync(join(REPO_ROOT, "docs", "user-guide", "z-loop.md"), "utf8");
+    expect(guide).toContain("refuses to force-remove");
   });
 });
 

@@ -246,6 +246,21 @@ export function configPath(slug: string, home = homedir()): string {
   return join(projectsDir(home), slug, "config.json");
 }
 
+// Where a project's generated artifacts live (loop reports, invocation logs, and
+// the parked-lane salvage patches below). z-loop/SKILL.md Step 0 mkdir -p's it;
+// every writer here re-creates it anyway, so a hand-deleted dir is never a crash.
+export function reportsDir(slug: string, home = homedir()): string {
+  return join(projectsDir(home), slug, "reports");
+}
+
+// #217: the ONE place the parked-lane salvage patch's filename is spelled.
+// lib/loop.ts names it in the park note and dumps it; lib/reconcile.ts looks for
+// exactly this file before it force-removes a dirty worktree. Two spellings of
+// the same name is how "the promise" and "the check" drift apart.
+export function salvagePatchName(ticket: number): string {
+  return `uncommitted-${ticket}.patch`;
+}
+
 // Which project config to use, in order: explicit --slug, ZSTACK_SLUG, or (when
 // exactly one project is configured) that one. Ambiguity is an error, never a
 // silent guess.

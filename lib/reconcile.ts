@@ -8,12 +8,23 @@
 //
 // What reconcile NEVER does (issue #2): no branch deletion, no board comment
 // deletion. It releases claims, parks tickets back to Ready, prunes worktrees,
-// and removes stale lane locks -- nothing that a human can't cheaply redo.
-import { readdirSync, rmSync } from "node:fs";
+// and removes stale lane locks -- nothing that a human can't cheaply redo. And
+// since #217, one more never: it does not force-remove a LOCKLESS worktree that
+// holds uncommitted work with no salvage patch on disk. That is the one prune
+// whose loss a human cannot redo at all, so the plan refuses it by name and the
+// CLI exits non-zero rather than starting a loop over the only copy.
+import { existsSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Board, ghExecutor } from "./board.ts";
 import { handleCliError, parseFlags, str } from "./cli.ts";
-import { DEFAULT_LOCK_STALENESS_MINUTES, TERMINAL_STATUSES, ZError, loadConfig } from "./config.ts";
+import {
+  DEFAULT_LOCK_STALENESS_MINUTES,
+  TERMINAL_STATUSES,
+  ZError,
+  loadConfig,
+  reportsDir,
+  salvagePatchName,
+} from "./config.ts";
 import { defaultLocksDir, inspectLoopLock, listLaneLocks, type LaneLock } from "./locks.ts";
 import { BOARD_STATUSES, type BoardStatus, type LaneState, type TicketSnapshot } from "./loop.ts";
 
@@ -47,11 +58,39 @@ export interface CrashedLane {
 }
 
 // A worktree with no backing lock. Pruned; also parked when the board still
-// shows it in-flight.
+// shows it in-flight. #217 adds the two facts the prune is now judged against:
+// whether the tree holds uncommitted work, and whether a salvage patch for it
+// already exists.
 export interface OrphanWorktree {
   ticket: number;
   worktreePath: string;
   boardStatus?: BoardStatus;
+  dirty: boolean; // uncommitted work present (git status --porcelain non-empty)
+  patchPath: string; // where this ticket's salvage patch lives, if it was dumped
+  hasPatch: boolean; // ...and whether it is actually on disk
+}
+
+// #217: what the prune step needs to know before it force-removes a lockless
+// worktree. `reportsDir` is the project's ~/.zstack/projects/<slug>/reports --
+// REQUIRED, not optional-with-a-default, so this check cannot be silently
+// omitted by a caller the way #177's git facts could be. `isDirty` defaults to
+// the real git probe; tests inject.
+export interface SalvageProbe {
+  reportsDir: string;
+  isDirty?: (worktreePath: string) => boolean;
+}
+
+// Does this worktree hold uncommitted work? Fail-CLOSED on a real worktree git
+// cannot read (exit != 0 -> assume work is there, so the prune refuses and a
+// human looks). A directory with no `.git` entry is not a git worktree at all --
+// git never knew it, `git diff` could not have salvaged it, and
+// pruneWorktreeReal's rmSync fallback exists precisely for that leftover -- so
+// it reads as clean rather than wedging every future reconcile on a stray dir.
+export function worktreeDirty(worktreePath: string): boolean {
+  if (!existsSync(join(worktreePath, ".git"))) return false;
+  const p = Bun.spawnSync(["git", "-C", worktreePath, "status", "--porcelain"], { stdout: "pipe", stderr: "pipe" });
+  if (p.exitCode !== 0) return true;
+  return p.stdout.toString().trim().length > 0;
 }
 
 export interface Orphans {
@@ -87,7 +126,8 @@ export function scanOrphans(
   locksDir: string,
   worktreesDir: string,
   boardSnapshot: BoardTicketStatus[],
-  nowMs: number
+  nowMs: number,
+  salvage: SalvageProbe
 ): Orphans {
   const locks = listLaneLocks(locksDir);
   const worktrees = listWorktrees(worktreesDir);
@@ -104,9 +144,20 @@ export function scanOrphans(
     boardStatus: statusByTicket.get(l.lock.ticket),
   }));
 
+  const isDirty = salvage.isDirty ?? worktreeDirty;
   const orphanWorktrees: OrphanWorktree[] = worktrees
     .filter((w) => !lockTickets.has(w.ticket))
-    .map((w) => ({ ticket: w.ticket, worktreePath: w.path, boardStatus: statusByTicket.get(w.ticket) }));
+    .map((w) => {
+      const patchPath = join(salvage.reportsDir, salvagePatchName(w.ticket));
+      return {
+        ticket: w.ticket,
+        worktreePath: w.path,
+        boardStatus: statusByTicket.get(w.ticket),
+        dirty: isDirty(w.path),
+        patchPath,
+        hasPatch: existsSync(patchPath),
+      };
+    });
 
   const buildingWithoutState = boardSnapshot
     .filter((t) => t.status === "Building" && !lockTickets.has(t.number) && !wtByTicket.has(t.number))
@@ -126,7 +177,9 @@ export type ReconcileAction =
   | { kind: "release-claim"; ticket: number }
   | { kind: "park-ready"; ticket: number; note: string }
   | { kind: "prune-worktree"; ticket: number; path: string }
-  | { kind: "remove-lock"; ticket: number; path: string };
+  | { kind: "remove-lock"; ticket: number; path: string }
+  // #217: the prune this plan REFUSES to make, and the patch it looked for.
+  | { kind: "refuse-prune"; ticket: number; path: string; patchPath: string };
 
 // Pure: orphans in, ordered action list out. For each crashed lane the board
 // status decides the recovery (issue #14 C4):
@@ -136,7 +189,9 @@ export type ReconcileAction =
 //   * INFLIGHT or unknown: release the assignee, prune its worktree (if present),
 //     park it back to Ready, remove its lock -- the crash left it mid-build.
 // A lockless worktree is pruned, and also released+parked when the board still
-// thinks it in-flight. A Building ticket with no on-disk state is released+parked.
+// thinks it in-flight -- UNLESS it holds uncommitted work with no salvage patch
+// on disk (#217), in which case the plan refuses to touch it at all. A Building
+// ticket with no on-disk state is released+parked.
 export function reconcilePlan(orphans: Orphans): ReconcileAction[] {
   const actions: ReconcileAction[] = [];
   for (const c of orphans.crashedLanes) {
@@ -156,6 +211,22 @@ export function reconcilePlan(orphans: Orphans): ReconcileAction[] {
     actions.push({ kind: "remove-lock", ticket: c.ticket, path: c.lockPath });
   }
   for (const w of orphans.orphanWorktrees) {
+    // #217: a lockless worktree is the shape the #177 exhausted-commit-retry park
+    // leaves behind (parking releases the lane lock), and it is the ONE recovery
+    // path whose only copy of real work may be uncommitted. Force-removing it
+    // without a salvage patch destroys that work silently, so the plan refuses --
+    // naming the file it looked for -- and does nothing else to that lane. The
+    // guard costs exactly nothing once the dump ran (`loop apply` writes the
+    // patch, so hasPatch is true) or when the tree is clean.
+    //
+    // Deliberately NOT extended to crashedLanes above: a crashed lane keeps its
+    // lock, is parked back to Ready, and rebuilds fresh -- discarding its
+    // uncommitted work is the documented, intended behaviour there (issue #2),
+    // not an accident of a released lock.
+    if (w.dirty && !w.hasPatch) {
+      actions.push({ kind: "refuse-prune", ticket: w.ticket, path: w.worktreePath, patchPath: w.patchPath });
+      continue;
+    }
     actions.push({ kind: "prune-worktree", ticket: w.ticket, path: w.worktreePath });
     if (w.boardStatus && INFLIGHT.includes(w.boardStatus)) {
       actions.push({ kind: "release-claim", ticket: w.ticket });
@@ -186,7 +257,13 @@ export interface ReconcileEffects {
   releaseClaim: (ticket: number) => void;
 }
 
-export async function applyReconcile(actions: ReconcileAction[], fx: ReconcileEffects): Promise<void> {
+// Returns the refusals (#217) rather than taking an effect for them: a refusal
+// is not something to DO, it is the plan declining to do something, and the
+// caller decides how loud that is (the CLI prints them and exits non-zero).
+export type RefusePrune = Extract<ReconcileAction, { kind: "refuse-prune" }>;
+
+export async function applyReconcile(actions: ReconcileAction[], fx: ReconcileEffects): Promise<RefusePrune[]> {
+  const refused: RefusePrune[] = [];
   for (const a of actions) {
     switch (a.kind) {
       case "remove-lock":
@@ -201,8 +278,24 @@ export async function applyReconcile(actions: ReconcileAction[], fx: ReconcileEf
       case "release-claim":
         await fx.releaseClaim(a.ticket);
         break;
+      case "refuse-prune":
+        refused.push(a);
+        break;
     }
   }
+  return refused;
+}
+
+// The operator-facing refusal text. One place, so `scan`'s JSON consumers and
+// `apply`'s stderr say the same thing: which worktree, which patch was missing,
+// and the two ways out.
+export function refusalMessage(r: RefusePrune): string {
+  return (
+    `REFUSED to prune ${r.path}: it has uncommitted work and no salvage patch at ${r.patchPath}.\n` +
+    `  Force-removing it would discard the only copy (#217). Either:\n` +
+    `    git -C "${r.path}" add -A && git -C "${r.path}" diff --cached --binary HEAD > "${r.patchPath}"\n` +
+    `  (dump it, then re-run --reconcile), or commit the work onto the lane's branch and delete the worktree yourself.`
+  );
 }
 
 // -- wave reconciliation (mid-loop board moves) -------------------------------
@@ -230,6 +323,8 @@ export function reconcileBoardMoves(tickets: TicketSnapshot[], lanes: LaneState[
 // likely left uncommitted work (discarded on purpose: the ticket is parked to
 // Ready for a fresh build). Falls back to an rmSync + `git worktree prune` for a
 // leftover directory git no longer tracks. NEVER deletes the branch (issue #2).
+// Since #217 this is only ever reached for a LOCKLESS worktree that is clean or
+// already has its salvage patch -- reconcilePlan refuses the rest.
 function pruneWorktreeReal(path: string): void {
   const rm = Bun.spawnSync(["git", "worktree", "remove", "--force", path], { stdout: "pipe", stderr: "pipe" });
   if (rm.exitCode === 0) return;
@@ -261,6 +356,9 @@ const USAGE = `reconcile <command> [args] --slug S
                       remove stale locks (never deletes branches or comments).
                       REFUSES while a loop lock is live, since reconciling a
                       running loop parks its tickets and deletes its worktrees.
+                      Also refuses (exit 1, worktree left in place) to force-remove
+                      a lockless worktree that has uncommitted work and no salvage
+                      patch in the project's reports dir (#217).
                       --session is the owning loop's own id: /z-loop reconciles
                       AFTER taking the lock, so it passes its session to proceed.
 
@@ -276,6 +374,20 @@ export async function sweep(board: Board): Promise<BoardTicketStatus[]> {
     for (const it of await board.list(status)) out.push({ number: it.number, status });
   }
   return out;
+}
+
+// The whole of `apply`'s second half: execute the plan, print the summary, and
+// return the process exit code. Exported (and board-free) so the #217 refusal's
+// EXIT CODE is gate-testable -- Step 0(b) keys on it, and a refusal that printed
+// but exited 0 would read as a successful reconcile and start the loop anyway.
+export async function applyAndReport(plan: ReconcileAction[], fx: ReconcileEffects): Promise<number> {
+  const refused = await applyReconcile(plan, fx);
+  const counts = plan.reduce((m, a) => ((m[a.kind] = (m[a.kind] ?? 0) + 1), m), {} as Record<string, number>);
+  console.log(`reconciled: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(", ") || "nothing"}`);
+  if (refused.length === 0) return 0;
+  for (const r of refused) console.error(refusalMessage(r));
+  console.error(`${refused.length} worktree(s) left in place; reconcile is INCOMPLETE.`);
+  return 1;
 }
 
 // Throws unless it is safe to reconcile: the loop lock must be free, stale, or
@@ -331,7 +443,7 @@ export async function main(argv: string[]): Promise<number> {
     // session and refuses on any live lock, which is the safe default.
     if (cmd === "apply") assertNotReconcilingLiveLoop(locksDir, nowMs, cfg, str(flags, "session"));
 
-    const orphans = scanOrphans(locksDir, worktreesDir, await sweep(board), nowMs);
+    const orphans = scanOrphans(locksDir, worktreesDir, await sweep(board), nowMs, { reportsDir: reportsDir(cfg.slug) });
     const plan = reconcilePlan(orphans);
 
     if (cmd === "scan") {
@@ -342,10 +454,7 @@ export async function main(argv: string[]): Promise<number> {
       console.log(JSON.stringify(plan, null, 2));
       return 0;
     }
-    await applyReconcile(plan, realEffects(board));
-    const counts = plan.reduce((m, a) => ((m[a.kind] = (m[a.kind] ?? 0) + 1), m), {} as Record<string, number>);
-    console.log(`reconciled: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(", ") || "nothing"}`);
-    return 0;
+    return await applyAndReport(plan, realEffects(board));
   } catch (e) {
     return handleCliError(e);
   }

@@ -104,10 +104,17 @@ records the result. It never re-derives a scheduling decision in prose.
   in the worktree rather than rebuild it. A second `BUILT` with nothing committed
   parks the ticket Blocked with that note, and because parking releases the lane
   lock — which makes the worktree an orphan the next run's reconcile scan
-  force-removes — the park first dumps the worktree's uncommitted state to
-  `~/.zstack/projects/<slug>/reports/uncommitted-<N>.patch`. Re-apply it with
-  `git apply` in a fresh worktree, or commit/stash the worktree yourself **before**
-  the next `/z-loop` run. That retry has its own budget — "you forgot to commit" is
+  force-removes — **the park itself dumps** the worktree's uncommitted state to
+  `~/.zstack/projects/<slug>/reports/uncommitted-<N>.patch`. That dump is a side
+  effect of the park action (`loop apply` performs it, the action carries the
+  path), not a step an orchestrator has to remember: the note names the real path,
+  and the file is there. Re-apply it with `git apply --index` in a fresh worktree,
+  or commit/stash the worktree yourself **before** the next `/z-loop` run. An
+  EMPTY (0-byte) patch is a real outcome, and the note says so — it means the
+  worktree held nothing uncommitted and the failure was purely the missing commit.
+  Belt and braces: if the patch is somehow missing, the next run's reconcile
+  **refuses to force-remove** that worktree rather than discarding the work (see
+  [--reconcile](#--reconcile-crash-recovery)). That retry has its own budget — "you forgot to commit" is
   neither a QA bug nor a reviewer finding, so it never consumes a rebuild those
   caps are holding.
 - **Adversarial review, when the card earns it.** When `adversarialMode` is
@@ -576,6 +583,17 @@ on any orphan (or names the live session if a loop is genuinely running).
 prunes worktrees, and clears the stale lock — then starts. It never deletes a
 branch, never touches a ticket with a live lane. A running loop's lock is never
 cleared: you cannot reconcile over a live loop.
+
+**What it will not delete (#217).** A worktree with no lane lock is normally
+force-removed. Reconcile **refuses to force-remove** one that holds uncommitted
+work and has no salvage patch at
+`~/.zstack/projects/<slug>/reports/uncommitted-<N>.patch`: it leaves the worktree
+untouched, prints the patch path it looked for, and exits non-zero, so the loop
+does not start over the only copy of that work. Salvage it (commit it onto the
+lane's branch, or dump the patch by hand with the command reconcile prints) and
+re-run. A *crashed lane* — one that still has its lane lock — is unaffected: its
+worktree is pruned and its ticket rebuilt fresh from Ready, the same documented
+discard as before. So is a clean worktree, which needs no patch.
 
 Mid-run, dragging a Building/QA ticket to Blocked or Questions on the board is
 respected: the loop stops that one lane cleanly at its next stage boundary and

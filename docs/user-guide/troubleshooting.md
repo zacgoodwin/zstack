@@ -102,10 +102,42 @@ state:
 ```
 
 Reconcile releases claims, parks the affected tickets back to Ready, prunes the
-stray worktrees (a crashed builder's uncommitted work is discarded — the ticket
+stray worktrees (a *crashed lane*'s uncommitted work is discarded — the ticket
 rebuilds fresh), and clears the stale lock, then starts normally. It never deletes
 a branch, never removes a board comment, and never touches a ticket that still has
-a live lane.
+a live lane. Since #217 it also never force-removes a *lockless* worktree that
+holds uncommitted work with no salvage patch — see the next section.
+
+## "REFUSED to prune …: it has uncommitted work and no salvage patch"
+
+`reconcile apply` found a worktree with **no lane lock** (the shape a
+`park N Blocked` leaves behind — parking releases the lock) whose tree is dirty,
+and no `~/.zstack/projects/<slug>/reports/uncommitted-<N>.patch` on disk. That
+worktree may hold the only copy of real work, so reconcile leaves it exactly as it
+is, exits non-zero, and the loop does not start. Nothing was deleted.
+
+Pick one:
+
+```bash
+# 1. Keep the work: commit it onto the lane's own branch (branches are never
+#    deleted, issue #2), then let reconcile prune the worktree.
+git -C .worktrees/ticket-<N> add -A
+git -C .worktrees/ticket-<N> commit -m "wip: salvaged from a parked lane"
+
+# 2. Or dump the patch reconcile looked for, and re-run.
+git -C .worktrees/ticket-<N> add -A
+git -C .worktrees/ticket-<N> diff --cached --binary HEAD \
+  > "$HOME/.zstack/projects/<slug>/reports/uncommitted-<N>.patch"
+```
+
+Then `/z-loop --reconcile` again. Re-apply a dumped patch later with
+`git apply --index <patch>` in a fresh worktree. A 0-byte patch is legitimate: it
+means the tree held nothing uncommitted.
+
+Reaching this at all means the park's own dump did not run or did not land — the
+park action carries the dump and `loop apply` performs it, so the usual causes are
+a loop killed mid-park or a worktree that moved. The refusal is the backstop, not
+the normal path.
 
 ## "Rates last checked … over the 14-day limit"
 

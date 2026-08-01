@@ -35,17 +35,21 @@ import {
   writeLaneLock,
   type LoopLock,
 } from "../lib/locks.ts";
-import { ZError } from "../lib/config.ts";
+import { ZError, salvagePatchName } from "../lib/config.ts";
 import {
+  applyAndReport,
   applyReconcile,
   assertNotReconcilingLiveLoop,
   hasOrphans,
   reconcileBoardMoves,
   reconcilePlan,
+  refusalMessage,
   scanOrphans,
   sweep,
+  worktreeDirty,
   type ReconcileAction,
   type ReconcileEffects,
+  type SalvageProbe,
 } from "../lib/reconcile.ts";
 import {
   applyAction,
@@ -682,6 +686,12 @@ describe("control 2: orphan scan (crash recovery)", () => {
     return plan.filter((a) => a.kind === kind).map((a) => (a as any).ticket).sort((x, y) => x - y);
   }
 
+  // #217: scanOrphans now REQUIRES a salvage probe, so the prune guard can never
+  // be silently omitted by a caller. Every case in THIS describe is a clean tree
+  // (the pre-#217 shape), which is exactly what keeps their behaviour identical;
+  // the guard's own cases live in the #217 describe below.
+  const CLEAN: SalvageProbe = { reportsDir: join(tmpdir(), "zstack-217-reports-that-do-not-exist"), isDirty: () => false };
+
   test("scan finds all three orphan categories; plan parks to Ready and prunes", () => {
     const locksDir = tmp();
     const worktreesDir = tmp();
@@ -694,7 +704,7 @@ describe("control 2: orphan scan (crash recovery)", () => {
     // #9: Building on the board with neither lock nor worktree.
     const board = [ticket(5, "Building"), ticket(7, "QA"), ticket(9, "Building")].map((t) => ({ number: t.number, status: t.status }));
 
-    const orphans = scanOrphans(locksDir, worktreesDir, board, 30 * 60_000);
+    const orphans = scanOrphans(locksDir, worktreesDir, board, 30 * 60_000, CLEAN);
     expect(hasOrphans(orphans)).toBe(true);
     expect(orphans.crashedLanes.map((c) => c.ticket)).toEqual([5]);
     expect(orphans.crashedLanes[0].worktreePath).toContain("ticket-5");
@@ -712,7 +722,7 @@ describe("control 2: orphan scan (crash recovery)", () => {
     const locksDir = tmp();
     const worktreesDir = tmp();
     mkdirSync(join(worktreesDir, "ticket-3"));
-    const orphans = scanOrphans(locksDir, worktreesDir, [{ number: 3, status: "Done" }], 0);
+    const orphans = scanOrphans(locksDir, worktreesDir, [{ number: 3, status: "Done" }], 0, CLEAN);
     const plan = reconcilePlan(orphans);
     expect(plan).toEqual([{ kind: "prune-worktree", ticket: 3, path: join(worktreesDir, "ticket-3") }]);
   });
@@ -725,7 +735,7 @@ describe("control 2: orphan scan (crash recovery)", () => {
     const worktreesDir = tmp();
     writeLaneLock(locksDir, { ticket: 5, stage: "merge", session: "dead", claimedAt: 0 });
     mkdirSync(join(worktreesDir, "ticket-5"));
-    const orphans = scanOrphans(locksDir, worktreesDir, [{ number: 5, status: "Done" }], 0);
+    const orphans = scanOrphans(locksDir, worktreesDir, [{ number: 5, status: "Done" }], 0, CLEAN);
     expect(orphans.crashedLanes[0].boardStatus).toBe("Done");
 
     const plan = reconcilePlan(orphans);
@@ -739,14 +749,14 @@ describe("control 2: orphan scan (crash recovery)", () => {
     for (const status of ["Done", "Questions", "Blocked", "Skipped"] as const) {
       const locksDir = tmp();
       writeLaneLock(locksDir, { ticket: 8, stage: "builder", session: "dead", claimedAt: 0 });
-      const plan = reconcilePlan(scanOrphans(locksDir, tmp(), [{ number: 8, status }], 0));
+      const plan = reconcilePlan(scanOrphans(locksDir, tmp(), [{ number: 8, status }], 0, CLEAN));
       expect(byKind(plan, "park-ready")).toEqual([]);
       expect(byKind(plan, "remove-lock")).toEqual([8]);
     }
     // Contrast: a Building crashed lane IS released + parked + unlocked.
     const locksDir = tmp();
     writeLaneLock(locksDir, { ticket: 8, stage: "builder", session: "dead", claimedAt: 0 });
-    const plan = reconcilePlan(scanOrphans(locksDir, tmp(), [{ number: 8, status: "Building" }], 0));
+    const plan = reconcilePlan(scanOrphans(locksDir, tmp(), [{ number: 8, status: "Building" }], 0, CLEAN));
     expect(byKind(plan, "park-ready")).toEqual([8]);
     expect(byKind(plan, "release-claim")).toEqual([8]);
     expect(byKind(plan, "remove-lock")).toEqual([8]);
@@ -793,7 +803,7 @@ describe("control 2: orphan scan (crash recovery)", () => {
     const snapshot = await sweep(new Board(CFG, doneBoard));
     expect(snapshot).toContainEqual({ number: 5, status: "Done" }); // sweep() saw the Done status
 
-    const plan = reconcilePlan(scanOrphans(locksDir, worktreesDir, snapshot, 0));
+    const plan = reconcilePlan(scanOrphans(locksDir, worktreesDir, snapshot, 0, CLEAN));
     expect(byKind(plan, "park-ready")).toEqual([]); // NEVER reopen merged work
     expect(byKind(plan, "release-claim")).toEqual([]); // NEVER unassign it either
     expect(byKind(plan, "prune-worktree")).toEqual([5]); // just clear the crashed run's state
@@ -801,7 +811,7 @@ describe("control 2: orphan scan (crash recovery)", () => {
   });
 
   test("no orphans -> empty plan, hasOrphans false", () => {
-    const orphans = scanOrphans(tmp(), tmp(), [ticket(1, "Ready")].map((t) => ({ number: t.number, status: t.status })), 0);
+    const orphans = scanOrphans(tmp(), tmp(), [ticket(1, "Ready")].map((t) => ({ number: t.number, status: t.status })), 0, CLEAN);
     expect(hasOrphans(orphans)).toBe(false);
     expect(reconcilePlan(orphans)).toEqual([]);
   });
@@ -814,7 +824,7 @@ describe("control 2: orphan scan (crash recovery)", () => {
     const lockPath = join(locksDir, "ticket-5.json");
     expect(existsSync(lockPath)).toBe(true);
 
-    const orphans = scanOrphans(locksDir, worktreesDir, [{ number: 5, status: "Building" }], 0);
+    const orphans = scanOrphans(locksDir, worktreesDir, [{ number: 5, status: "Building" }], 0, CLEAN);
     const plan = reconcilePlan(orphans);
 
     const parked: number[] = [];
@@ -832,6 +842,142 @@ describe("control 2: orphan scan (crash recovery)", () => {
     expect(parked).toEqual([5]);
     expect(released).toEqual([5]);
     expect(pruned[0]).toContain("ticket-5");
+  });
+});
+
+// ============================================================================
+// #217 -- the prune guard: reconcile never force-removes the only copy
+// ============================================================================
+// #177 made the exhausted-commit-retry park PROMISE a salvage patch, but the
+// dump was one line of orchestrator prose while the deletion (reconcile's
+// force-remove of any lockless worktree) was unconditional code. These cases are
+// the other end of that hole: the destroyer itself now refuses.
+describe("#217: reconcile refuses to prune a dirty worktree with no salvage patch", () => {
+  // A REAL git worktree, so `worktreeDirty` is exercised as shipped (it shells
+  // git) rather than through a fake that could agree with a broken probe.
+  function gitWorktree(worktreesDir: string, ticketNumber: number, dirt: "clean" | "modified" | "untracked"): string {
+    const path = join(worktreesDir, `ticket-${ticketNumber}`);
+    mkdirSync(path);
+    const git = (...args: string[]) => {
+      const p = Bun.spawnSync(["git", "-C", path, ...args], { stdout: "pipe", stderr: "pipe" });
+      if (p.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${p.stderr.toString()}`);
+    };
+    git("init", "-q", "-b", "main");
+    git("config", "user.email", "t@t.t");
+    git("config", "user.name", "t");
+    writeFileSync(join(path, "committed.txt"), "base\n");
+    git("add", "-A");
+    git("commit", "-qm", "base");
+    if (dirt === "modified") writeFileSync(join(path, "committed.txt"), "the builder's uncommitted work\n");
+    if (dirt === "untracked") writeFileSync(join(path, "new-test.ts"), "the test the builder never added\n");
+    return path;
+  }
+
+  const noEffects = () => {
+    const pruned: string[] = [];
+    const parked: number[] = [];
+    const released: number[] = [];
+    const fx: ReconcileEffects = {
+      removeLock: () => {},
+      pruneWorktree: (_t, p) => void pruned.push(p),
+      parkReady: (n) => void parked.push(n),
+      releaseClaim: (n) => void released.push(n),
+    };
+    return { fx, pruned, parked, released };
+  };
+
+  // AC2: dirty tree, no patch -> refused, by name, with a non-zero exit. On
+  // pre-#217 code this exact setup planned `prune-worktree` + park + release and
+  // returned 0, i.e. it force-removed the only copy and reported success.
+  test("AC2: a dirty lockless worktree with NO patch is refused, names the patch, and exits non-zero", async () => {
+    const worktreesDir = tmp();
+    const reports = tmp(); // exists, but holds no patch for #7
+    const wt = gitWorktree(worktreesDir, 7, "untracked");
+
+    const orphans = scanOrphans(tmp(), worktreesDir, [{ number: 7, status: "Building" }], 0, { reportsDir: reports });
+    const w = orphans.orphanWorktrees[0];
+    expect(w.dirty).toBe(true); // the real git probe saw the un-added file
+    expect(w.hasPatch).toBe(false);
+    expect(w.patchPath).toBe(join(reports, salvagePatchName(7)));
+
+    const plan = reconcilePlan(orphans);
+    // Refused, and NOTHING else happens to that lane -- no prune, and no board
+    // move either: reconcile did not touch it, so it must not say it did.
+    expect(plan).toEqual([{ kind: "refuse-prune", ticket: 7, path: wt, patchPath: w.patchPath }]);
+
+    const { fx, pruned, parked, released } = noEffects();
+    expect(await applyAndReport(plan, fx)).toBe(1); // Step 0(b) keys on this
+    expect(pruned).toEqual([]);
+    expect(parked).toEqual([]);
+    expect(released).toEqual([]);
+    expect(existsSync(wt)).toBe(true); // the only copy of the work survives
+    // The refusal tells the human which file was missing and how to make it.
+    expect(refusalMessage(plan[0] as any)).toContain(w.patchPath);
+    expect(refusalMessage(plan[0] as any)).toContain("diff --cached --binary HEAD");
+  });
+
+  // A MODIFIED tracked file is the same refusal as an untracked one -- both are
+  // work `git worktree remove --force` would silently discard.
+  test("AC2 (modified files too): a tracked edit with no patch is refused the same way", () => {
+    const worktreesDir = tmp();
+    gitWorktree(worktreesDir, 8, "modified");
+    const plan = reconcilePlan(scanOrphans(tmp(), worktreesDir, [{ number: 8, status: "QA" }], 0, { reportsDir: tmp() }));
+    expect(plan.map((a) => a.kind)).toEqual(["refuse-prune"]);
+  });
+
+  // AC3: the guard costs nothing once the salvage exists.
+  test("AC3: a dirty lockless worktree WITH its patch on disk prunes exactly as before", async () => {
+    const worktreesDir = tmp();
+    const reports = tmp();
+    const wt = gitWorktree(worktreesDir, 7, "untracked");
+    writeFileSync(join(reports, salvagePatchName(7)), "diff --git a/new-test.ts b/new-test.ts\n");
+
+    const plan = reconcilePlan(scanOrphans(tmp(), worktreesDir, [{ number: 7, status: "Building" }], 0, { reportsDir: reports }));
+    expect(plan).toEqual([
+      { kind: "prune-worktree", ticket: 7, path: wt },
+      { kind: "release-claim", ticket: 7 },
+      { kind: "park-ready", ticket: 7, note: expect.stringContaining("Worktree without a lock while the board showed Building") },
+    ]);
+    const { fx, pruned } = noEffects();
+    expect(await applyAndReport(plan, fx)).toBe(0);
+    expect(pruned).toEqual([wt]);
+  });
+
+  // AC4: a clean tree is unchanged from today -- no patch required.
+  test("AC4: a CLEAN lockless worktree prunes with no patch required", async () => {
+    const worktreesDir = tmp();
+    const wt = gitWorktree(worktreesDir, 7, "clean");
+    const plan = reconcilePlan(scanOrphans(tmp(), worktreesDir, [{ number: 7, status: "Done" }], 0, { reportsDir: tmp() }));
+    expect(plan).toEqual([{ kind: "prune-worktree", ticket: 7, path: wt }]);
+    const { fx, pruned } = noEffects();
+    expect(await applyAndReport(plan, fx)).toBe(0);
+    expect(pruned).toEqual([wt]);
+  });
+
+  // The probe's own edges. A stray directory git never tracked must NOT wedge
+  // every future reconcile (there is nothing git could have salvaged from it),
+  // while a real worktree git cannot read fails CLOSED.
+  test("worktreeDirty: a non-worktree directory reads clean; a real dirty worktree reads dirty", () => {
+    const d = tmp();
+    mkdirSync(join(d, "ticket-1"));
+    writeFileSync(join(d, "ticket-1", "stray.txt"), "not a git worktree");
+    expect(worktreeDirty(join(d, "ticket-1"))).toBe(false);
+    expect(worktreeDirty(join(d, "does-not-exist"))).toBe(false);
+    expect(worktreeDirty(gitWorktree(tmp(), 2, "clean"))).toBe(false);
+    expect(worktreeDirty(gitWorktree(tmp(), 3, "modified"))).toBe(true);
+  });
+
+  // A crashed lane (lock present) keeps the OLD behaviour on purpose: it is
+  // parked back to Ready and rebuilt fresh, which is the documented discard
+  // (issue #2). Only the lockless shape -- what a #177 park leaves behind -- is
+  // guarded, so ordinary crash recovery never needs a human.
+  test("a crashed lane's dirty worktree still prunes: the guard is scoped to LOCKLESS worktrees", () => {
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    writeLaneLock(locksDir, { ticket: 5, stage: "builder", session: "dead", claimedAt: 0 });
+    gitWorktree(worktreesDir, 5, "modified");
+    const plan = reconcilePlan(scanOrphans(locksDir, worktreesDir, [{ number: 5, status: "Building" }], 0, { reportsDir: tmp() }));
+    expect(plan.map((a) => a.kind)).toEqual(["release-claim", "prune-worktree", "park-ready", "remove-lock"]);
   });
 });
 
