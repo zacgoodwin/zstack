@@ -73,6 +73,21 @@ records the result. It never re-derives a scheduling decision in prose.
   instead of the drain wedging — including on the final move to Done, where the
   merge is still recorded even though the board can no longer show it, so a
   stacked child's PR retarget survives.
+- **Every stage transition writes the board.** A lane moving builder → QA →
+  Review → merge is two writes, not one: the reducer stamps the new status on
+  `state.json` and records it as the lane's in-flight-write marker, and the
+  orchestrator then moves the ticket on the board to `STATUS_FOR_STAGE[stage]` —
+  `builder`→Building, `qa`→QA, `reviewer`→Review, and `merge`→Review as well
+  (merge has no column of its own; Done means the PR landed). `loop apply` prints
+  the move it owes, so a transition that forgot one is visible in the tick output
+  rather than silent. It matters beyond the dashboard being honest: the **resume**
+  path reads the BOARD to pick a crashed ticket's stage, so a lane at QA whose
+  board still said Building would be re-claimed as a *builder* and would rebuild
+  finished, committed work. The write is deliberately performed AFTER the apply —
+  the marker the apply stamps is what lets the next tick tell this not-yet-landed
+  write of ours from a human's move-back, so a crash in that window resyncs
+  instead of stopping the lane, and the marker clears the moment a board read
+  shows the status land.
 - **A board status the loop does not know is evidence, not an error.** The nine
   canonical statuses are the whole state machine, but the board is yours: add a
   staging queue or a triage column and the loop ignores any ticket sitting in

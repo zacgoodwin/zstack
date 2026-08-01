@@ -27,15 +27,16 @@ Two lanes, two budgets (PRINCIPLES.md):
 
 ## Pass threshold
 
-**`check.ts` exits 0** — all ten assertions green. `check.ts` is deterministic
+**`check.ts` exits 0** — all eleven assertions green. `check.ts` is deterministic
 (no LLM in the checker), so there is no averaging: one green run clears the bar.
 Run it before ship and nightly. The planner quality lane (`../planner/`) keeps its
 own separate threshold (average rubric ≥ 8/10).
 
 ## How the checker works
 
-The load-bearing idea: the `walk`, `lane-cap`, and `fresh-context` assertions do
-not trust a recorded trace. They **re-derive the run** by driving the real
+The load-bearing idea: the `walk`, `lane-cap`, `fresh-context`, and
+`board-writes` assertions do not trust a recorded trace. They **re-derive the
+run** by driving the real
 scheduler (`lib/loop.ts` `nextAction`/`applyAction`/`recordOutcome`) from the
 recorded starting board (`state-initial.json`) with a happy-path outcome oracle,
 then assert the emergent properties. So the checker exercises the actual state
@@ -51,7 +52,7 @@ the `sample-run` fixture uses:
 
 | Path | Produced by | Read for |
 |------|-------------|----------|
-| `state-initial.json` | loop ingest after batch-commit (all workable tickets Building) | walk / lane-cap / fresh-context derivation |
+| `state-initial.json` | loop ingest after batch-commit (all workable tickets Building) | walk / lane-cap / fresh-context / board-writes derivation |
 | `state-final.json` | loop state at drain (`mergedThisRun` = completion order) | merge-order |
 | `board-final.json` | `z-board list` snapshot (per-ticket Status + fields) | actuals / report |
 | `loop-counter` | `endloop.ts counter bump` | loop-counter cadence |
@@ -72,7 +73,7 @@ be asserted offline (called out, never silently skipped).
 |-----|-------------|------------|------|
 | 1 | `/z-setup` creates project/board/9 statuses/4 fields; auto-close off; scripted verify | `tests/setup.test.ts` (scripted `verify` against GraphQL fixtures); `board-final.json` shape asserted by `actuals`/`report` in `check.ts`. **Live board creation + the manual workflow-rule toggle are live-run-only** (GitHub exposes no API for the workflows). | gate test + live-run-only |
 | 2 | `/z-plan` tickets carry `### Acceptance Criteria`, dep links, Model/Effort/Estimate; re-plan reproduces estimates | `../planner/` eval (quality, paid) + `tests/plan-schema.test.ts` (schema gate + per-tier estimate reproducibility) + `tests/estimate.test.ts`. `reviewer-blindness` inputs in `check.ts` carry the AC sections; `board-final.json` carries the fields. | gate test + paid eval |
-| 3 | 3 tickets reach Done via Building→QA→Review, merged in dependency order; ≤3 concurrent; fresh context per stage | `check.ts`: `walk`, `merge-order`, `lane-cap`, `fresh-context`. Binding-cap case also in `tests/loop.test.ts`. | check.ts (e2e) |
+| 3 | 3 tickets reach Done via Building→QA→Review, merged in dependency order; ≤3 concurrent; fresh context per stage | `check.ts`: `walk`, `merge-order`, `lane-cap`, `fresh-context`, `board-writes` (#205: every stage transition writes the board, so no lane ends with a residual `lastWroteStatus` and a resumed run reads a truthful stage). Binding-cap case also in `tests/loop.test.ts`. | check.ts (e2e) |
 | 4 | Reviewer blindness enforced by a gate test on prompt construction | `tests/stage-prompts.test.ts` (compile + runtime exact-keys) + `check.ts` `reviewer-blindness` (over recorded inputs). | gate test + check.ts |
 | 5 | A ticket with an open question parks in Questions, commented; loop never works it | `tests/loop.test.ts` "Questions tickets" (never claimable) + park→Questions on `needs-input`. **Not in the happy-path sample-run** (all three tickets succeed). | gate test |
 | 6 | Dead worker past 10 min → Skipped with note | `tests/loop.test.ts` watchdog → skip. **Not in the sample-run** (no stall on the happy path). | gate test |

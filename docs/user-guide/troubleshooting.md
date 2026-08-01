@@ -138,6 +138,56 @@ OPEN with a completion note so a human validates the edges the note names, then
 closes them. If you want them to auto-close, that fights the loop — leave the
 "close issue on Done" workflow OFF (see `/z-setup` Step 4).
 
+## The board says Building for a ticket the loop is actually QA-ing or reviewing
+
+A stage transition skipped its board write. Every `advance` is two writes — the
+reducer stamps `state.json` and the orchestrator moves the ticket to the new
+stage's status — and `bun lib/loop.ts apply` prints the one it owes:
+
+```text
+applied advance #168
+board write owed: z-board move 168 QA --if-present
+```
+
+If that move never ran, the board keeps showing the previous stage. Confirm it
+from the state file: the lane is at the newer stage and still carries the
+in-flight-write marker.
+
+```bash
+jq '.lanes[] | select(.ticket==168)' ~/.zstack/projects/<slug>/loop/state.json
+# {"ticket":168,"stage":"qa",…,"lastWroteStatus":"QA"}   <- board never showed QA
+```
+
+Fix it by hand and the next tick's ingest clears the marker:
+
+```bash
+z-board move 168 QA --if-present --slug <slug>
+```
+
+A `lastWroteStatus` that survives tick after tick is always this bug — the marker
+exists to name a write still in flight, and ingest drops it the moment a board
+read shows that status land.
+
+## A resumed run rebuilt work that was already committed
+
+The symptom above is what costs money. A crashed loop resumes off the **board**:
+`/z-loop` re-reads each ticket's status and re-claims it at the stage that status
+names (Building → builder, QA → qa, Review → reviewer). So a lane that had
+advanced to QA while the board still said Building comes back as a *builder*,
+spawns a fresh build agent on a branch whose work is already committed, and pays
+for it again.
+
+Two things to check before re-running a crashed loop:
+
+1. Every in-flight ticket's board status matches the stage its lane reached
+   (`jq '.lanes' …/state.json` against `/z-status`). Move any that disagree.
+2. `/z-loop --reconcile` if the crash left lane locks or orphan worktrees — it
+   parks affected tickets back to Ready rather than guessing a stage.
+
+If a rebuild already happened, the branch is intact (the loop never deletes
+branches) and the duplicate work is in the same worktree; the cost is the wasted
+build, not lost code.
+
 ## "#N sits in board status …, which the loop does not drive; ignoring it"
 
 You added a column to the board that is not one of the canonical nine, and a

@@ -7,7 +7,7 @@ import { test, expect, describe } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveSlug } from "../lib/config.ts";
-import { applyAction, type LoopState } from "../lib/loop.ts";
+import { applyAction, owedBoardWrite, type LoopState } from "../lib/loop.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const zLoop = () => readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
@@ -299,5 +299,75 @@ describe("Ticket #138: every lane-owned board move is --if-present", () => {
     expect(stopped.lanes).toEqual([]);
     expect(stopped.mergedThisRun).toEqual([]); // the retarget record would be lost
     expect(stopped.tickets[0]!.status).toBe("Review");
+  });
+});
+
+// ============================================================================
+// Ticket #205 -- the `advance N to S` row writes the board. Before this, the row
+// named a lane-lock re-stamp, an apply, and a spawn, and NO `z-board move`: the
+// reducer recorded the new status and stamped the #125 in-flight-write marker
+// while the board stayed a stage behind the lane, permanently. The expensive
+// consequence is the resume path, which picks a crashed ticket's stage from the
+// BOARD status -- a lane at qa reading Building comes back as a builder and
+// rebuilds committed work. Doc-canary: dropping the move again fails the suite.
+// ============================================================================
+describe("Ticket #205: the advance row moves the board to the new stage's status", () => {
+  // Just the one table row -- `section()` would run to the end of Step 4 and pick
+  // up the park/skip rows' moves.
+  function advanceRow(): string {
+    const row = zLoop().split("\n").find((l) => l.startsWith("| `advance N to S` |"));
+    return row ?? "";
+  }
+
+  test("AC1: the row performs `z-board move <N> <status>` mirroring STATUS_FOR_STAGE, --if-present like every other lane move", () => {
+    const row = advanceRow();
+    expect(row).not.toBe("");
+    expect(row).toContain('"$Z_BOARD" move <N> <status> --if-present');
+    expect(row).toContain("STATUS_FOR_STAGE[S]");
+    for (const pair of ["`builder`→`Building`", "`qa`→`QA`", "`reviewer`→`Review`"]) expect(row).toContain(pair);
+  });
+
+  test("the row names what an advance to `merge` writes instead of leaving it to the reader", () => {
+    const row = advanceRow();
+    expect(row).toContain("`merge`→`Review`");
+    expect(row).toMatch(/merge has no status of its own/);
+  });
+
+  test("order: lane lock -> apply -> board move -> spawn (the marker must exist before the write)", () => {
+    const row = advanceRow();
+    const lock = row.indexOf("lane-write");
+    const apply = row.indexOf("2. Apply");
+    const move = row.indexOf("move <N> <status>");
+    const spawn = row.indexOf("4. Spawn stage S fresh");
+    expect(lock).toBeGreaterThanOrEqual(0);
+    expect(lock).toBeLessThan(apply);
+    expect(apply).toBeLessThan(move);
+    expect(move).toBeLessThan(spawn);
+  });
+
+  test("the row states the cost of skipping it, so it cannot be read as optional bookkeeping", () => {
+    const row = advanceRow();
+    expect(row).toMatch(/never skip this/i);
+    expect(row).toMatch(/rebuild/i);
+  });
+
+  // The lib half: `apply` cannot make the write (pure reducer, board.ts is the
+  // sole gh caller) but it derives and PRINTS it, so the row and the tool agree.
+  test("owedBoardWrite derives exactly the statuses the row names", () => {
+    expect(owedBoardWrite({ kind: "advance", ticket: 5, to: "builder" })).toEqual({ ticket: 5, status: "Building" });
+    expect(owedBoardWrite({ kind: "advance", ticket: 5, to: "qa" })).toEqual({ ticket: 5, status: "QA" });
+    expect(owedBoardWrite({ kind: "advance", ticket: 5, to: "reviewer" })).toEqual({ ticket: 5, status: "Review" });
+    expect(owedBoardWrite({ kind: "advance", ticket: 5, to: "merge" })).toEqual({ ticket: 5, status: "Review" });
+  });
+
+  test("docs/user-guide keeps the user-facing contract in step with the row", () => {
+    const zloopDoc = readFileSync(join(REPO_ROOT, "docs", "user-guide", "z-loop.md"), "utf8");
+    expect(zloopDoc).toMatch(/Every stage transition writes the board/);
+    expect(zloopDoc).toContain("STATUS_FOR_STAGE[stage]");
+
+    const trouble = readFileSync(join(REPO_ROOT, "docs", "user-guide", "troubleshooting.md"), "utf8");
+    expect(trouble).toMatch(/board says Building for a ticket the loop is actually QA-ing or reviewing/i);
+    expect(trouble).toMatch(/resumed run rebuilt work that was already committed/i);
+    expect(trouble).toContain("board write owed: z-board move 168 QA --if-present");
   });
 });

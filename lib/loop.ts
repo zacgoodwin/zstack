@@ -1069,6 +1069,36 @@ function dropLane(state: LoopState, n: number): void {
   state.lanes = state.lanes.filter((l) => l.ticket !== n);
 }
 
+// The board write the orchestrator OWES for this action -- the half applyAction
+// cannot do. The reducer is pure and lib/board.ts is the pack's sole gh caller,
+// so applying a `claim`/`advance` can only RECORD the intent: it stamps the new
+// status on the state file and stamps lane.lastWroteStatus (#125's origin
+// marker), then the orchestrator must actually move the board. Undefined for
+// every other action kind -- park/skip/complete carry their own literal target
+// status in the action, and their SKILL rows write it directly; these two are
+// the only ones whose target is DERIVED from STATUS_FOR_STAGE, which is exactly
+// why the derivation belongs here and not in prose.
+//
+// #205: the `advance` row left that obligation to prose alone and never named a
+// move, so after every stage transition the board sat a stage behind the lane,
+// the marker never cleared, and a crashed run -- whose resume path picks the
+// stage from the BOARD status (lanes.ts claimStage) -- re-claimed a QA lane as a
+// builder and rebuilt finished, committed work. `loop apply` prints this so the
+// obligation is visible in the tick output, and evals/e2e's residual-marker
+// assertion drives it so a marker the orchestrator can never clear fails a check
+// instead of costing a rebuild. INVARIANT: every action kind applyAction sets
+// lastWroteStatus for must return a write here.
+export function owedBoardWrite(action: Action): { ticket: number; status: BoardStatus } | undefined {
+  switch (action.kind) {
+    case "claim":
+      return { ticket: action.ticket, status: STATUS_FOR_STAGE[action.stage] };
+    case "advance":
+      return { ticket: action.ticket, status: STATUS_FOR_STAGE[action.to] };
+    default:
+      return undefined;
+  }
+}
+
 // Applies an Action to the loop state, returning the new state (pure -- input
 // untouched). This mirrors on the state file exactly what the orchestrator
 // does on the board/worktrees, so the two never drift by prose bookkeeping.
@@ -1711,6 +1741,12 @@ export function main(argv: string[]): number {
       const action = readJson(positionals[1]) as Action;
       atomicWrite(statePath, JSON.stringify(applyAction(state, action, nowMs), null, 2));
       console.log(`applied ${action.kind}${"ticket" in action ? ` #${action.ticket}` : ""}`);
+      // #205: the state file now says the new stage's status and the lane carries
+      // the in-flight-write marker; the board does NOT until the orchestrator
+      // moves it. Print the owed move so the obligation rides the tick output
+      // instead of living only in the SKILL row that used to omit it.
+      const owed = owedBoardWrite(action);
+      if (owed) console.log(`board write owed: z-board move ${owed.ticket} ${owed.status} --if-present`);
       return 0;
     }
     if (cmd === "outcome") {

@@ -4,8 +4,9 @@
 // unavailable). It maps the epic's Definition of Done to executable checks --
 // see ../README.md for the traceability table.
 //
-// The load-bearing move: the "walk", "lane-cap", and "fresh-context" checks do
-// not trust a recorded trace -- they RE-DERIVE the run by driving the real
+// The load-bearing move: the "walk", "lane-cap", "fresh-context", and
+// "board-writes" checks do not trust a recorded trace -- they RE-DERIVE the run
+// by driving the real
 // scheduler (lib/loop.ts) from the recorded starting board (state-initial.json)
 // with a happy-path outcome oracle, then assert the emergent properties. So the
 // checker exercises the actual state machine, not a transcript of it. The other
@@ -16,8 +17,10 @@ import { join } from "node:path";
 import {
   applyAction,
   nextAction,
+  owedBoardWrite,
   recordOutcome,
   type Action,
+  type BoardStatus,
   type LaneState,
   type LoopState,
   type Stage,
@@ -97,6 +100,11 @@ export interface SimTrace {
   completionOrder: number[];
   finalState: LoopState;
   laneKeySets: Set<string>;
+  // #205: the board writes the orchestrator owed and performed during the
+  // derivation, and every lane snapshot whose in-flight-write marker no such
+  // write could ever match (see assertBoardWrites).
+  boardWrites: number;
+  residualMarkers: string[];
 }
 
 // Drives the real scheduler to drain, recording every emergent fact the checks
@@ -109,6 +117,12 @@ export function deriveRun(initial: LoopState, oracle = happyOutcome): SimTrace {
   const completionOrder: number[] = [];
   let maxObservedLanes = 0;
   let now = 0;
+  // #205: the BOARD, kept separately from state.tickets. The reducer only ever
+  // records what the orchestrator must write; this map moves only when an owed
+  // write is actually performed, which is what makes a skipped write visible.
+  const board = new Map<number, BoardStatus>();
+  const residualMarkers: string[] = [];
+  let boardWrites = 0;
 
   const recordStatuses = () => {
     for (const t of state.tickets) {
@@ -126,12 +140,28 @@ export function deriveRun(initial: LoopState, oracle = happyOutcome): SimTrace {
   for (let i = 0; i < 1000; i++) {
     now += 1;
     const action: Action = nextAction(state, now);
-    if (action.kind === "drain-complete") return { statusHistory, maxObservedLanes, completionOrder, finalState: state, laneKeySets };
+    if (action.kind === "drain-complete") {
+      return { statusHistory, maxObservedLanes, completionOrder, finalState: state, laneKeySets, boardWrites, residualMarkers };
+    }
     if (action.kind === "wait" || action.kind === "check-worker") {
       throw new Error(`Happy-path derivation hit an unexpected "${action.kind}" -- the recorded run is not the clean success this checker models.`);
     }
     if (action.kind === "complete") completionOrder.push(action.ticket);
     state = applyAction(state, action, now);
+    // The orchestrator's half of the transition (#205): perform the write the
+    // action owes, then look for any lane the accumulated writes leave stranded.
+    const owed = owedBoardWrite(action);
+    if (owed) {
+      board.set(owed.ticket, owed.status);
+      boardWrites += 1;
+    }
+    for (const l of state.lanes) {
+      if (l.lastWroteStatus !== undefined && board.get(l.ticket) !== l.lastWroteStatus) {
+        residualMarkers.push(
+          `#${l.ticket} at stage ${l.stage} carries lastWroteStatus=${l.lastWroteStatus} after ${action.kind}, but the board was left at ${board.get(l.ticket) ?? "(never written)"}`
+        );
+      }
+    }
     captureLanes();
     if (action.kind === "claim") state = recordOutcome(state, action.ticket, oracle(action.stage, action.ticket), now);
     if (action.kind === "advance") state = recordOutcome(state, action.ticket, oracle(action.to, action.ticket), now);
@@ -200,6 +230,24 @@ export function assertFreshContext(trace: SimTrace): AssertionResult {
     }
   }
   return ok("fresh-context", `lane state carried only ${[...ALLOWED_LANE_KEYS].join("/")} across every stage -- nothing latent travels`);
+}
+
+// #205: no drained lane may end a transition with a residual in-flight-write
+// marker. `lastWroteStatus` means "the loop wrote this status and has not seen it
+// land"; ingest clears it the moment a board read shows it. A marker no board
+// write the orchestrator owes could ever match is therefore permanent -- the
+// fingerprint of a stage transition that moved the state file and forgot the
+// board, which leaves `/z-status` lying and makes a crashed run resume off a
+// stale status and rebuild committed work. The derivation performs exactly the
+// writes `owedBoardWrite` names, so this fails the instant an action that stamps
+// the marker stops owing a write.
+export function assertBoardWrites(trace: SimTrace): AssertionResult {
+  if (trace.boardWrites === 0) {
+    return fail("board-writes", "the derivation performed no board writes at all -- every stage transition owes one, so this check would be vacuous");
+  }
+  return trace.residualMarkers.length
+    ? fail("board-writes", `a stage transition left the board behind its lane: ${trace.residualMarkers.join("; ")}`)
+    : ok("board-writes", `every stage transition wrote the board (${trace.boardWrites} writes, no lane kept a residual lastWroteStatus)`);
 }
 
 // The reviewer-blindness gate as an e2e check: every recorded reviewer input is
@@ -395,6 +443,7 @@ export function runAllAssertions(runDir: string): AssertionResult[] {
   results.push(assertLaneCap(trace, initial.maxLanes));
   results.push(assertMergeOrder(recordedFinal, trace));
   results.push(assertFreshContext(trace));
+  results.push(assertBoardWrites(trace));
   results.push(assertReviewerBlindness(runDir, doneTickets));
   results.push(assertActuals(runDir, board));
 

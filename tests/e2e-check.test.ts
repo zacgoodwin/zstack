@@ -8,7 +8,7 @@ import { test, expect, describe, afterEach } from "bun:test";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runAllAssertions, type AssertionResult } from "../evals/e2e/assertions.ts";
+import { assertBoardWrites, deriveRun, runAllAssertions, type AssertionResult } from "../evals/e2e/assertions.ts";
 import { main, SAMPLE_RUN } from "../evals/e2e/check.ts";
 
 const CHECK_CLI = join(import.meta.dir, "..", "evals", "e2e", "check.ts");
@@ -44,16 +44,17 @@ const writeJson = (p: string, v: unknown) => writeFileSync(p, JSON.stringify(v, 
 describe("sample-run (known good): every assertion passes", () => {
   const results = runAllAssertions(SAMPLE_RUN);
 
-  test("ten assertions all pass", () => {
+  test("eleven assertions all pass", () => {
     const failed = results.filter((r) => !r.pass);
     expect(failed.map((r) => `${r.name}: ${r.detail}`)).toEqual([]);
-    expect(results).toHaveLength(10);
+    expect(results).toHaveLength(11);
   });
 
   test("the exact assertion set is present (the DoD coverage the README maps)", () => {
     expect(results.map((r) => r.name).sort()).toEqual(
       [
         "actuals",
+        "board-writes",
         "completion-notes",
         "deploy-chain",
         "fresh-context",
@@ -213,6 +214,42 @@ describe("mutated runs: the checker catches the specific break", () => {
     });
     expect(result.exitCode).toBe(1);
     expect(result.stdout.toString()).toContain("FAIL");
+  });
+});
+
+// ============================================================================
+// #205 -- board-writes: a stage transition that moves the state file and forgets
+// the board leaves a permanent in-flight-write marker. The derivation performs
+// exactly the writes `owedBoardWrite` names, so this assertion is the coupling
+// gate between the reducer's marker and the orchestrator's obligation. The break
+// it catches is a CODE break, not a fixture one, so it is exercised directly.
+// ============================================================================
+describe("#205: board-writes catches a stage transition that skipped its board write", () => {
+  const initial = JSON.parse(readFileSync(join(SAMPLE_RUN, "state-initial.json"), "utf8"));
+
+  test("the sample-run derivation performs real board writes and strands no marker", () => {
+    const trace = deriveRun(initial);
+    expect(trace.boardWrites).toBeGreaterThan(0);
+    expect(trace.residualMarkers).toEqual([]);
+    expect(assertBoardWrites(trace).pass).toBe(true);
+  });
+
+  test("a lane left with a marker no board write matches fails board-writes", () => {
+    const trace = deriveRun(initial);
+    const r = assertBoardWrites({
+      ...trace,
+      residualMarkers: ["#2 at stage qa carries lastWroteStatus=QA after advance, but the board was left at Building"],
+    });
+    expect(r.pass).toBe(false);
+    expect(r.detail).toContain("left the board behind its lane");
+    expect(r.detail).toContain("lastWroteStatus=QA");
+  });
+
+  test("a derivation with zero board writes fails rather than passing vacuously", () => {
+    const trace = deriveRun(initial);
+    const r = assertBoardWrites({ ...trace, boardWrites: 0 });
+    expect(r.pass).toBe(false);
+    expect(r.detail).toContain("no board writes at all");
   });
 });
 
