@@ -41,6 +41,9 @@ import {
   type TicketSnapshot,
 } from "../lib/loop.ts";
 import { DEFAULT_MIN_SKEPTIC_QUORUM, ZError } from "../lib/config.ts";
+// #217: reconcile's own dirty/mtime probe, exercised here against the REAL
+// linked-worktree shape production uses (`.git` is a file, not a directory).
+import { worktreeWork } from "../lib/reconcile.ts";
 import { validateConfig } from "../lib/config-schema.ts";
 import {
   claimableTickets,
@@ -86,6 +89,15 @@ function approve(confidence: number | null, skeptics: { received: number; of: nu
 
 function state(tickets: TicketSnapshot[], lanes: LaneState[] = [], maxLanes = 3, watchdogMinutes = 10): LoopState {
   return { tickets, lanes, maxLanes, watchdogMinutes, mergedThisRun: [] };
+}
+
+// #217: park / skip / stop-lane / complete all release the lane lock while the
+// worktree stays on disk, so every one of them carries the salvage dump it owes.
+// With no project dir resolved (these fixtures pass none) the patch path is
+// expressed relative to it -- never a `<slug>` placeholder.
+function salvage(ticketNumber: number, projectDir?: string) {
+  const tail = `reports/uncommitted-${ticketNumber}.patch`;
+  return { worktree: `.worktrees/ticket-${ticketNumber}`, patch: projectDir ? `${projectDir}/${tail}` : tail };
 }
 
 // The happy-path final message per stage, for simulation. The reviewer's
@@ -192,6 +204,7 @@ describe("Questions tickets", () => {
       ticket: 7,
       status: "Blocked",
       note: expect.stringContaining("#5 (Questions)"),
+      salvage: salvage(7),
     });
     const s2 = applyAction(s, a, 0);
     expect(nextAction(s2, 0)).toEqual({ kind: "drain-complete" });
@@ -243,7 +256,7 @@ describe("watchdog", () => {
     // Probe says dead: skip with a note.
     s = recordProbe(s, 1, false, now);
     const skip = nextAction(s, now);
-    expect(skip).toEqual({ kind: "skip", ticket: 1, note: expect.stringContaining("watchdog") });
+    expect(skip).toEqual({ kind: "skip", ticket: 1, note: expect.stringContaining("watchdog"), salvage: salvage(1) });
     s = applyAction(s, skip, now);
     expect(s.tickets.find((t) => t.number === 1)!.status).toBe("Skipped");
     // The loop continues with the other lane: ticket 2 finishes normally.
@@ -312,13 +325,13 @@ describe("stage transitions", () => {
     let s = state([ticket(1, "Building")], [lane(1, "builder")]);
     s = recordOutcome(s, 1, "NEEDS-INPUT: which currency should defaults use?", 0);
     expect(nextAction(s, 0)).toEqual({
-      kind: "park", ticket: 1, status: "Questions", note: "which currency should defaults use?",
+      kind: "park", ticket: 1, status: "Questions", note: "which currency should defaults use?", salvage: salvage(1),
     });
 
     let s2 = state([ticket(2, "QA")], [lane(2, "qa")]);
     s2 = recordOutcome(s2, 2, "CONFUSED: ticket describes a service that does not exist", 0);
     expect(nextAction(s2, 0)).toEqual({
-      kind: "skip", ticket: 2, note: "ticket describes a service that does not exist",
+      kind: "skip", ticket: 2, note: "ticket describes a service that does not exist", salvage: salvage(2),
     });
   });
 
@@ -454,6 +467,7 @@ describe("reviewer confidence gate", () => {
       ticket: 1,
       status: "Blocked",
       note: "truth-check failed (confidence 60/100)",
+      salvage: salvage(1),
     });
   });
 
@@ -478,6 +492,7 @@ describe("reviewer confidence gate", () => {
       ticket: 1,
       status: "Blocked",
       note: "truth-check failed (reviewer approved with no parseable confidence score)",
+      salvage: salvage(1),
     });
   });
 });
@@ -1107,8 +1122,11 @@ describe("park salvage patch (#217)", () => {
 
   // A missing worktree (already pruned, or a markerless exit that lost it) must
   // not crash the park -- the lane still has to reach Blocked, and the operator
-  // gets a line saying no dump happened.
-  test("a missing worktree skips the dump loudly instead of throwing", () => {
+  // gets a line saying no dump happened -- naming the promised path, and saying
+  // the lock is safe to release. Without that last half an unattended
+  // orchestrator, told by the SKILL to "wait until the file exists", waits on a
+  // file that can never appear (the third #217 QA finding).
+  test("a missing worktree skips the dump loudly instead of throwing, and says the lock is safe", () => {
     const { projectDir, root } = parkWorld("dirty");
     try {
       const a = nextAction(parkedLane(DIRTY_NO_COMMIT), 0, { projectDir }) as Park;
@@ -1116,6 +1134,33 @@ describe("park salvage patch (#217)", () => {
       expect(r.bytes).toBeNull();
       expect(r.note).toContain("SKIPPED");
       expect(existsSync(a.salvage!.patch)).toBe(false);
+      // The note the board comment carries must contradict the park note's
+      // promise explicitly, or the "prose promises, disk disagrees" shape AC5
+      // closes just moves into this branch.
+      expect(r.note).toContain(a.salvage!.patch);
+      expect(r.note).toContain("NO file exists");
+      expect(r.note).toContain("lane lock is safe to release");
+      // ...and the note the human reads points at that line instead of asserting.
+      expect(a.note).toContain("`salvage:` line in this comment records what actually landed");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // The dump stages with `add -A` to catch untracked files, but a Questions park
+  // and a `stop-lane` keep their worktree for a human to inspect -- so it must
+  // stage into a throwaway index and leave the worktree's own status untouched.
+  test("the dump never mutates the lane worktree's index or leaves a scratch file behind", () => {
+    const { projectDir, repoRoot, worktree, root } = parkWorld("dirty");
+    try {
+      const before = Bun.spawnSync(["git", "-C", worktree, "status", "--porcelain"], { stdout: "pipe" }).stdout.toString();
+      const a = nextAction(parkedLane(DIRTY_NO_COMMIT), 0, { projectDir }) as Park;
+      const r = runSalvage(a.salvage!, undefined, repoRoot);
+      expect(r.bytes).toBeGreaterThan(0);
+      const after = Bun.spawnSync(["git", "-C", worktree, "status", "--porcelain"], { stdout: "pipe" }).stdout.toString();
+      expect(after).toBe(before); // still unstaged/untracked, exactly as the human left it
+      expect(before).toContain("?? new-test.ts");
+      expect(existsSync(`${a.salvage!.patch}.index`)).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1134,20 +1179,116 @@ describe("park salvage patch (#217)", () => {
     expect(r.note).toContain("SKIPPED");
   });
 
-  // Only this park owes a dump. Every other park/skip carries no salvage, so
-  // `loop apply` stays byte-identical for them.
-  test("no other park carries a salvage instruction", () => {
+  // EVERY action that releases the lane lock while the worktree stays on disk
+  // owes a dump -- not just the exhausted-commit-retry park. Scoping it to that
+  // one park made reconcile's guard a wedge for the routine flows: a Questions
+  // park, a watchdog skip and a human `stop-lane` all leave a dirty LOCKLESS
+  // worktree with no patch, so the next run's reconcile refused and the loop
+  // would not start until a human hand-ran the dump.
+  test("every lock-releasing action carries the salvage dump it owes", () => {
+    const P = "/tmp/p";
+    const owed = (a: Action, ticketNumber: number) =>
+      expect((a as Park).salvage).toEqual({
+        worktree: `.worktrees/ticket-${ticketNumber}`,
+        patch: `${P}/reports/uncommitted-${ticketNumber}.patch`,
+      });
+
+    // park Questions -- keeps the worktree, removes the lane lock.
     const q = nextAction(
       state([ticket(3, "Building")], [lane(3, "builder", { outcome: { kind: "needs-input", note: "which schema?" } })]),
       0,
-      { projectDir: "/tmp/p" }
-    ) as Park;
-    expect(q.status).toBe("Questions");
-    expect(q.salvage).toBeUndefined();
-    // ...and the FIRST commit-retry is an advance, not a park -- nothing to dump.
+      { projectDir: P }
+    );
+    expect(q).toMatchObject({ kind: "park", status: "Questions" });
+    owed(q, 3);
+
+    // skip -- same shape, and the watchdog one leaves the worktree "for inspection".
+    const c = nextAction(
+      state([ticket(4, "QA")], [lane(4, "qa", { outcome: { kind: "confused", note: "no such service" } })]),
+      0,
+      { projectDir: P }
+    );
+    expect(c).toMatchObject({ kind: "skip" });
+    owed(c, 4);
+
+    // stop-lane -- a human moved the ticket to a stop status mid-run.
+    const stopped = nextAction(
+      state([ticket(5, "Blocked")], [lane(5, "builder", { outcome: { kind: "built" } })]),
+      0,
+      { projectDir: P }
+    );
+    expect(stopped).toMatchObject({ kind: "stop-lane", ticket: 5 });
+    owed(stopped, 5);
+
+    // complete -- the merge step's own `git worktree remove` is NON-force, so a
+    // dirty tree leaves it on disk for an already-merged ticket. Normally the
+    // worktree is already gone by now and runSalvage just reports a skip.
+    let m = state([ticket(6, "Review")], [lane(6, "merge")]);
+    m = recordOutcome(m, 6, HAPPY.merge, 0);
+    const done = nextAction(m, 0, { projectDir: P });
+    expect(done).toMatchObject({ kind: "complete", ticket: 6 });
+    owed(done, 6);
+  });
+
+  // ...and nothing else does: an action that keeps its lock or touches no
+  // worktree stays byte-identical to pre-#217.
+  test("actions that keep the lane lock carry no salvage", () => {
+    const P = "/tmp/p";
+    // claim: the lock is written, not released.
+    expect(nextAction(state([ticket(1, "Ready")]), 0, { projectDir: P })).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+    // The FIRST commit-retry is an advance, not a park -- the lane keeps its lock.
     let s = state([ticket(7, "Building")], [lane(7, "builder")]);
     s = recordOutcome(s, 7, "BUILT: done", 0, DIRTY_NO_COMMIT);
-    expect(nextAction(s, 0, { projectDir: "/tmp/p" })).toMatchObject({ kind: "advance", to: "builder" });
+    const a = nextAction(s, 0, { projectDir: P });
+    expect(a).toMatchObject({ kind: "advance", to: "builder" });
+    expect("salvage" in a).toBe(false);
+    // ...and the lane-less actions.
+    expect(nextAction(state([]), 0, { projectDir: P })).toEqual({ kind: "drain-complete" });
+  });
+
+  // Production shape: a real LINKED worktree (`git worktree add`), where `.git`
+  // is a FILE pointing at the parent repo, not a directory. Every other fixture
+  // here git-inits a standalone repo, which is close enough for the diff but not
+  // for the two probes that branch on `.git` existing or on running inside a
+  // linked tree. Both halves are exercised against the shape production uses.
+  test("real linked worktree: the dump and the dirty probe both work where `.git` is a file", () => {
+    const root = mkdtempSync(join(tmpdir(), "zstack-217-linked-"));
+    try {
+      const repo = join(root, "repo");
+      mkdirSync(repo, { recursive: true });
+      const git = (cwd: string, ...args: string[]) => {
+        const p = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
+        if (p.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${p.stderr.toString()}`);
+      };
+      git(repo, "init", "-q", "-b", "main");
+      git(repo, "config", "user.email", "t@t.t");
+      git(repo, "config", "user.name", "t");
+      writeFileSync(join(repo, "committed.txt"), "base\n");
+      git(repo, "add", "-A");
+      git(repo, "commit", "-qm", "base");
+      git(repo, "worktree", "add", "-q", join(repo, ".worktrees", "ticket-7"), "-b", "z/ticket-7");
+      const wt = join(repo, ".worktrees", "ticket-7");
+      expect(statSync(join(wt, ".git")).isFile()).toBe(true); // the shape under test
+      writeFileSync(join(wt, "committed.txt"), "edited but never committed\n");
+      writeFileSync(join(wt, "new-test.ts"), "never git-added\n");
+
+      // reconcile's probe sees the work, with a real newest-change timestamp.
+      const work = worktreeWork(wt);
+      expect(work).toMatchObject({ dirty: true });
+      expect(work.newestChangeMs).toBeGreaterThan(0);
+
+      // ...and the park's dump captures it, without staging anything in the tree.
+      const projectDir = join(root, "projects", "linked-slug");
+      const a = nextAction(parkedLane(DIRTY_NO_COMMIT), 0, { projectDir }) as Park;
+      const r = runSalvage(a.salvage!, undefined, repo);
+      expect(r.bytes).toBeGreaterThan(0);
+      const patch = readFileSync(a.salvage!.patch, "utf8");
+      expect(patch).toContain("new-test.ts");
+      expect(patch).toContain("edited but never committed");
+      expect(Bun.spawnSync(["git", "-C", wt, "diff", "--cached", "--name-only"], { stdout: "pipe" }).stdout.toString()).toBe("");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   // The SKILL's park row is where an orchestrator learns what to do. It must now
@@ -1157,15 +1298,28 @@ describe("park salvage patch (#217)", () => {
     const skill = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
     const has = (s: string) => skill.includes(s); // never dump 60KB into a failure
     expect(has("`salvage` block")).toBe(true);
-    expect(has("apply FIRST")).toBe(true);
+    // Apply before the comment and before the lock removal, in every row that
+    // owes a dump (park Questions, park Blocked, skip) -- a comment posted first
+    // would name a patch that does not exist yet.
+    expect(skill.split("Apply FIRST").length - 1).toBeGreaterThanOrEqual(3);
     // The assertion the plan asked for: the orchestrator verifies, never assumes.
     expect(has("$SALVAGE_PATCH")).toBe(true);
+    // ...with an EXIT for the one case where the file can never appear. Without
+    // it, "do not release the lock until that file exists" strands an unattended
+    // orchestrator forever on a park whose worktree is already gone.
+    expect(has('[ -d ".worktrees/ticket-<N>" ]')).toBe(true);
+    expect(has("there is no tree to lose")).toBe(true);
+    // And the line that keeps a promised patch from outliving a dump that did
+    // not happen: apply's own salvage line goes into the board comment.
+    expect(has("`salvage:` line verbatim")).toBe(true);
     // And reconcile's half is documented where a human looks for it.
     const trouble = readFileSync(join(REPO_ROOT, "docs", "user-guide", "troubleshooting.md"), "utf8");
     expect(trouble).toContain("REFUSED to prune");
     expect(trouble).toContain("uncommitted-<N>.patch");
+    expect(trouble).toContain("NEWER than the salvage patch"); // the stale-patch refusal
     const guide = readFileSync(join(REPO_ROOT, "docs", "user-guide", "z-loop.md"), "utf8");
     expect(guide).toContain("refuses to force-remove");
+    expect(guide).toContain("older than the uncommitted work");
   });
 });
 
@@ -1203,6 +1357,7 @@ describe("reviewer bounce cap (issue #76)", () => {
       ticket: 1,
       status: "Blocked",
       note: "review bounce cap reached (2/2)\n\ntruth-check failed (confidence 10/100)",
+      salvage: salvage(1),
     });
     expect(s.tickets[0].status).toBe("Blocked");
     expect(s.lanes).toEqual([]); // the lane is dropped, not left spinning

@@ -110,11 +110,24 @@ holds uncommitted work with no salvage patch — see the next section.
 
 ## "REFUSED to prune …: it has uncommitted work and no salvage patch"
 
-`reconcile apply` found a worktree with **no lane lock** (the shape a
-`park N Blocked` leaves behind — parking releases the lock) whose tree is dirty,
+`reconcile apply` found a worktree with **no lane lock** (the shape every park,
+skip and stop-lane leaves behind — each releases the lock) whose tree is dirty,
 and no `~/.zstack/projects/<slug>/reports/uncommitted-<N>.patch` on disk. That
 worktree may hold the only copy of real work, so reconcile leaves it exactly as it
 is, exits non-zero, and the loop does not start. Nothing was deleted.
+
+The sibling message — **"it has uncommitted work NEWER than the salvage patch
+at …"** — means the patch *is* on disk but predates the work in the worktree.
+Nothing ever deletes these patches, so one from an earlier park of the same
+ticket number survives indefinitely; it is a leftover, not this worktree's
+salvage, and trusting it would discard the current work as silently as having no
+patch at all. Same fix either way: the dump command below overwrites it.
+
+A third variant — **"git could not read it"** — means the directory has a `.git`
+entry but `git status` failed there, usually a linked worktree whose parent repo
+moved or was deleted. Nothing can prove a patch covers work git will not
+describe, so it is refused even when a patch is present. Fix the worktree (or
+move it aside by hand) rather than dumping a patch.
 
 Pick one:
 
@@ -134,10 +147,12 @@ Then `/z-loop --reconcile` again. Re-apply a dumped patch later with
 `git apply --index <patch>` in a fresh worktree. A 0-byte patch is legitimate: it
 means the tree held nothing uncommitted.
 
-Reaching this at all means the park's own dump did not run or did not land — the
-park action carries the dump and `loop apply` performs it, so the usual causes are
-a loop killed mid-park or a worktree that moved. The refusal is the backstop, not
-the normal path.
+Reaching this at all means a dump that was owed did not run or did not land.
+Every action that releases a lane lock while keeping its worktree — park, skip,
+stop-lane, and the completion flow — carries the dump, and `loop apply` performs
+it, so the usual causes are a loop killed mid-park, a worktree that moved, or a
+patch left over from a much earlier park of the same ticket. The refusal is the
+backstop, not the normal path.
 
 ## "Rates last checked … over the 14-day limit"
 

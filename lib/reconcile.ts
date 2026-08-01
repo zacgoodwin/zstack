@@ -13,8 +13,8 @@
 // holds uncommitted work with no salvage patch on disk. That is the one prune
 // whose loss a human cannot redo at all, so the plan refuses it by name and the
 // CLI exits non-zero rather than starting a loop over the only copy.
-import { existsSync, readdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { Board, ghExecutor } from "./board.ts";
 import { handleCliError, parseFlags, str } from "./cli.ts";
 import {
@@ -58,39 +58,91 @@ export interface CrashedLane {
 }
 
 // A worktree with no backing lock. Pruned; also parked when the board still
-// shows it in-flight. #217 adds the two facts the prune is now judged against:
-// whether the tree holds uncommitted work, and whether a salvage patch for it
-// already exists.
+// shows it in-flight. #217 adds the facts the prune is now judged against:
+// whether the tree holds uncommitted work, how new that work is, and whether a
+// salvage patch covering it exists.
 export interface OrphanWorktree {
   ticket: number;
   worktreePath: string;
   boardStatus?: BoardStatus;
   dirty: boolean; // uncommitted work present (git status --porcelain non-empty)
+  newestChangeMs: number; // mtime of the newest uncommitted path; 0 when clean
   patchPath: string; // where this ticket's salvage patch lives, if it was dumped
-  hasPatch: boolean; // ...and whether it is actually on disk
+  patchStale: boolean; // on disk, but older than the work it would have to contain
+  hasPatch: boolean; // ...on disk AND new enough to be this worktree's salvage
 }
 
 // #217: what the prune step needs to know before it force-removes a lockless
 // worktree. `reportsDir` is the project's ~/.zstack/projects/<slug>/reports --
 // REQUIRED, not optional-with-a-default, so this check cannot be silently
-// omitted by a caller the way #177's git facts could be. `isDirty` defaults to
+// omitted by a caller the way #177's git facts could be. `probe` defaults to
 // the real git probe; tests inject.
 export interface SalvageProbe {
   reportsDir: string;
-  isDirty?: (worktreePath: string) => boolean;
+  probe?: (worktreePath: string) => WorktreeWork;
 }
 
-// Does this worktree hold uncommitted work? Fail-CLOSED on a real worktree git
-// cannot read (exit != 0 -> assume work is there, so the prune refuses and a
-// human looks). A directory with no `.git` entry is not a git worktree at all --
-// git never knew it, `git diff` could not have salvaged it, and
-// pruneWorktreeReal's rmSync fallback exists precisely for that leftover -- so
-// it reads as clean rather than wedging every future reconcile on a stray dir.
+// What one worktree holds, as the prune guard judges it.
+//
+// `newestChangeMs` is the whole of the staleness half: nothing ever deletes
+// reports/uncommitted-<N>.patch, so a patch dumped by a park weeks ago outlives
+// its worktree and would satisfy a filename-existence check forever. The next
+// time ticket N gets a worktree and leaves NEW uncommitted work in it, that
+// ancient file would wave the force-remove through and the loss would be silent
+// again -- the exact failure #217 exists to close, one re-park later. So the
+// evidence is tied to THIS tree's current state: a patch older than the newest
+// uncommitted path in the worktree cannot contain that path's contents.
+export interface WorktreeWork {
+  dirty: boolean;
+  newestChangeMs: number; // newest mtime among the uncommitted paths; 0 when clean
+}
+
+// mtime in ms, or 0 for anything unreadable (deleted between the scan and the
+// stat, a permission error). 0 never wins a Math.max and never makes a patch
+// look fresh, so an unreadable path degrades to "no evidence", not "safe".
+function mtimeMs(path: string): number {
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+// Does this worktree hold uncommitted work, and how new is it? Fail-CLOSED on a
+// real worktree git cannot read (exit != 0 -> assume work is there AND that no
+// patch could cover it, so the prune refuses and a human looks). A directory
+// with no `.git` entry is not a git worktree at all -- git never knew it, `git
+// diff` could not have salvaged it, and pruneWorktreeReal's rmSync fallback
+// exists precisely for that leftover -- so it reads as clean rather than wedging
+// every future reconcile on a stray dir.
+export function worktreeWork(worktreePath: string): WorktreeWork {
+  if (!existsSync(join(worktreePath, ".git"))) return { dirty: false, newestChangeMs: 0 };
+  // -uall lists untracked FILES (not just their directory), so a never-added
+  // test file contributes its own mtime; -z is the only quoting-proof format.
+  const p = Bun.spawnSync(["git", "-C", worktreePath, "status", "--porcelain", "-uall", "-z"], { stdout: "pipe", stderr: "pipe" });
+  if (p.exitCode !== 0) return { dirty: true, newestChangeMs: Number.POSITIVE_INFINITY };
+  const records = p.stdout.toString().split("\0").filter((s) => s.length > 0);
+  if (records.length === 0) return { dirty: false, newestChangeMs: 0 };
+  let newest = 0;
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i];
+    // `XY <path>`; a rename/copy is followed by its ORIGINAL path as the next
+    // record. That original no longer exists, so it is skipped as a record but
+    // its removal still shows up in its parent directory's mtime below.
+    if (rec[0] === "R" || rec[0] === "C") i++;
+    const full = join(worktreePath, rec.slice(3));
+    // A deleted path has no mtime of its own; deleting it bumps the mtime of the
+    // directory that held it, which is what keeps a delete-only dirty tree from
+    // reading as "newest change: never" and trusting an ancient patch.
+    newest = Math.max(newest, mtimeMs(full) || mtimeMs(dirname(full)));
+  }
+  return { dirty: true, newestChangeMs: newest };
+}
+
+// Kept as the boolean shorthand the rest of the codebase reads more easily; the
+// guard itself needs the mtime, so it calls worktreeWork directly.
 export function worktreeDirty(worktreePath: string): boolean {
-  if (!existsSync(join(worktreePath, ".git"))) return false;
-  const p = Bun.spawnSync(["git", "-C", worktreePath, "status", "--porcelain"], { stdout: "pipe", stderr: "pipe" });
-  if (p.exitCode !== 0) return true;
-  return p.stdout.toString().trim().length > 0;
+  return worktreeWork(worktreePath).dirty;
 }
 
 export interface Orphans {
@@ -144,18 +196,26 @@ export function scanOrphans(
     boardStatus: statusByTicket.get(l.lock.ticket),
   }));
 
-  const isDirty = salvage.isDirty ?? worktreeDirty;
+  const probe = salvage.probe ?? worktreeWork;
   const orphanWorktrees: OrphanWorktree[] = worktrees
     .filter((w) => !lockTickets.has(w.ticket))
     .map((w) => {
       const patchPath = join(salvage.reportsDir, salvagePatchName(w.ticket));
+      const work = probe(w.path);
+      // Existence is presence; the mtime is what makes it EVIDENCE for this
+      // tree. A clean tree needs no patch at all, so staleness is only asked
+      // about a dirty one.
+      const patchMs = existsSync(patchPath) ? mtimeMs(patchPath) : 0;
+      const patchStale = patchMs > 0 && work.dirty && patchMs < work.newestChangeMs;
       return {
         ticket: w.ticket,
         worktreePath: w.path,
         boardStatus: statusByTicket.get(w.ticket),
-        dirty: isDirty(w.path),
+        dirty: work.dirty,
+        newestChangeMs: work.newestChangeMs,
         patchPath,
-        hasPatch: existsSync(patchPath),
+        patchStale,
+        hasPatch: patchMs > 0 && !patchStale,
       };
     });
 
@@ -178,8 +238,10 @@ export type ReconcileAction =
   | { kind: "park-ready"; ticket: number; note: string }
   | { kind: "prune-worktree"; ticket: number; path: string }
   | { kind: "remove-lock"; ticket: number; path: string }
-  // #217: the prune this plan REFUSES to make, and the patch it looked for.
-  | { kind: "refuse-prune"; ticket: number; path: string; patchPath: string };
+  // #217: the prune this plan REFUSES to make, the patch it looked for, and why
+  // it did not count -- absent, older than the work, or unknowable because git
+  // could not read the worktree at all.
+  | { kind: "refuse-prune"; ticket: number; path: string; patchPath: string; reason: "missing" | "stale" | "unreadable" };
 
 // Pure: orphans in, ordered action list out. For each crashed lane the board
 // status decides the recovery (issue #14 C4):
@@ -224,7 +286,12 @@ export function reconcilePlan(orphans: Orphans): ReconcileAction[] {
     // uncommitted work is the documented, intended behaviour there (issue #2),
     // not an accident of a released lock.
     if (w.dirty && !w.hasPatch) {
-      actions.push({ kind: "refuse-prune", ticket: w.ticket, path: w.worktreePath, patchPath: w.patchPath });
+      // An infinite newest-change is worktreeWork's "git could not read this
+      // tree" sentinel: no patch can be proven newer than an unknown, so the
+      // refusal is right, but calling it stale would send a human hunting for a
+      // leftover patch instead of a broken worktree.
+      const reason = !Number.isFinite(w.newestChangeMs) ? "unreadable" : w.patchStale ? "stale" : "missing";
+      actions.push({ kind: "refuse-prune", ticket: w.ticket, path: w.worktreePath, patchPath: w.patchPath, reason });
       continue;
     }
     actions.push({ kind: "prune-worktree", ticket: w.ticket, path: w.worktreePath });
@@ -287,11 +354,17 @@ export async function applyReconcile(actions: ReconcileAction[], fx: ReconcileEf
 }
 
 // The operator-facing refusal text. One place, so `scan`'s JSON consumers and
-// `apply`'s stderr say the same thing: which worktree, which patch was missing,
-// and the two ways out.
+// `apply`'s stderr say the same thing: which worktree, which patch was missing
+// (or too old to be this worktree's salvage), and the two ways out.
 export function refusalMessage(r: RefusePrune): string {
+  const why =
+    r.reason === "stale"
+      ? `it has uncommitted work NEWER than the salvage patch at ${r.patchPath}, so that patch is a leftover from an earlier park and does not contain this work`
+      : r.reason === "unreadable"
+        ? `git could not read it, so whether it holds uncommitted work covered by ${r.patchPath} is unknowable`
+        : `it has uncommitted work and no salvage patch at ${r.patchPath}`;
   return (
-    `REFUSED to prune ${r.path}: it has uncommitted work and no salvage patch at ${r.patchPath}.\n` +
+    `REFUSED to prune ${r.path}: ${why}.\n` +
     `  Force-removing it would discard the only copy (#217). Either:\n` +
     `    git -C "${r.path}" add -A && git -C "${r.path}" diff --cached --binary HEAD > "${r.patchPath}"\n` +
     `  (dump it, then re-run --reconcile), or commit the work onto the lane's branch and delete the worktree yourself.`
@@ -358,7 +431,8 @@ const USAGE = `reconcile <command> [args] --slug S
                       running loop parks its tickets and deletes its worktrees.
                       Also refuses (exit 1, worktree left in place) to force-remove
                       a lockless worktree that has uncommitted work and no salvage
-                      patch in the project's reports dir (#217).
+                      patch in the project's reports dir -- or only one older than
+                      that work, which is a leftover, not a salvage (#217).
                       --session is the owning loop's own id: /z-loop reconciles
                       AFTER taking the lock, so it passes its session to proceed.
 

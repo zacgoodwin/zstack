@@ -35,7 +35,7 @@ import {
   writeLaneLock,
   type LoopLock,
 } from "../lib/locks.ts";
-import { ZError, salvagePatchName } from "../lib/config.ts";
+import { ZError, projectsDir, reportsDir, salvagePatchName } from "../lib/config.ts";
 import {
   applyAndReport,
   applyReconcile,
@@ -47,6 +47,7 @@ import {
   scanOrphans,
   sweep,
   worktreeDirty,
+  worktreeWork,
   type ReconcileAction,
   type ReconcileEffects,
   type SalvageProbe,
@@ -56,6 +57,7 @@ import {
   ingestBoardItems,
   nextAction,
   recordOutcome,
+  runSalvage,
   type LaneState,
   type LoopState,
   type Stage,
@@ -690,7 +692,10 @@ describe("control 2: orphan scan (crash recovery)", () => {
   // be silently omitted by a caller. Every case in THIS describe is a clean tree
   // (the pre-#217 shape), which is exactly what keeps their behaviour identical;
   // the guard's own cases live in the #217 describe below.
-  const CLEAN: SalvageProbe = { reportsDir: join(tmpdir(), "zstack-217-reports-that-do-not-exist"), isDirty: () => false };
+  const CLEAN: SalvageProbe = {
+    reportsDir: join(tmpdir(), "zstack-217-reports-that-do-not-exist"),
+    probe: () => ({ dirty: false, newestChangeMs: 0 }),
+  };
 
   test("scan finds all three orphan categories; plan parks to Ready and prunes", () => {
     const locksDir = tmp();
@@ -903,7 +908,7 @@ describe("#217: reconcile refuses to prune a dirty worktree with no salvage patc
     const plan = reconcilePlan(orphans);
     // Refused, and NOTHING else happens to that lane -- no prune, and no board
     // move either: reconcile did not touch it, so it must not say it did.
-    expect(plan).toEqual([{ kind: "refuse-prune", ticket: 7, path: wt, patchPath: w.patchPath }]);
+    expect(plan).toEqual([{ kind: "refuse-prune", ticket: 7, path: wt, patchPath: w.patchPath, reason: "missing" }]);
 
     const { fx, pruned, parked, released } = noEffects();
     expect(await applyAndReport(plan, fx)).toBe(1); // Step 0(b) keys on this
@@ -954,6 +959,108 @@ describe("#217: reconcile refuses to prune a dirty worktree with no salvage patc
     expect(pruned).toEqual([wt]);
   });
 
+  // Backdate a file so "older than the work" is a fact, not a race on how fast
+  // the test ran.
+  function backdate(path: string, days: number): void {
+    const t = new Date(Date.now() - days * 86_400_000);
+    utimesSync(path, t, t);
+  }
+
+  // The first cut of the guard proved salvage by FILENAME EXISTENCE alone, and
+  // nothing ever deletes reports/uncommitted-<N>.patch -- so the patch from a
+  // park weeks ago outlived its worktree and waved the next force-remove
+  // through. One re-park of the same ticket and the loss was silent again, which
+  // is the exact failure the guard exists to stop.
+  test("a STALE patch (older than the uncommitted work) does NOT satisfy the guard", async () => {
+    const worktreesDir = tmp();
+    const reports = tmp();
+    const wt = gitWorktree(worktreesDir, 7, "untracked"); // brand-new work, now
+    // A patch left behind by a park weeks ago, for the same ticket number.
+    const patchPath = join(reports, salvagePatchName(7));
+    writeFileSync(patchPath, "diff --git a/something-else.ts b/something-else.ts\n");
+    backdate(patchPath, 14);
+
+    const orphans = scanOrphans(tmp(), worktreesDir, [{ number: 7, status: "Building" }], 0, { reportsDir: reports });
+    const w = orphans.orphanWorktrees[0];
+    expect(w.dirty).toBe(true);
+    expect(w.patchStale).toBe(true);
+    expect(w.hasPatch).toBe(false); // present on disk, but not evidence for THIS work
+    expect(w.newestChangeMs).toBeGreaterThan(0);
+
+    const plan = reconcilePlan(orphans);
+    expect(plan).toEqual([{ kind: "refuse-prune", ticket: 7, path: wt, patchPath, reason: "stale" }]);
+    const { fx, pruned } = noEffects();
+    expect(await applyAndReport(plan, fx)).toBe(1);
+    expect(pruned).toEqual([]);
+    expect(existsSync(wt)).toBe(true);
+    // The message must say WHY, or a human deletes the "existing" patch's
+    // worktree by hand on the assumption the salvage already happened.
+    const msg = refusalMessage(plan[0] as any);
+    expect(msg).toContain("NEWER than the salvage patch");
+    expect(msg).toContain("leftover from an earlier park");
+
+    // ...and a re-dump (a patch newer than the work) clears it immediately.
+    writeFileSync(patchPath, "diff --git a/new-test.ts b/new-test.ts\n");
+    const after = reconcilePlan(scanOrphans(tmp(), worktreesDir, [{ number: 7, status: "Building" }], 0, { reportsDir: reports }));
+    expect(after[0]).toEqual({ kind: "prune-worktree", ticket: 7, path: wt });
+  });
+
+  // A worktree git cannot read fails CLOSED, but it is NOT a stale patch: saying
+  // so would send a human hunting for a leftover file instead of a broken tree.
+  test("a worktree git cannot read is refused as unreadable, not as stale", () => {
+    const worktreesDir = tmp();
+    const reports = tmp();
+    // A linked worktree whose parent repo is gone: `.git` is a file, so this is
+    // not the "stray directory" case, but `git status` cannot run.
+    const wt = join(worktreesDir, "ticket-3");
+    mkdirSync(wt);
+    writeFileSync(join(wt, ".git"), "gitdir: /definitely/not/a/repo/worktrees/ticket-3\n");
+    expect(worktreeWork(wt)).toEqual({ dirty: true, newestChangeMs: Number.POSITIVE_INFINITY });
+
+    // Even WITH a patch on disk, an unknowable tree is refused -- nothing can
+    // prove that patch covers work git will not describe.
+    writeFileSync(join(reports, salvagePatchName(3)), "some earlier dump\n");
+    const plan = reconcilePlan(scanOrphans(tmp(), worktreesDir, [{ number: 3, status: "Building" }], 0, { reportsDir: reports }));
+    expect(plan).toEqual([
+      { kind: "refuse-prune", ticket: 3, path: wt, patchPath: join(reports, salvagePatchName(3)), reason: "unreadable" },
+    ]);
+    expect(refusalMessage(plan[0] as any)).toContain("git could not read it");
+  });
+
+  // Staleness is only asked of a DIRTY tree: a clean worktree needs no patch at
+  // all, so an ancient leftover must not turn AC4 into a refusal.
+  test("an ancient patch beside a CLEAN worktree still prunes", () => {
+    const worktreesDir = tmp();
+    const reports = tmp();
+    const wt = gitWorktree(worktreesDir, 7, "clean");
+    const patchPath = join(reports, salvagePatchName(7));
+    writeFileSync(patchPath, "old\n");
+    backdate(patchPath, 30);
+    const plan = reconcilePlan(scanOrphans(tmp(), worktreesDir, [{ number: 7, status: "Done" }], 0, { reportsDir: reports }));
+    expect(plan).toEqual([{ kind: "prune-worktree", ticket: 7, path: wt }]);
+  });
+
+  // A delete-only dirty tree has no uncommitted FILE to take an mtime from, so
+  // the newest change comes from the directory the file was removed from.
+  // Without that fallback newestChangeMs would be 0 and every ancient patch
+  // would read as fresh -- the stale hole, reopened for deletions.
+  test("worktreeWork: a delete-only dirty tree still reports a newest change, so an old patch is stale", () => {
+    const worktreesDir = tmp();
+    const reports = tmp();
+    const wt = gitWorktree(worktreesDir, 9, "clean");
+    rmSync(join(wt, "committed.txt"));
+    const work = worktreeWork(wt);
+    expect(work.dirty).toBe(true);
+    expect(work.newestChangeMs).toBeGreaterThan(0);
+
+    const patchPath = join(reports, salvagePatchName(9));
+    writeFileSync(patchPath, "old\n");
+    backdate(patchPath, 14);
+    const plan = reconcilePlan(scanOrphans(tmp(), worktreesDir, [{ number: 9, status: "Building" }], 0, { reportsDir: reports }));
+    expect(plan.map((a) => a.kind)).toEqual(["refuse-prune"]);
+    expect((plan[0] as any).reason).toBe("stale");
+  });
+
   // The probe's own edges. A stray directory git never tracked must NOT wedge
   // every future reconcile (there is nothing git could have salvaged from it),
   // while a real worktree git cannot read fails CLOSED.
@@ -965,6 +1072,50 @@ describe("#217: reconcile refuses to prune a dirty worktree with no salvage patc
     expect(worktreeDirty(join(d, "does-not-exist"))).toBe(false);
     expect(worktreeDirty(gitWorktree(tmp(), 2, "clean"))).toBe(false);
     expect(worktreeDirty(gitWorktree(tmp(), 3, "modified"))).toBe(true);
+  });
+
+  // The two halves meeting, on the routine flow rather than the exotic one. A
+  // Questions park KEEPS its worktree and REMOVES its lane lock, so a builder
+  // that stopped to ask a question with uncommitted work leaves exactly the
+  // lockless-dirty shape the guard refuses. When only the exhausted-commit-retry
+  // park owed a dump, that routine park hit the refusal, `reconcile apply` exited
+  // 1, and the loop would not start at all until a human hand-ran the dump --
+  // the backstop firing on the normal path. This pins the whole chain: the park's
+  // own dump lands at the byte-exact path reconcile's guard looks for.
+  test("a Questions park's own dump lands where the guard looks, so the next run prunes instead of wedging", () => {
+    const home = tmp();
+    const slug = "demo";
+    const repoRoot = tmp();
+    const worktreesDir = join(repoRoot, ".worktrees");
+    mkdirSync(worktreesDir, { recursive: true });
+    const wt = gitWorktree(worktreesDir, 42, "untracked");
+    const board = [{ number: 42, status: "Questions" as const }];
+    const probe = { reportsDir: reportsDir(slug, home) };
+
+    // Before the dump: the shape a routine park leaves behind is refused.
+    expect(reconcilePlan(scanOrphans(tmp(), worktreesDir, board, 0, probe)).map((a) => a.kind)).toEqual(["refuse-prune"]);
+
+    // The park itself, as the reducer emits it -- nothing hand-built.
+    const parked = nextAction(
+      state([ticket(42, "Building")], [lane(42, "builder", { outcome: { kind: "needs-input", note: "which schema?" } })]),
+      0,
+      { projectDir: join(projectsDir(home), slug) }
+    );
+    expect(parked).toMatchObject({ kind: "park", status: "Questions", ticket: 42 });
+    const instruction = (parked as { salvage?: { worktree: string; patch: string } }).salvage!;
+    expect(instruction.worktree).toBe(".worktrees/ticket-42"); // relative to the orchestrator's repo root
+
+    // `loop apply` performs it from the repo root.
+    const r = runSalvage(instruction, undefined, repoRoot);
+    expect(r.bytes).toBeGreaterThan(0);
+    // The whole point: the producer's path and the guard's path are the same file.
+    expect(r.patch).toBe(join(probe.reportsDir, salvagePatchName(42)).replace(/\\/g, "/"));
+    expect(existsSync(r.patch)).toBe(true);
+
+    // After the dump: pruned, no refusal, no human.
+    expect(reconcilePlan(scanOrphans(tmp(), worktreesDir, board, 0, probe))).toEqual([
+      { kind: "prune-worktree", ticket: 42, path: wt },
+    ]);
   });
 
   // A crashed lane (lock present) keeps the OLD behaviour on purpose: it is

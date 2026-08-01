@@ -6,7 +6,7 @@
 // applies the returned Action with applyAction -- it never re-derives a
 // scheduling or transition decision in prose. No Date.now() outside the CLI
 // edge; every pure function takes nowMs.
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { atomicWrite, handleCliError, parseFlags, readJson, str } from "./cli.ts";
 import {
@@ -500,6 +500,39 @@ export function salvagePatchPath(ticket: number, projectDir?: string): string {
   return projectDir ? `${projectDir.replace(/\\/g, "/")}/${tail}` : tail;
 }
 
+// The actions that release a lane lock while leaving the worktree on disk. That
+// combination -- and ONLY that combination -- is the lockless-dirty shape
+// reconcile's #217 prune guard refuses to force-remove, so each one owes a dump.
+//
+// The first cut of #217 attached the dump to the exhausted-commit-retry park
+// alone, which made the guard unreachable-by-design for that park and a WEDGE
+// for every other: a Questions park, a watchdog skip, a human `stop-lane` and a
+// merge whose non-force `git worktree remove` bounced off a dirty tree all leave
+// a dirty lockless worktree with no patch, so the next run's reconcile refused
+// and the loop would not start until a human hand-ran the dump. Owing the dump
+// everywhere costs a patch file per at-risk worktree and makes the refusal mean
+// what the docs say it means: the dump did not run.
+//
+// `complete` is in the list for the merge case only; by the time it applies, the
+// merge step has normally already removed the worktree, so runSalvage reports a
+// skip and writes nothing. `claim`/`advance` keep their lock and `check-worker`/
+// `wait`/`context-clear`/`drain-complete` touch no worktree.
+type SalvageOwing = Extract<Action, { kind: "park" | "skip" | "stop-lane" | "complete" }>;
+const SALVAGE_OWING: ReadonlySet<string> = new Set<SalvageOwing["kind"]>(["park", "skip", "stop-lane", "complete"]);
+
+function owesSalvage(a: Action): a is SalvageOwing {
+  return SALVAGE_OWING.has(a.kind);
+}
+
+function withSalvage(action: Action, projectDir?: string): Action {
+  if (!owesSalvage(action)) return action;
+  const salvage: SalvageInstruction = {
+    worktree: `.worktrees/ticket-${action.ticket}`,
+    patch: salvagePatchPath(action.ticket, projectDir),
+  };
+  return { ...action, salvage };
+}
+
 export type Action =
   | { kind: "claim"; ticket: number; stage: Stage }
   | {
@@ -511,22 +544,25 @@ export type Action =
       stackedOn?: number[];
       resyncStatus?: BoardStatus; // #116: correct a one-hop-lagged board status before this advance's setStatus, bypassing canTransition -- see the nextAction desync guard for why this is safe
     }
+  // #217: `salvage` is the side effect these actions OWE before the lane lock
+  // goes away. Every one of them releases the lock while the worktree stays on
+  // disk, which is the lockless-dirty shape reconcile's prune guard refuses to
+  // force-remove without a patch -- so each carries the dump as data, `loop
+  // apply` executes it (runSalvage below), and the orchestrator asserts the file
+  // it names exists. Explicit data, not a sentence in the SKILL's park row: the
+  // layer that PROMISES the patch in a note is the layer that produces it.
+  // Attached at one seam (withSalvage), so no future action kind reopens the hole.
   | {
       kind: "park";
       ticket: number;
       status: "Questions" | "Blocked";
       note: string;
-      // #217: the side effect this park OWES before its lane lock goes away.
-      // Only the #177 exhausted-commit-retry park carries one; `loop apply`
-      // executes it (runSalvage below) and the orchestrator asserts the file it
-      // names exists. Explicit data, not a sentence in the SKILL's park row --
-      // the layer that PROMISES the patch in `note` is the layer that produces it.
       salvage?: SalvageInstruction;
     }
-  | { kind: "skip"; ticket: number; note: string }
-  | { kind: "stop-lane"; ticket: number; note: string }
+  | { kind: "skip"; ticket: number; note: string; salvage?: SalvageInstruction }
+  | { kind: "stop-lane"; ticket: number; note: string; salvage?: SalvageInstruction }
   | { kind: "check-worker"; ticket: number }
-  | { kind: "complete"; ticket: number; note: string }
+  | { kind: "complete"; ticket: number; note: string; salvage?: SalvageInstruction }
   | { kind: "wait" }
   | { kind: "context-clear" }
   | { kind: "drain-complete" };
@@ -603,22 +639,22 @@ export const MAX_COMMIT_RETRIES = 1;
 function commitRetryAction(lane: LaneState, detail: string, projectDir?: string): Action {
   const spent = lane.commitRetries ?? 0;
   if (spent >= MAX_COMMIT_RETRIES) {
-    const salvage: SalvageInstruction = {
-      worktree: `.worktrees/ticket-${lane.ticket}`,
-      patch: salvagePatchPath(lane.ticket, projectDir),
-    };
+    // withSalvage attaches the matching `salvage` block on the way out of
+    // nextAction; this only has to name the SAME path in the note a human reads.
+    const patch = salvagePatchPath(lane.ticket, projectDir);
     return {
       kind: "park",
       ticket: lane.ticket,
       status: "Blocked",
-      salvage,
       note:
         `${detail}\n\nA re-prompted builder reported BUILT with nothing committed again ` +
         `(${spent + 1} attempt(s)), so this is not a slip. The park itself dumped the lane ` +
         `worktree's uncommitted state (tracked, staged and untracked files, binaries included) to ` +
-        `\`${salvage.patch}\` ` +
+        `\`${patch}\` ` +
         `(re-apply it in a fresh worktree with \`git apply\`; an EMPTY patch file means the worktree ` +
-        `held nothing uncommitted, so the failure was the missing commit, not lost work) ` +
+        `held nothing uncommitted, so the failure was the missing commit, not lost work; the ` +
+        `\`salvage:\` line in this comment records what actually landed, including the case where ` +
+        `the worktree was already gone and no file was written) ` +
         `because the lane worktree does NOT survive: ` +
         `parking released its lane lock, so the next run's reconcile scan force-removes it ` +
         `(\`git worktree remove --force\` -- uncommitted work discarded) before the loop will start. ` +
@@ -808,6 +844,10 @@ function withResync(action: Action, resyncStatus: Map<number, BoardStatus>): Act
 // ~/.zstack dir is -- resolved at the CLI edge so the reducer stays pure and
 // nothing in a state file can ever go stale against the real path.
 export function nextAction(state: LoopState, nowMs: number, opts: NextActionOptions = {}): Action {
+  return withSalvage(decideAction(state, nowMs, opts.projectDir), opts.projectDir);
+}
+
+function decideAction(state: LoopState, nowMs: number, projectDir?: string): Action {
   const { tickets, lanes } = state;
   const maxLanes = state.maxLanes ?? DEFAULT_MAX_LANES;
   const wd = state.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES;
@@ -889,7 +929,7 @@ export function nextAction(state: LoopState, nowMs: number, opts: NextActionOpti
     // A PASSING review-approve (or a disabled gate) resolves to null here and
     // falls through to the merge gate below, exactly as before #62; a FAILING
     // approve is resolved right here, same as any other terminal outcome.
-    const action = resolveOutcome(lane, qaLimits, reviewerGate, byNumber.get(lane.ticket)?.skipQa ?? false, opts.projectDir);
+    const action = resolveOutcome(lane, qaLimits, reviewerGate, byNumber.get(lane.ticket)?.skipQa ?? false, projectDir);
     if (action) return withResync(action, resyncStatus);
   }
 
@@ -1746,9 +1786,22 @@ function builderFactsFromFlags(
 // a park whose worktree was clean is a real shape (#177's "no commit of its own"
 // half), the note explains what an empty patch means, and "the file the note
 // names is always there" is a far cheaper contract for a human at 2am than
-// "sometimes there is no file and that is fine". `add -A` stages untracked files
-// so a never-added test file lands in the patch too; the worktree is doomed, so
-// mutating its index costs nothing.
+// "sometimes there is no file and that is fine".
+//
+// The dump stages with `add -A` so a never-git-added test file lands in the
+// patch too, but it does that in a THROWAWAY index (GIT_INDEX_FILE), never the
+// worktree's own. The first cut mutated the real index on the grounds that "the
+// worktree is doomed"; that stopped being true once every lock-releasing action
+// owes a dump (SALVAGE_OWING above) -- a `stop-lane` and a Questions park keep
+// their worktree explicitly so a human can inspect it, and handing that human a
+// fully-staged index they did not ask for is a side effect the salvage has no
+// business having. Reading the tree into a scratch index costs one extra git
+// call and produces a byte-identical patch.
+//
+// `note` is the ONE operator-facing line, and it is deliberately truthful in
+// every branch, including the ones where no file is written: `apply` prints it
+// and the orchestrator copies it into the board comment, which is what stops a
+// note that promises a patch from outliving a dump that never happened.
 export interface SalvageResult {
   patch: string; // the path written (or the one that could not be resolved)
   bytes: number | null; // null = nothing was written; 0 = an honest empty patch
@@ -1762,36 +1815,63 @@ export function runSalvage(s: SalvageInstruction, projectDir?: string, cwd: stri
       patch: s.patch,
       bytes: null,
       note:
-        `salvage SKIPPED: "${s.patch}" is relative and no project dir resolved (pass --slug, or set ZSTACK_SLUG). ` +
-        `The lane worktree is NOT deleted by this park -- the next run's reconcile refuses to prune a dirty worktree with no patch (#217).`,
+        `salvage SKIPPED: "${s.patch}" is relative and no project dir resolved (pass --slug, or set ZSTACK_SLUG), so NO file was written. ` +
+        `The lane worktree is NOT deleted by this action -- the next run's reconcile refuses to prune a dirty worktree with no patch (#217).`,
     };
   }
   const worktree = isAbsolute(s.worktree) ? s.worktree : join(cwd, s.worktree);
   if (!existsSync(worktree)) {
-    return { patch, bytes: null, note: `salvage SKIPPED: no worktree at ${worktree} -- nothing to dump.` };
-  }
-  mkdirSync(dirname(patch), { recursive: true });
-  const run = (...args: string[]) => Bun.spawnSync(["git", "-C", worktree, ...args], { stdout: "pipe", stderr: "pipe" });
-  const add = run("add", "-A");
-  const diff = run("diff", "--cached", "--binary", "HEAD");
-  if (diff.exitCode !== 0) {
+    // The honest end of #217's own failure shape: there is no tree to dump, so
+    // NO file exists at the path the note names. Say both, and say that the lane
+    // lock is safe to release anyway -- an unattended orchestrator told only
+    // "wait for the file" would wait forever for a file that cannot appear.
     return {
       patch,
       bytes: null,
-      note: `salvage FAILED: git diff in ${worktree} exited ${diff.exitCode} (${diff.stderr.toString().trim()}). Do NOT delete that worktree.`,
+      note:
+        `salvage SKIPPED: no worktree at ${worktree}, so nothing was dumped and NO file exists at ${patch}. ` +
+        `Nothing was lost (there is no tree to lose) and the lane lock is safe to release; ignore any promise of that patch.`,
     };
   }
-  writeFileSync(patch, diff.stdout);
-  const bytes = diff.stdout.length;
-  const addWarning = add.exitCode === 0 ? "" : ` (WARNING: git add -A exited ${add.exitCode}; untracked files may be missing)`;
-  return {
-    patch,
-    bytes,
-    note:
-      bytes === 0
-        ? `salvage: wrote an EMPTY patch to ${patch} -- the worktree held nothing uncommitted${addWarning}`
-        : `salvage: wrote ${bytes} byte(s) to ${patch}${addWarning}`,
-  };
+  mkdirSync(dirname(patch), { recursive: true });
+  // Scratch index, removed however this returns. Placed beside the patch (a dir
+  // this function just created) rather than in the worktree, so a crash mid-dump
+  // cannot leave a stray file inside the tree a human is about to inspect.
+  const indexFile = `${patch}.index`;
+  const run = (...args: string[]) =>
+    Bun.spawnSync(["git", "-C", worktree, ...args], { stdout: "pipe", stderr: "pipe", env: { ...process.env, GIT_INDEX_FILE: indexFile } });
+  try {
+    const read = run("read-tree", "HEAD");
+    if (read.exitCode !== 0) {
+      return {
+        patch,
+        bytes: null,
+        note: `salvage FAILED: git read-tree HEAD in ${worktree} exited ${read.exitCode} (${read.stderr.toString().trim()}). Do NOT delete that worktree.`,
+      };
+    }
+    const add = run("add", "-A");
+    const diff = run("diff", "--cached", "--binary", "HEAD");
+    if (diff.exitCode !== 0) {
+      return {
+        patch,
+        bytes: null,
+        note: `salvage FAILED: git diff in ${worktree} exited ${diff.exitCode} (${diff.stderr.toString().trim()}). Do NOT delete that worktree.`,
+      };
+    }
+    writeFileSync(patch, diff.stdout);
+    const bytes = diff.stdout.length;
+    const addWarning = add.exitCode === 0 ? "" : ` (WARNING: git add -A exited ${add.exitCode}; untracked files may be missing)`;
+    return {
+      patch,
+      bytes,
+      note:
+        bytes === 0
+          ? `salvage: wrote an EMPTY patch to ${patch} -- the worktree held nothing uncommitted${addWarning}`
+          : `salvage: wrote ${bytes} byte(s) to ${patch}${addWarning}`,
+    };
+  } finally {
+    rmSync(indexFile, { force: true });
+  }
 }
 
 // The project dir (~/.zstack/projects/<slug>) for the salvage path, resolved at
@@ -1851,11 +1931,12 @@ export function main(argv: string[]): number {
       if (!positionals[1]) throw new ZError("Usage: loop apply <state.json> <action.json> [--now <ms>]");
       const state = readJson(statePath) as LoopState;
       const action = readJson(positionals[1]) as Action;
-      // #217: the park's owed dump runs BEFORE the state write, so a crash
-      // between the two leaves the patch on disk and the lane still parked-able
-      // -- never the other way round. Every other action carries no salvage and
-      // is byte-identical to pre-#217.
-      const salvage = action.kind === "park" && action.salvage ? runSalvage(action.salvage, projectDirFromFlags(flags)) : undefined;
+      // #217: the owed dump runs BEFORE the state write, so a crash between the
+      // two leaves the patch on disk and the lane still parked-able -- never the
+      // other way round. Keyed on the `salvage` block the action carries, not on
+      // its kind: SALVAGE_OWING is the one place that decides who owes one, and
+      // an action without one is byte-identical to pre-#217.
+      const salvage = "salvage" in action && action.salvage ? runSalvage(action.salvage, projectDirFromFlags(flags)) : undefined;
       if (salvage) console.log(salvage.note);
       atomicWrite(statePath, JSON.stringify(applyAction(state, action, nowMs), null, 2));
       console.log(`applied ${action.kind}${"ticket" in action ? ` #${action.ticket}` : ""}`);

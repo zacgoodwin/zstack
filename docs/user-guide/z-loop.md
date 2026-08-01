@@ -589,11 +589,21 @@ force-removed. Reconcile **refuses to force-remove** one that holds uncommitted
 work and has no salvage patch at
 `~/.zstack/projects/<slug>/reports/uncommitted-<N>.patch`: it leaves the worktree
 untouched, prints the patch path it looked for, and exits non-zero, so the loop
-does not start over the only copy of that work. Salvage it (commit it onto the
-lane's branch, or dump the patch by hand with the command reconcile prints) and
-re-run. A *crashed lane* — one that still has its lane lock — is unaffected: its
-worktree is pruned and its ticket rebuilt fresh from Ready, the same documented
-discard as before. So is a clean worktree, which needs no patch.
+does not start over the only copy of that work.
+A patch *older than the uncommitted work* in that tree does not count either —
+nothing ever deletes these files, so one from an earlier park of the same ticket
+number would otherwise wave the force-remove through forever. Salvage it (commit
+it onto the lane's branch, or dump the patch by hand with the command reconcile
+prints) and re-run. A
+*crashed lane* — one that still has its lane lock — is unaffected: its worktree
+is pruned and its ticket rebuilt fresh from Ready, the same documented discard as
+before. So is a clean worktree, which needs no patch.
+
+In normal running you should never see the refusal: **every** action that
+releases a lane lock while its worktree stays on disk — park, skip, stop-lane and
+the completion flow — carries the dump as data and `loop apply` performs it, so
+the patch is already there by the time reconcile looks. The refusal is what
+catches a loop killed before that ran.
 
 Mid-run, dragging a Building/QA ticket to Blocked or Questions on the board is
 respected: the loop stops that one lane cleanly at its next stage boundary and

@@ -337,15 +337,45 @@ Perform exactly that action, then record it. Action → side effects:
 |---|---|
 | `claim N` | 1. `"$Z_BOARD" claim <N> "$ME"` **before anything else**. Claim lost → `bun "$PACK/lib/loop.ts" claim-lost "$STATE" <N>` and re-run `next` (next ticket). 2. **Deferred commit (#133) — move the ticket to its claimed stage's status, ONLY after the claim succeeds** (a claim loser must never move a ticket, same C7 reason as the lock below): `"$Z_BOARD" move <N> <status> --if-present --slug "$SLUG"` (`moved:false` → the ticket left the board between confirms: take the claim-lost path in step 1 and re-run `next`, claiming nothing) where `<status>` mirrors the reducer's `STATUS_FOR_STAGE[stage]` — `builder`→`Building`, `qa`→`QA`, `reviewer`→`Review`. A fresh `builder` claim moves Ready→Building (the old Step 2 up-front move, now deferred to here); a resume claim at `qa`/`reviewer` is already at its stage's status, so the move is a no-op. 3. **Write the lane lock** (C7 — a claim loser never leaves a lock): `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <stage> --session "$SESSION"`. 4. Worktree (skip if it exists — a resume claim at stage qa/reviewer reuses it): `TSLUG=$(bun -e "import {slugifyTitle} from '$PACK/lib/ticket-schema.ts'; console.log(slugifyTitle(process.argv[1]))" "<title>")` then `git worktree add ".worktrees/ticket-<N>" -b "z/ticket-<N>-$TSLUG" "$BASE"`. 4b. **Stamp the lane's git author (#66) — every commit this lane makes must be authored by the account `gh` is authed as, not by this machine's global git identity:** `git config extensions.worktreeConfig true` then `git -C ".worktrees/ticket-<N>" config --worktree user.name "$ME"` and `git -C ".worktrees/ticket-<N>" config --worktree user.email "$ME_EMAIL"`. **WARNING — `--worktree` is load-bearing, do not drop it.** Git worktrees SHARE the main repo's `.git/config`, so the plain `git -C <worktree> config user.name` form silently rewrites the identity of the human's OWN checkout too, re-authoring their personal commits in this repo. `--worktree` scopes the write to `.git/worktrees/<name>/config.worktree`, leaving the main checkout untouched; it hard-fails unless `extensions.worktreeConfig` is on, which is why that line comes first (idempotent, additive, and safe at repo format version 0 — verified on git 2.55). Re-running on an existing worktree (a resume claim) just rewrites the same two values. 5. Apply: write the action JSON to a file, `bun "$PACK/lib/loop.ts" apply "$STATE" action.json` (its `claim` reducer sets the state-file status to `STATUS_FOR_STAGE[stage]`, matching the board move above). 6. Spawn the action's stage (table below). |
 | `advance N to S` | **Re-stamp the lane lock** to the new stage: `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <S> --session "$SESSION"`. Apply, then spawn stage S fresh. Before applying, read the lane's CURRENT stage from the state file: an advance to `builder` from `qa` passes the action's `note` as `qaNotes` (+ `investigateFirst`); from `reviewer`, as `reviewNotes`; from `builder` (the #177 commit re-spawn), as `commitNotes`. |
-| `park N Questions` | Comment the note as `## Needs input --` + the question, `"$Z_BOARD" move <N> Questions --if-present`, apply, then **remove the lane lock** (`bun "$PACK/lib/locks.ts" lane-remove --slug "$SLUG" <N>`). Tell the human in the comment which status to return the ticket to. Keep the worktree. **Notify** `human-pause` (`{ticket,title,note}`; see the Notify block below). |
-| `park N Blocked` | When the action carries a `salvage` block (`{worktree, patch}` — #177's exhausted commit retry, whose note begins `uncommitted work:`), **apply FIRST**, before the comment and before the lock removal: `apply` is what dumps that lane worktree's uncommitted state to `salvage.patch` (#217 — it stages with `add -A` so untracked files land in the patch too, and prints `salvage: wrote N byte(s)` or `salvage: wrote an EMPTY patch`). This is the ONE park whose only copy of real work is uncommitted — every other park's work is already committed on a branch, and branches are never deleted (issue #2) — and removing the lane lock below turns the worktree into an orphan the next run's reconcile scan force-removes. The note names that patch path, so the dump is what makes the note true; **assert it before removing the lane lock**: `SALVAGE_PATCH=$(jq -r '.salvage.patch // empty' action.json)`, and if it is non-empty but `[ ! -f "$SALVAGE_PATCH" ]`, dump it by hand — `git -C ".worktrees/ticket-<N>" add -A && git -C ".worktrees/ticket-<N>" diff --cached --binary HEAD > "$HOME/.zstack/projects/$SLUG/reports/uncommitted-<N>.patch"` — and do not release the lock until that file exists. (Belt and braces: if it never does, the next run's `reconcile` REFUSES to prune that worktree rather than discarding the work.) Then: comment the note (what was wrong + recommended next steps), `move <N> Blocked --if-present`, remove the lane lock. A park with no `salvage` block is unchanged: comment, move, apply, remove the lock. **Notify** `token-burn` (`{ticket,detail:note}`) when the note begins `Dependency deadlock:` (the step-6 deadlock break); otherwise `ticket-parked` (`{ticket,title,status:"Blocked",note}`). |
-| `skip N` | Comment the note (the confusion or the dead-worker evidence), `move <N> Skipped --if-present`, apply, remove the lane lock. (PROCESS.md global rule.) **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:note}`) when the note begins `Worker died mid-` (a watchdog dead-worker skip); otherwise `ticket-parked` (`{ticket,title,status:"Skipped",note}`). |
-| `stop-lane N` | A human moved #N to a stop status (Blocked/Questions/Skipped/Done) mid-run; the board already reflects it — do NOT move or comment it. Tear down the lane's background agent, remove the lane lock (`lane-remove`), keep the worktree for inspection, and apply (drops the lane, leaves the human's status). Other lanes are unaffected. |
+| `park N Questions` | **Apply FIRST** (it performs the action's `salvage` dump — see the salvage block below), then comment the note as `## Needs input --` + the question **plus `apply`'s `salvage:` line verbatim**, `"$Z_BOARD" move <N> Questions --if-present`, then **remove the lane lock** (`bun "$PACK/lib/locks.ts" lane-remove --slug "$SLUG" <N>`). Tell the human in the comment which status to return the ticket to. Keep the worktree. **Notify** `human-pause` (`{ticket,title,note}`; see the Notify block below). |
+| `park N Blocked` | **Apply FIRST**, before the comment and before the lock removal: `apply` performs the action's `salvage` dump (see the salvage block below). #177's exhausted commit retry (note begins `uncommitted work:`) is the park whose only copy of real work is uncommitted — every other park's work is already committed on a branch, and branches are never deleted (issue #2) — and its note names the patch path, so the dump is what makes the note true. Then: comment the note (what was wrong + recommended next steps) **plus `apply`'s `salvage:` line verbatim**, `move <N> Blocked --if-present`, remove the lane lock. **Notify** `token-burn` (`{ticket,detail:note}`) when the note begins `Dependency deadlock:` (the step-6 deadlock break); otherwise `ticket-parked` (`{ticket,title,status:"Blocked",note}`). |
+| `skip N` | **Apply FIRST** (it performs the `salvage` dump — the worktree is kept for inspection and the lane lock goes away, so it owes one like every other park). Comment the note (the confusion or the dead-worker evidence) **plus `apply`'s `salvage:` line**, `move <N> Skipped --if-present`, remove the lane lock. (PROCESS.md global rule.) **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:note}`) when the note begins `Worker died mid-` (a watchdog dead-worker skip); otherwise `ticket-parked` (`{ticket,title,status:"Skipped",note}`). |
+| `stop-lane N` | A human moved #N to a stop status (Blocked/Questions/Skipped/Done) mid-run; the board already reflects it — do NOT move or comment it. Tear down the lane's background agent, apply (drops the lane, leaves the human's status, and performs the `salvage` dump), keep the worktree for inspection, then remove the lane lock (`lane-remove`). Other lanes are unaffected. |
 | `check-worker N` | Is the lane's background agent still running (harness task list)? Alive → `bun "$PACK/lib/loop.ts" probe "$STATE" <N> alive`. Dead with no final message: **if the lane's stage is `merge`, do NOT probe-dead/skip** — verify PR state first (H9): `gh pr view <branch> --json state,url -q '.state'`. If `MERGED`, the PR landed before the worker died, so record it as merged (`printf 'MERGED: %s\n' "$prUrl" > msg.txt; bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`) → the reducer completes it and counts it in `mergedThisRun` (so a stacked child still retargets and the batch-end branch delete can't close its PR). If NOT merged, record `printf 'BLOCKED: merge worker died with the PR unmerged (%s)\n' "$state" > msg.txt; outcome ...` → parks it Blocked for a human, and **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:"merge worker died with the PR unmerged"}`). For any OTHER stage, dead with no final message → `probe "$STATE" <N> dead` (the next `next` returns the skip). |
-| `complete N` | The completion flow — Step 6 — then apply, then **remove the lane lock**. |
+| `complete N` | The completion flow — Step 6 — then apply, then **remove the lane lock**. Step 6's own `git worktree remove` is non-force and bounces off a dirty tree; when it does, `apply`'s `salvage` dump (see the salvage block below) is what lets the next run's reconcile prune that leftover instead of refusing. Normally the worktree is already gone by then and `apply` just prints `salvage SKIPPED: no worktree …`. |
 | `wait` | Block until a background stage agent finishes (the harness notifies you) or one minute passes, then re-run `next` — the watchdog only fires if `next` is called with a fresh clock. When an agent finishes: save its final message to a file and `bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt` — a **builder** lane additionally requires the three git-fact flags (see **BUILT verification (#177)** above; the command refuses without them) — then update Actual (below), then re-run `next`. |
 | `context-clear` | The context ceiling (`contextTokenLimit`, #131) is reached, every lane is idle, and the batch still has unbuilt tickets — a mid-batch PAUSE, distinct from `drain-complete`. Apply it (a pure no-op on state). Then: release the loop lock (`bun "$PACK/lib/locks.ts" release --slug "$SLUG"`), **keep** every worktree/branch and `state.json` (the batch is un-drained — `batchTickets` still holds the unbuilt tickets), and **exit WITHOUT running Step 7 end-of-loop** (no regression, no deploy — the batch isn't done). Print the resume instruction: the operator (or harness) clears this session's context and re-invokes `/z-loop`; the fresh orchestrator reads a small context on its first tick, so the gate is open and Step 3's ingest (seeing the un-drained `state.json`, `startingFreshBatch` false) preserves `batchTickets` and resumes claiming the next flagged-but-unbuilt ticket. In-flight lanes are never cut short — `context-clear` only fires with all lanes idle. |
 | `drain-complete` | Step 7. |
+
+**Salvage — the dump every lock-releasing action owes (#217).** `park`, `skip`,
+`stop-lane` and `complete` all release the lane lock while the worktree stays on
+disk. That lockless-dirty shape is precisely what the next run's `reconcile`
+REFUSES to force-remove without a patch (Step 0(c)), so each of those actions
+carries a `salvage` block (`{worktree, patch}`) and **`loop apply` performs the
+dump** — it stages into a throwaway index (`add -A`, so untracked files land in
+the patch; your worktree's own index is never touched) and prints exactly one
+line: `salvage: wrote N byte(s)`, `salvage: wrote an EMPTY patch`,
+`salvage SKIPPED: …` or `salvage FAILED: …`. **Copy that line verbatim into the
+board comment** — it is what keeps a note that promises a patch from outliving a
+dump that did not happen. Then assert, before `lane-remove`:
+
+```bash
+SALVAGE_PATCH=$(jq -r '.salvage.patch // empty' action.json)
+if [ -n "$SALVAGE_PATCH" ] && [ ! -f "$SALVAGE_PATCH" ]; then
+  if [ -d ".worktrees/ticket-<N>" ]; then
+    # The dump was owed and the tree is right there: do it by hand (this is the
+    # same file "$SALVAGE_PATCH" names), and do NOT release the lane lock until
+    # that file exists.
+    git -C ".worktrees/ticket-<N>" add -A && git -C ".worktrees/ticket-<N>" diff --cached --binary HEAD > "$HOME/.zstack/projects/$SLUG/reports/uncommitted-<N>.patch"
+  else
+    # No worktree: nothing to dump, and the file can never appear. Releasing the
+    # lock is safe -- there is no tree to lose. `apply` already printed the
+    # `salvage SKIPPED: no worktree …` line; the comment carries it, so the note
+    # and the disk agree. Do not wait on the file.
+    :
+  fi
+fi
+```
 
 **Notify (best-effort, one event per moment).** The park/skip/safety rows above
 each `send` exactly ONE Discord event through the single notification edge
@@ -539,7 +569,12 @@ bun "$PACK/lib/stage-prompts.ts" note "$TMP/note-<N>.json" > "$TMP/note-<N>.md"
    the truth and the lane is released either way, so the completion flow
    finishes normally instead of aborting on the move.
 5. `git worktree remove ".worktrees/ticket-<N>"`. Do NOT delete the branch yet
-   — a dependent PR may stack on it (branch cleanup is Step 7).
+   — a dependent PR may stack on it (branch cleanup is Step 7). This remove is
+   deliberately NOT `--force`: a dirty tree here means uncommitted work that was
+   never part of the merged PR, so it is left on disk rather than discarded. The
+   `complete` action's own `salvage` dump (#217) covers that case — the leftover
+   worktree gets its patch, and the next run's reconcile prunes it normally
+   instead of refusing.
 
 ## Step 7 — Exit (on `drain-complete`)
 
@@ -770,12 +805,16 @@ first clears the wedge, then the loop starts normally. Reconcile:
   uncommitted work is discarded; the ticket rebuilds fresh from Ready);
 - **removes stale lane locks** — and clears the stale `loop.lock`.
 
-One prune it **refuses** (#217): a LOCKLESS worktree (no lane lock — the shape a
-`park N Blocked` leaves behind) that holds uncommitted work with no
-`reports/uncommitted-<N>.patch` on disk. That is the only recovery whose loss a
-human cannot redo, so `reconcile apply` leaves the worktree alone, prints the
-patch path it looked for, and exits 1. A crashed lane (lock present) is
-unaffected — it is parked back to Ready and rebuilt, the documented discard.
+One prune it **refuses** (#217): a LOCKLESS worktree (no lane lock — the shape
+every `park`/`skip`/`stop-lane` leaves behind) that holds uncommitted work with
+no `reports/uncommitted-<N>.patch` on disk, **or only one older than that work**
+— nothing ever deletes those patches, so a leftover from an earlier park of the
+same ticket is not evidence for the work sitting there now. That is the only
+recovery whose loss a human cannot redo, so `reconcile apply` leaves the worktree
+alone, prints the patch path it looked for and why it did not count, and exits 1.
+A crashed lane (lock present) is unaffected — it is parked back to Ready and
+rebuilt, the documented discard. Reaching the refusal means a dump that was owed
+did not run: every lock-releasing action carries one and `loop apply` performs it.
 
 Reconcile **never**: deletes a branch, deletes a board comment, or touches a
 ticket that has a live lane. It only undoes the parts of a crashed run that a
