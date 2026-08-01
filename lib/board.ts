@@ -259,8 +259,16 @@ export class Board {
   // request per gql() call after the first: a subcommand making G backend calls
   // costs G+1 requests instead of 2G. G=1 subcommands (list/snapshot of a
   // single-page board, field-get, quota) save nothing; the paginated reads and
-  // multi-call writes do. Measured per shape in tests/board.test.ts.
+  // multi-call writes do -- `link` is the extreme at G=10 (20 -> 11). Measured
+  // per shape in tests/board.test.ts.
   private lastQuota?: QuotaStatus;
+  // The first-call probe while it is still in flight. Without this, "one probe
+  // per process" is false the moment two gql() calls start concurrently:
+  // link() awaits Promise.all([lookup(n), lookup(m)]), so both read the empty
+  // cache before either probe resolves and each spends a request (10 ops, 2
+  // probes, 12 requests). Sharing the in-flight promise makes the contract
+  // hold under concurrency too. Cleared on settle so a failed probe re-probes.
+  private probeInFlight?: Promise<QuotaStatus>;
 
   constructor(
     private cfg: BoardConfig,
@@ -328,7 +336,7 @@ export class Board {
   // ride). Probes call exec() directly via probeRateLimit(), not gql, because
   // the probe IS the guard -- gating it on itself would recurse.
   private async enforceQuota(): Promise<void> {
-    let rl = (this.lastQuota ??= await this.probeRateLimit());
+    let rl = this.lastQuota ?? (await this.firstProbe());
     if (rl.remaining >= this.threshold) return;
     if (this.mode === "abort") {
       throw new ZError(
@@ -353,6 +361,17 @@ export class Board {
         `${rl.remaining} < ${this.threshold} remaining. Resets at ${rl.resetAt}. Refusing to keep sleeping -- ` +
         `clock skew or an early wake means the reset window may not actually be open yet.`
     );
+  }
+
+  // The process's one cold-start probe. Concurrent callers share the single
+  // in-flight request rather than each issuing their own (see probeInFlight).
+  private async firstProbe(): Promise<QuotaStatus> {
+    const inFlight = (this.probeInFlight ??= this.probeRateLimit());
+    try {
+      return (this.lastQuota = await inFlight);
+    } finally {
+      if (this.probeInFlight === inFlight) this.probeInFlight = undefined;
+    }
   }
 
   async quota(): Promise<QuotaStatus> {

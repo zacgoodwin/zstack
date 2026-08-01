@@ -940,9 +940,33 @@ describe("link", () => {
 
 describe("quota subcommand", () => {
   test("reports remaining points without gating", async () => {
-    const board = new Board(CFG, makeExecutor({ rateLimit: "rate-limit-low" }));
+    const calls: Call[] = [];
+    const board = new Board(CFG, makeExecutor({ calls, rateLimit: "rate-limit-low" }));
     const q = await board.quota();
-    expect(q.remaining).toBe(150);
+    expect(q.remaining).toBe(150); // reported, not gated on -- 150 is below the 200 threshold
+    expect(calls.map((c) => c.op)).toEqual(["RateLimit"]); // G=0: one probe, nothing to piggyback on
+  });
+
+  // #153 changed quota() from casting data.rateLimit blind to routing through
+  // the shared format-drift guard, so this subcommand now THROWS where it used
+  // to print `undefined`/`NaN`. That is a deliberate behavior change and it is
+  // load-bearing: `z-board quota` is the Step-0 precondition gating loop start,
+  // so drift has to stop the loop at Step 0 rather than print a junk reading and
+  // let 100+ ticks run against a guard reading nobody can trust.
+  test("a drifted rateLimit shape fails the Step-0 precondition loudly instead of printing junk", async () => {
+    const board = new Board(CFG, makeExecutor({ overrides: { RateLimit: { rateLimit: null } } }));
+    await expect(board.quota()).rejects.toThrow(ZError);
+    await expect(board.quota()).rejects.toThrow(
+      /rateLimit probe returned no usable \{remaining, resetAt\} \(got null\)/
+    );
+  });
+
+  test("a renamed remaining field is drift too, not a zero reading", async () => {
+    const board = new Board(
+      CFG,
+      makeExecutor({ overrides: { RateLimit: { rateLimit: { cost: 1, resetAt: "2026-07-18T23:30:00Z" } } } })
+    );
+    await expect(board.quota()).rejects.toThrow(/rateLimit probe returned no usable/);
   });
 });
 
@@ -1062,41 +1086,47 @@ describe("quota guard", () => {
 //   1    2       2     list/snapshot of a single-page board, field-get, quota
 //   2    4       3     move, comment, claim's lookup+write pair
 //   3    6       4     create, field-set, a 3-page snapshot
+//  10   20      11     link (2 lookups + 4 calls per side)
 //   P   2P      P+1    any paginated read -- approaches half as P grows
 //
 // So a one-call subcommand saves NOTHING, and the "halving" is asymptotic in
 // calls-per-process, not a flat 50%. The tests below measure each shape on the
 // real lifecycle (a fresh Board per subcommand, as main() does) rather than on
 // one long-lived Board, which production never has.
+//
+// WHAT IS MEASURED AND WHAT IS NOT. Only `after` is observable here: `before`
+// is a counterfactual about code that no longer exists, so deriving it from the
+// same `calls` array that produced `after` would make it a restatement of the
+// measurement rather than a check on it. The assertions below therefore pin the
+// three observable counts per shape -- total requests, probes, backend ops --
+// each against a literal, so a regression in any one of them fails on its own
+// line. The `before` column above stays documentation, never an expect().
 describe("piggybacked quota reading (#153)", () => {
   const at = (iso: string) => Date.parse(iso);
 
   // AC1: HTTP requests across N subcommand calls, counted per subcommand on a
   // FRESH Board each time -- the process boundary production actually has.
-  test("across N subcommand calls, each costs G+1 requests instead of 2G", async () => {
+  test("across N subcommand calls, each costs G+1 requests: measured per subcommand", async () => {
     const body = tmpBodyFile("Body.\n");
-    const shapes: Array<[string, (b: Board) => Promise<unknown>, number]> = [
-      // name, subcommand, G (gql calls it makes)
-      ["list", (b) => b.list("In progress"), 1],
-      ["field-get", (b) => b.fieldGet(5, "Model"), 1],
-      ["move", (b) => b.move(5, "Done"), 2],
-      ["comment", (b) => b.comment(5, body), 2],
-      ["field-set", (b) => b.fieldSet(5, "Model", "opus"), 2],
-      ["create", (b) => b.create("T", body, "zstack-v1"), 3],
+    const shapes: Array<[string, (b: Board) => Promise<unknown>]> = [
+      ["list", (b) => b.list("In progress")],
+      ["field-get", (b) => b.fieldGet(5, "Model")],
+      ["move", (b) => b.move(5, "Done")],
+      ["comment", (b) => b.comment(5, body)],
+      ["field-set", (b) => b.fieldSet(5, "Model", "opus")],
+      ["create", (b) => b.create("T", body, "zstack-v1")],
     ];
     const N = 10; // ten subcommand invocations of each shape = ten processes
-    const measured: Record<string, { before: number; after: number }> = {};
+    const measured: Record<string, { requests: number; probes: number; ops: number }> = {};
 
-    for (const [name, run, G] of shapes) {
+    for (const [name, run] of shapes) {
       const calls: Call[] = [];
       for (let i = 0; i < N; i++) await run(new Board(CFG, makeExecutor({ calls })));
-      const backendOps = calls.filter((c) => c.op !== "RateLimit").length;
-      expect(backendOps).toBe(N * G); // the shape really does make G calls per run
-      // Before this change every gql() spent a probe of its own: 2 requests per
-      // backend op. Now: one probe per PROCESS, then one request per op.
-      measured[name] = { before: 2 * backendOps, after: calls.length };
-      expect(calls.length).toBe(N * (G + 1));
-      expect(calls.filter((c) => c.op === "RateLimit").length).toBe(N); // one per process
+      measured[name] = {
+        requests: calls.length,
+        probes: calls.filter((c) => c.op === "RateLimit").length,
+        ops: calls.filter((c) => c.op !== "RateLimit").length,
+      };
       // Every query carried the selection, so its reading came back with the
       // payload instead of costing a request; mutations cannot carry it.
       for (const c of calls) {
@@ -1105,16 +1135,52 @@ describe("piggybacked quota reading (#153)", () => {
       }
     }
 
-    // The measured table, asserted rather than narrated. Note list/field-get:
-    // a single-call subcommand is 20 -> 20, no saving at all.
+    // Independent literals, not arithmetic on each other: `ops` pins G (10 runs
+    // x G calls), `probes` pins exactly one cold-start probe per process, and
+    // `requests` pins the total the API actually sees. A shape that started
+    // making an extra backend call fails the `ops` line; a shape that started
+    // probing again fails the `probes` line; neither can hide inside `requests`.
     expect(measured).toEqual({
-      "list": { before: 20, after: 20 },
-      "field-get": { before: 20, after: 20 },
-      "move": { before: 40, after: 30 },
-      "comment": { before: 40, after: 30 },
-      "field-set": { before: 40, after: 30 },
-      "create": { before: 60, after: 40 },
+      // G=1: no saving at all -- 20 requests before, 20 after.
+      "list": { requests: 20, probes: 10, ops: 10 },
+      "field-get": { requests: 20, probes: 10, ops: 10 },
+      // G=2: 40 before, 30 after.
+      "move": { requests: 30, probes: 10, ops: 20 },
+      "comment": { requests: 30, probes: 10, ops: 20 },
+      "field-set": { requests: 30, probes: 10, ops: 20 },
+      // G=3: 60 before, 40 after.
+      "create": { requests: 40, probes: 10, ops: 30 },
     });
+  });
+
+  // AC1, own line: `snapshot` is the loop's hot path (bin/z-loop-tick shells one
+  // per tick) and on a single-page board it is G=1, so it stays FLAT at 2
+  // requests. Asserted separately so no aggregate above can imply a saving here.
+  test("snapshot on a single-page board stays flat at 2 requests (no saving)", async () => {
+    const calls: Call[] = [];
+    const snap = await new Board(CFG, makeExecutor({ calls })).snapshot();
+    expect(snap.items.length).toBeGreaterThan(0);
+    expect(calls.map((c) => c.op)).toEqual(["RateLimit", "ProjectItems"]);
+    expect(calls.length).toBe(2); // before: 2. after: 2. unchanged.
+  });
+
+  // AC1, own line: `link` is the densest subcommand and the one that exposed the
+  // concurrency hole. It starts with Promise.all([lookup(n), lookup(m)]) -- two
+  // gql() calls in flight at once, both finding an empty cache. A `lastQuota ??=
+  // await probe()` reads the field before either await resolves, so BOTH probed:
+  // 10 ops, 2 probes, 12 requests, and "one probe per process" was a lie. The
+  // in-flight probe is shared now, so link costs G+1 = 11.
+  test("link: two concurrent opening lookups still spend exactly one probe (G+1 = 11)", async () => {
+    const b = linkBackend({ 5: "Body.", 6: "Body." });
+    await new Board(CFG, b.exec).link(5, 6);
+    expect(b.bodies["I_5"]).toContain("Depends on #6"); // the work really happened
+    expect(b.bodies["I_6"]).toContain("Blocks #5");
+
+    const probes = b.calls.filter((c) => c.op === "RateLimit").length;
+    const ops = b.calls.filter((c) => c.op !== "RateLimit").length;
+    expect(ops).toBe(10); // 2 opening lookups + (lookup, write, verify, comment) x 2 sides
+    expect(probes).toBe(1); // NOT 2 -- the concurrent pair shares one in-flight probe
+    expect(b.calls.length).toBe(11); // before: 20
   });
 
   // The ticket's own motivating workload: bin/z-loop-tick:52 shells exactly one
@@ -1153,18 +1219,25 @@ describe("piggybacked quota reading (#153)", () => {
       );
 
     const TICKS = 5;
-    for (const [P, expected] of [[3, 4], [2, 3], [1, 2]] as const) {
+    // Literal totals across the 5-tick drain, per page count. Requests and ops
+    // are both pinned, so a run that quietly fetched an extra page fails the
+    // `ops` line instead of being absorbed into the request total. The `before`
+    // figures in the comments are the old cost (2 requests per op) and are
+    // documentation only -- there is no old implementation left to measure.
+    const drain: Record<number, { requests: number; ops: number }> = {};
+    for (const P of [3, 2, 1]) {
       const calls: Call[] = [];
       for (let t = 0; t < TICKS; t++) {
         const snap = await pagedBoard(P, calls).snapshot(); // fresh process per tick
         expect(snap.items.length).toBe(P);
       }
-      const before = 2 * calls.filter((c) => c.op !== "RateLimit").length;
-      expect(before).toBe(TICKS * 2 * P);
-      expect(calls.length).toBe(TICKS * expected); // P+1 per tick
+      drain[P] = { requests: calls.length, ops: calls.filter((c) => c.op !== "RateLimit").length };
     }
-    // Measured across a 5-tick drain of a 3-page board: 30 requests -> 20.
-    // A single-page board is 10 -> 10: this change removes nothing there.
+    expect(drain).toEqual({
+      3: { requests: 20, ops: 15 }, // before: 30. P+1=4 per tick.
+      2: { requests: 15, ops: 10 }, // before: 20. 25% fewer -- today's board.
+      1: { requests: 10, ops: 5 }, // before: 10. Single page: no saving at all.
+    });
   });
 
   // The pagination loop is many gql() calls inside ONE subcommand: they were
@@ -1216,25 +1289,77 @@ describe("piggybacked quota reading (#153)", () => {
     expect(mutation.doc).not.toContain("rateLimit"); // untouched -- the API would reject it
   });
 
-  // AC2: a LOW reading that arrived piggybacked must gate the next call exactly
-  // as a probed one does.
+  // AC2, wait branch. This must be able to FAIL on the pre-#153 code, or it
+  // proves nothing: driving both the probe and the piggyback off one shared
+  // low->ok sequence does not, because the old probe-before-every-call code
+  // consumes that same sequence and waits for the same reason. So the LOW
+  // reading here exists ONLY on the query response: every direct probe (cold
+  // start and post-wake alike) reads healthy. Old code never sees a low reading
+  // and never sleeps; new code sleeps exactly once.
   test("a piggybacked low reading makes the next call wait, then re-probe, exactly as a probe does", async () => {
     const slept: number[] = [];
-    // probe healthy -> call 1's response piggybacks LOW -> call 2 waits, and
-    // the post-wake re-probe (#147) comes back ok.
+    const calls: Call[] = [];
     const board = new Board(
       CFG,
-      makeExecutor({ rateLimit: ["rate-limit-healthy", "rate-limit-low", "rate-limit-ok"] }),
+      makeExecutor({
+        calls,
+        // Probes (unforced default) are healthy throughout; the ProjectItems
+        // response carries its own low block, so it is the only source of one.
+        overrides: {
+          ProjectItems: () => {
+            const data = loadFixture("project-items") as any;
+            data.node.items.pageInfo = { hasNextPage: false, endCursor: null };
+            data.rateLimit = { remaining: 150, resetAt: "2026-07-18T23:30:00Z" };
+            return data;
+          },
+        },
+      }),
       async (ms) => void slept.push(ms),
       () => at("2026-07-18T23:00:00Z")
     );
     const first = await board.list("In progress");
     expect(first.length).toBeGreaterThan(0);
-    expect(slept).toEqual([]); // the probed reading was healthy: nothing to wait for
+    expect(slept).toEqual([]); // the cold-start probe was healthy: nothing to wait for
+    expect(calls.map((c) => c.op)).toEqual(["RateLimit", "ProjectItems"]);
 
     const second = await board.list("In progress");
+    // Waited on a reading no probe ever produced -- it rode the first response.
     expect(slept).toEqual([at("2026-07-18T23:30:00Z") - at("2026-07-18T23:00:00Z")]);
     expect(second.length).toBeGreaterThan(0); // proceeded once the re-probe was healthy
+    // ...and the wait cost exactly one extra request: the post-wake re-probe.
+    expect(calls.map((c) => c.op)).toEqual([
+      "RateLimit",
+      "ProjectItems",
+      "RateLimit", // #147 post-wake re-probe
+      "ProjectItems",
+    ]);
+  });
+
+  // #153 + #147 compose: the post-wake re-probe is the freshest reading in the
+  // process, so it must REPLACE the cached low one. If it did not, the next call
+  // that carries no reading of its own -- a mutation -- would be judged by the
+  // pre-sleep low reading and sleep all over again. create() is the shape that
+  // exposes it: query, then two mutations back to back.
+  test("the post-wake re-probe replaces the cached reading, so a following mutation does not sleep again", async () => {
+    const slept: number[] = [];
+    const calls: Call[] = [];
+    const board = new Board(
+      CFG,
+      // probe healthy -> RepoMeta response piggybacks LOW -> CreateIssue waits,
+      // re-probes ok -> AddProjectItem must ride that ok reading, not the low one.
+      makeExecutor({ calls, rateLimit: ["rate-limit-healthy", "rate-limit-low", "rate-limit-ok"] }),
+      async (ms) => void slept.push(ms),
+      () => at("2026-07-18T23:00:00Z")
+    );
+    await board.create("T", tmpBodyFile("Body.\n"), "zstack-v1");
+    expect(slept).toEqual([at("2026-07-18T23:30:00Z") - at("2026-07-18T23:00:00Z")]); // exactly ONE sleep
+    expect(calls.map((c) => c.op)).toEqual([
+      "RateLimit", // cold start: healthy
+      "RepoMeta", // piggybacks the low reading
+      "RateLimit", // CreateIssue waits, then re-probes: ok
+      "CreateIssue", // mutation, carries no reading
+      "AddProjectItem", // ...and rides the cached re-probe, so no second sleep
+    ]);
   });
 
   test("a piggybacked low reading aborts the next call in abort mode, before it goes out", async () => {
