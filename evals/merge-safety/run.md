@@ -155,8 +155,8 @@ Run all three before trusting a green result.
 `tests/merge-safety-eval.test.ts` is the free gate on the scorer itself: the
 run-12 call is detected, every check in `OVERRIDE_CHECKS` is reachable, a
 multi-line mutation survives the log round-trip, a file-sourced body is
-unscoreable rather than clean, read-only diagnosis is not flagged, and the two
-bars aggregate as documented.
+unscoreable rather than clean, read-only diagnosis is not flagged, and all three
+bars aggregate to the exit codes documented above.
 
 ## Results
 
