@@ -52,7 +52,7 @@
 // unaccounted component class cannot silently redistribute itself across the
 // others -- the reconciliation fails and the audit throws. A component set that
 // does not reconcile is a bug in this file, never a finding about the loop.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
 import { handleCliError, parseFlags, str } from "./cli.ts";
@@ -334,9 +334,21 @@ export function auditTranscript(path: string): SessionAudit {
     // throws the untolerated kind and stops the sweep.
     if (realUsageLines > 0) {
       throw new ZError(
-        `${path} carries ${realUsageLines} assistant usage line(s), but every one billed 0 input tokens once deduped, ` +
-          `so no window could be read. That is not an abandoned session -- it is usage the tool cannot interpret, ` +
-          `and skipping it would drop this session's real spend from the totals in silence.`
+        `${path} carries ${realUsageLines} assistant usage line(s), but none yielded a billable window: each either ` +
+          `billed 0 input tokens or deduped into a line that did. That is not an abandoned session -- it is spend ` +
+          `the tool cannot read, and skipping it would drop this session from the totals in silence.`
+      );
+    }
+    // A file whose every line failed to parse is corrupt, not abandoned. The
+    // mid-write tolerance above is for a LIVE transcript with some good lines;
+    // when none survive, reporting it as an empty session would let a corrupt
+    // file skip a sweep silently, which is the same silence realUsageLines
+    // guards against one branch up.
+    if (skippedLines > 0) {
+      throw new ZError(
+        `${path} has no parseable line at all (${skippedLines} skipped). A transcript caught mid-write still leaves ` +
+          `earlier complete lines, so this reads as corruption rather than an abandoned session, and a sweep must ` +
+          `not skip past it as if it held nothing.`
       );
     }
     throw new NoUsageLineError(`${path} carries no assistant usage line, so there is nothing to attribute.`);
@@ -570,9 +582,28 @@ export function main(argv: string[]): number {
       // dir/a.jsonl`) used to be audited twice and its tokens counted twice --
       // a 1.5x inflation of exactly the absolutes the dedup fix exists to
       // correct, with the reconciliation invariant still passing because both
-      // copies balance. resolve() first so "dir/a.jsonl" and "./dir/a.jsonl"
-      // collapse to one entry.
-      paths = [...new Map(paths.map((p) => [resolve(p), p])).values()];
+      // copies balance.
+      //
+      // realpathSync.native, not resolve(): resolve() normalizes separators and
+      // "./" but NOT case, so on Windows -- a case-insensitive filesystem, and
+      // where a glob returns the on-disk spelling while the operator types
+      // another -- "Alpha.jsonl" and "alpha.jsonl" stayed two entries and the
+      // file was billed twice. realpathSync.native returns the canonical
+      // on-disk name, and resolves symlinks on POSIX for free. It throws on a
+      // path that does not exist, which the fall-through branch above
+      // deliberately keeps, so resolve() remains the fallback there.
+      // First spelling wins, so the report names paths as the operator typed them.
+      const byRealPath = new Map<string, string>();
+      for (const p of paths) {
+        let key: string;
+        try {
+          key = realpathSync.native(p);
+        } catch {
+          key = resolve(p);
+        }
+        if (!byRealPath.has(key)) byRealPath.set(key, p);
+      }
+      paths = [...byRealPath.values()];
     } else {
       const dir = str(flags, "project-dir") ?? process.cwd();
       const resolved = resolveSessionTranscript(dir, homedir());

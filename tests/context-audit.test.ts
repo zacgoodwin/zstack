@@ -8,7 +8,7 @@
 // shapes a transcript can use, and the drain/dev separation -- the three places
 // a silent attribution error can hide.
 import { test, expect, describe, afterAll } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -431,7 +431,7 @@ describe("split-response dedup", () => {
     const CA = join(REPO_ROOT, "lib", "context-audit.ts");
     const r = Bun.spawnSync(["bun", CA, "audit", dead, alive, "--json"], { stdout: "pipe", stderr: "pipe" });
     expect(r.exitCode).toBe(1); // NOT a clean report with the session quietly missing
-    expect(r.stderr.toString()).toContain("assistant usage line(s), but every one billed 0");
+    expect(r.stderr.toString()).toContain("none yielded a billable window");
   });
 
   // Dedup keys are per-transcript. The same response appearing in two session
@@ -538,6 +538,49 @@ describe("context-audit CLI", () => {
       const r = run("audit", good, drifted);
       expect(r.exitCode).toBe(1);
       expect(r.stdout.toString()).not.toContain("static prefix");
+      // Assert the SPECIFIC failure, not just "something went wrong" -- any
+      // crash satisfies a bare exit-1 check.
+      expect(r.stderr.toString()).toContain("missing/renamed key(s)");
+      // And that the operator is told how far the sweep got before it died.
+      expect(r.stderr.toString()).toContain("audited cleanly before it");
+    });
+
+    // Three shapes that all reach "no window", which must NOT all be treated as
+    // an abandoned session. Only the genuinely empty one is skippable.
+    test("a session with real usage lines that yield no window aborts a sweep", () => {
+      const zero = write("sweep-zerobill.jsonl", [assistant(0, [{ type: "text", text: "a" }])]);
+      const r = run("audit", zero, write("sweep-zb-live.jsonl", live()));
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr.toString()).toContain("none yielded a billable window");
+      // The wording must hold whether or not dedup was involved -- here nothing deduped.
+      expect(r.stderr.toString()).not.toContain("once deduped");
+    });
+
+    test("a wholly unparseable transcript aborts a sweep rather than reading as abandoned", () => {
+      const corrupt = write("sweep-corrupt.jsonl", ["{not json", "also not json"]);
+      const r = run("audit", corrupt, write("sweep-corrupt-live.jsonl", live()));
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr.toString()).toContain("no parseable line at all");
+    });
+
+    // A rate-limited or interrupted session carries only synthetic entries. That
+    // IS an abandoned session, so a sweep skips it -- pinned so the verdict is a
+    // decision rather than an accident of where realUsageLines++ sits.
+    test("a synthetic-only transcript is skipped by a sweep", () => {
+      const synth = write("sweep-synthetic.jsonl", [
+        assistant(0, [{ type: "text", text: "rate limited" }], SYNTHETIC_MODEL),
+      ]);
+      const r = run("audit", synth, write("sweep-synth-live.jsonl", live()), "--json");
+      expect(r.exitCode).toBe(0);
+      const parsed = JSON.parse(r.stdout.toString());
+      expect(parsed.sessions).toBe(1);
+      expect(parsed.unauditable).toEqual([synth]);
+    });
+
+    test("report omits the skipped block entirely when nothing was skipped", () => {
+      const out = report(rollup([auditTranscript(write("no-skips.jsonl", live()))]));
+      expect(out).not.toContain("session(s) skipped");
+      expect(out).toContain("static prefix");
     });
 
     // The skip is scoped to NoUsageLineError alone. An unreadable path is a
@@ -597,14 +640,34 @@ describe("context-audit CLI", () => {
       const g = mkdtempSync(join(tmpdir(), "zstack-ctxdup-"));
       writeFileSync(join(g, "a.jsonl"), live().join("\n") + "\n");
       writeFileSync(join(g, "b.jsonl"), live().join("\n") + "\n");
-      const globOnly = JSON.parse(run("audit", join(g, "*.jsonl"), "--json").stdout.toString());
-      const overlap = JSON.parse(run("audit", join(g, "*.jsonl"), join(g, "a.jsonl"), "--json").stdout.toString());
-      const twice = JSON.parse(run("audit", join(g, "a.jsonl"), join(g, "a.jsonl"), "--json").stdout.toString());
+      const globOnlyOut = run("audit", join(g, "*.jsonl"), "--json").stdout.toString();
+      const overlapOut = run("audit", join(g, "*.jsonl"), join(g, "a.jsonl"), "--json").stdout.toString();
+      const twiceOut = run("audit", join(g, "a.jsonl"), join(g, "a.jsonl"), "--json").stdout.toString();
+      // Clean up before parsing: a parse failure used to leak the mkdtemp dir.
       rmSync(g, { recursive: true, force: true });
+      const globOnly = JSON.parse(globOnlyOut);
+      const overlap = JSON.parse(overlapOut);
       expect(globOnly.sessions).toBe(2);
       expect(overlap.sessions).toBe(2);
       expect(overlap.totalBilled).toBe(globOnly.totalBilled);
-      expect(twice.sessions).toBe(1);
+      expect(JSON.parse(twiceOut).sessions).toBe(1);
+    });
+
+    // The spellings above are byte-identical, so a plain string Set would pass
+    // that test. Case is what actually needs canonicalizing: Windows is
+    // case-insensitive and a glob returns the on-disk spelling while the
+    // operator may type another, so resolve() alone left two entries and billed
+    // the file twice. Only realpathSync.native collapses them.
+    test("two spellings of one file differing only in case audit once", () => {
+      const g = mkdtempSync(join(tmpdir(), "zstack-ctxcase-"));
+      writeFileSync(join(g, "Alpha.jsonl"), live().join("\n") + "\n");
+      const out = run("audit", join(g, "Alpha.jsonl"), join(g, "alpha.jsonl"), "--json");
+      const lower = existsSync(join(g, "alpha.jsonl")); // false on a case-sensitive FS
+      rmSync(g, { recursive: true, force: true });
+      if (!lower) return; // case-sensitive filesystem: the two ARE different files
+      const parsed = JSON.parse(out.stdout.toString());
+      expect(parsed.sessions).toBe(1);
+      expect(parsed.totalBilled).toBe(2600);
     });
 
     // Red team: Bun.Glob read "session[1].jsonl" as a character class and
