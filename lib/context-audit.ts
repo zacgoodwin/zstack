@@ -15,6 +15,12 @@
 // -- What is measured exactly, and what is estimated -------------------------
 //
 // REAL (tokenizer readings, straight from billed usage):
+//   turns         UNIQUE API responses, not transcript lines. Claude Code
+//                 writes one line per content block and repeats the response's
+//                 usage snapshot on each, so a split response is counted once
+//                 (see DEDUP in auditTranscript). Every absolute below is
+//                 post-dedup; figures published before that fix read ~1.87x
+//                 high, though the component RANKING was unaffected.
 //   totalBilled   sum over turns of (input + cache_read + cache_creation)
 //   staticFloor   min billed window across turns, times the turn count. The
 //                 minimum is the window right after a /clear (or turn 1), i.e.
@@ -46,12 +52,12 @@
 // unaccounted component class cannot silently redistribute itself across the
 // others -- the reconciliation fails and the audit throws. A component set that
 // does not reconcile is a bug in this file, never a finding about the loop.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename } from "node:path";
+import { basename, resolve } from "node:path";
 import { handleCliError, parseFlags, str } from "./cli.ts";
 import { ZError } from "./config.ts";
-import { SYNTHETIC_MODEL, expandGlob, parseLine } from "./cost.ts";
+import { GLOB_META, SYNTHETIC_MODEL, expandGlob, parseLine } from "./cost.ts";
 import { mangleProjectDir, resolveSessionTranscript } from "./context-budget.ts";
 
 // -- phases -------------------------------------------------------------------
@@ -102,9 +108,20 @@ export interface ComponentSpend {
   rawTokens: number; // chars/4 of the content itself, un-weighted
 }
 
+// A transcript with no assistant usage line carries nothing to attribute. On a
+// single-file audit that is a real error -- the operator named that file and
+// deserves to hear it. On a multi-file audit it is routine: ~3% of a session
+// corpus is an abandoned or never-answered session, and aborting the whole
+// rollup on the first one made batch auditing impossible (the CLI's own
+// documented use, "audit [<transcript.jsonl>...]"). A distinct type is what
+// lets the CLI skip THIS case only: parseLine's format-drift assertion, an
+// unreadable file, and any other ZError must still abort the run rather than
+// silently drop a session's spend from the totals.
+export class NoUsageLineError extends ZError {}
+
 export interface SessionAudit {
   file: string;
-  turns: number;
+  turns: number; // unique API responses, post-dedup (see DEDUP note below)
   totalBilled: number;
   staticFloor: number; // per-turn floor
   staticFloorCost: number; // floor x turns
@@ -185,6 +202,12 @@ export function auditTranscript(path: string): SessionAudit {
   const toolCmd = new Map<string, string>();
   const evs: Ev[] = [];
   const tickets = new Set<number>();
+  const seenKeys = new Set<string>();
+  // Counts every real (non-synthetic) assistant usage line seen, whatever it
+  // billed and whether or not it deduped away. Distinguishes "this session was
+  // abandoned" from "this session has spend I failed to read" when no window
+  // survives -- see the branch at the end of this function.
+  let realUsageLines = 0;
   let skippedLines = 0;
   let drainStarted = false;
 
@@ -230,7 +253,42 @@ export function auditTranscript(path: string): SessionAudit {
       // Synthetic entries are not measurements (see SYNTHETIC_MODEL): a
       // rate-limited or interrupted turn carries all-zero usage and would read
       // as an empty window, which would drag the static floor to 0.
+      //
+      // DEDUP: Claude Code writes ONE transcript line per content block, and
+      // every line of a split response repeats that response's usage snapshot
+      // verbatim. Summing per line therefore counts one API call's window once
+      // per block. Two different multiples, measured over this machine's
+      // 88-session orchestrator corpus: 2.00x by LINE count (17,693 usage lines
+      // / 8,839 unique responses) and 1.87x by BILLED TOKENS (4.97B summed
+      // per-line vs 2.66B deduped). They differ because duplicate lines skew
+      // toward the smaller windows early in a session.
+      // The reconciliation invariant does NOT catch this: staticFloorCost and
+      // the component weights inflate together, so the audit still balances
+      // while every absolute number (turns, totalBilled, per-ticket accretion)
+      // reads high. lib/cost.ts's costOfFiles has deduped since it was written;
+      // parseLine already hands back the same dedupKeys, so this reuses them
+      // rather than inventing a second rule. Keys are per-transcript: the same response
+      // appearing in two files is two sessions' worth of re-sent window, which
+      // is exactly what rollup() should add up.
       if (parsed && parsed.model !== SYNTHETIC_MODEL) {
+        realUsageLines++;
+        // Register EVERY key before skipping, never after -- costOfFiles in
+        // lib/cost.ts does the same, for the reason its F14 note gives: one
+        // response's lines do not all carry the same id fields, so a line
+        // carrying BOTH requestId and message.id is the only thing linking
+        // them. Skip it before it registers and a later message.id-only sibling
+        // looks new and bills the response a second time.
+        //
+        // Keys register regardless of `billed`, so the FIRST line of a response
+        // wins even if its snapshot reads 0. costOfFiles resolves a divergent
+        // sibling the same first-wins way; both rest on the same empirical fact
+        // (a response's lines repeat one snapshot verbatim -- 0 disagreements
+        // across 3,982 multi-line responses on this machine). Pinned by
+        // "first-seen snapshot wins when siblings disagree" in the tests, so a
+        // divergence would fail a gate rather than silently shift the totals.
+        const duplicate = parsed.dedupKeys.some((k) => seenKeys.has(k));
+        for (const k of parsed.dedupKeys) seenKeys.add(k);
+        if (duplicate) continue;
         const u = parsed.usage;
         const billed = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
         if (billed > 0) evs.push({ k: "turn", billed });
@@ -266,7 +324,22 @@ export function auditTranscript(path: string): SessionAudit {
 
   const windows = evs.filter((e): e is Extract<Ev, { k: "turn" }> => e.k === "turn").map((e) => e.billed);
   if (windows.length === 0) {
-    throw new ZError(`${path} carries no assistant usage line, so there is nothing to attribute.`);
+    // Two very different reasons produce no windows, and conflating them let a
+    // real session vanish from a sweep. An abandoned prompt genuinely carries
+    // no usage line -- routine in a corpus, and what NoUsageLineError exists to
+    // let a sweep skip. A file whose usage lines all exist but whose first-seen
+    // snapshot per response reads 0 is NOT that: it has real spend the tool is
+    // failing to read, and skipping it silently subtracts a whole session from
+    // the rollup while reporting the run as complete. That is drift, so it
+    // throws the untolerated kind and stops the sweep.
+    if (realUsageLines > 0) {
+      throw new ZError(
+        `${path} carries ${realUsageLines} assistant usage line(s), but every one billed 0 input tokens once deduped, ` +
+          `so no window could be read. That is not an abandoned session -- it is usage the tool cannot interpret, ` +
+          `and skipping it would drop this session's real spend from the totals in silence.`
+      );
+    }
+    throw new NoUsageLineError(`${path} carries no assistant usage line, so there is nothing to attribute.`);
   }
   const totalBilled = windows.reduce((a, b) => a + b, 0);
   const staticFloor = Math.min(...windows);
@@ -339,6 +412,10 @@ export function assertReconciles(components: ComponentSpend[], staticFloorCost: 
 
 export interface Rollup {
   sessions: number;
+  // Paths skipped as NoUsageLineError. Named, never just counted: a silently
+  // dropped session is spend missing from the totals, and the whole point of
+  // this tool is that a number cannot be wrong without saying so.
+  unauditable: string[];
   turns: number;
   totalBilled: number;
   staticFloorCost: number;
@@ -347,7 +424,7 @@ export interface Rollup {
   skippedLines: number;
 }
 
-export function rollup(audits: SessionAudit[]): Rollup {
+export function rollup(audits: SessionAudit[], unauditable: string[] = []): Rollup {
   const agg = new Map<string, ComponentSpend>();
   let turns = 0, totalBilled = 0, staticFloorCost = 0, drainedTickets = 0, skippedLines = 0;
   for (const a of audits) {
@@ -367,6 +444,7 @@ export function rollup(audits: SessionAudit[]): Rollup {
   }
   return {
     sessions: audits.length,
+    unauditable,
     turns,
     totalBilled,
     staticFloorCost,
@@ -387,6 +465,15 @@ export function report(r: Rollup, opts: { drainOnly?: boolean } = {}): string {
     `orchestrator context audit -- ${r.sessions} session(s), ${n(r.turns)} turns, ${n(r.totalBilled)} billed input tokens`
   );
   if (r.skippedLines) out.push(`  (${r.skippedLines} unparseable line(s) skipped -- a live transcript caught mid-write)`);
+  if (r.unauditable.length > 0) {
+    out.push(`  (${r.unauditable.length} session(s) skipped -- no assistant usage line, nothing to attribute:)`);
+    // Basenames only while they stay distinct. A sweep across the loop's own
+    // per-ticket transcript dirs collides on every "builder-1.jsonl", and three
+    // identical lines tell the operator nothing about which sessions dropped.
+    const names = r.unauditable.map((f) => basename(f)); // not .map(basename): map's index arg lands in basename's `ext`
+    const collides = new Set(names).size !== names.length;
+    for (const f of r.unauditable) out.push(`     ${collides ? f : basename(f)}`);
+  }
   out.push("");
   out.push(`  ${"static prefix (floor x turns)".padEnd(34)} ${n(r.staticFloorCost).padStart(14)} ${pct(r.staticFloorCost).padStart(8)}`);
   out.push(`  ${"-- accreted conversation --".padEnd(34)} ${n(r.totalBilled - r.staticFloorCost).padStart(14)} ${pct(r.totalBilled - r.staticFloorCost).padStart(8)}`);
@@ -420,6 +507,16 @@ const USAGE = `context-audit <command> [args]
     --drain-only                  show only loop-issued (drain steady-state) rows
     --json                        machine-readable rollup
 
+  Sweeps (several paths, or any glob) skip a transcript that carries no
+  assistant usage line and name it in the report -- and in --json under
+  \`unauditable\`. One literal path is a question about THAT file, so the same
+  empty transcript is an error there. Every other failure, including a renamed
+  usage key, aborts the whole run in both modes.
+
+  \`turns\` counts unique API responses, not transcript lines: a response split
+  across content-block lines repeats its usage snapshot on each and is billed
+  once.
+
   Costs are real billed tokens; the split BETWEEN components is a chars/4 ratio
   normalized onto real accretion, so read the ranking, not the absolute numbers.
   See the module header for the exact contract.`;
@@ -439,11 +536,43 @@ export function main(argv: string[]): number {
       return 1;
     }
     let paths: string[] = [];
+    // A glob positional is a SWEEP by intent, however many files it happens to
+    // match. Deciding tolerance on the expanded count alone made the identical
+    // documented command (`audit path/to/*.jsonl`) hard-fail or succeed
+    // depending on how many transcripts were sitting in the directory that day.
+    // GLOB_META is imported, not restated, so this classifier and the splitting
+    // expandGlob does can never disagree about what a glob is.
+    let sweep = positionals.length > 1;
     if (positionals.length > 0) {
       for (const p of positionals) {
-        const expanded = expandGlob(p);
-        paths.push(...(expanded.length > 0 ? expanded : [p]));
+        // An existing file is a literal path, whatever characters are in its
+        // name. Globbing it first let Bun.Glob read "session[1].jsonl" as a
+        // character class and silently audit a DIFFERENT file, reporting that
+        // one's numbers with exit 0.
+        if (existsSync(p)) {
+          paths.push(p);
+          continue;
+        }
+        if (GLOB_META.test(p)) {
+          sweep = true;
+          const expanded = expandGlob(p);
+          // Falling through to the literal handed the pattern itself to
+          // readFileSync, so a mistyped extension read as a missing file.
+          if (expanded.length === 0) throw new ZError(`No files matched "${p}".`);
+          paths.push(...expanded);
+          continue;
+        }
+        // Not on disk and not a pattern: keep it so auditTranscript's own
+        // "Cannot read transcript at" names the path the operator typed.
+        paths.push(p);
       }
+      // The same file reachable through two positionals (`dir/*.jsonl
+      // dir/a.jsonl`) used to be audited twice and its tokens counted twice --
+      // a 1.5x inflation of exactly the absolutes the dedup fix exists to
+      // correct, with the reconciliation invariant still passing because both
+      // copies balance. resolve() first so "dir/a.jsonl" and "./dir/a.jsonl"
+      // collapse to one entry.
+      paths = [...new Map(paths.map((p) => [resolve(p), p])).values()];
     } else {
       const dir = str(flags, "project-dir") ?? process.cwd();
       const resolved = resolveSessionTranscript(dir, homedir());
@@ -454,8 +583,40 @@ export function main(argv: string[]): number {
       }
       paths = [resolved];
     }
-    const audits = paths.map(auditTranscript);
-    const r = rollup(audits);
+    // One named path is a question about THAT file: an empty transcript is an
+    // answer the operator asked for, so it still throws. A sweep -- several
+    // paths, or any glob -- must not let one dead session take the rollup with
+    // it (see NoUsageLineError). Only that error is tolerated; everything else,
+    // including parseLine's format-drift assertion, still aborts.
+    const audits: SessionAudit[] = [];
+    const unauditable: string[] = [];
+    for (const p of paths) {
+      try {
+        audits.push(auditTranscript(p));
+      } catch (e) {
+        if (sweep && e instanceof NoUsageLineError) {
+          unauditable.push(p);
+          continue;
+        }
+        // A sweep's docs promote it as the primary use, so an abort partway
+        // through is a common path, not a rare one. Say how far it got: without
+        // this the operator sees one drift message and no sign that 89 of 90
+        // sessions parsed cleanly.
+        if (paths.length > 1) {
+          console.error(
+            `context-audit: aborted on ${p} (file ${paths.indexOf(p) + 1} of ${paths.length}; ` +
+              `${audits.length} audited cleanly before it). Nothing is reported -- a partial rollup would understate the corpus.`
+          );
+        }
+        throw e;
+      }
+    }
+    if (audits.length === 0) {
+      throw new ZError(
+        `None of the ${paths.length} transcript(s) carry an assistant usage line, so there is nothing to attribute.`
+      );
+    }
+    const r = rollup(audits, unauditable);
     if (flags["json"]) {
       console.log(JSON.stringify(r, null, 2));
       return 0;

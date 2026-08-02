@@ -581,12 +581,24 @@ bin/z-context-audit audit --drain-only          # loop steady-state only
 bin/z-context-audit audit --json                # machine-readable
 ```
 
-The orchestrator is where the money is: measured over 35 real drains on this
-repo it was **90% of the loop's billed input tokens** (3.23B, against 354M for
-every lane subagent combined). It is one long session that re-sends its whole
-window every turn, so a byte entering early is paid for again on every later
-turn. The audit weights each block by the turns it rides in, which is why its
-ranking differs sharply from a naive byte count.
+The orchestrator is where the money is: re-measured 2026-08-01 over this repo's
+session corpus it is **~83% of the loop's billed input tokens** (2.67B, against
+548M for every lane subagent combined). It is one long session that re-sends its
+whole window every turn, so a byte entering early is paid for again on every
+later turn. The audit weights each block by the turns it rides in, which is why
+its ranking differs sharply from a naive byte count.
+
+> Figures published before 2026-08-01 (the earlier "90%, 3.23B" reading) came
+> from the pre-dedup tool, which summed a split response's usage snapshot once
+> per content-block line and so over-reported orchestrator absolutes ~1.87x.
+> Component ranking was unaffected. Absolutes from the two eras are not
+> comparable; re-measure rather than mixing them.
+
+A sweep (several paths, or any glob) skips a transcript carrying no assistant
+usage line and names it in the report, and under `unauditable` in `--json`. A
+single literal path is a question about that file, so the same empty transcript
+is an error there instead. Every other failure, a renamed usage key included,
+aborts the run in both modes.
 
 ### Drain vs dev
 
