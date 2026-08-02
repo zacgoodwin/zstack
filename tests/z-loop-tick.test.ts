@@ -28,6 +28,28 @@ import { throttleDelayMs, throttleTick, defaultLoopDir, readLastTick } from "../
 const REPO_ROOT = join(import.meta.dir, "..");
 const Z_LOOP_TICK = join(REPO_ROOT, "bin", "z-loop-tick");
 
+// Every test below that spawns bin/z-loop-tick gets this budget instead of bun's
+// 5000ms default. MEASURED on this Windows machine, idle, with --timeout 120000
+// so nothing was cut short: the nine tick-driving tests run 1.98s-4.86s, and the
+// slowest (#150, which drives TWO ticks) lands within 3% of the default. One
+// tick costs ~2s because bin/z-loop-tick runs seven sequential `bun` subprocess
+// spawns on every iteration -- throttle wait, locks beat, context-budget
+// current, loop confirm-targets, loop ingest, loop human-needed, loop next --
+// plus the stubbed z-board and two jq calls, and process spawn on Windows is far
+// more expensive than on POSIX.
+//
+// So the default was never a real budget here -- it was a coin flip that came up
+// heads on an idle machine. Under load it failed nondeterministically: three
+// consecutive runs of this file produced 9, then 5, then 2 failures, every one a
+// timeout and never an assertion (issue #252).
+//
+// 30s is ~6x the measured idle worst case. It is deliberately NOT unbounded: a
+// tick that genuinely hangs (a lock never released, a subprocess awaiting stdin)
+// still fails this suite rather than stalling CI forever. Raise it only with a
+// fresh measurement pasted here -- if the honest number ever approaches 30s, the
+// fix is to cut the spawn count, not to grow this constant again.
+const TICK_TIMEOUT_MS = 30_000;
+
 // The board the stubbed `z-board snapshot` emits: one Ready ticket, no deps.
 const ITEMS = JSON.stringify([
   { number: 1, title: "T1", url: "http://x/1", fields: { Status: "Ready" } },
@@ -209,7 +231,7 @@ describe("z-loop-tick", () => {
     const loopDir = defaultLoopDir("demo", home);
     expect(existsSync(join(loopDir, "last-tick"))).toBe(true);
     expect(readLastTick(loopDir)).not.toBeNull();
-  });
+  }, TICK_TIMEOUT_MS);
 
   // #131 review-bounce finding 3(b): the assertion above (contextTokens === 0)
   // is NOT load-bearing on its own -- a reverted wrapper that never threads
@@ -272,7 +294,7 @@ describe("z-loop-tick", () => {
     );
     expect(ing.exitCode).toBe(0);
     expect(readFileSync(tickState, "utf8")).toBe(readFileSync(expectedState, "utf8"));
-  });
+  }, TICK_TIMEOUT_MS);
 
   test("missing a required flag fails loudly, prints no Action", () => {
     const dir = mkTmp();
@@ -284,7 +306,7 @@ describe("z-loop-tick", () => {
     expect(proc.exitCode).not.toBe(0);
     expect(proc.stdout.toString().trim()).toBe("");
     expect(proc.stderr.toString()).toContain("usage: z-loop-tick");
-  });
+  }, TICK_TIMEOUT_MS);
 
   // #198: --session is required, not optional. An absent session would silently
   // disable the liveness heartbeat and reintroduce "a live loop reads stale"
@@ -299,7 +321,7 @@ describe("z-loop-tick", () => {
     expect(proc.exitCode).not.toBe(0);
     expect(proc.stdout.toString().trim()).toBe("");
     expect(proc.stderr.toString()).toContain("--session");
-  });
+  }, TICK_TIMEOUT_MS);
 
   // -- issue #63: the human-needed safety control -----------------------------
   test("human-needed: writes tripped:true when parked tickets cross the threshold, and an unconfigured notify send never aborts the tick or sets the fire-once flag", () => {
@@ -335,7 +357,7 @@ describe("z-loop-tick", () => {
     // the real notification still fires once the project IS configured.
     const written = JSON.parse(readFileSync(tickState, "utf8"));
     expect(written.humanNeededNotified).not.toBe(true);
-  });
+  }, TICK_TIMEOUT_MS);
 
   // #150: driven through two REAL wrapper ticks against the same --state file
   // (not a hand-built prev), so state.json's persistence across invocations is
@@ -390,7 +412,7 @@ describe("z-loop-tick", () => {
     const hn = JSON.parse(readFileSync(join(tickTmp, "human-needed.json"), "utf8"));
     expect(hn.blocked).toBe(0); // the 3 pre-existing Blocked tickets are excluded
     expect(hn.tripped).toBe(false); // 0/10 = 0%, no false trip before a single lane of this batch ran
-  });
+  }, TICK_TIMEOUT_MS);
 
   // The test above only exercises the failure/unconfigured branch (`SENT` !=
   // "sent") of z-loop-tick's `[ "$SENT" = "sent" ] && human-needed-ack` line;
@@ -481,7 +503,7 @@ describe("z-loop-tick", () => {
     } finally {
       server.stop(true);
     }
-  });
+  }, TICK_TIMEOUT_MS);
 
   // -- #138: the targeted confirm pass ---------------------------------------
   // Both cases run the REAL wrapper against a REAL prior state file with two
@@ -518,7 +540,7 @@ describe("z-loop-tick", () => {
     expect(log).toContain("read missed #1");
     expect(log).toContain("still on the board");
     expect(log).not.toContain("releasing its lane");
-  });
+  }, TICK_TIMEOUT_MS);
 
   test("#138 AC5: the same read + a lookup that positively reports not-on-project -> #1 released, #2 untouched", () => {
     const dir = mkTmp();
@@ -545,7 +567,7 @@ describe("z-loop-tick", () => {
     expect(log).toContain("read missed #1");
     expect(log).toContain("gone from the board (not-on-project)");
     expect(log).toContain("releasing its lane");
-  });
+  }, TICK_TIMEOUT_MS);
 
   test("#138: an unparseable lookup answer degrades to no confirmations, never a dead tick", () => {
     const dir = mkTmp();
@@ -570,7 +592,7 @@ describe("z-loop-tick", () => {
     const state = JSON.parse(readFileSync(tickState, "utf8"));
     expect(state.tickets.map((t: any) => t.number)).toEqual([1, 2]); // both carried
     expect(state.lanes.map((l: any) => l.ticket)).toEqual([1, 2]);
-  });
+  }, TICK_TIMEOUT_MS);
 
   test("#138: a FAILING single-ticket lookup carries the ticket forward and never releases a lane", () => {
     const dir = mkTmp();
@@ -591,7 +613,7 @@ describe("z-loop-tick", () => {
     expect(state.tickets.find((t: any) => t.number === 1).status).toBe("Building"); // carried forward
     expect(state.lanes.map((l: any) => l.ticket)).toEqual([1, 2]);
     expect(proc.stderr.toString()).toContain("single-ticket lookup for #1 failed");
-  });
+  }, TICK_TIMEOUT_MS);
 
   // Ordering canary (issue #58): the throttle step must run BEFORE the
   // snapshot call, matching Plan step 4 ("before it issues the first
