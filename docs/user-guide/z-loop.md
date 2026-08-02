@@ -262,7 +262,9 @@ records the result. It never re-derives a scheduling decision in prose.
   ceiling an agent killed mid-tool-call could never satisfy the shape check at any
   age, and a single one of those (17 of 1,490 transcripts here) held the sweep
   open forever. `sweep-review --stale-ms` overrides that ceiling for a session you
-  know is dead. The parent's transcript
+  know is dead, and `sweep-review --quiet-ms` overrides the 15-minute settling
+  window the same way; `--quiet-ms 0` collapses the gate entirely, so it is only
+  safe when you know nothing is mid-turn. The parent's transcript
   cannot answer it either: the skeptics
   are background spawns, so the only record the reviewer ever gets for one is the
   "launched successfully" acknowledgement written the instant it starts, and
