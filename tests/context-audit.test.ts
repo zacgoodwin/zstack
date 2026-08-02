@@ -446,6 +446,134 @@ describe("split-response dedup", () => {
   });
 });
 
+// -- the numbers an operator actually spends against --------------------------
+
+// Adversarial review: every finding here is a way the printed number is wrong
+// while the reconciliation invariant still balances. That invariant normalizes
+// components onto real accretion, so it can never detect spend that failed to
+// enter the sum in the first place. These are the guards that can.
+describe("silently-wrong-number guards", () => {
+  function ticketTick(nums: number[]) {
+    return nums.map((t) => `"$PACK/bin/z-loop-tick" --slug demo --state s.json --tmp prompt-${t}.txt --session x`);
+  }
+
+  // A ticket worked across two sessions was counted once per session, so the
+  // headline "accretion per ticket touched" read 1.24x low on this repo's own
+  // corpus (68 summed vs 55 distinct).
+  test("rollup unions ticket ids across sessions instead of summing counts", () => {
+    const mk = (name: string, cmds: string[]) =>
+      auditTranscript(
+        write(
+          name,
+          cmds
+            .flatMap((c, i) => [
+              assistant(1000 + i * 100, [toolUse(`t${i}`, "Bash", { command: c })]),
+              user([toolResult(`t${i}`, "A".repeat(200))]),
+            ])
+            .concat([assistant(4000, [{ type: "text", text: "." }])])
+        )
+      );
+    const s1 = mk("union-a.jsonl", ticketTick([101, 102]));
+    const s2 = mk("union-b.jsonl", ticketTick([102, 103])); // 102 overlaps
+    const r = rollup([s1, s2]);
+    expect(r.drainedTickets).toEqual([101, 102, 103]); // union, not 4
+    expect(report(r)).toContain("3 distinct ticket(s)");
+  });
+
+  // First-wins discards a real window when the first line of a response billed
+  // 0. Empirically absent today, which is why it needs a counter rather than a
+  // comment: the discarded window never enters totalBilled, so nothing else sees it.
+  test("a window discarded by first-wins is counted and reported", () => {
+    const a = auditTranscript(
+      write("shadowed.jsonl", [
+        JSON.stringify({
+          type: "assistant",
+          requestId: "s1",
+          message: {
+            role: "assistant",
+            model: "claude-opus-4-20250101",
+            content: [{ type: "text", text: "a" }],
+            usage: { input_tokens: 0, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+          },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          requestId: "s1",
+          message: {
+            role: "assistant",
+            model: "claude-opus-4-20250101",
+            content: [{ type: "text", text: "b" }],
+            usage: { input_tokens: 0, output_tokens: 1, cache_read_input_tokens: 9000, cache_creation_input_tokens: 0 },
+          },
+        }),
+        assistant(1000, [{ type: "text", text: "." }]),
+        assistant(2000, [{ type: "text", text: "." }]),
+      ])
+    );
+    expect(a.shadowedWindows).toBe(1);
+    expect(a.totalBilled).toBe(3000); // the 9000 window is genuinely absent
+    expect(report(rollup([a]))).toContain("NOT in the totals below");
+  });
+
+  test("no shadowed windows means no such line in the report", () => {
+    const a = auditTranscript(
+      write("unshadowed.jsonl", [
+        assistant(1000, [{ type: "text", text: "x".repeat(400) }]),
+        assistant(2000, [{ type: "text", text: "." }]),
+      ])
+    );
+    expect(a.shadowedWindows).toBe(0);
+    expect(report(rollup([a]))).not.toContain("NOT in the totals below");
+  });
+
+  // "Caught mid-write" is a causal claim. A truncation is the LAST line by
+  // definition, so an unparseable line anywhere else is corruption and the
+  // report must stop explaining away the missing spend.
+  test("report only claims mid-write when the bad line is at end-of-file", () => {
+    const body = (t: string) => [{ type: "text", text: t }];
+    const tail = auditTranscript(
+      write("bad-tail.jsonl", [assistant(1000, body("y".repeat(400))), assistant(2000, body(".")), "{trunc"])
+    );
+    expect(tail.skippedLines).toBe(1);
+    expect(tail.skippedBeyondFinalLine).toBe(0);
+    expect(report(rollup([tail]))).toContain("all at end-of-file");
+
+    const mid = auditTranscript(
+      write("bad-middle.jsonl", [assistant(1000, body("z".repeat(400))), "{corrupt", assistant(2000, body("."))])
+    );
+    expect(mid.skippedBeyondFinalLine).toBe(1);
+    const out = report(rollup([mid]));
+    expect(out).toContain("NOT at end-of-file");
+    expect(out).toContain("that is corruption");
+  });
+
+  // A wholly-sidechain file is a subagent transcript, not an orchestrator
+  // session. Skipping it is right; saying it holds "nothing to attribute" is a
+  // false statement about a file full of real subagent spend.
+  test("a sidechain-only transcript says what it actually is", () => {
+    const side = JSON.stringify({
+      type: "assistant",
+      isSidechain: true,
+      requestId: "sc1",
+      message: {
+        role: "assistant",
+        model: "claude-opus-4-20250101",
+        content: [{ type: "text", text: "subagent work" }],
+        usage: { input_tokens: 0, output_tokens: 5, cache_read_input_tokens: 50000, cache_creation_input_tokens: 0 },
+      },
+    });
+    const p = write("sidechain-only.jsonl", [side, side]);
+    expect(() => auditTranscript(p)).toThrow(NoUsageLineError); // still skippable by a sweep
+    try {
+      auditTranscript(p);
+    } catch (e) {
+      expect((e as Error).message).toContain("only sidechain (subagent) usage lines -- 2 of them");
+      expect((e as Error).message).toContain("z-cost");
+      expect((e as Error).message).not.toContain("carries no assistant usage line");
+    }
+  });
+});
+
 // -- rollup -------------------------------------------------------------------
 
 describe("rollup", () => {

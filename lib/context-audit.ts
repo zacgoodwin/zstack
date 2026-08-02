@@ -128,7 +128,17 @@ export interface SessionAudit {
   accretion: number;
   components: ComponentSpend[];
   drainedTickets: number[];
-  skippedLines: number; // unparseable (a live file caught mid-write)
+  skippedLines: number; // unparseable
+  // Unparseable lines that are NOT the file's last line. A mid-write truncation
+  // is by definition the final line, so anything earlier is real corruption and
+  // the report must stop explaining it away as a live file caught mid-write.
+  skippedBeyondFinalLine: number;
+  // Responses whose first-seen line billed 0 while a later sibling billed more.
+  // First-wins then discards the real window. Empirically 0 across this
+  // machine's corpus, which is exactly why it would go unnoticed the day it
+  // changes -- the reconciliation invariant cannot see a window that never
+  // entered the sum.
+  shadowedWindows: number;
 }
 
 // Markers that identify the z-loop SKILL.md body, which arrives as a user
@@ -202,26 +212,48 @@ export function auditTranscript(path: string): SessionAudit {
   const toolCmd = new Map<string, string>();
   const evs: Ev[] = [];
   const tickets = new Set<number>();
-  const seenKeys = new Set<string>();
+  // key -> billed of the FIRST line seen for that response, so a later sibling
+  // carrying a real window over a zero first-seen can be counted (shadowedWindows).
+  const seenKeys = new Map<string, number>();
   // Counts every real (non-synthetic) assistant usage line seen, whatever it
   // billed and whether or not it deduped away. Distinguishes "this session was
   // abandoned" from "this session has spend I failed to read" when no window
   // survives -- see the branch at the end of this function.
   let realUsageLines = 0;
+  // Usage lines belonging to a spawned subagent, skipped because this tool
+  // measures the ORCHESTRATOR's window. Counted so a wholly-sidechain file gets
+  // an accurate verdict instead of "nothing to attribute", which is false.
+  let sidechainUsageLines = 0;
   let skippedLines = 0;
+  let skippedBeyondFinalLine = 0;
+  let shadowedWindows = 0;
   let drainStarted = false;
+
+  // Index of the last non-blank line: the only position a mid-write truncation
+  // can occupy.
+  let finalLine = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim()) {
+      finalLine = i;
+      break;
+    }
+  }
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!line.trim()) continue;
     if (!parsesAsJson(line)) {
       skippedLines++;
+      if (i !== finalLine) skippedBeyondFinalLine++;
       continue;
     }
     // Valid JSON: parseLine's assertion still applies to usage-bearing lines.
     const parsed = parseLine(line, `${path}:${i + 1}`);
     const j = JSON.parse(line);
-    if (j.isSidechain) continue;
+    if (j.isSidechain) {
+      if (parsed && parsed.model !== SYNTHETIC_MODEL) sidechainUsageLines++;
+      continue;
+    }
 
     if (j.attachment?.type === "skill_listing") {
       evs.push({ k: "content", component: "skillListing", tokens: String(j.attachment.content ?? "").length / 4, phase: drainStarted ? "drain" : "dev" });
@@ -286,11 +318,18 @@ export function auditTranscript(path: string): SessionAudit {
         // across 3,982 multi-line responses on this machine). Pinned by
         // "first-seen snapshot wins when siblings disagree" in the tests, so a
         // divergence would fail a gate rather than silently shift the totals.
-        const duplicate = parsed.dedupKeys.some((k) => seenKeys.has(k));
-        for (const k of parsed.dedupKeys) seenKeys.add(k);
-        if (duplicate) continue;
         const u = parsed.usage;
         const billed = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
+        const firstSeen = parsed.dedupKeys.map((k) => seenKeys.get(k)).find((v) => v !== undefined);
+        const duplicate = firstSeen !== undefined;
+        for (const k of parsed.dedupKeys) if (!seenKeys.has(k)) seenKeys.set(k, billed);
+        if (duplicate) {
+          // The first line won, but this sibling carries a window it does not.
+          // Count it: the discarded window never enters totalBilled, so the
+          // reconciliation invariant balances while the total is short.
+          if (billed > 0 && firstSeen === 0) shadowedWindows++;
+          continue;
+        }
         if (billed > 0) evs.push({ k: "turn", billed });
       }
       continue;
@@ -351,6 +390,18 @@ export function auditTranscript(path: string): SessionAudit {
           `not skip past it as if it held nothing.`
       );
     }
+    // A wholly-sidechain file is a spawned subagent's transcript, not an
+    // orchestrator session. Skipping it is right -- this tool measures the
+    // orchestrator's window -- but "nothing to attribute" would be a false
+    // statement about a file full of real subagent spend. Price those with
+    // z-cost instead.
+    if (sidechainUsageLines > 0) {
+      throw new NoUsageLineError(
+        `${path} carries only sidechain (subagent) usage lines -- ${sidechainUsageLines} of them -- and no ` +
+          `orchestrator turn. This tool measures the orchestrator's own window, so there is nothing here for it to ` +
+          `attribute; price subagent transcripts with z-cost.`
+      );
+    }
     throw new NoUsageLineError(`${path} carries no assistant usage line, so there is nothing to attribute.`);
   }
   const totalBilled = windows.reduce((a, b) => a + b, 0);
@@ -398,6 +449,8 @@ export function auditTranscript(path: string): SessionAudit {
     components,
     drainedTickets: [...tickets].sort((a, b) => a - b),
     skippedLines,
+    skippedBeyondFinalLine,
+    shadowedWindows,
   };
 }
 
@@ -424,6 +477,12 @@ export function assertReconciles(components: ComponentSpend[], staticFloorCost: 
 
 export interface Rollup {
   sessions: number;
+  // The UNION of ticket ids across sessions, not the sum of per-session counts.
+  // Summing double-counted every ticket worked across two sessions and made the
+  // headline "accretion per ticket touched" read 1.24x low on this repo's own
+  // corpus (68 summed vs 55 distinct). An array, not a count, so a --json
+  // consumer can audit the set rather than trust the number.
+  drainedTickets: number[];
   // Paths skipped as NoUsageLineError. Named, never just counted: a silently
   // dropped session is spend missing from the totals, and the whole point of
   // this tool is that a number cannot be wrong without saying so.
@@ -432,19 +491,23 @@ export interface Rollup {
   totalBilled: number;
   staticFloorCost: number;
   components: ComponentSpend[];
-  drainedTickets: number;
   skippedLines: number;
+  skippedBeyondFinalLine: number;
+  shadowedWindows: number;
 }
 
 export function rollup(audits: SessionAudit[], unauditable: string[] = []): Rollup {
   const agg = new Map<string, ComponentSpend>();
-  let turns = 0, totalBilled = 0, staticFloorCost = 0, drainedTickets = 0, skippedLines = 0;
+  const tickets = new Set<number>();
+  let turns = 0, totalBilled = 0, staticFloorCost = 0, skippedLines = 0, skippedBeyondFinalLine = 0, shadowedWindows = 0;
   for (const a of audits) {
     turns += a.turns;
     totalBilled += a.totalBilled;
     staticFloorCost += a.staticFloorCost;
-    drainedTickets += a.drainedTickets.length;
+    for (const t of a.drainedTickets) tickets.add(t);
     skippedLines += a.skippedLines;
+    skippedBeyondFinalLine += a.skippedBeyondFinalLine;
+    shadowedWindows += a.shadowedWindows;
     for (const c of a.components) {
       const key = `${c.component}|${c.phase}`;
       const cur = agg.get(key) ?? { component: c.component, phase: c.phase, cost: 0, calls: 0, rawTokens: 0 };
@@ -461,8 +524,10 @@ export function rollup(audits: SessionAudit[], unauditable: string[] = []): Roll
     totalBilled,
     staticFloorCost,
     components: [...agg.values()].sort((a, b) => b.cost - a.cost),
-    drainedTickets,
+    drainedTickets: [...tickets].sort((a, b) => a - b),
     skippedLines,
+    skippedBeyondFinalLine,
+    shadowedWindows,
   };
 }
 
@@ -476,7 +541,24 @@ export function report(r: Rollup, opts: { drainOnly?: boolean } = {}): string {
   out.push(
     `orchestrator context audit -- ${r.sessions} session(s), ${n(r.turns)} turns, ${n(r.totalBilled)} billed input tokens`
   );
-  if (r.skippedLines) out.push(`  (${r.skippedLines} unparseable line(s) skipped -- a live transcript caught mid-write)`);
+  if (r.skippedLines) {
+    // Only claim mid-write when the evidence supports it. A truncation is by
+    // definition the last line of a file, so an unparseable line anywhere else
+    // is corruption, and explaining it away cost the operator the one signal
+    // that some of this session's spend is missing.
+    out.push(
+      r.skippedBeyondFinalLine > 0
+        ? `  (${r.skippedLines} unparseable line(s) skipped, ${r.skippedBeyondFinalLine} of them NOT at end-of-file -- ` +
+            `that is corruption, not a live transcript caught mid-write, and those lines' spend is missing from the totals)`
+        : `  (${r.skippedLines} unparseable line(s) skipped, all at end-of-file -- a live transcript caught mid-write)`
+    );
+  }
+  if (r.shadowedWindows) {
+    out.push(
+      `  (${r.shadowedWindows} response(s) whose first transcript line billed 0 while a later sibling billed more; ` +
+        `first-seen wins, so those windows are NOT in the totals below)`
+    );
+  }
   if (r.unauditable.length > 0) {
     out.push(`  (${r.unauditable.length} session(s) skipped -- no assistant usage line, nothing to attribute:)`);
     // Basenames only while they stay distinct. A sweep across the loop's own
@@ -502,8 +584,10 @@ export function report(r: Rollup, opts: { drainOnly?: boolean } = {}): string {
   const devTotal = r.components.filter((c) => c.phase === "dev").reduce((a, c) => a + c.cost, 0);
   out.push("");
   out.push(`  drain steady-state: ${n(drainTotal)} (${pct(drainTotal)})   operator/dev: ${n(devTotal)} (${pct(devTotal)})`);
-  if (r.drainedTickets > 0) {
-    out.push(`  drain accretion per ticket touched: ${n(drainTotal / r.drainedTickets)} tokens over ${r.drainedTickets} ticket(s)`);
+  if (r.drainedTickets.length > 0) {
+    out.push(
+      `  drain accretion per ticket touched: ${n(drainTotal / r.drainedTickets.length)} tokens over ${r.drainedTickets.length} distinct ticket(s)`
+    );
   }
   return out.join("\n");
 }

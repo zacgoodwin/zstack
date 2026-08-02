@@ -581,12 +581,25 @@ bin/z-context-audit audit --drain-only          # loop steady-state only
 bin/z-context-audit audit --json                # machine-readable
 ```
 
-The orchestrator is where the money is: re-measured 2026-08-01 over this repo's
-session corpus it is **~83% of the loop's billed input tokens** (2.67B, against
-548M for every lane subagent combined). It is one long session that re-sends its
-whole window every turn, so a byte entering early is paid for again on every
-later turn. The audit weights each block by the turns it rides in, which is why
-its ranking differs sharply from a naive byte count.
+The orchestrator is where the money is: **~83% of the loop's billed input
+tokens**, against every lane subagent combined. It is one long session that
+re-sends its whole window every turn, so a byte entering early is paid for again
+on every later turn. The audit weights each block by the turns it rides in,
+which is why its ranking differs sharply from a naive byte count.
+
+Reproduce the ratio rather than trusting the figure. The corpus is a live
+directory that grows every session, so absolutes move between runs; only the
+ratio is stable:
+
+```bash
+# orchestrator side
+bin/z-context-audit audit ~/.claude/projects/<mangled-cwd>/*.jsonl --json | jq .totalBilled
+# lane-subagent side (z-cost, which has always deduped)
+bin/z-cost '~/.zstack/projects/<slug>/loop/transcripts/*/*.jsonl' --json \
+  | jq '[.by_model[].tokens | .fresh_input_tokens + .cached_input_tokens] | add'
+```
+
+On 2026-08-02 that returned 2.67B against 548M.
 
 > Figures published before 2026-08-01 (the earlier "90%, 3.23B" reading) came
 > from the pre-dedup tool, which summed a split response's usage snapshot once
