@@ -193,6 +193,15 @@ bun ~/.claude/skills/zstack/lib/reconcile.ts sweep-review --stale-ms 1000
 That treats any transcript untouched for a second as finished. Do not use it while
 a review is genuinely running: it is the same removal, without the protection.
 
+`--quiet-ms` is the other half of the same gate and carries the same warning. It
+sets the settling window applied to an agent whose transcript already *looks*
+finished (a final answer, no pending tool call) — 15 minutes by default, measured
+rather than picked. `--quiet-ms 0` accepts any such agent immediately, which
+collapses the gate for the population it protects: an agent that narrated and then
+kept working reads as done, and the sweep removes the worktree it is still reading
+from. Reach for `--stale-ms` when you know a session is dead; reach for
+`--quiet-ms` only when you also know nothing is mid-turn.
+
 ## "Rates last checked … over the 14-day limit"
 
 `bin/z-estimate` / `bin/z-cost` warn when `references/rates.json`'s `checked_at`
