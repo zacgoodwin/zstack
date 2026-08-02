@@ -361,40 +361,21 @@ describe("split-response dedup", () => {
     expect(a.totalBilled).toBe(2500);
   });
 
-  // Neither id present: parseLine falls back to a "file:line" key, unique per
-  // line. Every line must still count -- a fallback line is priced once, never
-  // dropped as a phantom duplicate.
-  test("lines carrying neither id are each counted, never collapsed", () => {
-    const bare = (billed: number, text: string) =>
-      JSON.stringify({
-        type: "assistant",
-        message: {
-          role: "assistant",
-          model: "claude-opus-4-20250101",
-          content: [{ type: "text", text }],
-          usage: { input_tokens: 0, output_tokens: 10, cache_read_input_tokens: billed, cache_creation_input_tokens: 0 },
-        },
-      });
-    const a = auditTranscript(write("no-ids.jsonl", [bare(1000, "a"), bare(1000, "b"), bare(1500, "c")]));
-    expect(a.turns).toBe(3);
-    expect(a.totalBilled).toBe(3500);
-  });
+  // SUPERSEDED, deliberately. An earlier round pinned "lines carrying neither
+  // id are each counted, never collapsed", reasoning that parseLine's file:line
+  // fallback must never drop a line. Codex showed the cost of that: with the id
+  // fields gone, every content-block line becomes its own billed response and
+  // the ~1.87x per-line inflation is silently back. Counting each line is only
+  // conservative for z-cost, which prices lines; here it corrupts the total. So
+  // the rule is now "no stable identity is drift", pinned in
+  // "a usage line with neither requestId nor message.id aborts" below.
 
-  // Keys register regardless of `billed`, so the first line of a response wins
-  // even when its snapshot reads 0 and a sibling's does not. costOfFiles
-  // resolves a divergent sibling the same way. Both rest on the empirical fact
-  // that a response's lines repeat one snapshot verbatim, so this pins the
-  // resolution rather than leaving a divergence to shift the totals in silence.
-  test("first-seen snapshot wins when siblings disagree", () => {
-    const p = write("divergent-siblings.jsonl", [
-      split("r1", 0, [{ type: "text", text: "a" }]),
-      split("r1", 1000, [{ type: "text", text: "b" }]),
-      split("r2", 1500, [{ type: "text", text: "." }]),
-    ]);
-    const a = auditTranscript(p);
-    expect(a.turns).toBe(1); // r1's zero snapshot won and carries no window
-    expect(a.totalBilled).toBe(1500);
-  });
+  // SUPERSEDED, deliberately. An earlier round pinned first-wins as the
+  // resolution for divergent siblings, matching costOfFiles. Codex pointed out
+  // that "resolve it quietly" is the wrong call for a tool whose output is a
+  // spending number: the discarded window never enters totalBilled and the
+  // reconciliation invariant balances anyway. Divergence now aborts, pinned in
+  // "siblings disagreeing about billed input abort, in either direction".
 
   // Red team, and the reason the two fixes in this change had to be tested
   // TOGETHER rather than each on its own: first-wins-zero can leave a session
@@ -402,12 +383,14 @@ describe("split-response dedup", () => {
   // sweep's skip would then drop that whole session's spend while reporting the
   // run complete. The two behaviours are individually defensible and jointly a
   // silent subtraction, so this file must never read as an abandoned prompt.
+  // Siblings AGREE at 0 here: a divergence would abort one branch earlier, and
+  // this test is about the branch where every window legitimately reads 0.
   test("real usage lines that all dedup to zero abort rather than skip", () => {
     const p = write("real-but-zero.jsonl", [
       split("r1", 0, [{ type: "text", text: "a" }]),
-      split("r1", 50000, [{ type: "text", text: "b" }]),
+      split("r1", 0, [{ type: "text", text: "b" }]),
       split("r2", 0, [{ type: "text", text: "c" }]),
-      split("r2", 60000, [{ type: "text", text: "d" }]),
+      split("r2", 0, [{ type: "text", text: "d" }]),
     ]);
     expect(() => auditTranscript(p)).toThrow(ZError);
     expect(() => auditTranscript(p)).not.toThrow(NoUsageLineError);
@@ -422,7 +405,7 @@ describe("split-response dedup", () => {
   test("a session with real-but-zero usage is not silently skipped by a sweep", () => {
     const dead = write("sweep-zero.jsonl", [
       split("z1", 0, [{ type: "text", text: "a" }]),
-      split("z1", 50000, [{ type: "text", text: "b" }]),
+      split("z1", 0, [{ type: "text", text: "b" }]),
     ]);
     const alive = write("sweep-alive.jsonl", [
       split("q1", 1000, [{ type: "text", text: "x" }]),
@@ -480,50 +463,76 @@ describe("silently-wrong-number guards", () => {
     expect(report(r)).toContain("3 distinct ticket(s)");
   });
 
-  // First-wins discards a real window when the first line of a response billed
-  // 0. Empirically absent today, which is why it needs a counter rather than a
-  // comment: the discarded window never enters totalBilled, so nothing else sees it.
-  test("a window discarded by first-wins is counted and reported", () => {
-    const a = auditTranscript(
-      write("shadowed.jsonl", [
-        JSON.stringify({
-          type: "assistant",
-          requestId: "s1",
-          message: {
-            role: "assistant",
-            model: "claude-opus-4-20250101",
-            content: [{ type: "text", text: "a" }],
-            usage: { input_tokens: 0, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
-          },
-        }),
-        JSON.stringify({
-          type: "assistant",
-          requestId: "s1",
-          message: {
-            role: "assistant",
-            model: "claude-opus-4-20250101",
-            content: [{ type: "text", text: "b" }],
-            usage: { input_tokens: 0, output_tokens: 1, cache_read_input_tokens: 9000, cache_creation_input_tokens: 0 },
-          },
-        }),
-        assistant(1000, [{ type: "text", text: "." }]),
-        assistant(2000, [{ type: "text", text: "." }]),
-      ])
-    );
-    expect(a.shadowedWindows).toBe(1);
-    expect(a.totalBilled).toBe(3000); // the 9000 window is genuinely absent
-    expect(report(rollup([a]))).toContain("NOT in the totals below");
+  // Dedup is only sound because a response repeats ONE snapshot verbatim on
+  // every content-block line. When siblings disagree, first-wins throws away a
+  // real window, it never enters totalBilled, and the reconciliation invariant
+  // balances regardless because it normalizes onto whatever accretion it got.
+  // So the assumption is asserted. 0 disagreements across 18,340 lines here.
+  const sibling = (req: string, billed: number, text: string) =>
+    JSON.stringify({
+      type: "assistant",
+      requestId: req,
+      message: {
+        role: "assistant",
+        model: "claude-opus-4-20250101",
+        content: [{ type: "text", text }],
+        usage: { input_tokens: 0, output_tokens: 1, cache_read_input_tokens: billed, cache_creation_input_tokens: 0 },
+      },
+    });
+
+  test("siblings disagreeing about billed input abort, in either direction", () => {
+    // zero shadowing a real window
+    const shadow = write("diverge-zero.jsonl", [sibling("s1", 0, "a"), sibling("s1", 9000, "b"), assistant(1000)]);
+    expect(() => auditTranscript(shadow)).toThrow(/disagree about billed input \(0 then 9000\)/);
+    // and positive-to-positive, which a zero-only guard would have missed
+    const posPos = write("diverge-pos.jsonl", [sibling("s2", 1000, "a"), sibling("s2", 9000, "b"), assistant(1000)]);
+    expect(() => auditTranscript(posPos)).toThrow(/disagree about billed input \(1000 then 9000\)/);
+    // The abort is drift, never the sweep-tolerated kind.
+    expect(() => auditTranscript(posPos)).not.toThrow(NoUsageLineError);
   });
 
-  test("no shadowed windows means no such line in the report", () => {
+  test("siblings repeating one snapshot verbatim stay one turn", () => {
     const a = auditTranscript(
-      write("unshadowed.jsonl", [
-        assistant(1000, [{ type: "text", text: "x".repeat(400) }]),
-        assistant(2000, [{ type: "text", text: "." }]),
-      ])
+      write("agree.jsonl", [sibling("s1", 1000, "a"), sibling("s1", 1000, "b".repeat(400)), assistant(2600)])
     );
-    expect(a.shadowedWindows).toBe(0);
-    expect(report(rollup([a]))).not.toContain("NOT in the totals below");
+    expect(a.turns).toBe(2);
+    expect(a.totalBilled).toBe(3600);
+  });
+
+  // Lose the identifier fields and parseLine's file:line fallback makes every
+  // content-block line its own response -- the exact ~1.87x per-line inflation
+  // this module was fixed to remove. z-cost keeps that fallback on purpose;
+  // here it must fail loud.
+  test("a usage line with neither requestId nor message.id aborts", () => {
+    const noId = JSON.stringify({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        model: "claude-opus-4-20250101",
+        content: [{ type: "text", text: "a" }],
+        usage: { input_tokens: 0, output_tokens: 1, cache_read_input_tokens: 1000, cache_creation_input_tokens: 0 },
+      },
+    });
+    expect(() => auditTranscript(write("no-identity.jsonl", [noId]))).toThrow(/neither "requestId" nor "message.id"/);
+  });
+
+  // Rename message.usage and every assistant line goes unrecognized, leaving a
+  // real session looking abandoned -- which a sweep skips at exit 0 with the
+  // whole session's spend missing.
+  test("assistant messages with an unrecognized usage schema abort, not skip", () => {
+    const renamed = JSON.stringify({
+      type: "assistant",
+      requestId: "r1",
+      message: {
+        role: "assistant",
+        model: "claude-opus-4-20250101",
+        content: [{ type: "text", text: "a" }],
+        token_usage: { input_tokens: 5 }, // usage -> token_usage
+      },
+    });
+    const p = write("usage-renamed.jsonl", [renamed, renamed]);
+    expect(() => auditTranscript(p)).toThrow(/carrying no recognized usage object/);
+    expect(() => auditTranscript(p)).not.toThrow(NoUsageLineError); // must not be sweep-skippable
   });
 
   // "Caught mid-write" is a causal claim. A truncation is the LAST line by

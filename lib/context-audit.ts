@@ -41,6 +41,18 @@
 // scaling error cancels in the ratio. Read this output as "which component
 // dominates", never as "component X costs exactly N tokens".
 //
+// A second, smaller bound on the same footing. Within ONE split response, the
+// first line's blocks are weighted across that response's own turn plus every
+// later one, while its sibling lines' blocks are weighted only across later
+// turns -- the turn event is emitted between them. So sibling blocks ride one
+// turn fewer than the first. Two independent reviews measured the effect at
+// ~0.1% of component cost on this machine's corpus (split responses are common,
+// but multi-block LINES are not: 2 of 9,090 responses), far below the chars/4
+// bias above and never enough to reorder the table. Left as a documented bound
+// rather than restructured, because emitting the turn before its content would
+// change the weighting of every single-line response to fix a rounding error in
+// a rare one.
+//
 // -- The invariant that makes the output trustworthy -------------------------
 //
 // staticFloor + sum(components) == totalBilled, asserted on every audit.
@@ -133,12 +145,6 @@ export interface SessionAudit {
   // is by definition the final line, so anything earlier is real corruption and
   // the report must stop explaining it away as a live file caught mid-write.
   skippedBeyondFinalLine: number;
-  // Responses whose first-seen line billed 0 while a later sibling billed more.
-  // First-wins then discards the real window. Empirically 0 across this
-  // machine's corpus, which is exactly why it would go unnoticed the day it
-  // changes -- the reconciliation invariant cannot see a window that never
-  // entered the sum.
-  shadowedWindows: number;
 }
 
 // Markers that identify the z-loop SKILL.md body, which arrives as a user
@@ -212,8 +218,8 @@ export function auditTranscript(path: string): SessionAudit {
   const toolCmd = new Map<string, string>();
   const evs: Ev[] = [];
   const tickets = new Set<number>();
-  // key -> billed of the FIRST line seen for that response, so a later sibling
-  // carrying a real window over a zero first-seen can be counted (shadowedWindows).
+  // key -> billed of the FIRST line seen for that response, so a sibling whose
+  // snapshot disagrees can be caught instead of silently discarded.
   const seenKeys = new Map<string, number>();
   // Counts every real (non-synthetic) assistant usage line seen, whatever it
   // billed and whether or not it deduped away. Distinguishes "this session was
@@ -224,9 +230,9 @@ export function auditTranscript(path: string): SessionAudit {
   // measures the ORCHESTRATOR's window. Counted so a wholly-sidechain file gets
   // an accurate verdict instead of "nothing to attribute", which is false.
   let sidechainUsageLines = 0;
+  let assistantNoUsage = 0;
   let skippedLines = 0;
   let skippedBeyondFinalLine = 0;
-  let shadowedWindows = 0;
   let drainStarted = false;
 
   // Index of the last non-blank line: the only position a mid-write truncation
@@ -254,6 +260,14 @@ export function auditTranscript(path: string): SessionAudit {
       if (parsed && parsed.model !== SYNTHETIC_MODEL) sidechainUsageLines++;
       continue;
     }
+    // parseLine returns null when message.usage is absent. Rename that field
+    // (usage -> token_usage, say) and EVERY assistant line goes null: no
+    // realUsageLines, no windows, and the session reads as abandoned -- which a
+    // sweep then skips at exit 0 with its whole spend missing. Counting the
+    // envelopes separately is what tells "this session never got a reply" apart
+    // from "I stopped recognizing the replies". 0 such envelopes across this
+    // machine's 18,340 assistant usage lines.
+    if (!parsed && j.message?.role === "assistant" && j.message?.usage === undefined) assistantNoUsage++;
 
     if (j.attachment?.type === "skill_listing") {
       evs.push({ k: "content", component: "skillListing", tokens: String(j.attachment.content ?? "").length / 4, phase: drainStarted ? "drain" : "dev" });
@@ -320,14 +334,40 @@ export function auditTranscript(path: string): SessionAudit {
         // divergence would fail a gate rather than silently shift the totals.
         const u = parsed.usage;
         const billed = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
+        // A usage-bearing line with NEITHER requestId nor message.id has no
+        // stable response identity, and parseLine's last-resort key is
+        // "file:line" -- unique per line, which silently restores the exact
+        // per-line overcounting this module was fixed to remove. z-cost keeps
+        // that fallback deliberately (pricing a line once is a conservative
+        // overcount there); here it is the bug, so it fails loud instead. 0 of
+        // 18,340 non-sidechain usage lines on this machine lack both ids.
+        if (parsed.dedupKeys.length === 1 && parsed.dedupKeys[0] === `${path}:${i + 1}`) {
+          throw new ZError(
+            `${path}:${i + 1}: assistant usage line carries neither "requestId" nor "message.id", so this response ` +
+              `has no stable identity to dedup on. Counting it per line is how a split response gets billed once per ` +
+              `content block -- the ~1.87x inflation this tool exists to remove -- so this is format drift, not data.`
+          );
+        }
         const firstSeen = parsed.dedupKeys.map((k) => seenKeys.get(k)).find((v) => v !== undefined);
         const duplicate = firstSeen !== undefined;
         for (const k of parsed.dedupKeys) if (!seenKeys.has(k)) seenKeys.set(k, billed);
         if (duplicate) {
-          // The first line won, but this sibling carries a window it does not.
-          // Count it: the discarded window never enters totalBilled, so the
-          // reconciliation invariant balances while the total is short.
-          if (billed > 0 && firstSeen === 0) shadowedWindows++;
+          // Dedup is only sound because a response's lines repeat ONE snapshot
+          // verbatim. When two lines of the same response disagree, first-wins
+          // discards a real window, it never enters totalBilled, and the
+          // reconciliation invariant balances anyway because it normalizes onto
+          // whatever accretion it was handed. So the assumption is asserted
+          // rather than assumed: 0 disagreements across 18,340 lines here, and
+          // lib/cost.ts records the same for its corpus. Any disagreement at
+          // all -- not just a zero shadowing a real window -- is drift.
+          if (firstSeen !== billed) {
+            throw new ZError(
+              `${path}:${i + 1}: two lines of one API response disagree about billed input (${firstSeen} then ` +
+                `${billed}). Dedup assumes a response repeats one usage snapshot verbatim on every content-block ` +
+                `line; if that stopped holding, first-wins would drop a real window from the totals without the ` +
+                `reconciliation invariant noticing.`
+            );
+          }
           continue;
         }
         if (billed > 0) evs.push({ k: "turn", billed });
@@ -395,6 +435,13 @@ export function auditTranscript(path: string): SessionAudit {
     // orchestrator's window -- but "nothing to attribute" would be a false
     // statement about a file full of real subagent spend. Price those with
     // z-cost instead.
+    if (assistantNoUsage > 0) {
+      throw new ZError(
+        `${path} holds ${assistantNoUsage} assistant message(s) carrying no recognized usage object. A session that ` +
+          `got real replies is not an abandoned one, so this is a usage-schema change, not an empty transcript -- ` +
+          `and skipping it would drop the whole session's spend from a sweep at exit 0.`
+      );
+    }
     if (sidechainUsageLines > 0) {
       throw new NoUsageLineError(
         `${path} carries only sidechain (subagent) usage lines -- ${sidechainUsageLines} of them -- and no ` +
@@ -450,7 +497,6 @@ export function auditTranscript(path: string): SessionAudit {
     drainedTickets: [...tickets].sort((a, b) => a - b),
     skippedLines,
     skippedBeyondFinalLine,
-    shadowedWindows,
   };
 }
 
@@ -493,13 +539,12 @@ export interface Rollup {
   components: ComponentSpend[];
   skippedLines: number;
   skippedBeyondFinalLine: number;
-  shadowedWindows: number;
 }
 
 export function rollup(audits: SessionAudit[], unauditable: string[] = []): Rollup {
   const agg = new Map<string, ComponentSpend>();
   const tickets = new Set<number>();
-  let turns = 0, totalBilled = 0, staticFloorCost = 0, skippedLines = 0, skippedBeyondFinalLine = 0, shadowedWindows = 0;
+  let turns = 0, totalBilled = 0, staticFloorCost = 0, skippedLines = 0, skippedBeyondFinalLine = 0;
   for (const a of audits) {
     turns += a.turns;
     totalBilled += a.totalBilled;
@@ -507,7 +552,6 @@ export function rollup(audits: SessionAudit[], unauditable: string[] = []): Roll
     for (const t of a.drainedTickets) tickets.add(t);
     skippedLines += a.skippedLines;
     skippedBeyondFinalLine += a.skippedBeyondFinalLine;
-    shadowedWindows += a.shadowedWindows;
     for (const c of a.components) {
       const key = `${c.component}|${c.phase}`;
       const cur = agg.get(key) ?? { component: c.component, phase: c.phase, cost: 0, calls: 0, rawTokens: 0 };
@@ -527,7 +571,6 @@ export function rollup(audits: SessionAudit[], unauditable: string[] = []): Roll
     drainedTickets: [...tickets].sort((a, b) => a - b),
     skippedLines,
     skippedBeyondFinalLine,
-    shadowedWindows,
   };
 }
 
@@ -551,12 +594,6 @@ export function report(r: Rollup, opts: { drainOnly?: boolean } = {}): string {
         ? `  (${r.skippedLines} unparseable line(s) skipped, ${r.skippedBeyondFinalLine} of them NOT at end-of-file -- ` +
             `that is corruption, not a live transcript caught mid-write, and those lines' spend is missing from the totals)`
         : `  (${r.skippedLines} unparseable line(s) skipped, all at end-of-file -- a live transcript caught mid-write)`
-    );
-  }
-  if (r.shadowedWindows) {
-    out.push(
-      `  (${r.shadowedWindows} response(s) whose first transcript line billed 0 while a later sibling billed more; ` +
-        `first-seen wins, so those windows are NOT in the totals below)`
     );
   }
   if (r.unauditable.length > 0) {
@@ -732,6 +769,17 @@ export function main(argv: string[]): number {
       );
     }
     const r = rollup(audits, unauditable);
+    // Mid-file corruption does NOT abort: one bad line in one of 90 sessions
+    // must not take the sweep with it, which is this command's whole point. But
+    // a --json caller pipes stdout and never sees the report's warning line, so
+    // the same fact goes to stderr too. `skippedBeyondFinalLine` is in the JSON
+    // as well, for a caller that checks rather than reads.
+    if (r.skippedBeyondFinalLine > 0) {
+      console.error(
+        `context-audit: ${r.skippedBeyondFinalLine} unparseable line(s) sit BEFORE end-of-file, so they are ` +
+          `corruption rather than a live transcript caught mid-write. Their spend is missing from the totals below.`
+      );
+    }
     if (flags["json"]) {
       console.log(JSON.stringify(r, null, 2));
       return 0;
