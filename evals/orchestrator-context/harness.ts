@@ -20,7 +20,10 @@ import {
   type Stage,
   type TicketSnapshot,
 } from "../../lib/loop.ts";
-import { builderPrompt, mergePrompt, qaPrompt, reviewerPrompt } from "../../lib/stage-prompts.ts";
+import { builderPrompt, mergePrompt, qaPrompt, reviewerPrompt, spawnStub } from "../../lib/stage-prompts.ts";
+
+// A representative ABSOLUTE prompt path, the shape z-loop writes per ticket.
+const PROMPT_PATH = "/home/dev/.zstack/projects/demo/loop/tmp/prompt-1.txt";
 
 // A representative ABSOLUTE input path, the shape z-loop writes per ticket.
 const INPUT_PATH = "/home/dev/.zstack/projects/demo/loop/tmp/input-1.json";
@@ -88,6 +91,14 @@ function afterPromptBytes(stage: Stage, p: Payloads): number {
 // immaterial to a >=60% ratio, and conservative if anything.
 function baselinePromptBytes(stage: Stage, p: Payloads): number {
   return afterPromptBytes(stage, p) + payloadBytes(stage, p);
+}
+
+// Leak 3: what the orchestrator holds per spawn AFTER the stub change. #57 made
+// this number independent of the PAYLOAD; the stub makes it independent of the
+// PROMPT too, so it is a function of the stage name and the path alone. This is
+// the flat line the whole exercise is chasing.
+function stubPromptBytes(stage: Stage): number {
+  return spawnStub(stage, PROMPT_PATH).length;
 }
 
 // Leak 2: the per-iteration bash the orchestrator re-reads every tick. Baseline
@@ -164,32 +175,58 @@ export interface Measurement {
   iterations: number;
   baselineTotal: number;
   afterTotal: number;
+  stubTotal: number;
   baselinePerTicket: number;
   afterPerTicket: number;
+  stubPerTicket: number;
   reductionPct: number;
+  stubReductionPct: number; // stub vs the #57 pointer-prompt state, not vs baseline
 }
 
 export const THRESHOLD_PCT = 60;
+// The stub must cut the REMAINING per-spawn prompt text by most of its bulk.
+// Calibrated against THIS fixture, not against production: the synthetic
+// prompts here average ~1.85 KB where real drains measured ~2.87 KB, so the
+// fixture is the harder case and clears 60% with ~14 points of headroom (real
+// prompts clear it with ~27). A tighter 70% sat 0.1 points above the fixture's
+// actual number -- a gate that a one-sentence prompt edit would flip, which
+// measures wording, not the property. What 60% still catches is the only
+// regression worth catching: a stub that has grown back into a copy of the
+// prompt it points at.
+export const STUB_THRESHOLD_PCT = 60;
 
 export function measure(nTickets: number, p: Payloads = defaultPayloads()): Measurement {
   const { spawns, iterations, ticketsDrained } = simulateDrain(nTickets);
   let baselineTotal = 0;
   let afterTotal = 0;
+  let stubTotal = 0;
+  let promptOnlyAfter = 0; // prompt bytes only, for the stub-vs-after ratio
+  let promptOnlyStub = 0;
   for (const sp of spawns) {
     baselineTotal += baselinePromptBytes(sp.stage, p);
     afterTotal += afterPromptBytes(sp.stage, p);
+    promptOnlyAfter += afterPromptBytes(sp.stage, p);
+    promptOnlyStub += stubPromptBytes(sp.stage);
+    stubTotal += stubPromptBytes(sp.stage);
   }
   baselineTotal += iterations * BASELINE_TICK.length;
   afterTotal += iterations * AFTER_TICK.length;
+  stubTotal += iterations * AFTER_TICK.length;
   return {
     ticketsDrained,
     spawns: spawns.length,
     iterations,
     baselineTotal,
     afterTotal,
+    stubTotal,
     baselinePerTicket: baselineTotal / ticketsDrained,
     afterPerTicket: afterTotal / ticketsDrained,
+    stubPerTicket: stubTotal / ticketsDrained,
     reductionPct: (1 - afterTotal / baselineTotal) * 100,
+    // Ratio over PROMPT bytes alone: the tick text is identical in both states,
+    // so including it would dilute the number the stub is actually responsible
+    // for and let a regression hide behind a constant.
+    stubReductionPct: (1 - promptOnlyStub / promptOnlyAfter) * 100,
   };
 }
 
@@ -199,9 +236,11 @@ export function report(m: Measurement): string {
     `orchestrator-context drain eval (synthetic ${m.ticketsDrained}-ticket happy-path drain)`,
     `  stage spawns: ${m.spawns}   drain ticks (next calls): ${m.iterations}`,
     `  baseline per-ticket: ${m.baselinePerTicket.toFixed(0)} chars (~${tok(m.baselinePerTicket)} tok)  <- recorded ceiling`,
-    `  after    per-ticket: ${m.afterPerTicket.toFixed(0)} chars (~${tok(m.afterPerTicket)} tok)`,
-    `  reduction: ${m.reductionPct.toFixed(1)}%   (threshold >= ${THRESHOLD_PCT}%)`,
-    `  VERDICT: ${m.reductionPct >= THRESHOLD_PCT ? "PASS" : "FAIL"}`,
+    `  after    per-ticket: ${m.afterPerTicket.toFixed(0)} chars (~${tok(m.afterPerTicket)} tok)  <- #57 pointer prompts`,
+    `  stub     per-ticket: ${m.stubPerTicket.toFixed(0)} chars (~${tok(m.stubPerTicket)} tok)  <- + spawn stubs`,
+    `  reduction vs baseline: ${m.reductionPct.toFixed(1)}%   (threshold >= ${THRESHOLD_PCT}%)`,
+    `  stub reduction of remaining prompt bytes: ${m.stubReductionPct.toFixed(1)}%   (threshold >= ${STUB_THRESHOLD_PCT}%)`,
+    `  VERDICT: ${m.reductionPct >= THRESHOLD_PCT && m.stubReductionPct >= STUB_THRESHOLD_PCT ? "PASS" : "FAIL"}`,
   ].join("\n");
 }
 
@@ -209,7 +248,7 @@ export function main(argv: string[]): number {
   const n = Number(argv[0] ?? "6");
   const m = measure(Number.isFinite(n) && n > 0 ? Math.floor(n) : 6);
   console.log(report(m));
-  return m.reductionPct >= THRESHOLD_PCT ? 0 : 1;
+  return m.reductionPct >= THRESHOLD_PCT && m.stubReductionPct >= STUB_THRESHOLD_PCT ? 0 : 1;
 }
 
 if (import.meta.main) process.exit(main(process.argv.slice(2)));

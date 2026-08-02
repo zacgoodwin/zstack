@@ -20,6 +20,8 @@ import {
   ADVERSARIAL_TRIGGER_LABELS,
   REVIEWER_INPUT_KEYS,
   SPAWN_TAG_MARKER,
+  STAGES,
+  spawnStub,
   type BuilderPromptInput,
   type CompletionEdge,
   type CompletionNoteInput,
@@ -709,5 +711,71 @@ describe("stage-prompts CLI", () => {
     const bad = run("prompt", "reviewer", leaky, "--spawn-tag", "zs-000102030405");
     expect(bad.exitCode).toBe(1);
     expect(bad.stderr.toString()).toContain("blinded by design");
+  });
+});
+
+// -- spawn stub (Leak 3) ------------------------------------------------------
+
+// The property that makes the stub worth having: the orchestrator's per-spawn
+// context cost stops tracking the prompt's size. If these ever start covarying,
+// the stub has silently regressed into a second copy of the prompt.
+describe("spawnStub", () => {
+  const dir = mkdtempSync(join(tmpdir(), "zstack-stub-test-"));
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+  const SP = join(REPO_ROOT, "lib", "stage-prompts.ts");
+  const run = (...args: string[]) => Bun.spawnSync(["bun", SP, ...args], { stdout: "pipe", stderr: "pipe" });
+
+  test("stub length is invariant to the prompt file's size", () => {
+    const p = "/abs/loop/tmp/prompt-1.txt";
+    // Same stage, same path, wildly different prompts on disk -> identical stub.
+    // spawnStub never reads the file, which is the structural reason this holds.
+    for (const stage of STAGES) {
+      const a = spawnStub(stage, p);
+      const b = spawnStub(stage, p);
+      expect(a).toBe(b);
+      // and it stays far below a real stage prompt (~2.9 KB measured)
+      expect(a.length).toBeLessThan(700);
+    }
+  });
+
+  test("stub names the ABSOLUTE prompt path, twice: instruction and BLOCKED fallback", () => {
+    const p = "/abs/loop/tmp/prompt-42.txt";
+    const s = spawnStub("builder", p);
+    expect(isAbsolute(p)).toBe(true);
+    expect(s).toContain(`\n${p}\n`);
+    // The fallback must be a marker lib/loop.ts already parses, carrying the
+    // path, so an unreadable prompt parks the lane loudly instead of wedging it.
+    expect(s).toContain(`BLOCKED: could not read stage prompt at ${p}`);
+  });
+
+  test("stub identifies its stage and carries the spawn tag as its first line", () => {
+    const TAG = "zs-0a1b2c3d4e5f";
+    for (const stage of STAGES) {
+      const tagged = spawnStub(stage, "/abs/p.txt", TAG);
+      expect(tagged.split("\n")[0]).toContain(`${SPAWN_TAG_MARKER} ${TAG}`);
+      expect(tagged).toContain(`You are the ${stage.toUpperCase()} stage`);
+      // Additive, exactly like the prompt stamp: strip line 1 and they agree.
+      expect(tagged.split("\n").slice(1).join("\n")).toBe(spawnStub(stage, "/abs/p.txt"));
+    }
+  });
+
+  test("CLI stub resolves a relative path and refuses an unreadable prompt", () => {
+    const file = join(dir, "prompt-7.txt");
+    writeFileSync(file, "PROMPT BODY\n".repeat(400));
+    const ok = run("stub", "qa", file);
+    expect(ok.exitCode).toBe(0);
+    const out = ok.stdout.toString();
+    expect(out).toContain(file);
+    // The 4.8 KB prompt must NOT be echoed into the stub.
+    expect(out).not.toContain("PROMPT BODY");
+    expect(out.length).toBeLessThan(700);
+
+    const missing = run("stub", "qa", join(dir, "does-not-exist.txt"));
+    expect(missing.exitCode).toBe(1);
+    expect(missing.stderr.toString()).toContain("Cannot read stage prompt at");
+
+    const badStage = run("stub", "nope", file);
+    expect(badStage.exitCode).toBe(1);
+    expect(badStage.stderr.toString()).toContain('Unknown stage "nope"');
   });
 });

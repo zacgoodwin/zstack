@@ -392,8 +392,19 @@ the input file, never through your context; ticket #57, Leak 1):
 
    ```bash
    TAG=$(bun "$PACK/lib/transcripts.ts" tag --slug "$SLUG" --ticket <N> --stage <stage> --attempt <attempt>)
-   bun "$PACK/lib/stage-prompts.ts" prompt <stage> "$TMP/input-<N>.json" --spawn-tag "$TAG" > "$TMP/prompt-<N>.txt"
+   bun "$PACK/lib/stage-prompts.ts" prompt <stage> "$TMP/input-<N>.json" > "$TMP/prompt-<N>.txt"
+   STUB=$(bun "$PACK/lib/stage-prompts.ts" stub <stage> "$TMP/prompt-<N>.txt" --spawn-tag "$TAG")
    ```
+
+   **Never read `prompt-<N>.txt` yourself, and never pass its contents to the
+   Agent.** `$STUB` is a ~480-byte pointer at that file and is the ONLY thing
+   that goes into the spawn. The prompt averages ~2.9 KB, and anything you read
+   or send stays in your window for the rest of the drain, so reading it back
+   cost ~8% of all orchestrator tokens across 35 measured drains for text you
+   never reason about. `stub` fails loudly if the prompt file is missing, which
+   is why step 2 writes it first. `--spawn-tag` moves to `stub` because the stub,
+   not the prompt, is now the worker's first message and that is where
+   `transcripts collect` looks for the marker.
 
    The tag is an opaque digest of those four facts and nothing else, so it is
    **recomputable** — the per-stage Actual step below re-runs the identical `tag`
@@ -403,8 +414,9 @@ the input file, never through your context; ticket #57, Leak 1):
 
    The constructor prints a POINTER prompt: small/fixed fields inline plus an
    instruction to read `ticketBody`/`diff`/`acceptanceCriteria` from the
-   ABSOLUTE path of `input-<N>.json`. `prompt-<N>.txt` stays small (payload-
-   independent), so reading it to spawn the Agent is cheap. The constructor is the
+   ABSOLUTE path of `input-<N>.json`, so `prompt-<N>.txt` is payload-independent.
+   The stub above then makes your own context prompt-independent too. The
+   constructor is the
    contract; if it exits non-zero the input is wrong, fix the input, never
    hand-write the prompt. The `reviewer` stage additionally takes two flags
    (`--adversarial-mode`, `--labels`) — see its row below. All three ride as
@@ -412,8 +424,8 @@ the input file, never through your context; ticket #57, Leak 1):
    untouched (the tag is a digest for that reason too: a readable
    `<slug>/t<n>/<stage>/<attempt>` would tell the reviewer which review attempt
    this is).
-3. Spawn a FRESH harness Agent (Agent tool), `run_in_background: true`, with
-   that prompt and `model` resolved through the per-stage router (issue #82:
+3. Spawn a FRESH harness Agent (Agent tool), `run_in_background: true`, passing
+   `$STUB` as the prompt and `model` resolved through the per-stage router (issue #82:
    the merge stage is mechanical — a PR create, a conflict check, a PR merge —
    and never needs the ticket's build-tier model, a direct, zero-quality-risk
    cost cut):
@@ -434,7 +446,7 @@ the input file, never through your context; ticket #57, Leak 1):
 |---|---|
 | `builder` | `ticketNumber`, `ticketTitle`, `ticketBody` (fresh `gh issue view` → `"$TMP/body-<N>.md"`, injected `--rawfile`), `worktreePath` (`.worktrees/ticket-<N>`), `branch`, `baseBranch`; on a bounce also `qaNotes`/`investigateFirst`, `reviewNotes`, or `commitNotes` per the advance row above. |
 | `qa` | `ticketNumber`, `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `worktreePath`, `branch`, `qaPass` (the lane's `qaBounces` in the state file + 1), `webTarget` (true when the ticket changes a web-served surface — your judgment; QA then drives gstack /qa). |
-| `reviewer` | **BLINDED — exactly** `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `acceptanceCriteria` (the `### Acceptance Criteria` section to a file: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$TMP/body-<N>.md" > "$TMP/ac-<N>.md"`, injected `--rawfile`), `diff` (exclude lockfiles to avoid flooding the reviewer with generated code: `git -C .worktrees/ticket-<N> diff "$BASE"...HEAD -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)pnpm-lock.yaml' ':(exclude)yarn.lock' > "$TMP/diff-<N>.txt"`; if the filtered diff is empty — a lockfile-only change — fall back to the unfiltered diff: `[ ! -s "$TMP/diff-<N>.txt" ] && git -C .worktrees/ticket-<N> diff "$BASE"...HEAD > "$TMP/diff-<N>.txt"`. Injected `--rawfile` so it never enters your context), `worktreePath` = a THROWAWAY worktree of the head commit, placed under the repo's own `.worktrees/` — NEVER under `$TMP` / `~/.zstack` (issue #118: the reviewer runs the full `bun test` suite in this worktree, and several tests write to/delete real `~/.zstack` subtrees via `homedir()`; a throwaway worktree rooted there lets that suite's cleanup destroy the loop's own live state.json/locks/transcripts mid-run) — `git worktree add ".worktrees/review-<N>" <head-sha>`; remove it after the stage (`git worktree remove ".worktrees/review-<N>" --force`). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. **Adversarial control (#59):** build this stage's prompt with two extra flags — `MODE=$("$Z_BOARD" ... )` the project's `adversarialMode` (read it from `~/.zstack/projects/$SLUG/config.json`; `loadConfig` defaults it to `non-trivial`) and `LABELS=$(gh issue view <N> --json labels -q '[.labels[].name]')` (a JSON array — labels live on the GitHub issue, NOT on the board item, so `board.list` never fetched them; get them here). Then `bun "$PACK/lib/stage-prompts.ts" prompt reviewer "$TMP/input-<N>.json" --adversarial-mode "$MODE" --labels "$LABELS" --spawn-tag "$TAG" > "$TMP/prompt-<N>.txt"` (`--spawn-tag` per step 1b — required here like every other stage, and #190's skeptic transcripts are the reason it exists at all). The predicate (`adversarialActive`) reads the diff's own changed-line count from the blinded input — `always`/`non-trivial`-on-a-big-or-labeled diff spawns the skeptic fan-out (and stamps a `confidence=` token onto `REVIEW-FINDINGS` too); `off`/small-unlabeled is the single pass. Either way `REVIEW-APPROVE` always carries a `confidence=` token (issue #62's safety gate reads it regardless) — see `/z-loop`'s reviewer-confidence-gate section for what a sub-floor score does. Mode + labels ride as FLAGS; the four-key input JSON is untouched. |
+| `reviewer` | **BLINDED — exactly** `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `acceptanceCriteria` (the `### Acceptance Criteria` section to a file: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$TMP/body-<N>.md" > "$TMP/ac-<N>.md"`, injected `--rawfile`), `diff` (exclude lockfiles to avoid flooding the reviewer with generated code: `git -C .worktrees/ticket-<N> diff "$BASE"...HEAD -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)pnpm-lock.yaml' ':(exclude)yarn.lock' > "$TMP/diff-<N>.txt"`; if the filtered diff is empty — a lockfile-only change — fall back to the unfiltered diff: `[ ! -s "$TMP/diff-<N>.txt" ] && git -C .worktrees/ticket-<N> diff "$BASE"...HEAD > "$TMP/diff-<N>.txt"`. Injected `--rawfile` so it never enters your context), `worktreePath` = a THROWAWAY worktree of the head commit, placed under the repo's own `.worktrees/` — NEVER under `$TMP` / `~/.zstack` (issue #118: the reviewer runs the full `bun test` suite in this worktree, and several tests write to/delete real `~/.zstack` subtrees via `homedir()`; a throwaway worktree rooted there lets that suite's cleanup destroy the loop's own live state.json/locks/transcripts mid-run) — `git worktree add ".worktrees/review-<N>" <head-sha>`; remove it after the stage (`git worktree remove ".worktrees/review-<N>" --force`). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. **Adversarial control (#59):** build this stage's prompt with two extra flags — `MODE=$("$Z_BOARD" ... )` the project's `adversarialMode` (read it from `~/.zstack/projects/$SLUG/config.json`; `loadConfig` defaults it to `non-trivial`) and `LABELS=$(gh issue view <N> --json labels -q '[.labels[].name]')` (a JSON array — labels live on the GitHub issue, NOT on the board item, so `board.list` never fetched them; get them here). Then `bun "$PACK/lib/stage-prompts.ts" prompt reviewer "$TMP/input-<N>.json" --adversarial-mode "$MODE" --labels "$LABELS" > "$TMP/prompt-<N>.txt"`, followed by the same `stub reviewer "$TMP/prompt-<N>.txt" --spawn-tag "$TAG"` every other stage runs (`--spawn-tag` rides on the stub per step 1b — required here like every other stage, and #190's skeptic transcripts are the reason it exists at all). The predicate (`adversarialActive`) reads the diff's own changed-line count from the blinded input — `always`/`non-trivial`-on-a-big-or-labeled diff spawns the skeptic fan-out (and stamps a `confidence=` token onto `REVIEW-FINDINGS` too); `off`/small-unlabeled is the single pass. Either way `REVIEW-APPROVE` always carries a `confidence=` token (issue #62's safety gate reads it regardless) — see `/z-loop`'s reviewer-confidence-gate section for what a sub-floor score does. Mode + labels ride as FLAGS; the four-key input JSON is untouched. |
 | `merge` | `ticketNumber`, `prTitle` (the ticket title), `branch`, `baseBranch`, `worktreePath`, `stackedOn` (from the advance action — parents whose branches this PR stacks on; the prompt carries the PROCESS.md step 18 chain rules: parents first, no branch deletion mid-batch, retarget, delete last). |
 
 **Per-stage Actual (every stage, no exceptions):** when a stage agent finishes,
