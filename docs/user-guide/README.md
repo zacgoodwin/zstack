@@ -480,4 +480,5 @@ Also on disk:
 [troubleshooting.md](troubleshooting.md) covers the deliberate stops: the gh
 `project` scope failure, the two "refuses to start" messages and when
 `--reconcile` is the answer, the stale-rates warning, the corrupt loop counter,
-the auto-approvals straggler session, and why Done tickets stay open.
+the auto-approvals straggler session, why Done tickets stay open, and the
+transcript-format aborts that make `z-context-audit` refuse to print a number.

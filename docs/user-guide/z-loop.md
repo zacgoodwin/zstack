@@ -644,6 +644,34 @@ other component by ~1.9x. A component set that fails to reconcile is a bug in
 `lib/context-audit.ts`, never a finding about the loop, and it throws rather
 than printing.
 
+### The `--json` rollup
+
+`--json` prints the rollup object in place of the table: `sessions`, `turns`,
+`totalBilled`, `staticFloorCost`, and `components` (each `{component, phase,
+cost, calls, rawTokens}`, sorted by cost). It is the unfiltered set — the table
+drops rows under 0.02% and obeys `--drain-only`, the JSON does neither. Four
+more fields exist so a caller can tell a complete run from a partial one:
+
+- `drainedTickets` — the sorted **union** of ticket ids the drain touched. Two
+  sessions that both worked #201 contribute one id, not two.
+- `unauditable` — the paths a sweep skipped. Named, never merely counted: a
+  dropped session is spend missing from the totals.
+- `skippedLines` / `skippedBeyondFinalLine` — unparseable transcript lines, and
+  how many of those sat somewhere other than end-of-file. All-at-EOF is a live
+  transcript caught mid-write. Anything beyond it is corruption, those lines'
+  spend is missing from the numbers, and the run says so on stderr too, since a
+  `--json` caller never sees the report's warning.
+
+```bash
+bin/z-context-audit audit '<glob>' --json \
+  | jq '{tickets: (.drainedTickets | length), skipped: .unauditable, corrupt: .skippedBeyondFinalLine}'
+```
+
+> **Contract change in 1.0.1.0.** `drainedTickets` used to be a count and is now
+> an array of ids. `.drainedTickets | length` gives the old number back, but not
+> the old value: the count summed per session and double-counted any ticket two
+> sessions touched.
+
 ## --reconcile (crash recovery)
 
 A crashed loop leaves lane locks, stray worktrees, or Building tickets with no
