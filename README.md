@@ -1,4 +1,4 @@
-# zstack: The Part Gary Forgot
+# z-stack: The Part Gary Forgot
 
 zstack came about for two reason: 
 1. I am poor (but if you want to fix that Mr. Tan....). gstack is great at making a robust design but once I asked claude to "Make the thing" my usage shot through the roof.
