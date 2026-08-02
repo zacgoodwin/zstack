@@ -452,7 +452,10 @@ const ABSOLUTE_PATTERN = /^(?:[a-zA-Z]:[\\/]|[\\/])/; // POSIX "/..." or Windows
 // transcripts always live under the user's home directory -- so UNC patterns
 // are refused outright instead.
 const UNC_PATTERN = /^[\\/]{2}/;
-const GLOB_META = /[*?[\]{}]/;
+// Exported: lib/context-audit.ts classifies a positional as a glob (a corpus
+// sweep) with the SAME test expandGlob splits on. Two copies could drift into a
+// pattern that gets globbed without being treated as a sweep, or the reverse.
+export const GLOB_META = /[*?[\]{}]/;
 
 // Splits an absolute pattern into { prefix, rest } where `prefix` has no glob
 // metacharacter in any segment and `rest` is the (relative) remainder handed
@@ -478,7 +481,9 @@ export function expandGlob(pattern: string, cwd: string = process.cwd()): string
   if (ABSOLUTE_PATTERN.test(pattern)) {
     if (UNC_PATTERN.test(pattern)) {
       throw new ZError(
-        `UNC patterns (\\\\server\\share\\...) are not supported by z-cost; use a mapped drive letter or a local path. Got: "${pattern}"`
+        // expandGlob is shared by z-cost and z-context-audit, so the message
+        // names neither -- it used to blame z-cost from inside an audit run.
+        `UNC patterns (\\\\server\\share\\...) are not supported; use a mapped drive letter or a local path. Got: "${pattern}"`
       );
     }
     const split = splitAbsoluteGlob(pattern);

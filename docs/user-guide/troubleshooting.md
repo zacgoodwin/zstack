@@ -114,6 +114,49 @@ is more than 14 days old. The dollar figures are still computed, but the publish
 model prices may have moved. Verify current rates and update `references/rates.json`
 (bump `checked_at` to today). The warning is a nudge, not a hard stop.
 
+## `z-context-audit` aborts instead of printing a number
+
+The audit exists to produce a figure you can act on, so it refuses to print one
+it cannot stand behind. Each message below stops the whole run — a sweep reports
+nothing rather than a rollup that quietly understates the corpus, and names how
+far it got first (`aborted on <path> (file 12 of 91; 11 audited cleanly before
+it)`). None of them are input you can fix by retrying: each says the transcript
+format moved under an assumption the arithmetic rests on, so the fix is in
+`lib/context-audit.ts`, not in your invocation. File it.
+
+- **"two lines of one API response disagree about billed input"** — dedup keeps
+  the first usage snapshot a response shows, which is only sound because Claude
+  Code repeats one snapshot verbatim on every content-block line of that
+  response. Zero disagreements when it was measured across this machine's 18,340
+  lines, which is exactly why it would go unnoticed the day it changed.
+- **"assistant usage line carries neither `requestId` nor `message.id`"** — with
+  no stable response id, dedup falls back to a file-and-line key, which is
+  unique per line and restores the ~1.87x per-block overcount dedup removes.
+- **"carries N assistant usage line(s), but none yielded a billable window"** —
+  the usage lines are there, but each reads 0 or dedups into one that does. That
+  is spend the tool cannot read; skipping it would drop a session at exit 0.
+- **"holds N assistant message(s) carrying no recognized usage object"** — a
+  session that got real replies, so this reads as a usage-schema rename rather
+  than an empty transcript.
+- **"has no parseable line at all (N skipped)"** — corruption. A transcript
+  caught mid-write still leaves the earlier complete lines behind.
+
+Two neighboring messages are *not* format drift:
+
+- **"carries no assistant usage line, so there is nothing to attribute"** — an
+  abandoned prompt. A sweep (several paths, or any glob) skips it and lists it
+  under `unauditable`; one literal path is a question about that file, so there
+  it is an error. A wholly-sidechain transcript reads the same way — that is a
+  subagent's window, not the orchestrator's; price those with `bin/z-cost`.
+- **"No files matched …"** — the glob expanded to nothing, usually a mistyped
+  extension or directory. Quote the pattern so your shell doesn't expand it
+  first, and note that a path that exists on disk is always treated as a literal
+  even when its name contains `*`, `?`, or brackets.
+
+Mid-file corruption warns rather than aborts: `N unparseable line(s) sit BEFORE
+end-of-file` goes to stderr and `skippedBeyondFinalLine` into `--json`. The
+rollup still prints, short by whatever those lines held.
+
 ## "Loop counter … is corrupt"
 
 `~/.zstack/projects/<slug>/loop-counter` must be a single non-negative integer. If

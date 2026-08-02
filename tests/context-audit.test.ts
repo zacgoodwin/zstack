@@ -8,10 +8,17 @@
 // shapes a transcript can use, and the drain/dev separation -- the three places
 // a silent attribution error can hide.
 import { test, expect, describe, afterAll } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { auditTranscript, assertReconciles, rollup, type ComponentSpend } from "../lib/context-audit.ts";
+import {
+  auditTranscript,
+  assertReconciles,
+  NoUsageLineError,
+  report,
+  rollup,
+  type ComponentSpend,
+} from "../lib/context-audit.ts";
 import { SYNTHETIC_MODEL } from "../lib/cost.ts";
 import { ZError } from "../lib/config.ts";
 
@@ -250,6 +257,332 @@ describe("turn weighting", () => {
   });
 });
 
+// -- split-response dedup ------------------------------------------------------
+
+// Claude Code writes one transcript line per content block, and every line of a
+// split response repeats that response's usage snapshot verbatim. Counting the
+// window per LINE prices one API call once per block. The reconciliation
+// invariant cannot catch it -- floor and components inflate together, so the
+// audit still balances at ~2x (measured 1.87x over an 88-session corpus:
+// 17,693 usage lines / 8,839 unique responses). Only these tests pin it.
+describe("split-response dedup", () => {
+  // Same requestId across two lines, DISTINCT content on each -- the real shape
+  // (5,076 of 5,083 multi-line responses in the corpus carry distinct blocks).
+  function split(reqId: string, billed: number, content: any[], id?: string) {
+    return JSON.stringify({
+      type: "assistant",
+      requestId: reqId,
+      message: {
+        role: "assistant",
+        model: "claude-opus-4-20250101",
+        ...(id ? { id } : {}),
+        content,
+        usage: { input_tokens: 0, output_tokens: 10, cache_read_input_tokens: billed, cache_creation_input_tokens: 0 },
+      },
+    });
+  }
+
+  test("a response split across lines is one turn billed once", () => {
+    const p = write("split.jsonl", [
+      split("r1", 1000, [toolUse("t1", "Bash", { command: TICK })]),
+      split("r1", 1000, [{ type: "text", text: "prose half of the same response" }]),
+      user([toolResult("t1", "Z".repeat(400))]),
+      split("r2", 1500, [{ type: "text", text: "." }]),
+    ]);
+    const a = auditTranscript(p);
+    expect(a.turns).toBe(2); // not 3
+    expect(a.totalBilled).toBe(1000 + 1500); // not 3500
+    expect(a.staticFloor).toBe(1000);
+    expect(a.staticFloorCost).toBe(2000);
+    expect(a.accretion).toBe(500);
+    const sum = a.components.reduce((s, c) => s + c.cost, 0) + a.staticFloorCost;
+    expect(sum).toBeCloseTo(a.totalBilled, 6);
+  });
+
+  // Dedup is on the usage snapshot only. Each line of a split response carries a
+  // DIFFERENT content block, so dropping their content would under-report the
+  // very components the tool exists to rank.
+  test("both halves of a split response still contribute content", () => {
+    const p = write("split-content.jsonl", [
+      split("r1", 1000, [toolUse("t1", "Bash", { command: TICK })]),
+      split("r1", 1000, [{ type: "text", text: "K".repeat(4000) }]),
+      split("r2", 4000, [{ type: "text", text: "." }]),
+    ]);
+    const a = auditTranscript(p);
+    const names = a.components.map((c) => c.component);
+    expect(names).toContain("toolUseParams");
+    expect(names).toContain("assistantText");
+    const text = a.components.find((c) => c.component === "assistantText")!;
+    expect(text.rawTokens).toBeGreaterThan(900); // the 4000-char half survived
+  });
+
+  // lib/cost.ts F14: one response's lines don't all carry the same id fields --
+  // a requestId+message.id line can sit next to a message.id-only sibling. Both
+  // keys must dedup or the two halves get different keys and bill twice.
+  test("a message.id-only sibling dedups against its requestId line", () => {
+    const withBoth = split("r1", 1000, [{ type: "text", text: "a" }], "msg_1");
+    const idOnly = JSON.stringify({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        model: "claude-opus-4-20250101",
+        id: "msg_1",
+        content: [{ type: "text", text: "b" }],
+        usage: { input_tokens: 0, output_tokens: 10, cache_read_input_tokens: 1000, cache_creation_input_tokens: 0 },
+      },
+    });
+    const p = write("split-msgid.jsonl", [withBoth, idOnly, split("r2", 1500, [{ type: "text", text: "." }])]);
+    const a = auditTranscript(p);
+    expect(a.turns).toBe(2);
+    expect(a.totalBilled).toBe(2500);
+  });
+
+  // The full F14 chain from lib/cost.ts, and the reason keys must be registered
+  // BEFORE the duplicate skip rather than after. The middle line is the only
+  // thing linking r1 to m1; skip it before it registers and the msgid-only
+  // sibling looks new. Caught in ship review: the first cut of the dedup fix
+  // skipped first and billed this response twice (turns 3, totalBilled 3500).
+  test("a mixed-id chain dedups whichever order the linking line arrives in", () => {
+    const reqOnly = split("r1", 1000, [{ type: "text", text: "a" }]);
+    const both = split("r1", 1000, [{ type: "text", text: "b" }], "msg_1");
+    const idOnly = JSON.stringify({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        model: "claude-opus-4-20250101",
+        id: "msg_1",
+        content: [{ type: "text", text: "c" }],
+        usage: { input_tokens: 0, output_tokens: 10, cache_read_input_tokens: 1000, cache_creation_input_tokens: 0 },
+      },
+    });
+    const tail = split("r2", 1500, [{ type: "text", text: "." }]);
+    const a = auditTranscript(write("f14-chain.jsonl", [reqOnly, both, idOnly, tail]));
+    expect(a.turns).toBe(2);
+    expect(a.totalBilled).toBe(2500);
+  });
+
+  // SUPERSEDED, deliberately. An earlier round pinned "lines carrying neither
+  // id are each counted, never collapsed", reasoning that parseLine's file:line
+  // fallback must never drop a line. Codex showed the cost of that: with the id
+  // fields gone, every content-block line becomes its own billed response and
+  // the ~1.87x per-line inflation is silently back. Counting each line is only
+  // conservative for z-cost, which prices lines; here it corrupts the total. So
+  // the rule is now "no stable identity is drift", pinned in
+  // "a usage line with neither requestId nor message.id aborts" below.
+
+  // SUPERSEDED, deliberately. An earlier round pinned first-wins as the
+  // resolution for divergent siblings, matching costOfFiles. Codex pointed out
+  // that "resolve it quietly" is the wrong call for a tool whose output is a
+  // spending number: the discarded window never enters totalBilled and the
+  // reconciliation invariant balances anyway. Divergence now aborts, pinned in
+  // "siblings disagreeing about billed input abort, in either direction".
+
+  // Red team, and the reason the two fixes in this change had to be tested
+  // TOGETHER rather than each on its own: first-wins-zero can leave a session
+  // with no readable window even though it holds real usage lines, and the
+  // sweep's skip would then drop that whole session's spend while reporting the
+  // run complete. The two behaviours are individually defensible and jointly a
+  // silent subtraction, so this file must never read as an abandoned prompt.
+  // Siblings AGREE at 0 here: a divergence would abort one branch earlier, and
+  // this test is about the branch where every window legitimately reads 0.
+  test("real usage lines that all dedup to zero abort rather than skip", () => {
+    const p = write("real-but-zero.jsonl", [
+      split("r1", 0, [{ type: "text", text: "a" }]),
+      split("r1", 0, [{ type: "text", text: "b" }]),
+      split("r2", 0, [{ type: "text", text: "c" }]),
+      split("r2", 0, [{ type: "text", text: "d" }]),
+    ]);
+    expect(() => auditTranscript(p)).toThrow(ZError);
+    expect(() => auditTranscript(p)).not.toThrow(NoUsageLineError);
+    try {
+      auditTranscript(p);
+    } catch (e) {
+      expect((e as Error).message).toContain("4 assistant usage line(s)");
+      expect((e as Error).message).not.toContain("carries no assistant usage line");
+    }
+  });
+
+  test("a session with real-but-zero usage is not silently skipped by a sweep", () => {
+    const dead = write("sweep-zero.jsonl", [
+      split("z1", 0, [{ type: "text", text: "a" }]),
+      split("z1", 0, [{ type: "text", text: "b" }]),
+    ]);
+    const alive = write("sweep-alive.jsonl", [
+      split("q1", 1000, [{ type: "text", text: "x" }]),
+      split("q2", 2600, [{ type: "text", text: "y" }]),
+    ]);
+    const CA = join(REPO_ROOT, "lib", "context-audit.ts");
+    const r = Bun.spawnSync(["bun", CA, "audit", dead, alive, "--json"], { stdout: "pipe", stderr: "pipe" });
+    expect(r.exitCode).toBe(1); // NOT a clean report with the session quietly missing
+    expect(r.stderr.toString()).toContain("none yielded a billable window");
+  });
+
+  // Dedup keys are per-transcript. The same response appearing in two session
+  // files is two sessions each re-sending that window, which is exactly what a
+  // rollup should add up -- deduping across files would erase real spend.
+  test("keys do not leak across sessions in a rollup", () => {
+    const a1 = write("dup-a.jsonl", [split("shared", 1000, [{ type: "text", text: "a" }]), split("x1", 1200, [{ type: "text", text: "." }])]);
+    const a2 = write("dup-b.jsonl", [split("shared", 1000, [{ type: "text", text: "a" }]), split("x2", 1200, [{ type: "text", text: "." }])]);
+    const r = rollup([auditTranscript(a1), auditTranscript(a2)]);
+    expect(r.turns).toBe(4);
+    expect(r.totalBilled).toBe(4400);
+  });
+});
+
+// -- the numbers an operator actually spends against --------------------------
+
+// Adversarial review: every finding here is a way the printed number is wrong
+// while the reconciliation invariant still balances. That invariant normalizes
+// components onto real accretion, so it can never detect spend that failed to
+// enter the sum in the first place. These are the guards that can.
+describe("silently-wrong-number guards", () => {
+  function ticketTick(nums: number[]) {
+    return nums.map((t) => `"$PACK/bin/z-loop-tick" --slug demo --state s.json --tmp prompt-${t}.txt --session x`);
+  }
+
+  // A ticket worked across two sessions was counted once per session, so the
+  // headline "accretion per ticket touched" read 1.24x low on this repo's own
+  // corpus (68 summed vs 55 distinct).
+  test("rollup unions ticket ids across sessions instead of summing counts", () => {
+    const mk = (name: string, cmds: string[]) =>
+      auditTranscript(
+        write(
+          name,
+          cmds
+            .flatMap((c, i) => [
+              assistant(1000 + i * 100, [toolUse(`t${i}`, "Bash", { command: c })]),
+              user([toolResult(`t${i}`, "A".repeat(200))]),
+            ])
+            .concat([assistant(4000, [{ type: "text", text: "." }])])
+        )
+      );
+    const s1 = mk("union-a.jsonl", ticketTick([101, 102]));
+    const s2 = mk("union-b.jsonl", ticketTick([102, 103])); // 102 overlaps
+    const r = rollup([s1, s2]);
+    expect(r.drainedTickets).toEqual([101, 102, 103]); // union, not 4
+    expect(report(r)).toContain("3 distinct ticket(s)");
+  });
+
+  // Dedup is only sound because a response repeats ONE snapshot verbatim on
+  // every content-block line. When siblings disagree, first-wins throws away a
+  // real window, it never enters totalBilled, and the reconciliation invariant
+  // balances regardless because it normalizes onto whatever accretion it got.
+  // So the assumption is asserted. 0 disagreements across 18,340 lines here.
+  const sibling = (req: string, billed: number, text: string) =>
+    JSON.stringify({
+      type: "assistant",
+      requestId: req,
+      message: {
+        role: "assistant",
+        model: "claude-opus-4-20250101",
+        content: [{ type: "text", text }],
+        usage: { input_tokens: 0, output_tokens: 1, cache_read_input_tokens: billed, cache_creation_input_tokens: 0 },
+      },
+    });
+
+  test("siblings disagreeing about billed input abort, in either direction", () => {
+    // zero shadowing a real window
+    const shadow = write("diverge-zero.jsonl", [sibling("s1", 0, "a"), sibling("s1", 9000, "b"), assistant(1000)]);
+    expect(() => auditTranscript(shadow)).toThrow(/disagree about billed input \(0 then 9000\)/);
+    // and positive-to-positive, which a zero-only guard would have missed
+    const posPos = write("diverge-pos.jsonl", [sibling("s2", 1000, "a"), sibling("s2", 9000, "b"), assistant(1000)]);
+    expect(() => auditTranscript(posPos)).toThrow(/disagree about billed input \(1000 then 9000\)/);
+    // The abort is drift, never the sweep-tolerated kind.
+    expect(() => auditTranscript(posPos)).not.toThrow(NoUsageLineError);
+  });
+
+  test("siblings repeating one snapshot verbatim stay one turn", () => {
+    const a = auditTranscript(
+      write("agree.jsonl", [sibling("s1", 1000, "a"), sibling("s1", 1000, "b".repeat(400)), assistant(2600)])
+    );
+    expect(a.turns).toBe(2);
+    expect(a.totalBilled).toBe(3600);
+  });
+
+  // Lose the identifier fields and parseLine's file:line fallback makes every
+  // content-block line its own response -- the exact ~1.87x per-line inflation
+  // this module was fixed to remove. z-cost keeps that fallback on purpose;
+  // here it must fail loud.
+  test("a usage line with neither requestId nor message.id aborts", () => {
+    const noId = JSON.stringify({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        model: "claude-opus-4-20250101",
+        content: [{ type: "text", text: "a" }],
+        usage: { input_tokens: 0, output_tokens: 1, cache_read_input_tokens: 1000, cache_creation_input_tokens: 0 },
+      },
+    });
+    expect(() => auditTranscript(write("no-identity.jsonl", [noId]))).toThrow(/neither "requestId" nor "message.id"/);
+  });
+
+  // Rename message.usage and every assistant line goes unrecognized, leaving a
+  // real session looking abandoned -- which a sweep skips at exit 0 with the
+  // whole session's spend missing.
+  test("assistant messages with an unrecognized usage schema abort, not skip", () => {
+    const renamed = JSON.stringify({
+      type: "assistant",
+      requestId: "r1",
+      message: {
+        role: "assistant",
+        model: "claude-opus-4-20250101",
+        content: [{ type: "text", text: "a" }],
+        token_usage: { input_tokens: 5 }, // usage -> token_usage
+      },
+    });
+    const p = write("usage-renamed.jsonl", [renamed, renamed]);
+    expect(() => auditTranscript(p)).toThrow(/carrying no recognized usage object/);
+    expect(() => auditTranscript(p)).not.toThrow(NoUsageLineError); // must not be sweep-skippable
+  });
+
+  // "Caught mid-write" is a causal claim. A truncation is the LAST line by
+  // definition, so an unparseable line anywhere else is corruption and the
+  // report must stop explaining away the missing spend.
+  test("report only claims mid-write when the bad line is at end-of-file", () => {
+    const body = (t: string) => [{ type: "text", text: t }];
+    const tail = auditTranscript(
+      write("bad-tail.jsonl", [assistant(1000, body("y".repeat(400))), assistant(2000, body(".")), "{trunc"])
+    );
+    expect(tail.skippedLines).toBe(1);
+    expect(tail.skippedBeyondFinalLine).toBe(0);
+    expect(report(rollup([tail]))).toContain("all at end-of-file");
+
+    const mid = auditTranscript(
+      write("bad-middle.jsonl", [assistant(1000, body("z".repeat(400))), "{corrupt", assistant(2000, body("."))])
+    );
+    expect(mid.skippedBeyondFinalLine).toBe(1);
+    const out = report(rollup([mid]));
+    expect(out).toContain("NOT at end-of-file");
+    expect(out).toContain("that is corruption");
+  });
+
+  // A wholly-sidechain file is a subagent transcript, not an orchestrator
+  // session. Skipping it is right; saying it holds "nothing to attribute" is a
+  // false statement about a file full of real subagent spend.
+  test("a sidechain-only transcript says what it actually is", () => {
+    const side = JSON.stringify({
+      type: "assistant",
+      isSidechain: true,
+      requestId: "sc1",
+      message: {
+        role: "assistant",
+        model: "claude-opus-4-20250101",
+        content: [{ type: "text", text: "subagent work" }],
+        usage: { input_tokens: 0, output_tokens: 5, cache_read_input_tokens: 50000, cache_creation_input_tokens: 0 },
+      },
+    });
+    const p = write("sidechain-only.jsonl", [side, side]);
+    expect(() => auditTranscript(p)).toThrow(NoUsageLineError); // still skippable by a sweep
+    try {
+      auditTranscript(p);
+    } catch (e) {
+      expect((e as Error).message).toContain("only sidechain (subagent) usage lines -- 2 of them");
+      expect((e as Error).message).toContain("z-cost");
+      expect((e as Error).message).not.toContain("carries no assistant usage line");
+    }
+  });
+});
+
 // -- rollup -------------------------------------------------------------------
 
 describe("rollup", () => {
@@ -302,5 +635,229 @@ describe("context-audit CLI", () => {
     const missing = run("audit", join(dir, "no-such-file.jsonl"));
     expect(missing.exitCode).toBe(1);
     expect(missing.stderr.toString()).toContain("Cannot read transcript at");
+  });
+
+  // A corpus sweep is the CLI's documented multi-path use, and ~3% of a real
+  // session corpus is an abandoned session with no assistant usage line. One of
+  // those used to abort the entire rollup.
+  describe("a dead session does not take the corpus with it", () => {
+    const live = () => [
+      assistant(1000, [toolUse("t1", "Bash", { command: TICK })]),
+      user([toolResult("t1", "A".repeat(800))]),
+      assistant(1600, [{ type: "text", text: "x" }]),
+    ];
+
+    test("multi-path: the empty session is skipped, named, and excluded", () => {
+      const good = write("sweep-good.jsonl", live());
+      const dead = write("sweep-dead.jsonl", [user("just a prompt, never answered")]);
+      const r = run("audit", good, dead, "--json");
+      expect(r.exitCode).toBe(0);
+      const parsed = JSON.parse(r.stdout.toString());
+      expect(parsed.sessions).toBe(1);
+      expect(parsed.unauditable).toEqual([dead]);
+      expect(parsed.totalBilled).toBe(2600); // the dead file contributes nothing
+      const txt = run("audit", good, dead);
+      expect(txt.stdout.toString()).toContain("sweep-dead.jsonl");
+    });
+
+    // The skip is scoped to "nothing to attribute". A renamed usage key is
+    // format drift and must still abort, or the sweep quietly under-reports.
+    test("format drift still aborts the whole sweep", () => {
+      const good = write("sweep-good2.jsonl", live());
+      const drifted = write(
+        "sweep-drift.jsonl",
+        [JSON.stringify({
+          type: "assistant",
+          requestId: "d1",
+          message: { role: "assistant", model: "claude-opus-4-20250101", content: [], usage: { in_tokens: 5 } },
+        })]
+      );
+      const r = run("audit", good, drifted);
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout.toString()).not.toContain("static prefix");
+      // Assert the SPECIFIC failure, not just "something went wrong" -- any
+      // crash satisfies a bare exit-1 check.
+      expect(r.stderr.toString()).toContain("missing/renamed key(s)");
+      // And that the operator is told how far the sweep got before it died.
+      expect(r.stderr.toString()).toContain("audited cleanly before it");
+    });
+
+    // Three shapes that all reach "no window", which must NOT all be treated as
+    // an abandoned session. Only the genuinely empty one is skippable.
+    test("a session with real usage lines that yield no window aborts a sweep", () => {
+      const zero = write("sweep-zerobill.jsonl", [assistant(0, [{ type: "text", text: "a" }])]);
+      const r = run("audit", zero, write("sweep-zb-live.jsonl", live()));
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr.toString()).toContain("none yielded a billable window");
+      // The wording must hold whether or not dedup was involved -- here nothing deduped.
+      expect(r.stderr.toString()).not.toContain("once deduped");
+    });
+
+    test("a wholly unparseable transcript aborts a sweep rather than reading as abandoned", () => {
+      const corrupt = write("sweep-corrupt.jsonl", ["{not json", "also not json"]);
+      const r = run("audit", corrupt, write("sweep-corrupt-live.jsonl", live()));
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr.toString()).toContain("no parseable line at all");
+    });
+
+    // A rate-limited or interrupted session carries only synthetic entries. That
+    // IS an abandoned session, so a sweep skips it -- pinned so the verdict is a
+    // decision rather than an accident of where realUsageLines++ sits.
+    test("a synthetic-only transcript is skipped by a sweep", () => {
+      const synth = write("sweep-synthetic.jsonl", [
+        assistant(0, [{ type: "text", text: "rate limited" }], SYNTHETIC_MODEL),
+      ]);
+      const r = run("audit", synth, write("sweep-synth-live.jsonl", live()), "--json");
+      expect(r.exitCode).toBe(0);
+      const parsed = JSON.parse(r.stdout.toString());
+      expect(parsed.sessions).toBe(1);
+      expect(parsed.unauditable).toEqual([synth]);
+    });
+
+    test("report omits the skipped block entirely when nothing was skipped", () => {
+      const out = report(rollup([auditTranscript(write("no-skips.jsonl", live()))]));
+      expect(out).not.toContain("session(s) skipped");
+      expect(out).toContain("static prefix");
+    });
+
+    // The skip is scoped to NoUsageLineError alone. An unreadable path is a
+    // different ZError and must abort, or a typo'd path silently vanishes from
+    // a sweep's totals and the report reads as complete.
+    test("an unreadable path still aborts the whole sweep", () => {
+      const good = write("sweep-good3.jsonl", live());
+      const r = run("audit", good, join(dir, "no-such-file.jsonl"));
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr.toString()).toContain("Cannot read transcript at");
+      expect(r.stdout.toString()).not.toContain("static prefix");
+    });
+
+    // The skipped list is rendered by basename, not full path -- an absolute
+    // path would satisfy a naive "contains the filename" assertion, so pin the
+    // directory's absence explicitly.
+    test("report names skipped sessions by basename and counts them", () => {
+      const r = report(
+        rollup([auditTranscript(write("basename-good.jsonl", live()))], ["/abs/some/dir/dead-one.jsonl"])
+      );
+      expect(r).toContain("1 session(s) skipped");
+      expect(r).toContain("dead-one.jsonl");
+      expect(r).not.toContain("/abs/some/dir");
+    });
+
+    // A glob is a sweep by intent. Deciding on the expanded count alone made
+    // the identical documented command hard-fail or succeed depending on how
+    // many transcripts happened to be in the directory that day.
+    test("a glob is a sweep even when it matches exactly one dead file", () => {
+      const g = mkdtempSync(join(tmpdir(), "zstack-ctxglob-"));
+      writeFileSync(join(g, "only-dead.jsonl"), user("never answered") + "\n");
+      const r = run("audit", join(g, "*.jsonl"), "--json");
+      rmSync(g, { recursive: true, force: true });
+      expect(r.exitCode).toBe(1); // every path dead is still an error...
+      // ...but via the all-dead guard, NOT the single-path strict throw. That
+      // distinction is the whole point of treating a glob as a sweep.
+      expect(r.stderr.toString()).toContain("None of the 1 transcript(s)");
+      expect(r.stderr.toString()).not.toContain("carries no assistant usage line");
+    });
+
+    test("a glob matching one live and one dead file skips the dead one", () => {
+      const g = mkdtempSync(join(tmpdir(), "zstack-ctxglob2-"));
+      writeFileSync(join(g, "a-live.jsonl"), live().join("\n") + "\n");
+      writeFileSync(join(g, "b-dead.jsonl"), user("never answered") + "\n");
+      const r = run("audit", join(g, "*.jsonl"), "--json");
+      rmSync(g, { recursive: true, force: true });
+      expect(r.exitCode).toBe(0);
+      const parsed = JSON.parse(r.stdout.toString());
+      expect(parsed.sessions).toBe(1);
+      expect(parsed.unauditable.length).toBe(1);
+    });
+
+    // Red team: one file reachable through two positionals was audited twice and
+    // its tokens counted twice -- a 1.5x inflation of exactly the absolutes the
+    // dedup fix exists to correct, invisible because both copies reconcile.
+    test("a file reached by two positionals is audited once", () => {
+      const g = mkdtempSync(join(tmpdir(), "zstack-ctxdup-"));
+      writeFileSync(join(g, "a.jsonl"), live().join("\n") + "\n");
+      writeFileSync(join(g, "b.jsonl"), live().join("\n") + "\n");
+      const globOnlyOut = run("audit", join(g, "*.jsonl"), "--json").stdout.toString();
+      const overlapOut = run("audit", join(g, "*.jsonl"), join(g, "a.jsonl"), "--json").stdout.toString();
+      const twiceOut = run("audit", join(g, "a.jsonl"), join(g, "a.jsonl"), "--json").stdout.toString();
+      // Clean up before parsing: a parse failure used to leak the mkdtemp dir.
+      rmSync(g, { recursive: true, force: true });
+      const globOnly = JSON.parse(globOnlyOut);
+      const overlap = JSON.parse(overlapOut);
+      expect(globOnly.sessions).toBe(2);
+      expect(overlap.sessions).toBe(2);
+      expect(overlap.totalBilled).toBe(globOnly.totalBilled);
+      expect(JSON.parse(twiceOut).sessions).toBe(1);
+    });
+
+    // The spellings above are byte-identical, so a plain string Set would pass
+    // that test. Case is what actually needs canonicalizing: Windows is
+    // case-insensitive and a glob returns the on-disk spelling while the
+    // operator may type another, so resolve() alone left two entries and billed
+    // the file twice. Only realpathSync.native collapses them.
+    test("two spellings of one file differing only in case audit once", () => {
+      const g = mkdtempSync(join(tmpdir(), "zstack-ctxcase-"));
+      writeFileSync(join(g, "Alpha.jsonl"), live().join("\n") + "\n");
+      const out = run("audit", join(g, "Alpha.jsonl"), join(g, "alpha.jsonl"), "--json");
+      const lower = existsSync(join(g, "alpha.jsonl")); // false on a case-sensitive FS
+      rmSync(g, { recursive: true, force: true });
+      if (!lower) return; // case-sensitive filesystem: the two ARE different files
+      const parsed = JSON.parse(out.stdout.toString());
+      expect(parsed.sessions).toBe(1);
+      expect(parsed.totalBilled).toBe(2600);
+    });
+
+    // Red team: Bun.Glob read "session[1].jsonl" as a character class and
+    // silently audited a decoy, reporting the wrong file's numbers with exit 0.
+    // An existing file is a literal path whatever characters are in its name.
+    test("a literal path containing glob metacharacters reads that file", () => {
+      const g = mkdtempSync(join(tmpdir(), "zstack-ctxmeta-"));
+      writeFileSync(join(g, "session[1].jsonl"), live().join("\n") + "\n");
+      writeFileSync(join(g, "session1.jsonl"), [assistant(7, [{ type: "text", text: "decoy" }])].join("\n") + "\n");
+      const r = run("audit", join(g, "session[1].jsonl"), "--json");
+      rmSync(g, { recursive: true, force: true });
+      expect(r.exitCode).toBe(0);
+      expect(JSON.parse(r.stdout.toString()).totalBilled).toBe(2600); // not the decoy's 7
+    });
+
+    // Red team: a glob matching nothing fell through to the literal, so the
+    // pattern itself hit readFileSync and a mistyped extension read as ENOENT.
+    test("a glob matching nothing says so instead of ENOENT on the pattern", () => {
+      const g = mkdtempSync(join(tmpdir(), "zstack-ctxnomatch-"));
+      writeFileSync(join(g, "a.jsonl"), live().join("\n") + "\n");
+      const r = run("audit", join(g, "*.nomatch"));
+      rmSync(g, { recursive: true, force: true });
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr.toString()).toContain("No files matched");
+      expect(r.stderr.toString()).not.toContain("ENOENT");
+    });
+
+    // Red team: colliding basenames rendered as identical lines, so the operator
+    // could not tell which sessions dropped. The loop's own transcripts are all
+    // named "<stage>-<attempt>.jsonl", so a sweep across ticket dirs always collides.
+    test("colliding basenames render as full paths", () => {
+      const good = auditTranscript(write("collide-good.jsonl", live()));
+      const distinct = report(rollup([good], ["/x/alpha/one.jsonl", "/x/beta/two.jsonl"]));
+      expect(distinct).toContain("one.jsonl");
+      expect(distinct).not.toContain("/x/alpha");
+      const colliding = report(rollup([good], ["/x/alpha/chat.jsonl", "/x/beta/chat.jsonl"]));
+      expect(colliding).toContain("/x/alpha/chat.jsonl");
+      expect(colliding).toContain("/x/beta/chat.jsonl");
+    });
+
+    test("a single named empty transcript still errors", () => {
+      const dead = write("solo-dead.jsonl", [user("nothing here")]);
+      const r = run("audit", dead);
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr.toString()).toContain("no assistant usage line");
+    });
+
+    test("every path dead is an error, not an empty report", () => {
+      const d1 = write("all-dead-1.jsonl", [user("a")]);
+      const d2 = write("all-dead-2.jsonl", [user("b")]);
+      const r = run("audit", d1, d2);
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr.toString()).toContain("None of the 2 transcript(s)");
+    });
   });
 });

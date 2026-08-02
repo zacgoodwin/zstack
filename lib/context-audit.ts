@@ -15,6 +15,12 @@
 // -- What is measured exactly, and what is estimated -------------------------
 //
 // REAL (tokenizer readings, straight from billed usage):
+//   turns         UNIQUE API responses, not transcript lines. Claude Code
+//                 writes one line per content block and repeats the response's
+//                 usage snapshot on each, so a split response is counted once
+//                 (see DEDUP in auditTranscript). Every absolute below is
+//                 post-dedup; figures published before that fix read ~1.87x
+//                 high, though the component RANKING was unaffected.
 //   totalBilled   sum over turns of (input + cache_read + cache_creation)
 //   staticFloor   min billed window across turns, times the turn count. The
 //                 minimum is the window right after a /clear (or turn 1), i.e.
@@ -35,6 +41,18 @@
 // scaling error cancels in the ratio. Read this output as "which component
 // dominates", never as "component X costs exactly N tokens".
 //
+// A second, smaller bound on the same footing. Within ONE split response, the
+// first line's blocks are weighted across that response's own turn plus every
+// later one, while its sibling lines' blocks are weighted only across later
+// turns -- the turn event is emitted between them. So sibling blocks ride one
+// turn fewer than the first. Two independent reviews measured the effect at
+// ~0.1% of component cost on this machine's corpus (split responses are common,
+// but multi-block LINES are not: 2 of 9,090 responses), far below the chars/4
+// bias above and never enough to reorder the table. Left as a documented bound
+// rather than restructured, because emitting the turn before its content would
+// change the weighting of every single-line response to fix a rounding error in
+// a rare one.
+//
 // -- The invariant that makes the output trustworthy -------------------------
 //
 // staticFloor + sum(components) == totalBilled, asserted on every audit.
@@ -46,12 +64,12 @@
 // unaccounted component class cannot silently redistribute itself across the
 // others -- the reconciliation fails and the audit throws. A component set that
 // does not reconcile is a bug in this file, never a finding about the loop.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename } from "node:path";
+import { basename, resolve } from "node:path";
 import { handleCliError, parseFlags, str } from "./cli.ts";
 import { ZError } from "./config.ts";
-import { SYNTHETIC_MODEL, expandGlob, parseLine } from "./cost.ts";
+import { GLOB_META, SYNTHETIC_MODEL, expandGlob, parseLine } from "./cost.ts";
 import { mangleProjectDir, resolveSessionTranscript } from "./context-budget.ts";
 
 // -- phases -------------------------------------------------------------------
@@ -102,16 +120,31 @@ export interface ComponentSpend {
   rawTokens: number; // chars/4 of the content itself, un-weighted
 }
 
+// A transcript with no assistant usage line carries nothing to attribute. On a
+// single-file audit that is a real error -- the operator named that file and
+// deserves to hear it. On a multi-file audit it is routine: ~3% of a session
+// corpus is an abandoned or never-answered session, and aborting the whole
+// rollup on the first one made batch auditing impossible (the CLI's own
+// documented use, "audit [<transcript.jsonl>...]"). A distinct type is what
+// lets the CLI skip THIS case only: parseLine's format-drift assertion, an
+// unreadable file, and any other ZError must still abort the run rather than
+// silently drop a session's spend from the totals.
+export class NoUsageLineError extends ZError {}
+
 export interface SessionAudit {
   file: string;
-  turns: number;
+  turns: number; // unique API responses, post-dedup (see DEDUP note below)
   totalBilled: number;
   staticFloor: number; // per-turn floor
   staticFloorCost: number; // floor x turns
   accretion: number;
   components: ComponentSpend[];
   drainedTickets: number[];
-  skippedLines: number; // unparseable (a live file caught mid-write)
+  skippedLines: number; // unparseable
+  // Unparseable lines that are NOT the file's last line. A mid-write truncation
+  // is by definition the final line, so anything earlier is real corruption and
+  // the report must stop explaining it away as a live file caught mid-write.
+  skippedBeyondFinalLine: number;
 }
 
 // Markers that identify the z-loop SKILL.md body, which arrives as a user
@@ -185,20 +218,56 @@ export function auditTranscript(path: string): SessionAudit {
   const toolCmd = new Map<string, string>();
   const evs: Ev[] = [];
   const tickets = new Set<number>();
+  // key -> billed of the FIRST line seen for that response, so a sibling whose
+  // snapshot disagrees can be caught instead of silently discarded.
+  const seenKeys = new Map<string, number>();
+  // Counts every real (non-synthetic) assistant usage line seen, whatever it
+  // billed and whether or not it deduped away. Distinguishes "this session was
+  // abandoned" from "this session has spend I failed to read" when no window
+  // survives -- see the branch at the end of this function.
+  let realUsageLines = 0;
+  // Usage lines belonging to a spawned subagent, skipped because this tool
+  // measures the ORCHESTRATOR's window. Counted so a wholly-sidechain file gets
+  // an accurate verdict instead of "nothing to attribute", which is false.
+  let sidechainUsageLines = 0;
+  let assistantNoUsage = 0;
   let skippedLines = 0;
+  let skippedBeyondFinalLine = 0;
   let drainStarted = false;
+
+  // Index of the last non-blank line: the only position a mid-write truncation
+  // can occupy.
+  let finalLine = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim()) {
+      finalLine = i;
+      break;
+    }
+  }
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!line.trim()) continue;
     if (!parsesAsJson(line)) {
       skippedLines++;
+      if (i !== finalLine) skippedBeyondFinalLine++;
       continue;
     }
     // Valid JSON: parseLine's assertion still applies to usage-bearing lines.
     const parsed = parseLine(line, `${path}:${i + 1}`);
     const j = JSON.parse(line);
-    if (j.isSidechain) continue;
+    if (j.isSidechain) {
+      if (parsed && parsed.model !== SYNTHETIC_MODEL) sidechainUsageLines++;
+      continue;
+    }
+    // parseLine returns null when message.usage is absent. Rename that field
+    // (usage -> token_usage, say) and EVERY assistant line goes null: no
+    // realUsageLines, no windows, and the session reads as abandoned -- which a
+    // sweep then skips at exit 0 with its whole spend missing. Counting the
+    // envelopes separately is what tells "this session never got a reply" apart
+    // from "I stopped recognizing the replies". 0 such envelopes across this
+    // machine's 18,340 assistant usage lines.
+    if (!parsed && j.message?.role === "assistant" && j.message?.usage === undefined) assistantNoUsage++;
 
     if (j.attachment?.type === "skill_listing") {
       evs.push({ k: "content", component: "skillListing", tokens: String(j.attachment.content ?? "").length / 4, phase: drainStarted ? "drain" : "dev" });
@@ -230,9 +299,77 @@ export function auditTranscript(path: string): SessionAudit {
       // Synthetic entries are not measurements (see SYNTHETIC_MODEL): a
       // rate-limited or interrupted turn carries all-zero usage and would read
       // as an empty window, which would drag the static floor to 0.
+      //
+      // DEDUP: Claude Code writes ONE transcript line per content block, and
+      // every line of a split response repeats that response's usage snapshot
+      // verbatim. Summing per line therefore counts one API call's window once
+      // per block. Two different multiples, measured over this machine's
+      // 88-session orchestrator corpus: 2.00x by LINE count (17,693 usage lines
+      // / 8,839 unique responses) and 1.87x by BILLED TOKENS (4.97B summed
+      // per-line vs 2.66B deduped). They differ because duplicate lines skew
+      // toward the smaller windows early in a session.
+      // The reconciliation invariant does NOT catch this: staticFloorCost and
+      // the component weights inflate together, so the audit still balances
+      // while every absolute number (turns, totalBilled, per-ticket accretion)
+      // reads high. lib/cost.ts's costOfFiles has deduped since it was written;
+      // parseLine already hands back the same dedupKeys, so this reuses them
+      // rather than inventing a second rule. Keys are per-transcript: the same response
+      // appearing in two files is two sessions' worth of re-sent window, which
+      // is exactly what rollup() should add up.
       if (parsed && parsed.model !== SYNTHETIC_MODEL) {
+        realUsageLines++;
+        // Register EVERY key before skipping, never after -- costOfFiles in
+        // lib/cost.ts does the same, for the reason its F14 note gives: one
+        // response's lines do not all carry the same id fields, so a line
+        // carrying BOTH requestId and message.id is the only thing linking
+        // them. Skip it before it registers and a later message.id-only sibling
+        // looks new and bills the response a second time.
+        //
+        // Keys register regardless of `billed`, so the FIRST line of a response
+        // wins even if its snapshot reads 0. costOfFiles resolves a divergent
+        // sibling the same first-wins way; both rest on the same empirical fact
+        // (a response's lines repeat one snapshot verbatim -- 0 disagreements
+        // across 3,982 multi-line responses on this machine). Pinned by
+        // "first-seen snapshot wins when siblings disagree" in the tests, so a
+        // divergence would fail a gate rather than silently shift the totals.
         const u = parsed.usage;
         const billed = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
+        // A usage-bearing line with NEITHER requestId nor message.id has no
+        // stable response identity, and parseLine's last-resort key is
+        // "file:line" -- unique per line, which silently restores the exact
+        // per-line overcounting this module was fixed to remove. z-cost keeps
+        // that fallback deliberately (pricing a line once is a conservative
+        // overcount there); here it is the bug, so it fails loud instead. 0 of
+        // 18,340 non-sidechain usage lines on this machine lack both ids.
+        if (parsed.dedupKeys.length === 1 && parsed.dedupKeys[0] === `${path}:${i + 1}`) {
+          throw new ZError(
+            `${path}:${i + 1}: assistant usage line carries neither "requestId" nor "message.id", so this response ` +
+              `has no stable identity to dedup on. Counting it per line is how a split response gets billed once per ` +
+              `content block -- the ~1.87x inflation this tool exists to remove -- so this is format drift, not data.`
+          );
+        }
+        const firstSeen = parsed.dedupKeys.map((k) => seenKeys.get(k)).find((v) => v !== undefined);
+        const duplicate = firstSeen !== undefined;
+        for (const k of parsed.dedupKeys) if (!seenKeys.has(k)) seenKeys.set(k, billed);
+        if (duplicate) {
+          // Dedup is only sound because a response's lines repeat ONE snapshot
+          // verbatim. When two lines of the same response disagree, first-wins
+          // discards a real window, it never enters totalBilled, and the
+          // reconciliation invariant balances anyway because it normalizes onto
+          // whatever accretion it was handed. So the assumption is asserted
+          // rather than assumed: 0 disagreements across 18,340 lines here, and
+          // lib/cost.ts records the same for its corpus. Any disagreement at
+          // all -- not just a zero shadowing a real window -- is drift.
+          if (firstSeen !== billed) {
+            throw new ZError(
+              `${path}:${i + 1}: two lines of one API response disagree about billed input (${firstSeen} then ` +
+                `${billed}). Dedup assumes a response repeats one usage snapshot verbatim on every content-block ` +
+                `line; if that stopped holding, first-wins would drop a real window from the totals without the ` +
+                `reconciliation invariant noticing.`
+            );
+          }
+          continue;
+        }
         if (billed > 0) evs.push({ k: "turn", billed });
       }
       continue;
@@ -266,7 +403,53 @@ export function auditTranscript(path: string): SessionAudit {
 
   const windows = evs.filter((e): e is Extract<Ev, { k: "turn" }> => e.k === "turn").map((e) => e.billed);
   if (windows.length === 0) {
-    throw new ZError(`${path} carries no assistant usage line, so there is nothing to attribute.`);
+    // Two very different reasons produce no windows, and conflating them let a
+    // real session vanish from a sweep. An abandoned prompt genuinely carries
+    // no usage line -- routine in a corpus, and what NoUsageLineError exists to
+    // let a sweep skip. A file whose usage lines all exist but whose first-seen
+    // snapshot per response reads 0 is NOT that: it has real spend the tool is
+    // failing to read, and skipping it silently subtracts a whole session from
+    // the rollup while reporting the run as complete. That is drift, so it
+    // throws the untolerated kind and stops the sweep.
+    if (realUsageLines > 0) {
+      throw new ZError(
+        `${path} carries ${realUsageLines} assistant usage line(s), but none yielded a billable window: each either ` +
+          `billed 0 input tokens or deduped into a line that did. That is not an abandoned session -- it is spend ` +
+          `the tool cannot read, and skipping it would drop this session from the totals in silence.`
+      );
+    }
+    // A file whose every line failed to parse is corrupt, not abandoned. The
+    // mid-write tolerance above is for a LIVE transcript with some good lines;
+    // when none survive, reporting it as an empty session would let a corrupt
+    // file skip a sweep silently, which is the same silence realUsageLines
+    // guards against one branch up.
+    if (skippedLines > 0) {
+      throw new ZError(
+        `${path} has no parseable line at all (${skippedLines} skipped). A transcript caught mid-write still leaves ` +
+          `earlier complete lines, so this reads as corruption rather than an abandoned session, and a sweep must ` +
+          `not skip past it as if it held nothing.`
+      );
+    }
+    // A wholly-sidechain file is a spawned subagent's transcript, not an
+    // orchestrator session. Skipping it is right -- this tool measures the
+    // orchestrator's window -- but "nothing to attribute" would be a false
+    // statement about a file full of real subagent spend. Price those with
+    // z-cost instead.
+    if (assistantNoUsage > 0) {
+      throw new ZError(
+        `${path} holds ${assistantNoUsage} assistant message(s) carrying no recognized usage object. A session that ` +
+          `got real replies is not an abandoned one, so this is a usage-schema change, not an empty transcript -- ` +
+          `and skipping it would drop the whole session's spend from a sweep at exit 0.`
+      );
+    }
+    if (sidechainUsageLines > 0) {
+      throw new NoUsageLineError(
+        `${path} carries only sidechain (subagent) usage lines -- ${sidechainUsageLines} of them -- and no ` +
+          `orchestrator turn. This tool measures the orchestrator's own window, so there is nothing here for it to ` +
+          `attribute; price subagent transcripts with z-cost.`
+      );
+    }
+    throw new NoUsageLineError(`${path} carries no assistant usage line, so there is nothing to attribute.`);
   }
   const totalBilled = windows.reduce((a, b) => a + b, 0);
   const staticFloor = Math.min(...windows);
@@ -313,6 +496,7 @@ export function auditTranscript(path: string): SessionAudit {
     components,
     drainedTickets: [...tickets].sort((a, b) => a - b),
     skippedLines,
+    skippedBeyondFinalLine,
   };
 }
 
@@ -339,23 +523,35 @@ export function assertReconciles(components: ComponentSpend[], staticFloorCost: 
 
 export interface Rollup {
   sessions: number;
+  // The UNION of ticket ids across sessions, not the sum of per-session counts.
+  // Summing double-counted every ticket worked across two sessions and made the
+  // headline "accretion per ticket touched" read 1.24x low on this repo's own
+  // corpus (68 summed vs 55 distinct). An array, not a count, so a --json
+  // consumer can audit the set rather than trust the number.
+  drainedTickets: number[];
+  // Paths skipped as NoUsageLineError. Named, never just counted: a silently
+  // dropped session is spend missing from the totals, and the whole point of
+  // this tool is that a number cannot be wrong without saying so.
+  unauditable: string[];
   turns: number;
   totalBilled: number;
   staticFloorCost: number;
   components: ComponentSpend[];
-  drainedTickets: number;
   skippedLines: number;
+  skippedBeyondFinalLine: number;
 }
 
-export function rollup(audits: SessionAudit[]): Rollup {
+export function rollup(audits: SessionAudit[], unauditable: string[] = []): Rollup {
   const agg = new Map<string, ComponentSpend>();
-  let turns = 0, totalBilled = 0, staticFloorCost = 0, drainedTickets = 0, skippedLines = 0;
+  const tickets = new Set<number>();
+  let turns = 0, totalBilled = 0, staticFloorCost = 0, skippedLines = 0, skippedBeyondFinalLine = 0;
   for (const a of audits) {
     turns += a.turns;
     totalBilled += a.totalBilled;
     staticFloorCost += a.staticFloorCost;
-    drainedTickets += a.drainedTickets.length;
+    for (const t of a.drainedTickets) tickets.add(t);
     skippedLines += a.skippedLines;
+    skippedBeyondFinalLine += a.skippedBeyondFinalLine;
     for (const c of a.components) {
       const key = `${c.component}|${c.phase}`;
       const cur = agg.get(key) ?? { component: c.component, phase: c.phase, cost: 0, calls: 0, rawTokens: 0 };
@@ -367,12 +563,14 @@ export function rollup(audits: SessionAudit[]): Rollup {
   }
   return {
     sessions: audits.length,
+    unauditable,
     turns,
     totalBilled,
     staticFloorCost,
     components: [...agg.values()].sort((a, b) => b.cost - a.cost),
-    drainedTickets,
+    drainedTickets: [...tickets].sort((a, b) => a - b),
     skippedLines,
+    skippedBeyondFinalLine,
   };
 }
 
@@ -386,7 +584,27 @@ export function report(r: Rollup, opts: { drainOnly?: boolean } = {}): string {
   out.push(
     `orchestrator context audit -- ${r.sessions} session(s), ${n(r.turns)} turns, ${n(r.totalBilled)} billed input tokens`
   );
-  if (r.skippedLines) out.push(`  (${r.skippedLines} unparseable line(s) skipped -- a live transcript caught mid-write)`);
+  if (r.skippedLines) {
+    // Only claim mid-write when the evidence supports it. A truncation is by
+    // definition the last line of a file, so an unparseable line anywhere else
+    // is corruption, and explaining it away cost the operator the one signal
+    // that some of this session's spend is missing.
+    out.push(
+      r.skippedBeyondFinalLine > 0
+        ? `  (${r.skippedLines} unparseable line(s) skipped, ${r.skippedBeyondFinalLine} of them NOT at end-of-file -- ` +
+            `that is corruption, not a live transcript caught mid-write, and those lines' spend is missing from the totals)`
+        : `  (${r.skippedLines} unparseable line(s) skipped, all at end-of-file -- a live transcript caught mid-write)`
+    );
+  }
+  if (r.unauditable.length > 0) {
+    out.push(`  (${r.unauditable.length} session(s) skipped -- no assistant usage line, nothing to attribute:)`);
+    // Basenames only while they stay distinct. A sweep across the loop's own
+    // per-ticket transcript dirs collides on every "builder-1.jsonl", and three
+    // identical lines tell the operator nothing about which sessions dropped.
+    const names = r.unauditable.map((f) => basename(f)); // not .map(basename): map's index arg lands in basename's `ext`
+    const collides = new Set(names).size !== names.length;
+    for (const f of r.unauditable) out.push(`     ${collides ? f : basename(f)}`);
+  }
   out.push("");
   out.push(`  ${"static prefix (floor x turns)".padEnd(34)} ${n(r.staticFloorCost).padStart(14)} ${pct(r.staticFloorCost).padStart(8)}`);
   out.push(`  ${"-- accreted conversation --".padEnd(34)} ${n(r.totalBilled - r.staticFloorCost).padStart(14)} ${pct(r.totalBilled - r.staticFloorCost).padStart(8)}`);
@@ -403,8 +621,10 @@ export function report(r: Rollup, opts: { drainOnly?: boolean } = {}): string {
   const devTotal = r.components.filter((c) => c.phase === "dev").reduce((a, c) => a + c.cost, 0);
   out.push("");
   out.push(`  drain steady-state: ${n(drainTotal)} (${pct(drainTotal)})   operator/dev: ${n(devTotal)} (${pct(devTotal)})`);
-  if (r.drainedTickets > 0) {
-    out.push(`  drain accretion per ticket touched: ${n(drainTotal / r.drainedTickets)} tokens over ${r.drainedTickets} ticket(s)`);
+  if (r.drainedTickets.length > 0) {
+    out.push(
+      `  drain accretion per ticket touched: ${n(drainTotal / r.drainedTickets.length)} tokens over ${r.drainedTickets.length} distinct ticket(s)`
+    );
   }
   return out.join("\n");
 }
@@ -419,6 +639,16 @@ const USAGE = `context-audit <command> [args]
     --project-dir <dir>           resolve the newest session under that cwd
     --drain-only                  show only loop-issued (drain steady-state) rows
     --json                        machine-readable rollup
+
+  Sweeps (several paths, or any glob) skip a transcript that carries no
+  assistant usage line and name it in the report -- and in --json under
+  \`unauditable\`. One literal path is a question about THAT file, so the same
+  empty transcript is an error there. Every other failure, including a renamed
+  usage key, aborts the whole run in both modes.
+
+  \`turns\` counts unique API responses, not transcript lines: a response split
+  across content-block lines repeats its usage snapshot on each and is billed
+  once.
 
   Costs are real billed tokens; the split BETWEEN components is a chars/4 ratio
   normalized onto real accretion, so read the ranking, not the absolute numbers.
@@ -439,11 +669,62 @@ export function main(argv: string[]): number {
       return 1;
     }
     let paths: string[] = [];
+    // A glob positional is a SWEEP by intent, however many files it happens to
+    // match. Deciding tolerance on the expanded count alone made the identical
+    // documented command (`audit path/to/*.jsonl`) hard-fail or succeed
+    // depending on how many transcripts were sitting in the directory that day.
+    // GLOB_META is imported, not restated, so this classifier and the splitting
+    // expandGlob does can never disagree about what a glob is.
+    let sweep = positionals.length > 1;
     if (positionals.length > 0) {
       for (const p of positionals) {
-        const expanded = expandGlob(p);
-        paths.push(...(expanded.length > 0 ? expanded : [p]));
+        // An existing file is a literal path, whatever characters are in its
+        // name. Globbing it first let Bun.Glob read "session[1].jsonl" as a
+        // character class and silently audit a DIFFERENT file, reporting that
+        // one's numbers with exit 0.
+        if (existsSync(p)) {
+          paths.push(p);
+          continue;
+        }
+        if (GLOB_META.test(p)) {
+          sweep = true;
+          const expanded = expandGlob(p);
+          // Falling through to the literal handed the pattern itself to
+          // readFileSync, so a mistyped extension read as a missing file.
+          if (expanded.length === 0) throw new ZError(`No files matched "${p}".`);
+          paths.push(...expanded);
+          continue;
+        }
+        // Not on disk and not a pattern: keep it so auditTranscript's own
+        // "Cannot read transcript at" names the path the operator typed.
+        paths.push(p);
       }
+      // The same file reachable through two positionals (`dir/*.jsonl
+      // dir/a.jsonl`) used to be audited twice and its tokens counted twice --
+      // a 1.5x inflation of exactly the absolutes the dedup fix exists to
+      // correct, with the reconciliation invariant still passing because both
+      // copies balance.
+      //
+      // realpathSync.native, not resolve(): resolve() normalizes separators and
+      // "./" but NOT case, so on Windows -- a case-insensitive filesystem, and
+      // where a glob returns the on-disk spelling while the operator types
+      // another -- "Alpha.jsonl" and "alpha.jsonl" stayed two entries and the
+      // file was billed twice. realpathSync.native returns the canonical
+      // on-disk name, and resolves symlinks on POSIX for free. It throws on a
+      // path that does not exist, which the fall-through branch above
+      // deliberately keeps, so resolve() remains the fallback there.
+      // First spelling wins, so the report names paths as the operator typed them.
+      const byRealPath = new Map<string, string>();
+      for (const p of paths) {
+        let key: string;
+        try {
+          key = realpathSync.native(p);
+        } catch {
+          key = resolve(p);
+        }
+        if (!byRealPath.has(key)) byRealPath.set(key, p);
+      }
+      paths = [...byRealPath.values()];
     } else {
       const dir = str(flags, "project-dir") ?? process.cwd();
       const resolved = resolveSessionTranscript(dir, homedir());
@@ -454,8 +735,51 @@ export function main(argv: string[]): number {
       }
       paths = [resolved];
     }
-    const audits = paths.map(auditTranscript);
-    const r = rollup(audits);
+    // One named path is a question about THAT file: an empty transcript is an
+    // answer the operator asked for, so it still throws. A sweep -- several
+    // paths, or any glob -- must not let one dead session take the rollup with
+    // it (see NoUsageLineError). Only that error is tolerated; everything else,
+    // including parseLine's format-drift assertion, still aborts.
+    const audits: SessionAudit[] = [];
+    const unauditable: string[] = [];
+    for (const p of paths) {
+      try {
+        audits.push(auditTranscript(p));
+      } catch (e) {
+        if (sweep && e instanceof NoUsageLineError) {
+          unauditable.push(p);
+          continue;
+        }
+        // A sweep's docs promote it as the primary use, so an abort partway
+        // through is a common path, not a rare one. Say how far it got: without
+        // this the operator sees one drift message and no sign that 89 of 90
+        // sessions parsed cleanly.
+        if (paths.length > 1) {
+          console.error(
+            `context-audit: aborted on ${p} (file ${paths.indexOf(p) + 1} of ${paths.length}; ` +
+              `${audits.length} audited cleanly before it). Nothing is reported -- a partial rollup would understate the corpus.`
+          );
+        }
+        throw e;
+      }
+    }
+    if (audits.length === 0) {
+      throw new ZError(
+        `None of the ${paths.length} transcript(s) carry an assistant usage line, so there is nothing to attribute.`
+      );
+    }
+    const r = rollup(audits, unauditable);
+    // Mid-file corruption does NOT abort: one bad line in one of 90 sessions
+    // must not take the sweep with it, which is this command's whole point. But
+    // a --json caller pipes stdout and never sees the report's warning line, so
+    // the same fact goes to stderr too. `skippedBeyondFinalLine` is in the JSON
+    // as well, for a caller that checks rather than reads.
+    if (r.skippedBeyondFinalLine > 0) {
+      console.error(
+        `context-audit: ${r.skippedBeyondFinalLine} unparseable line(s) sit BEFORE end-of-file, so they are ` +
+          `corruption rather than a live transcript caught mid-write. Their spend is missing from the totals below.`
+      );
+    }
     if (flags["json"]) {
       console.log(JSON.stringify(r, null, 2));
       return 0;

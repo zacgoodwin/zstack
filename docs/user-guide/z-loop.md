@@ -581,12 +581,37 @@ bin/z-context-audit audit --drain-only          # loop steady-state only
 bin/z-context-audit audit --json                # machine-readable
 ```
 
-The orchestrator is where the money is: measured over 35 real drains on this
-repo it was **90% of the loop's billed input tokens** (3.23B, against 354M for
-every lane subagent combined). It is one long session that re-sends its whole
-window every turn, so a byte entering early is paid for again on every later
-turn. The audit weights each block by the turns it rides in, which is why its
-ranking differs sharply from a naive byte count.
+The orchestrator is where the money is: **~83% of the loop's billed input
+tokens**, against every lane subagent combined. It is one long session that
+re-sends its whole window every turn, so a byte entering early is paid for again
+on every later turn. The audit weights each block by the turns it rides in,
+which is why its ranking differs sharply from a naive byte count.
+
+Reproduce the ratio rather than trusting the figure. The corpus is a live
+directory that grows every session, so absolutes move between runs; only the
+ratio is stable:
+
+```bash
+# orchestrator side
+bin/z-context-audit audit ~/.claude/projects/<mangled-cwd>/*.jsonl --json | jq .totalBilled
+# lane-subagent side (z-cost, which has always deduped)
+bin/z-cost '~/.zstack/projects/<slug>/loop/transcripts/*/*.jsonl' --json \
+  | jq '[.by_model[].tokens | .fresh_input_tokens + .cached_input_tokens] | add'
+```
+
+On 2026-08-02 that returned 2.67B against 548M.
+
+> Figures published before 2026-08-01 (the earlier "90%, 3.23B" reading) came
+> from the pre-dedup tool, which summed a split response's usage snapshot once
+> per content-block line and so over-reported orchestrator absolutes ~1.87x.
+> Component ranking was unaffected. Absolutes from the two eras are not
+> comparable; re-measure rather than mixing them.
+
+A sweep (several paths, or any glob) skips a transcript carrying no assistant
+usage line and names it in the report, and under `unauditable` in `--json`. A
+single literal path is a question about that file, so the same empty transcript
+is an error there instead. Every other failure, a renamed usage key included,
+aborts the run in both modes.
 
 ### Drain vs dev
 
@@ -618,6 +643,34 @@ it had omitted tool-call parameters from its pool, which silently inflated every
 other component by ~1.9x. A component set that fails to reconcile is a bug in
 `lib/context-audit.ts`, never a finding about the loop, and it throws rather
 than printing.
+
+### The `--json` rollup
+
+`--json` prints the rollup object in place of the table: `sessions`, `turns`,
+`totalBilled`, `staticFloorCost`, and `components` (each `{component, phase,
+cost, calls, rawTokens}`, sorted by cost). It is the unfiltered set — the table
+drops rows under 0.02% and obeys `--drain-only`, the JSON does neither. Four
+more fields exist so a caller can tell a complete run from a partial one:
+
+- `drainedTickets` — the sorted **union** of ticket ids the drain touched. Two
+  sessions that both worked #201 contribute one id, not two.
+- `unauditable` — the paths a sweep skipped. Named, never merely counted: a
+  dropped session is spend missing from the totals.
+- `skippedLines` / `skippedBeyondFinalLine` — unparseable transcript lines, and
+  how many of those sat somewhere other than end-of-file. All-at-EOF is a live
+  transcript caught mid-write. Anything beyond it is corruption, those lines'
+  spend is missing from the numbers, and the run says so on stderr too, since a
+  `--json` caller never sees the report's warning.
+
+```bash
+bin/z-context-audit audit '<glob>' --json \
+  | jq '{tickets: (.drainedTickets | length), skipped: .unauditable, corrupt: .skippedBeyondFinalLine}'
+```
+
+> **Contract change in 1.0.1.0.** `drainedTickets` used to be a count and is now
+> an array of ids. `.drainedTickets | length` gives the old number back, but not
+> the old value: the count summed per session and double-counted any ticket two
+> sessions touched.
 
 ## --reconcile (crash recovery)
 
