@@ -204,11 +204,17 @@ describe("Issue #118: throwaway review worktree is placed outside ~/.zstack", ()
     expect(worktreePath).not.toContain(".zstack");
   });
 
-  test("AC1: the reviewer row still documents removing the throwaway worktree after the stage", () => {
+  // #209 changed WHEN the throwaway worktree is removed, never WHETHER: removal
+  // is now gated on the whole spawn subtree finishing (the skeptics execute
+  // inside it and outlive their parent), so the command lives in the Per-stage
+  // Actual block behind that gate rather than inline in this row. #118's own
+  // guarantee is unchanged and still pinned here -- the worktree is still
+  // removed, and still at a path outside ~/.zstack (AC1 above).
+  test("AC1: the reviewer row still documents removing the throwaway worktree, gated on the subtree", () => {
     const md = zLoop();
     const reviewerRow = section(md, "| `reviewer` |");
-    expect(reviewerRow).toMatch(/remove it after the stage/);
-    expect(reviewerRow).toContain('git worktree remove ".worktrees/review-<N>"');
+    expect(reviewerRow).toMatch(/remove it only once the whole spawn SUBTREE has finished/);
+    expect(md).toContain('git worktree remove ".worktrees/review-<N>" --force');
   });
 });
 
@@ -299,5 +305,160 @@ describe("Ticket #138: every lane-owned board move is --if-present", () => {
     expect(stopped.lanes).toEqual([]);
     expect(stopped.mergedThisRun).toEqual([]); // the retarget record would be lost
     expect(stopped.tickets[0]!.status).toBe("Review");
+  });
+});
+
+// ============================================================================
+// Ticket #209 -- the dead-worker re-spawn is only real if the orchestrator can
+// execute it. lib/stage-prompts.ts renders the briefing from a `respawnNotes`
+// key, and the orchestrator builds each spawn's input JSON from the "Input JSON
+// fields" table -- so a `respawn` row that says to pass the note, over a table
+// that never names the key, ships a transition whose whole payload is dropped.
+// Both surfaces, pinned together.
+// ============================================================================
+describe("Ticket #209: the respawn action and the input-field table agree on respawnNotes", () => {
+  // One table row, not `section`'s slice-to-next-heading (which would run past
+  // the row and let a mention in a LATER row satisfy an assertion about this one).
+  const row = (md: string, prefix: string) => md.split("\n").find((l) => l.startsWith(prefix)) ?? "";
+
+  test("the respawn action row names the stages, the key, the cap, and the fresh spawn", () => {
+    const r = row(zLoop(), "| `respawn N at S` |");
+    expect(r).not.toBe("");
+    expect(r).toContain("respawnNotes");
+    expect(r).toContain("one re-spawn per stage per lane"); // the cap, per the Plan
+    expect(r).toMatch(/[Nn]ever SendMessage/); // fresh spawn, never a resume
+    expect(r).toContain("no board move"); // the lane never left this stage's status
+  });
+
+  test("the builder and qa input rows both name respawnNotes; the blinded reviewer row does not", () => {
+    const md = zLoop();
+    expect(row(md, "| `builder` |")).toContain("respawnNotes");
+    expect(row(md, "| `qa` |")).toContain("respawnNotes");
+    // RESPAWN_STAGES excludes the reviewer on purpose: its input is pinned to
+    // exactly four blinded keys (assertReviewerInput), so a fifth would be
+    // rejected by the constructor and the briefing has nowhere to live.
+    expect(row(md, "| `reviewer` |")).not.toContain("respawnNotes");
+  });
+
+  test("check-worker collects the worktree's dirtiness before probing dead", () => {
+    const r = row(zLoop(), "| `check-worker N` |");
+    expect(r).toContain("status --porcelain --branch");
+    expect(r).toContain("--porcelain");
+    // Order: read the worktree, THEN probe -- a probe without it can only skip.
+    expect(r.indexOf("status --porcelain --branch")).toBeLessThan(r.indexOf('probe "$STATE" <N> dead'));
+  });
+
+  // A dead spawn still spent money, and the ONLY window in which its spend is
+  // reachable is before the respawn is applied: the spawn tag is a digest of
+  // <attempt>, and applying the respawn spends respawns[<stage>] so `loop attempt`
+  // returns the NEXT number forever after. Miss it and a recovered ticket goes
+  // Done with an Actual covering only the spawn that survived -- the same silent
+  // undercount #190 exists to prevent, and the one the Plan's "the prior spend is
+  // still priced" promises against.
+  test("check-worker prices the dead spawn BEFORE probing, and the respawn row does not re-collect", () => {
+    const md = zLoop();
+    const cw = row(md, "| `check-worker N` |");
+    expect(cw).toContain("collect --tag");
+    // Pricing comes first: before the porcelain read, before the probe.
+    expect(cw.indexOf("collect --tag")).toBeLessThan(cw.indexOf("status --porcelain --branch"));
+    expect(cw.indexOf("collect --tag")).toBeLessThan(cw.indexOf('probe "$STATE" <N> dead'));
+    // And it names why this is the last chance.
+    expect(cw).toMatch(/loop attempt.{0,120}dead spawn's number|dead spawn's number/);
+
+    // The respawn row must not tell the orchestrator to collect again after apply:
+    // the attempt has moved on, so that tag names the spawn about to be made.
+    const rs = row(md, "| `respawn N at S` |");
+    expect(rs).toContain("already priced");
+    expect(rs).not.toContain("collect --tag");
+  });
+
+  // The Per-stage Actual block is the one place that copies transcripts, so it has
+  // to admit the dead-worker caller or the check-worker row above points at prose
+  // that only covers a clean finish.
+  test("the Per-stage Actual block covers a dead stage agent, not only a finished one", () => {
+    expect(section(zLoop(), "**Per-stage Actual")).toMatch(/found DEAD at `check-worker`/);
+  });
+});
+
+// ============================================================================
+// Ticket #209 (QA finding 2) -- the throwaway review worktree sweep is a
+// COMMAND, not prose. #209 gated in-run removal on the reviewer's whole spawn
+// subtree going quiet, which makes a leftover `.worktrees/review-<N>` the norm
+// rather than the exception; the only sweep it leaned on was a Step 7 sentence
+// with nothing to run, skipped by `context-clear` and by any crash. Nine
+// leftovers had accumulated in this repo by the time anyone counted.
+// ============================================================================
+describe("Ticket #209: leftover review worktrees are swept by a command on every exit path", () => {
+  test("Step 7's batch cleanup runs reconcile sweep-review", () => {
+    const step7 = section(zLoop(), "## Step 7 — Exit");
+    expect(step7).not.toBe("");
+    expect(step7).toContain('lib/reconcile.ts" sweep-review');
+  });
+
+  test("Step 0 sweeps too -- after the lock acquire, covering context-clear and crash exits", () => {
+    const md = zLoop();
+    const step0 = section(md, "## Step 0");
+    expect(step0).not.toBe("");
+    expect(step0).toContain('lib/reconcile.ts" sweep-review');
+    // Only safe once the acquire proved no other loop is running.
+    expect(step0.indexOf('locks.ts" acquire')).toBeLessThan(step0.indexOf('reconcile.ts" sweep-review'));
+    // And it is NOT part of the orphan refusal gate below it.
+    expect(step0.indexOf('reconcile.ts" sweep-review')).toBeLessThan(step0.indexOf("HAS_ORPHANS"));
+  });
+
+  test("the --reconcile contract lists throwaway review worktrees among what it prunes", () => {
+    const sec = section(zLoop(), "## `--reconcile` and the safety locks");
+    expect(sec).not.toBe("");
+    expect(sec).toMatch(/throwaway review worktrees/);
+    expect(sec).toContain("review-<N>");
+  });
+
+  // Review finding 2: Step 7 justified its unconditional sweep with "every lane
+  // is finished by the time this runs, so a subtree that still reads live here is
+  // one that will never write again" -- which is the parent-returned-means-
+  // subtree-finished assumption #209 exists to refute. The reviewer returns while
+  // its skeptics execute BY DESIGN (it checks each at most once and stops
+  // waiting), and on the last lane drain-complete fires minutes later. The prose
+  // must not tell the orchestrator to retry or treat a deferral as a failure
+  // either, or the gate gets worked around in the shell.
+  test("Step 7 does not claim drain-complete proves the subtree finished", () => {
+    const step7 = section(zLoop(), "## Step 7 — Exit");
+    expect(step7).not.toContain("a subtree that still reads live here is one that will never write again");
+    expect(step7).toContain("liveness gate");
+    expect(step7).toMatch(/do not retry\s+it/i); // the prose wraps, so the gap is whitespace
+  });
+
+  test("the teardown gate points at those sweeps, not at a habit", () => {
+    // section() stops at the next "## " heading (Step 5), so Step 7's own sweep
+    // cannot satisfy this.
+    const block = section(zLoop(), "**Worktree teardown is gated");
+    expect(block).not.toBe("");
+    expect(block).toContain("sweep-review");
+    expect(block).not.toContain("Step 7's batch cleanup sweeps leftover review worktrees"); // the old prose-only promise
+  });
+
+  // AC7's rule is about the REMOVAL, not about one row: the gate was taught to the
+  // stage-teardown row only, and this ticket's own review reproduced #66 anyway --
+  // the orchestrator's `park N Blocked` cleanup force-removed `.worktrees/review-209`
+  // while a skeptic was still working in it, following the SKILL exactly as written
+  // (it said nothing either way). So the SKILL now names the only two places that
+  // may remove one, and this pins the count: a third `git worktree remove` of a
+  // review path anywhere in the file is a new ungated path.
+  test("only the gated teardown removes a review worktree by hand", () => {
+    const md = zLoop();
+    const removals = md.match(/git worktree remove "\.worktrees\/review-[^"]*"/g) ?? [];
+    expect(removals).toHaveLength(1);
+    // ...and that one sits behind the subtree gate.
+    const gate = md.indexOf('jq -r .subtreeDone "$TMP/collected-<N>.json"');
+    expect(gate).toBeGreaterThan(-1);
+    expect(md.indexOf(removals[0]!)).toBeGreaterThan(gate);
+
+    // The rule itself is written down, and every lane-dropping row points at it.
+    const rule = section(md, "**Removing a review worktree.**");
+    // Booleans, not the section: a miss must not dump 60KB into the failure.
+    expect(rule === "").toBe(false);
+    expect(rule.includes("sweep-review")).toBe(true);
+    expect(rule.includes("not in a park, not in a skip, not in a")).toBe(true);
+    expect(md.match(/\(\*\*Removing a review worktree\*\* below\)/g)).toHaveLength(3);
   });
 });

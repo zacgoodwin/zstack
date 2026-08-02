@@ -40,6 +40,10 @@ import {
   applyReconcile,
   assertNotReconcilingLiveLoop,
   hasOrphans,
+  holdLiveThrowawayPrunes,
+  listThrowawayWorktrees,
+  planReviewSweep,
+  main as reconcileMain,
   reconcileBoardMoves,
   reconcilePlan,
   scanOrphans,
@@ -47,6 +51,7 @@ import {
   type ReconcileAction,
   type ReconcileEffects,
 } from "../lib/reconcile.ts";
+import { SUBTREE_STALE_MS } from "../lib/transcripts.ts";
 import {
   applyAction,
   ingestBoardItems,
@@ -72,6 +77,32 @@ function tmp(prefix = "zstack-safety-"): string {
 afterEach(() => {
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
+
+// A sub-agent transcript directory, for #209's review-worktree sweep gate. Only
+// the two shapes the liveness read distinguishes are needed here (the full
+// corpus-derived fixtures live in tests/transcripts.test.ts): a transcript
+// parked on a `tool_use` (the agent is blocked on a call -- LIVE) versus one
+// ending on a final answer written long enough ago to clear SUBTREE_QUIET_MS.
+const NOW = Date.parse("2026-07-29T16:00:00.000Z");
+function subagents(agents: { id: string; live: boolean }[]): string {
+  const dir = tmp("zstack-subagents-");
+  for (const a of agents) {
+    const first = JSON.stringify({ type: "user", message: { role: "user", content: `brief for ${a.id}` } });
+    const last = a.live
+      ? JSON.stringify({
+          type: "assistant",
+          message: { role: "assistant", content: [{ type: "tool_use", id: `toolu_${a.id}`, name: "Bash", input: {} }] },
+          timestamp: new Date(NOW - 5_000).toISOString(),
+        })
+      : JSON.stringify({
+          type: "assistant",
+          message: { role: "assistant", content: [{ type: "text", text: "COULD NOT REFUTE: ..." }] },
+          timestamp: new Date(NOW - 30 * 60_000).toISOString(),
+        });
+    writeFileSync(join(dir, `agent-${a.id}.jsonl`), `${first}\n${last}\n`);
+  }
+  return dir;
+}
 
 // -- fixture builders (mirror tests/loop.test.ts) -----------------------------
 function ticket(number: number, status: TicketSnapshot["status"], dependsOn: number[] = []): TicketSnapshot {
@@ -834,6 +865,177 @@ describe("control 2: orphan scan (crash recovery)", () => {
     expect(parked).toEqual([5]);
     expect(released).toEqual([5]);
     expect(pruned[0]).toContain("ticket-5");
+  });
+
+  // -- #209: the reviewer's throwaway checkouts are reconcile's to clean up ------
+  // #209 gated in-run removal of `.worktrees/review-<N>` on the reviewer's whole
+  // spawn subtree going quiet (the skeptics execute inside it and outlive their
+  // parent), which makes "left behind" the ordinary outcome. Before this the scan
+  // matched nothing but `ticket-<N>`, so nothing but a prose sentence in Step 7
+  // ever removed them and they accumulated across runs.
+  test("leftover `review-<N>` worktrees are scanned and pruned -- never parked or released", () => {
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    mkdirSync(join(worktreesDir, "review-42"));
+    mkdirSync(join(worktreesDir, "review-42-lead")); // a fanned-out review's variants
+    mkdirSync(join(worktreesDir, "review-7-base"));
+
+    // #42 is Done (merged, the ordinary case) and #7 is still in Review.
+    const orphans = scanOrphans(locksDir, worktreesDir, [{ number: 42, status: "Done" }, { number: 7, status: "Review" }], 0);
+    expect(orphans.throwawayWorktrees.map((w) => w.ticket)).toEqual([7, 42, 42]);
+    expect(orphans.orphanWorktrees).toEqual([]); // never counted as a lane's worktree
+    expect(listThrowawayWorktrees(worktreesDir).map((w) => w.path)).toEqual([
+      join(worktreesDir, "review-7-base"),
+      join(worktreesDir, "review-42"),
+      join(worktreesDir, "review-42-lead"),
+    ]);
+
+    const plan = reconcilePlan(orphans);
+    expect(plan.every((a) => a.kind === "prune-worktree")).toBe(true);
+    expect(plan.map((a) => (a as any).path).sort()).toEqual(
+      [join(worktreesDir, "review-42"), join(worktreesDir, "review-42-lead"), join(worktreesDir, "review-7-base")].sort()
+    );
+    // Never park or release: the number names the ticket the review was FOR, and
+    // #42 is merged -- reopening it would rebuild landed work.
+    expect(byKind(plan, "park-ready")).toEqual([]);
+    expect(byKind(plan, "release-claim")).toEqual([]);
+  });
+
+  // hasOrphans is the STARTUP REFUSAL gate. A leftover scratch checkout is litter,
+  // not a wedge, and since #209 made leftovers the norm, counting them here would
+  // refuse to start the loop after almost every run.
+  test("a leftover review worktree alone does NOT trip hasOrphans (the startup refusal gate)", () => {
+    const worktreesDir = tmp();
+    mkdirSync(join(worktreesDir, "review-42"));
+    const orphans = scanOrphans(tmp(), worktreesDir, [{ number: 42, status: "Done" }], 0);
+    expect(orphans.throwawayWorktrees).toHaveLength(1);
+    expect(hasOrphans(orphans)).toBe(false); // startup proceeds
+    expect(reconcilePlan(orphans)).toHaveLength(1); // but reconcile still prunes it
+
+    // Contrast: a real lane worktree with no lock IS a wedge.
+    mkdirSync(join(worktreesDir, "ticket-42"));
+    expect(hasOrphans(scanOrphans(tmp(), worktreesDir, [{ number: 42, status: "Done" }], 0))).toBe(true);
+  });
+
+  // The CLI branch Step 0 and Step 7 call. It must run BEFORE loadConfig and the
+  // Board client: batch cleanup holds the loop lock and must not be able to fail
+  // on a missing project config or a GraphQL quota. No slug is passed here, so a
+  // non-zero exit would prove that ordering regressed.
+  test("`sweep-review` needs no slug, no board, and no locks dir", async () => {
+    expect(await reconcileMain(["sweep-review", "--worktrees", tmp(), "--subagents-dir", subagents([])])).toBe(0);
+  });
+
+  // -- #209 (review finding 2): the sweep is gated on subtree liveness ---------
+  // AC7 says the review worktree is removed ONLY once the subtree is done, and
+  // the in-stage gate alone does not deliver that end to end: with a 15-minute
+  // settling window it answers `false` almost always, so the SWEEP is the
+  // de-facto removal path. Ungated, it force-removes `.worktrees/review-<N>`
+  // under a live skeptic exactly like #66 -- and on the last lane, drain-complete
+  // fires minutes after the reviewer returned, with its skeptics still executing
+  // (the reviewer checks each at most once and stops waiting: that is the
+  // DESIGNED case, not an anomaly).
+  test("AC7: sweep-review removes nothing while any sub-agent of this session is unproven", async () => {
+    const worktreesDir = tmp();
+    mkdirSync(join(worktreesDir, "review-66"));
+    mkdirSync(join(worktreesDir, "review-66-lead"));
+
+    const busy = subagents([{ id: "skeptic2", live: true }, { id: "reviewer", live: false }]);
+    expect(planReviewSweep({ worktreesDir, subagentsDir: busy, now: NOW }).paths).toEqual([]);
+    expect(planReviewSweep({ worktreesDir, subagentsDir: busy, now: NOW }).live).toEqual(["skeptic2"]);
+    // ...and the CLI actually leaves them on disk, which is the thing that matters.
+    expect(await reconcileMain(["sweep-review", "--worktrees", worktreesDir, "--subagents-dir", busy, "--now", String(NOW)])).toBe(0);
+    expect(existsSync(join(worktreesDir, "review-66"))).toBe(true);
+    expect(existsSync(join(worktreesDir, "review-66-lead"))).toBe(true);
+  });
+
+  // AC8, end to end: with the session quiet the sweep is byte-identical to the
+  // unconditional one -- the gate must not turn into a permanent refusal.
+  test("AC8: with every agent finished, sweep-review removes the leftovers", async () => {
+    const worktreesDir = tmp();
+    mkdirSync(join(worktreesDir, "review-66"));
+    mkdirSync(join(worktreesDir, "ticket-66")); // a lane worktree is never the sweep's business
+    const quiet = subagents([{ id: "skeptic2", live: false }, { id: "reviewer", live: false }]);
+    expect(planReviewSweep({ worktreesDir, subagentsDir: quiet, now: NOW }).paths).toEqual([join(worktreesDir, "review-66")]);
+    expect(await reconcileMain(["sweep-review", "--worktrees", worktreesDir, "--subagents-dir", quiet, "--now", String(NOW)])).toBe(0);
+    expect(existsSync(join(worktreesDir, "review-66"))).toBe(false);
+    expect(existsSync(join(worktreesDir, "ticket-66"))).toBe(true);
+  });
+
+  // The wedge the staleness ceiling exists for, at the CLI. An agent killed
+  // mid-tool-call can never satisfy the finished SHAPE at any age, so before the
+  // ceiling one of them disabled this command (and reconcile's throwaway prunes)
+  // for the whole session -- and `sweep-review` is what troubleshooting.md sells
+  // as the by-hand clear, so the documented escape hatch was the thing that got
+  // wedged. Measured: 17 of 1,490 sub-agent transcripts on this machine.
+  test("a crashed agent stops holding the sweep once it is stale, and --stale-ms is the override", async () => {
+    const worktreesDir = tmp();
+    mkdirSync(join(worktreesDir, "review-66"));
+    const wedged = subagents([{ id: "crashed", live: true }]); // last record: a tool_use, 5s old
+    expect(planReviewSweep({ worktreesDir, subagentsDir: wedged, now: NOW }).live).toEqual(["crashed"]);
+    // Far enough past its last record, it is not running anything.
+    expect(planReviewSweep({ worktreesDir, subagentsDir: wedged, now: NOW + SUBTREE_STALE_MS }).paths).toHaveLength(1);
+    // ...and the operator who knows the session is dead does not have to wait.
+    expect(
+      await reconcileMain([
+        "sweep-review",
+        "--worktrees",
+        worktreesDir,
+        "--subagents-dir",
+        wedged,
+        "--now",
+        String(NOW),
+        "--stale-ms",
+        "1000",
+      ])
+    ).toBe(0);
+    expect(existsSync(join(worktreesDir, "review-66"))).toBe(false);
+  });
+
+  test("--stale-ms and --quiet-ms reject a value that is not a non-negative number", async () => {
+    for (const flag of ["--stale-ms", "--quiet-ms"]) {
+      expect(await reconcileMain(["sweep-review", "--worktrees", tmp(), "--subagents-dir", subagents([]), flag, "soon"])).toBe(1);
+      expect(await reconcileMain(["sweep-review", "--worktrees", tmp(), "--subagents-dir", subagents([]), flag, "-1"])).toBe(1);
+    }
+  });
+
+  // Step 0's shape: a fresh session has spawned nothing, so the directory does
+  // not exist yet and the sweep proceeds. This is what makes the gate a deferral
+  // rather than a leak -- whatever Step 7 declined to remove goes here.
+  test("a session that has spawned no sub-agents sweeps (Step 0)", () => {
+    const worktreesDir = tmp();
+    mkdirSync(join(worktreesDir, "review-66"));
+    const missing = join(tmp(), "subagents-never-created");
+    expect(planReviewSweep({ worktreesDir, subagentsDir: missing, now: NOW }).paths).toEqual([join(worktreesDir, "review-66")]);
+    // No resolvable session at all (no Claude Code running in this cwd): same.
+    expect(planReviewSweep({ worktreesDir, subagentsDir: undefined, now: NOW }).paths).toHaveLength(1);
+  });
+
+  // `reconcile apply` is the OTHER path that force-removes review worktrees, so
+  // it takes the same hold -- and only over those. A wedged lane's recovery must
+  // never wait on someone else's skeptic.
+  test("the reconcile plan's throwaway prunes are held while an agent is live -- lane recovery is not", () => {
+    const worktreesDir = tmp();
+    mkdirSync(join(worktreesDir, "review-66"));
+    mkdirSync(join(worktreesDir, "ticket-5"));
+    const plan = reconcilePlan(scanOrphans(tmp(), worktreesDir, [{ number: 5, status: "Building" }], 0));
+    expect(plan.filter((a) => a.kind === "prune-worktree")).toHaveLength(2);
+
+    const held = holdLiveThrowawayPrunes(plan, ["skeptic2"]);
+    expect(held.filter((a) => a.kind === "prune-worktree").map((a) => (a as any).path)).toEqual([join(worktreesDir, "ticket-5")]);
+    expect(held.some((a) => a.kind === "park-ready" && a.ticket === 5)).toBe(true); // the recovery still runs
+    expect(holdLiveThrowawayPrunes(plan, [])).toEqual(plan); // nothing live, nothing held
+  });
+
+  // The name is matched, not merely prefixed: an unrelated directory must not be
+  // force-removed by the sweep.
+  test("only `review-<N>` shapes are throwaway; unrelated directories are ignored entirely", () => {
+    const worktreesDir = tmp();
+    for (const name of ["review", "reviews-3", "review-abc", "notes", "ticket-3x"]) mkdirSync(join(worktreesDir, name));
+    const orphans = scanOrphans(tmp(), worktreesDir, [], 0);
+    expect(orphans.throwawayWorktrees).toEqual([]);
+    expect(orphans.orphanWorktrees).toEqual([]);
+    expect(listThrowawayWorktrees(worktreesDir)).toEqual([]);
+    expect(reconcilePlan(orphans)).toEqual([]);
   });
 });
 

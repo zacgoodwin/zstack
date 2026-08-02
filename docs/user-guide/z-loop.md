@@ -168,16 +168,67 @@ records the result. It never re-derives a scheduling decision in prose.
   of bouncing again. A worker silent past the watchdog (default 10 min) is
   probed and then Skipped with a note. Exception: a dead merge lane is verified
   via PR state and ends Merged or Blocked, never Skipped.
+- **A stage that died without ever reporting can still be recovered.** A stage
+  agent's exit contract is parsed from its final message, so a worker that ends
+  its turn with no marker reads as CONFUSED — and a CONFUSED skips the ticket.
+  That is the right answer when the agent could not do the job and the wrong one
+  when it simply never said it did: run 11's #170 builder addressed both reviewer
+  findings, backgrounded its own `bun test`, and stopped to wait for a run nobody
+  could report back to, with the finished diff sitting uncommitted in its
+  worktree. So the dead-worker probe now collects that worktree's
+  `git status --porcelain --branch` too, and a lane whose worker died holding
+  **uncommitted changes** re-spawns that same stage ONCE (`respawn`) instead of
+  being skipped — a fresh agent, never a resumed conversation, so nothing latent
+  travels between stages. It is told plainly that the prior attempt's changes are
+  uncommitted and UNVERIFIED and that keeping, fixing, or dropping them is its own
+  call: carrying them forward as trusted would defeat the fresh-agent guarantee,
+  and dropping them silently is the waste being fixed. The re-spawn has its own
+  budget — **one per stage, per lane** — separate from the QA, reviewer, and commit
+  caps, and the cap is what keeps this from becoming an unbounded retry. Per stage,
+  not per lane: a builder that died silently says nothing about the QA agent that
+  runs after it, so burning the builder's re-spawn still leaves QA's
+  intact. After the stage's one re-spawn is spent the
+  skip applies, and because skipping releases the lane lock — which makes the
+  worktree an orphan the next run's reconcile scan force-removes — the skip first
+  dumps the uncommitted state to
+  `~/.zstack/projects/<slug>/reports/uncommitted-<N>.patch`, same salvage contract
+  as the uncommitted-work park above. A worktree with nothing uncommitted in it is
+  skipped exactly as before: there is nothing to recover, so no re-spawn is spent.
+  So is one whose `git status` produced **no output at all** — that is what a
+  missing or broken worktree yields (git always prints its `## <branch>` header
+  when it runs), so there is provably nothing there and no fresh agent is briefed
+  about changes that do not exist. The reviewer is excluded (it executes in a
+  throwaway worktree, and its blinded
+  four-key input has nowhere to put a briefing about a prior attempt), and a dead
+  merge lane keeps its own PR-state resolution. A ticket a **human** moved to a
+  stop status mid-run is never re-spawned either: that move is respected, so the
+  lane stops cleanly at the dead worker, spends nothing, and leaves the human's
+  own status alone — with the same patch dumped first if that lane's worktree held
+  uncommitted work, since stopping the lane releases its lock and the worktree is
+  no more durable there than after a skip.
+  Every stage prompt that runs the gauntlet now also states the other half: run
+  verification in the FOREGROUND, because ending a turn with a background job
+  still pending is parsed as CONFUSED.
 - **Actual per ticket.** After each stage the ticket's transcripts are priced with
-  `bin/z-cost` (dedup by requestId) and written to the Actual field.
+  `bin/z-cost` (dedup by requestId) and written to the Actual field. A stage that
+  died without reporting is priced too, at the moment it is found dead and before
+  its replacement is spawned — that is the last instant its transcript can be
+  located, since the spawn tag is keyed on the attempt number and the re-spawn
+  moves that number on. So a ticket recovered by a re-spawn carries the cost of
+  **both** spawns, not just the one that finished.
 - **Per-stage transcript layout.** Each stage's copy lands at
   `~/.zstack/projects/<slug>/state/transcripts/ticket-<N>/<stage>-<attempt>.jsonl`
   — `<stage>` is `builder`/`qa`/`reviewer`/`merge`, `<attempt>` is that lane's
-  1-based spawn count for the stage (a QA bounce, a reviewer bounce, and an
-  uncommitted-work re-spawn each re-spawn builder — so `builder-3.jsonl` might
-  follow two bounces of different kinds, not necessarily three QA passes). This
-  naming is what lets the end-of-loop report break spend down by stage instead
-  of only by ticket.
+  1-based spawn count for the stage (a QA bounce, a reviewer bounce, an
+  uncommitted-work re-spawn, and a dead-worker re-spawn each re-spawn builder —
+  so `builder-3.jsonl` might follow two bounces of different kinds, not
+  necessarily three QA passes; and a reviewer bounce sends the lane back through
+  the builder and into QA a second time, so `qa-2.jsonl` need not mean a QA bug
+  either). The count is computed by `lib/loop.ts attempt`,
+  never by hand: two spawns of one stage that compute the same number mint the
+  same spawn tag, which makes collection refuse and would overwrite the earlier
+  transcript. This naming is what lets the end-of-loop report break spend down by
+  stage instead of only by ticket.
 - **Sub-agent transcripts count too.** A stage that spawns its own sub-agents —
   the adversarial reviewer's 3 skeptics are the case that matters — lands each
   one beside its parent as `<stage>-<attempt>-sub-<agentId>.jsonl`, and those
@@ -190,6 +241,55 @@ records the result. It never re-derives a scheduling decision in prose.
   sweep is not a substitute — three lanes drain concurrently, so sibling
   reviewers' skeptics interleave in one flat directory, and the sweep tried by
   hand during a real run gave a reviewer with 3 skeptics 8 transcripts.
+- **The review worktree survives until the whole subtree does.** The reviewer's
+  throwaway `.worktrees/review-<N>` used to be removed as soon as the reviewer
+  returned — but the skeptics execute inside it and outlive their parent, and in
+  #66's review that removal fired while two of the three were still running (one
+  reported the worktree disappearing from `git worktree list` mid-review, which
+  is indistinguishable from a skeptic that simply failed). Removal is now gated
+  on the same parentage walk that collects the transcripts: a stage's worktree
+  goes only once every descendant has been observed finishing.
+  "Finishing" is read from each descendant's **own** transcript, three ways, in
+  order of how strong the evidence is. A turn-ending stop reason on the last
+  record is proof by itself and needs no wait — measured over all 1,546 sub-agent
+  transcripts on this machine, 1,310 of the 1,532 finished ones end that way and
+  none of the 10,517 mid-work records carry one. Failing that, a final-answer
+  shape (text, no pending tool call) counts once nothing has been appended for 15
+  minutes; that window is measured too, since an agent that narrated mid-work and
+  kept going went quiet for as long as 423 seconds before its next record, so a
+  shorter one declares a working skeptic finished. And whatever the shape, a
+  transcript nobody has written to for 8 hours reads finished — without that
+  ceiling an agent killed mid-tool-call could never satisfy the shape check at any
+  age, and a single one of those (17 of 1,490 transcripts here) held the sweep
+  open forever. `sweep-review --stale-ms` overrides that ceiling for a session you
+  know is dead. The parent's transcript
+  cannot answer it either: the skeptics
+  are background spawns, so the only record the reviewer ever gets for one is the
+  "launched successfully" acknowledgement written the instant it starts, and
+  reading that as a result would remove the worktree at the exact moment #66 did.
+  Anything unproven — an unreadable or half-written transcript, one still parked
+  on a tool call, or a sub-agent whose **metadata sidecar** could not be parsed
+  (its parentage is unknown, so it may well be one of these skeptics, and a
+  half-written sidecar is likeliest at spawn when the child is youngest) — counts
+  as still running. That never stalls the drain: nothing
+  waits on the flag, and a leftover directory is the cheap direction to be wrong
+  in.
+  Whatever the in-stage gate declines to remove is collected by a command
+  (`bun lib/reconcile.ts sweep-review`, which touches `.worktrees/review-<N>` and
+  nothing else). It carries the same guard rather than working around it: it
+  removes nothing while **any** sub-agent of the session is still unproven, since
+  a reviewer returning with skeptics still executing is the designed case, not an
+  anomaly — the reviewer checks each skeptic at most once and stops waiting. It is
+  called at batch cleanup when the drain completes, and at the start of the next
+  run right after the loop lock is acquired, which covers the exits batch cleanup
+  never reaches (a context-clear pause, a crash). Neither call assumes the session
+  is quiet — both check and print what they found, because `/z-loop` can be invoked
+  inside a session that already holds sub-agent transcripts. Those are the only
+  two places the loop removes a review worktree by hand; a park, a skip, or a
+  stop-lane never does, because the same live skeptic is at stake whichever action
+  is being taken. `--reconcile` prunes them too, under the same hold. They never
+  block startup: a scratch checkout nobody owns is litter, not a wedge, so it is
+  swept rather than reported as an orphan.
 - **Per-stage model routing.** The merge stage is mechanical (`gh pr create`, a
   conflict check, `gh pr merge`) and doesn't need the ticket's build-tier
   model; the `stageModels` config knob (default `{"merge": "haiku"}`)
@@ -681,6 +781,11 @@ on any orphan (or names the live session if a loop is genuinely running).
 prunes worktrees, and clears the stale lock — then starts. It never deletes a
 branch, never touches a ticket with a live lane. A running loop's lock is never
 cleared: you cannot reconcile over a live loop.
+
+Leftover throwaway review worktrees (`.worktrees/review-<N>` and its
+`-lead`/`-base` variants) are pruned too, but they are never an orphan that
+refuses startup — they hold no work and belong to no lane, and every run sweeps
+them at Step 0 anyway.
 
 Mid-run, dragging a Building/QA ticket to Blocked or Questions on the board is
 respected: the loop stops that one lane cleanly at its next stage boundary and

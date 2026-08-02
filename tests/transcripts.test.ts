@@ -14,7 +14,7 @@
 // the stamp's format on the writer side fails here on the reader side rather
 // than silently making every future collect find nothing. No LLM calls.
 import { test, expect, describe, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, utimesSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ZError } from "../lib/config.ts";
@@ -22,9 +22,15 @@ import { KNOWN_STAGES } from "../lib/cost.ts";
 import { STATUS_FOR_STAGE } from "../lib/loop.ts";
 import { SPAWN_TAG_MARKER, builderPrompt, reviewerPrompt } from "../lib/stage-prompts.ts";
 import {
+  MEASURED_MAX_STALL_MS,
+  MEASURED_MIDWORK_GAP_MS,
+  SUBTREE_QUIET_MS,
+  SUBTREE_STALE_MS,
   collectTranscripts,
   descendantsOf,
   findRootAgents,
+  liveAgentsIn,
+  liveDescendants,
   main,
   readAgentMetas,
   spawnTag,
@@ -114,6 +120,108 @@ function writeAgent(
         ...(opts.parent === undefined ? {} : { parentAgentId: opts.parent }),
       })
   );
+}
+
+// -- #209 liveness fixtures ----------------------------------------------------
+//
+// Every shape below was read off real transcripts on this machine (loop run 11,
+// plus a live 70-second probe agent), NOT invented. That matters: the first cut
+// of this feature shipped green against a fabricated "the parent records the
+// child's verdict" fixture, which is a thing the harness does not do for the
+// background spawns the loop actually uses.
+const NOW = Date.parse("2026-07-29T16:00:00.000Z");
+const QUIET = new Date(NOW - 30 * 60_000).toISOString(); // well past SUBTREE_QUIET_MS (15 min)
+const RECENT = new Date(NOW - 5_000).toISOString(); // written 5s ago: still noisy
+
+function append(dir: string, id: string, record: unknown): void {
+  const path = join(dir, `agent-${id}.jsonl`);
+  writeFileSync(path, readFileSync(path, "utf8") + JSON.stringify(record) + "\n");
+}
+
+// What a sub-agent's transcript ends on WHILE IT RUNS: the `tool_use` it is
+// blocked on. A live probe agent sat on exactly this record -- file untouched --
+// for the whole 70 seconds of its Bash call, which is why quiescence alone can
+// never mean "finished".
+function appendRunning(dir: string, id: string, at: string = RECENT): void {
+  append(dir, id, {
+    isSidechain: true,
+    agentId: id,
+    type: "assistant",
+    message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", id: `toolu_call_${id}`, name: "Bash", input: {} }] },
+    timestamp: at,
+  });
+}
+
+// What it ends on when it RETURNS: an assistant entry carrying text and no
+// tool_use. `stop_reason` is deliberately null here -- 11 of 87 real finished
+// transcripts ended that way (streaming splits the final message), so the check
+// must not lean on end_turn.
+function appendFinalAnswer(dir: string, id: string, at: string = QUIET): void {
+  append(dir, id, {
+    isSidechain: true,
+    agentId: id,
+    type: "assistant",
+    message: { role: "assistant", stop_reason: null, content: [{ type: "text", text: "COULD NOT REFUTE: ..." }] },
+    timestamp: at,
+  });
+}
+
+// What it ends on when it returns and the harness records WHY the turn ended:
+// a terminal `stop_reason`. 1,310 of this machine's 1,532 finished sub-agent
+// transcripts look like this, and no mid-work record in the corpus does -- which
+// is what lets it skip the settling window. `reason` is a parameter so the
+// non-terminal values that also appear on text-only records (`tool_use`,
+// `max_tokens`) can be held to the window instead.
+function appendTerminalAnswer(dir: string, id: string, at: string = QUIET, reason: string = "end_turn"): void {
+  append(dir, id, {
+    isSidechain: true,
+    agentId: id,
+    type: "assistant",
+    message: { role: "assistant", stop_reason: reason, content: [{ type: "text", text: "COULD NOT REFUTE: ..." }] },
+    timestamp: at,
+  });
+}
+
+// The ONLY record a parent ever gets for a background child, verbatim from a real
+// run-11 reviewer transcript: an immediate ack, written at SPAWN time. Reading it
+// as a result is the #66 bug -- so the fixtures write it everywhere the loop's
+// reviewer would, and the assertions below prove it proves nothing.
+function appendBackgroundAck(dir: string, parentId: string, childId: string, at: string = RECENT): void {
+  append(dir, parentId, {
+    isSidechain: true,
+    agentId: parentId,
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        {
+          tool_use_id: `toolu_${childId}`,
+          type: "tool_result",
+          content: [
+            {
+              type: "text",
+              text:
+                `Async agent launched successfully. (This tool result is internal metadata ...)\n` +
+                `agentId: ${childId} (internal ID - do not mention to user.)\n` +
+                `The agent is working in the background. You will be notified automatically when it completes.`,
+            },
+          ],
+        },
+      ],
+    },
+    timestamp: at,
+  });
+}
+
+// The loop's reviewer, as it really spawns: three skeptics in the BACKGROUND, so
+// the parent holds three acks and nothing else. `finished` names the ones whose
+// own transcripts have come to rest.
+function backgroundSkeptics(dir: string, parent: string, kids: string[], finished: string[]): void {
+  for (const k of kids) {
+    appendBackgroundAck(dir, parent, k);
+    if (finished.includes(k)) appendFinalAnswer(dir, k);
+    else appendRunning(dir, k);
+  }
 }
 
 // The run-10 shape: two reviewers with three skeptics each, all in one flat
@@ -290,6 +398,308 @@ describe("descendantsOf (#190)", () => {
     writeAgent(dir, "root");
     const { metas } = readAgentMetas(dir);
     expect(descendantsOf(metas, "root")).toEqual([]);
+  });
+});
+
+// -- #209: the throwaway worktree may not be removed under a live descendant ---
+//
+// #66's review removed `.worktrees/review-66` while two of its three skeptics
+// were still executing inside it -- skeptic 2 reported the worktree disappearing
+// from `git worktree list` partway through. Children outlive the stage that
+// spawned them, so "the parent returned" is not "the subtree finished". The
+// signal is the parentage data collection already walks, never a second liveness
+// mechanism and never wall-clock proximity (which was already the wrong answer
+// for attribution: sibling reviewers' skeptics interleave in one flat directory).
+describe("subtree liveness (#209)", () => {
+  const live = (dir: string, root: string) => liveDescendants(dir, readAgentMetas(dir).metas, root, { now: NOW });
+  const collect = (dir: string, tag: string, name: string) =>
+    collectTranscripts({ subagentsDir: dir, tag, dest: join(mkTmp(), "collected"), name, now: NOW });
+
+  test("AC7: a background skeptic still writing blocks the teardown, ack or no ack", () => {
+    const dir = mkTmp();
+    const { t1 } = twoReviewersWithSkeptics(dir);
+    // The real reviewer shape: all three spawned in the background (so the parent
+    // holds three "Async agent launched successfully" acks and nothing else), one
+    // returned, two still on a tool call inside `.worktrees/review-<N>`.
+    backgroundSkeptics(dir, "r1", ["s1a", "s1b", "s1c"], ["s1a"]);
+    expect(live(dir, "r1")).toEqual(["s1b", "s1c"]);
+    const r = collect(dir, t1, "reviewer-1");
+    expect(r.subtreeDone).toBe(false); // the SKILL's gate: do NOT remove the worktree
+    expect(r.live).toEqual(["s1b", "s1c"]);
+    // Collection itself is unaffected -- the stage's spend is still attributed.
+    expect(r.descendants).toBe(3);
+  });
+
+  // The regression QA caught: the spawn-time ack carries the child's tool_use_id,
+  // so anything keyed on that id in the parent's file reads EVERY background child
+  // as finished the instant it starts -- exactly the #66 removal this prevents.
+  test("AC7: the spawn ack alone never counts as a result", () => {
+    const dir = mkTmp();
+    twoReviewersWithSkeptics(dir);
+    for (const s of ["s1a", "s1b", "s1c"]) appendBackgroundAck(dir, "r1", s);
+    // Not one skeptic has written a thing yet; the parent already holds all three
+    // acks. Every one of them is still running.
+    expect(live(dir, "r1")).toEqual(["s1a", "s1b", "s1c"]);
+  });
+
+  test("AC8: with every descendant returned and quiet, the subtree is done and removal proceeds", () => {
+    const dir = mkTmp();
+    const { t1 } = twoReviewersWithSkeptics(dir);
+    backgroundSkeptics(dir, "r1", ["s1a", "s1b", "s1c"], ["s1a", "s1b", "s1c"]);
+    const r = collect(dir, t1, "reviewer-1");
+    expect(r.live).toEqual([]);
+    expect(r.subtreeDone).toBe(true);
+  });
+
+  // Shape without quiescence is not enough: agents narrate mid-work ("Now I'll
+  // write the extraction JSON.") and keep going. 9,632 of the finished-shape
+  // records across this machine's 1,388 sub-agent transcripts were NOT the last
+  // record in their file.
+  test("a final-looking record written seconds ago is still live", () => {
+    const dir = mkTmp();
+    twoReviewersWithSkeptics(dir);
+    appendFinalAnswer(dir, "s1a", RECENT);
+    appendFinalAnswer(dir, "s1b", QUIET);
+    appendFinalAnswer(dir, "s1c", QUIET);
+    expect(live(dir, "r1")).toEqual(["s1a"]);
+    // ...and the boundary is the constant, not a guess.
+    const metas = readAgentMetas(dir).metas;
+    expect(liveDescendants(dir, metas, "r1", { now: Date.parse(RECENT) + SUBTREE_QUIET_MS })).toEqual([]);
+    expect(liveDescendants(dir, metas, "r1", { now: Date.parse(RECENT) + SUBTREE_QUIET_MS - 1 })).toEqual(["s1a"]);
+  });
+
+  // The quiet window is a measurement, and this is the measurement's gate. The
+  // first cut shipped 180s on the strength of an 87-transcript sample whose
+  // longest mid-work gap was 94s ("~2x the ceiling"). Re-measured over EVERY
+  // sub-agent transcript on this machine -- 1,388 files, 9,632 finished-shape
+  // records that were not the last in their file -- the mid-work ceiling is 423s:
+  // three real transcripts narrate, go quiet for 202s/303s/423s, then resume with
+  // `thinking` or `tool_use`. At 180s each of those, as a skeptic, has
+  // `.worktrees/review-<N>` removed out from under it mid-run -- #66 exactly. So
+  // the constant must clear the measured ceiling by the same 2x margin the
+  // original rule claimed, and this test is what stops it drifting back down: the
+  // cost of being long is one worktree Step 7 sweeps anyway.
+  test("the quiet window clears the measured mid-work ceiling by 2x", () => {
+    expect(MEASURED_MIDWORK_GAP_MS).toBe(423_110);
+    expect(SUBTREE_QUIET_MS).toBeGreaterThanOrEqual(2 * MEASURED_MIDWORK_GAP_MS);
+    // Each of the three real gaps that break 180s, as a live skeptic.
+    const dir = mkTmp();
+    twoReviewersWithSkeptics(dir);
+    const gaps = [202_000, 303_000, MEASURED_MIDWORK_GAP_MS];
+    ["s1a", "s1b", "s1c"].forEach((s, i) => appendFinalAnswer(dir, s, new Date(NOW - gaps[i]).toISOString()));
+    expect(live(dir, "r1")).toEqual(["s1a", "s1b", "s1c"]);
+  });
+
+  test("a transcript still parked on a tool_use is live however long it has been quiet", () => {
+    const dir = mkTmp();
+    twoReviewersWithSkeptics(dir);
+    // The live-probe shape: blocked on a 70s Bash call, nothing appended since.
+    for (const s of ["s1a", "s1b", "s1c"]) appendRunning(dir, s, QUIET);
+    expect(live(dir, "r1")).toEqual(["s1a", "s1b", "s1c"]);
+  });
+
+  test("a stage with no sub-agents at all is done immediately (every builder/qa/merge)", () => {
+    const dir = mkTmp();
+    const tag = spawnTag("zstack", 151, "builder", 1);
+    writeAgent(dir, "b1", { prompt: stagePromptWithTag(tag) });
+    const r = collect(dir, tag, "builder-1");
+    expect(r.subtreeDone).toBe(true);
+    expect(r.live).toEqual([]);
+  });
+
+  test("a sibling reviewer's outstanding skeptics never hold THIS stage's worktree", () => {
+    const dir = mkTmp();
+    const { t1 } = twoReviewersWithSkeptics(dir);
+    backgroundSkeptics(dir, "r1", ["s1a", "s1b", "s1c"], ["s1a", "s1b", "s1c"]);
+    // r2's three are all still running, in the same flat directory.
+    backgroundSkeptics(dir, "r2", ["s2a", "s2b", "s2c"], []);
+    expect(collect(dir, t1, "reviewer-1").subtreeDone).toBe(true);
+  });
+
+  test("liveness is transitive: a live grandchild holds the worktree too", () => {
+    const dir = mkTmp();
+    const tag = spawnTag("zstack", 151, "reviewer", 1);
+    writeAgent(dir, "r1", { prompt: stagePromptWithTag(tag) });
+    writeAgent(dir, "s1", { parent: "r1" });
+    writeAgent(dir, "g1", { parent: "s1" });
+    appendFinalAnswer(dir, "s1"); // the skeptic returned; its own sub-agent did not
+    appendRunning(dir, "g1");
+    expect(live(dir, "r1")).toEqual(["g1"]);
+  });
+
+  // Every unreadable input fails toward LIVE, and that direction is free: a kept
+  // worktree is swept by the batch-end cleanup, while a removed one destroys the
+  // workspace a running agent is reading.
+  test("an unreadable, unparseable, or undated transcript reads as live", () => {
+    const dir = mkTmp();
+    writeAgent(dir, "r1");
+    writeAgent(dir, "s1", { parent: "r1" }); // only the spawn prompt so far: no answer
+    writeAgent(dir, "s2", { parent: "r1" });
+    writeAgent(dir, "s3", { parent: "r1" });
+    // A final line the harness is still writing -- truncated JSON IS activity.
+    appendFinalAnswer(dir, "s2");
+    writeFileSync(join(dir, "agent-s2.jsonl"), readFileSync(join(dir, "agent-s2.jsonl"), "utf8") + '{"type":"assist');
+    // A final answer with no usable timestamp: nothing to measure quiet against.
+    append(dir, "s3", { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "done" }] } });
+    expect(live(dir, "r1")).toEqual(["s1", "s2", "s3"]);
+    // A descendant whose transcript file does not exist at all, same answer.
+    expect(liveDescendants(dir, [{ agentId: "gone", parentAgentId: "ghost" }], "ghost", { now: NOW })).toEqual(["gone"]);
+  });
+
+  // The hole review found in the first cut, reproduced exactly: readAgentMetas
+  // SKIPS an unparseable sidecar, so descendantsOf never sees that child and the
+  // liveness walk never checked it -- one truncated meta and `subtreeDone` said
+  // TRUE with a skeptic 5 seconds into a tool call. The SKILL's gate is
+  // `[ "$(jq -r .subtreeDone ...)" = "true" ] && git worktree remove --force`, so
+  // that is #66's removal-under-a-live-skeptic with a new trigger, and a
+  // half-written meta is likeliest at SPAWN, when the child is youngest.
+  test("AC7: an unreadable meta hides a LIVE child, so the subtree is not done", () => {
+    const dir = mkTmp();
+    const tag = spawnTag("zstack", 66, "reviewer", 1);
+    writeAgent(dir, "r1", { prompt: stagePromptWithTag(tag) });
+    writeAgent(dir, "s1", { parent: "r1", meta: '{"agentType":"general-pur' }); // truncated mid-write
+    appendRunning(dir, "s1"); // last record is a tool_use written 5s ago
+    const r = collect(dir, tag, "reviewer-1");
+    expect(r.skippedMeta).toEqual(["agent-s1.meta.json"]);
+    expect(r.live).toEqual(["s1"]); // the evidence is in the same object, and used
+    expect(r.subtreeDone).toBe(false);
+  });
+
+  // ...but unknown parentage is not blanket-blocking: the child's OWN transcript
+  // is the same evidence agentFinished already reads, and one that has come to
+  // rest cannot be holding any worktree, whoever spawned it. Otherwise a single
+  // bad sidecar anywhere in a shared directory would wedge every teardown.
+  test("an unreadable meta whose agent has come to rest does not block removal", () => {
+    const dir = mkTmp();
+    const tag = spawnTag("zstack", 66, "reviewer", 1);
+    writeAgent(dir, "r1", { prompt: stagePromptWithTag(tag) });
+    writeAgent(dir, "s1", { parent: "r1", meta: "{oops" });
+    appendFinalAnswer(dir, "s1"); // returned, and quiet since
+    const r = collect(dir, tag, "reviewer-1");
+    expect(r.skippedMeta).toEqual(["agent-s1.meta.json"]);
+    expect(r.live).toEqual([]);
+    expect(r.subtreeDone).toBe(true);
+  });
+
+  // The batch sweep's question is different from collect's -- "could ANY agent of
+  // this session still be reading a review worktree", asked of a directory of
+  // leftover checkouts with no stage tag to trace back -- so it ignores parentage
+  // entirely, which also makes it immune to the sidecar hole above.
+  describe("liveAgentsIn", () => {
+    test("names every unfinished agent regardless of parentage, and none when all are quiet", () => {
+      const dir = mkTmp();
+      writeAgent(dir, "r1");
+      writeAgent(dir, "s1", { parent: "r1" });
+      writeAgent(dir, "s2", { parent: "r1", meta: "not json at all" });
+      appendFinalAnswer(dir, "r1");
+      appendRunning(dir, "s1"); // mid tool call
+      appendFinalAnswer(dir, "s2", RECENT); // returned, but only 5s ago
+      expect(liveAgentsIn(dir, { now: NOW })).toEqual(["s1", "s2"]);
+      appendFinalAnswer(dir, "s1");
+      appendFinalAnswer(dir, "s2");
+      expect(liveAgentsIn(dir, { now: NOW })).toEqual([]);
+    });
+
+    // Step 0's case: the harness creates `subagents/` when the session's first
+    // sub-agent spawns, so its absence is evidence of none, not a fail-open.
+    test("a missing sub-agent directory is no live agents", () => {
+      expect(liveAgentsIn(join(mkTmp(), "never-created"))).toEqual([]);
+    });
+
+    // The wedge this bound exists for, at the level the operator meets it: ONE
+    // agent killed mid-tool-call disabled `sweep-review` and reconcile's
+    // throwaway prunes for that whole session, at any age, with no override --
+    // and `sweep-review` is what troubleshooting.md sells as the by-hand clear.
+    // Measured: 17 of 1,490 sub-agent transcripts on this machine were
+    // permanently live that way, across 8 of 114 sessions.
+    test("one agent killed mid-tool-call does not wedge the sweep forever", () => {
+      const dir = mkTmp();
+      writeAgent(dir, "crashed");
+      writeAgent(dir, "done");
+      appendRunning(dir, "crashed", new Date(NOW - SUBTREE_STALE_MS).toISOString());
+      appendTerminalAnswer(dir, "done");
+      // One second short of the ceiling it still holds the sweep...
+      expect(liveAgentsIn(dir, { now: NOW - 1 })).toEqual(["crashed"]);
+      // ...and at it, the sweep runs.
+      expect(liveAgentsIn(dir, { now: NOW })).toEqual([]);
+      // The operator override, for the session they know is dead.
+      expect(liveAgentsIn(dir, { now: NOW - 1, staleMs: 1_000 })).toEqual([]);
+    });
+  });
+
+  // Why Step 7's sweep can fire at all. It runs seconds after the merge stage
+  // returns, scanning the same `subagents/` directory that stage agent lives in,
+  // so under shape+quiescence alone every stage agent of the batch read LIVE for
+  // 15 minutes and the call could never sweep anything -- theater in the SKILL.
+  // A turn-ending stop_reason is the harness saying the agent has no more to
+  // write, and it is measured to be unambiguous: 1,310 of this machine's 1,532
+  // finished transcripts end on one, and of the 10,517 final-answer-shaped
+  // records that were NOT last in their file, ZERO carry one.
+  test("a turn-ending stop_reason is proof on its own -- no settling window", () => {
+    const dir = mkTmp();
+    twoReviewersWithSkeptics(dir);
+    appendTerminalAnswer(dir, "s1a", RECENT); // returned 5 seconds ago
+    appendTerminalAnswer(dir, "s1b", RECENT, "stop_sequence");
+    appendFinalAnswer(dir, "s1c", RECENT); // same shape, stop_reason null: still noisy
+    expect(live(dir, "r1")).toEqual(["s1c"]);
+  });
+
+  // ...but the fast path is the stop_reason, not the shape: `tool_use` and
+  // `max_tokens` both mean more is coming, and both appear on mid-work records in
+  // the corpus (44 and 1).
+  test("a non-terminal stop_reason still waits out the settling window", () => {
+    const dir = mkTmp();
+    twoReviewersWithSkeptics(dir);
+    appendTerminalAnswer(dir, "s1a", RECENT, "tool_use");
+    appendTerminalAnswer(dir, "s1b", RECENT, "max_tokens");
+    appendTerminalAnswer(dir, "s1c", QUIET, "tool_use"); // quiet long enough anyway
+    expect(live(dir, "r1")).toEqual(["s1a", "s1b"]);
+  });
+
+  // The ceiling is a measurement like the window is, and this is its gate. The
+  // sample: 135,373 gaps between a NON-final-shaped record (the tool_use an agent
+  // is blocked on, the tool_result it just took, a bare thinking chunk) and that
+  // agent's next one, over all 1,546 sub-agent transcripts. p50 1.3s, p99 77s, 25
+  // over 600s, and one 13,004s Bash call.
+  test("the staleness ceiling clears the measured max stall by 2x, and outlasts the quiet window", () => {
+    expect(MEASURED_MAX_STALL_MS).toBe(13_003_952);
+    expect(SUBTREE_STALE_MS).toBeGreaterThanOrEqual(2 * MEASURED_MAX_STALL_MS);
+    // It is the OUTER bound: a shape the quiet window could clear must never be
+    // held open by the ceiling instead.
+    expect(SUBTREE_STALE_MS).toBeGreaterThan(SUBTREE_QUIET_MS);
+    // A skeptic blocked on the longest real stall in the corpus is still live.
+    const dir = mkTmp();
+    twoReviewersWithSkeptics(dir);
+    for (const s of ["s1a", "s1b", "s1c"]) appendRunning(dir, s, new Date(NOW - MEASURED_MAX_STALL_MS).toISOString());
+    expect(live(dir, "r1")).toEqual(["s1a", "s1b", "s1c"]);
+  });
+
+  // The ceiling has to cover the shapes that carry no usable timestamp too --
+  // otherwise the "fails toward LIVE" rule above is a second way to wedge
+  // forever. The file's own mtime answers for those, and only for the ceiling:
+  // the settling window stays on the record's stamp, so copying a transcript
+  // (which collection does) can never make a live agent look finished.
+  test("an undated transcript nobody has touched in ages is finished too", () => {
+    const dir = mkTmp();
+    writeAgent(dir, "r1");
+    writeAgent(dir, "s1", { parent: "r1" });
+    append(dir, "s1", { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "done" }] } });
+    const metas = readAgentMetas(dir).metas;
+    expect(liveDescendants(dir, metas, "r1", { now: NOW })).toEqual(["s1"]); // no timestamp: live
+    const old = statSync(join(dir, "agent-s1.jsonl")).mtimeMs + SUBTREE_STALE_MS;
+    expect(liveDescendants(dir, metas, "r1", { now: old })).toEqual([]);
+  });
+
+  // The verdict is in code, but the REMOVAL is the SKILL's, so the ordering is
+  // pinned here: collect (which knows the subtree) first, then a teardown gated
+  // on its answer -- never a removal keyed on the parent returning.
+  test("the SKILL gates the review worktree removal on the collected subtree", () => {
+    const skill = readFileSync(join(import.meta.dir, "..", "z-loop", "SKILL.md"), "utf8");
+    const has = (s: string) => skill.includes(s); // booleans: a miss must not dump 60KB
+    expect(has(`jq -r .subtreeDone "$TMP/collected-<N>.json"`)).toBe(true);
+    expect(has(`git worktree remove ".worktrees/review-<N>" --force`)).toBe(true);
+    // The unconditional "remove it after the stage" form is what #66 hit.
+    expect(has(`remove it after the stage (\`git worktree remove ".worktrees/review-<N>" --force\`)`)).toBe(false);
   });
 });
 
@@ -504,6 +914,11 @@ describe("transcripts CLI (#190)", () => {
     expect(manifest.descendants).toBe(3);
     expect(manifest.files).toHaveLength(4);
     expect(readdirSync(dest)).toHaveLength(4);
+    // #209: the teardown gate is `jq -r .subtreeDone` over this exact payload, so
+    // the key has to be here and has to be a bare boolean. Nothing in this fixture
+    // has returned, so the honest answer is "still running".
+    expect(manifest.subtreeDone).toBe(false);
+    expect(manifest.live).toEqual(["s1a", "s1b", "s1c"]);
   });
 
   test("collect exits 1 with the reason when the tag matches nothing", () => {

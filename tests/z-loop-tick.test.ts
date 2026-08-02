@@ -412,6 +412,10 @@ describe("z-loop-tick", () => {
     const hn = JSON.parse(readFileSync(join(tickTmp, "human-needed.json"), "utf8"));
     expect(hn.blocked).toBe(0); // the 3 pre-existing Blocked tickets are excluded
     expect(hn.tripped).toBe(false); // 0/10 = 0%, no false trip before a single lane of this batch ran
+    // Two full synchronous wrapper ticks, each shelling several `bun` processes:
+    // the only test in this file that pays that cost twice (observed 5.2-5.5s on
+    // Windows against bun's 5s default). TICK_TIMEOUT_MS covers it and its
+    // siblings, which flake the same way under load.
   }, TICK_TIMEOUT_MS);
 
   // The test above only exercises the failure/unconfigured branch (`SENT` !=

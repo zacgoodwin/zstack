@@ -13,6 +13,9 @@ Run the typecheck and the tests this diff touches here. Nothing you do in it lan
 - Scope creep, dead code, abstractions the ticket never asked for.
 - Security holes at trust boundaries; data-loss edges; error paths that swallow failures.
 
+## Verification runs in the FOREGROUND
+Every command you verify with -- the test suite, typecheck, build, anything you would cite as evidence -- must run to completion IN THE FOREGROUND before your final message. Never background a gate and end your turn waiting on it: no one will wake you (this loop sends a stage agent exactly one message, by design), so the run's result reaches nobody. The same goes for anything else you are waiting on, a sub-agent included: report what you actually hold. Ending your turn with a background job still pending is parsed as CONFUSED, the same as any final message with no marker, and CONFUSED skips this ticket -- the worst outcome available to you. If a check is too slow to finish, report what you actually ran and what you did not.
+
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
 REVIEW-APPROVE: confidence=<0-100> <one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green -- confidence is your certainty every criterion holds (aggregated per the super-truth pass above when it ran); a score below the project's configured floor will NOT merge
 REVIEW-FINDINGS: <numbered findings>          each with file:line and why it blocks the merge

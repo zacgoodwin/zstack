@@ -95,6 +95,43 @@ If you cannot read it, do nothing else and make your final message exactly:
 BLOCKED: could not read stage prompt at ${promptPath}`;
 }
 
+// -- shared stage rules --------------------------------------------------------
+
+// #209, gap 2. The stage prompts told the worker to run the gauntlet and never
+// said the run must FINISH before the marker, and the loop sends a stage agent
+// exactly one message by design ("One fresh agent per stage. Never reuse or
+// SendMessage a previous stage's agent") -- so an agent that backgrounds `bun
+// test` and stops to wait can never be woken. Run 11's #170 builder did exactly
+// that: it fixed both reviewer findings, backgrounded the suite, and ended its
+// turn saying it would finalize once the run landed. A markerless final message
+// parses as CONFUSED, so that lane was one recorded outcome away from being
+// skipped with the finished diff sitting uncommitted in its worktree.
+//
+// Shared verbatim by all three judging stages. The REVIEWER carries it too, and
+// that is where the observed damage actually is: reviewers were 3 of run 11's 4
+// markerless exits, and run 12 reproduced it three more times (#149, #178, #205
+// each ended a turn with no marker while waiting on skeptics, each needing a
+// manual resume to avoid being parsed as CONFUSED and skipped). The reviewer runs
+// the same typecheck-and-touched-tests gauntlet in its throwaway worktree, and
+// #191's super-truth block only covers the skeptic half of the wait -- so the
+// generic rule goes to all three and the single-pass reviewer's golden file was
+// regenerated rather than protected. Merge is excluded: it runs `gh pr merge`,
+// not a gauntlet, and H9 already refuses to blind-skip a dead merge worker.
+const FOREGROUND_RULE = `## Verification runs in the FOREGROUND
+Every command you verify with -- the test suite, typecheck, build, anything you would cite as evidence -- must run to completion IN THE FOREGROUND before your final message. Never background a gate and end your turn waiting on it: no one will wake you (this loop sends a stage agent exactly one message, by design), so the run's result reaches nobody. The same goes for anything else you are waiting on, a sub-agent included: report what you actually hold. Ending your turn with a background job still pending is parsed as CONFUSED, the same as any final message with no marker, and CONFUSED skips this ticket -- the worst outcome available to you. If a check is too slow to finish, report what you actually ran and what you did not.`;
+
+// #209: the briefing a stage gets when it is a RE-SPAWN of a worker that died
+// without ever reporting. Its predecessor's changes are still in the worktree,
+// and the judgment call is handed over explicitly: carrying them forward as
+// trusted would defeat the fresh-agent guarantee (nothing verified them), and
+// dropping them silently is the waste the re-spawn exists to prevent. The note
+// itself lives in the input file, same pointer discipline as every other bounce.
+function respawnSection(respawnNotes: string | undefined, inputPath: string): string {
+  return respawnNotes
+    ? `\n## Your predecessor on this lane died without reporting\n\nRead what it left behind from \`respawnNotes\` in ${inputPath}. Its changes are still in this worktree, UNCOMMITTED and UNVERIFIED -- no stage ever confirmed them, and no transcript of that attempt reaches you. Look before you act (\`git status\`, \`git diff\`, \`git log\`), then decide for yourself whether to keep, fix, or drop them. That call is yours; so is this stage's outcome either way.\n`
+    : "";
+}
+
 // -- builder ------------------------------------------------------------------
 
 export interface BuilderPromptInput {
@@ -107,6 +144,7 @@ export interface BuilderPromptInput {
   qaNotes?: string; // present on a QA bounce-back
   reviewNotes?: string; // present on a reviewer bounce-back
   commitNotes?: string; // #177: present on a builder->builder re-spawn (BUILT shipped nothing)
+  respawnNotes?: string; // #209: present on a re-spawn of a worker that died with no exit marker
   investigateFirst?: boolean; // second QA bounce: root-cause before touching code
 }
 
@@ -127,6 +165,7 @@ export function builderPrompt(i: BuilderPromptInput, inputPath: string, tag?: st
   const commit = i.commitNotes
     ? `\n## Your predecessor on this lane shipped nothing\n\nRead what the pre-advance guard found from \`commitNotes\` in ${inputPath}. Start by inspecting the worktree (\`git status\`, \`git log ${i.baseBranch}..HEAD\`): finish and COMMIT whatever is already there rather than rebuilding it, and only build from scratch if the worktree is genuinely empty. A BUILT is not accepted until the tree is clean and the branch carries at least one commit.\n`
     : "";
+  const respawn = respawnSection(i.respawnNotes, inputPath);
   return `${spawnStamp(tag)}You are the BUILDER for ticket #${i.ticketNumber}: "${i.ticketTitle}", running UNATTENDED inside the zstack dev loop. No user is available -- never ask a question, never wait for input; decide or exit via the contract below.
 
 ## Workspace
@@ -135,7 +174,7 @@ export function builderPrompt(i: BuilderPromptInput, inputPath: string, tag?: st
 
 ## Ticket
 Read your full ticket body (Context, Plan, Acceptance Criteria, Tests + evals, Docs pages touched, Out of scope) from ${inputPath} -- field \`ticketBody\` -- before doing anything else. That body is the contract for this build.
-${bounce}${review}${commit}
+${bounce}${review}${commit}${respawn}
 ## Discipline
 - Ponytail ladder before writing any code: does it need to exist at all; does this codebase already have it; does the stdlib/platform/an installed dep cover it; can it be one line -- only then write the minimum that works. Smallest correct diff, full scope.
 - If the ticket has a \`## Files\` section, it is the map -- start from those paths instead of searching.
@@ -144,6 +183,8 @@ ${bounce}${review}${commit}
 - Deterministic work (arithmetic, parsing, transforms, lookups) goes in scripts with tests, never in your prose.
 - Fix root causes, not symptoms: grep every caller of anything you change.
 - Do not edit the issue body, comment on issues, close issues, or expand scope beyond the ticket.
+
+${FOREGROUND_RULE}
 
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
 BUILT: <one-line summary>            all acceptance criteria pass, tests green in the worktree, work committed on ${i.branch} -- VERIFIED before the lane advances: \`git status --porcelain\` empty AND HEAD off ${i.baseBranch}. A BUILT with work still uncommitted sends this lane straight back to you.
@@ -161,6 +202,7 @@ export interface QaPromptInput {
   branch: string;
   qaPass: number; // 1-based; pass 3 finding bugs blocks the ticket
   webTarget: boolean; // drive gstack /qa against a running site
+  respawnNotes?: string; // #209: present on a re-spawn of a QA worker that died with no exit marker
 }
 
 // PROCESS.md steps 11-16: functional + technical, as a fresh context that
@@ -176,10 +218,12 @@ export function qaPrompt(i: QaPromptInput, inputPath: string, tag?: string): str
 
 ## Ticket
 Read the ticket body -- Context, Plan, and especially every "### Acceptance Criteria" case -- from ${inputPath}, field \`ticketBody\`, before you start.
-
+${respawnSection(i.respawnNotes, inputPath)}
 ## Check BOTH, in this order
 1. Functional: exercise the built behavior end to end as a user would. Verify every "### Acceptance Criteria" case (setup -> action -> expected outcome) AS WRITTEN -- a case the diff quietly weakened counts as a bug.${web}
 2. Technical: typecheck, the full test suite, and the build all green in this worktree; tests + evals + docs the ticket demanded actually present in the diff; the repo's programming principles respected.
+
+${FOREGROUND_RULE}
 
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
 QA-PASS: <one-line evidence summary>       everything above verified green
@@ -296,7 +340,7 @@ export function reviewerPrompt(input: ReviewerPromptInput, inputPath: string, ad
 ## Super-truth pass (adversarial mode active)
 This card's blast radius earned an adversarial review; do NOT trust your single read. Spawn 3 INDEPENDENT skeptic sub-agents with the Agent tool -- nested \`claude -p\` is denied by the classifier, so use the Agent tool, not headless claude. Give each skeptic ONLY the four inputs you were given (this ticket, the acceptance criteria, the diff, the throwaway worktree); they are blinded exactly as you are. Task each one to REFUTE that the diff satisfies the acceptance criteria: find the one criterion it violates, the edge it breaks, a test that passes without the change. They work in isolation -- no skeptic sees another's verdict.
 
-Delivery is BEST-EFFORT and you must report how many verdicts arrived. A skeptic can die, time out, or come back with nothing usable; that is a delivery race, not evidence about the diff. Check for outstanding verdicts AT MOST ONCE per skeptic, then stop waiting and reconcile the \`k\` verdicts you actually hold (0 <= k <= 3). Do not spawn replacements. Do NOT end your turn without one of the exit markers below -- a final message with no marker is parsed as CONFUSED and SKIPS this ticket, which is the worst outcome available to you.
+Delivery is BEST-EFFORT and you must report how many verdicts arrived. A skeptic can die, time out, or come back with nothing usable; that is a delivery race, not evidence about the diff. Check for outstanding verdicts AT MOST ONCE per skeptic, then stop waiting and reconcile the \`k\` verdicts you actually hold (0 <= k <= 3). Do not spawn replacements. Do NOT end your turn without one of the exit markers below -- a final message with no marker is parsed as CONFUSED and SKIPS this ticket, which is the worst outcome available to you. "Still waiting on a skeptic" is not an exception to that, it is the single most common way a review is lost: three reviews in one run ended a turn on exactly those words and had to be rescued by hand.
 
 Report BOTH tokens in your marker: \`skeptics=<k>/3\` -- the number of verdicts you actually received -- and \`confidence=<0-100>\`, the share of THOSE k that could not refute the diff. Read it off this table; do no arithmetic:
 - k=3: 3 unrefuted -> 100, 2 -> 67, 1 -> 33, 0 -> 0
@@ -334,6 +378,8 @@ Run the typecheck and the tests this diff touches here. Nothing you do in it lan
 - Scope creep, dead code, abstractions the ticket never asked for.
 - Security holes at trust boundaries; data-loss edges; error paths that swallow failures.
 ${superTruth}
+${FOREGROUND_RULE}
+
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
 REVIEW-APPROVE: confidence=<0-100> ${skept}<one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green -- confidence is your certainty every criterion holds (aggregated per the super-truth pass above when it ran); a score below the project's configured floor will NOT merge
 REVIEW-FINDINGS: ${conf}${skept}<numbered findings>          each with file:line and why it blocks the merge

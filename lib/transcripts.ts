@@ -34,7 +34,7 @@
 // the prompt as an inert HTML comment, and the same string is passed back here.
 // Ambiguity is resolved structurally, not by heuristic -- see findRootAgents.
 import { createHash } from "node:crypto";
-import { closeSync, copyFileSync, mkdirSync, openSync, readFileSync, readSync, readdirSync } from "node:fs";
+import { closeSync, copyFileSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { handleCliError, parseFlags, requireFlag, str } from "./cli.ts";
@@ -217,6 +217,285 @@ export function descendantsOf(metas: AgentMeta[], rootId: string): string[] {
   return out.sort();
 }
 
+// -- subtree liveness (#209) ---------------------------------------------------
+
+// The teardown problem this section answers: the reviewer's throwaway worktree
+// was removed "after the stage", i.e. when the PARENT returned -- and in #66's
+// review that removal fired while two of its three skeptics were still executing
+// inside it (one reported `.worktrees/review-66` disappearing from `git worktree
+// list` partway through). Children outlive the stage that spawned them, so "the
+// parent returned" is not "the subtree finished".
+//
+// The parent's transcript CANNOT answer this. The obvious reading -- a sub-agent
+// is finished once its `toolUseId` shows up as a `tool_result` in the parent's
+// file -- only holds for a FOREGROUND spawn, and the loop's skeptics are not
+// foreground: stage-prompts.ts tells the reviewer to spawn them with the Agent
+// tool and never passes `run_in_background: false`, whose documented default is
+// background. A background spawn's tool_result is written at spawn time and says
+// "Async agent launched successfully ... The agent is working in the background",
+// and it is the ONLY record of that child the parent ever gets (measured: all
+// three skeptic ids appear exactly once each in a real reviewer transcript, and
+// 77 of 177 real skeptics on this machine were background spawns whose ack landed
+// 15s-1501s before the child stopped writing). So parentage alone reads every
+// background child as finished the instant it starts -- byte-identical to the #66
+// failure -- and no amount of reading the parent can fix that, because the parent
+// holds no completion record at all.
+//
+// Completion evidence therefore comes from the CHILD's own transcript, which is
+// append-only and is the one file that keeps changing while the agent runs. Two
+// conditions, measured against a live sub-agent rather than assumed:
+//
+//  1. the last record is a FINAL ANSWER -- an `assistant` entry carrying text and
+//     no `tool_use` block. A running agent's last record is the `tool_use` it is
+//     blocked on (a 70s probe agent sat on exactly that for the whole 70s), the
+//     `tool_result` it just received, or a bare `thinking` chunk; only a returning
+//     one ends on text.
+//  2. nothing has been appended since, for SUBTREE_QUIET_MS.
+//
+// Condition 2 is load-bearing, not belt-and-braces: an agent that narrates
+// mid-work ("Now I'll write the extraction JSON.") writes a text-only record and
+// keeps going, so shape alone would call it finished. The quiet window is what
+// separates those from a real return, and it is measured off the record's OWN
+// `timestamp` rather than the file's mtime so that copying a transcript (which
+// collection does) can never make a live agent look finished.
+//
+// Every unreadable, unparseable, or undatable input fails toward LIVE (blocks
+// removal), and that direction is free: a kept worktree is swept by the batch-end
+// cleanup that already removes leftover review worktrees (z-loop/SKILL.md Step 7),
+// while a removed one destroys the workspace a running agent is reading. The
+// orphan case -- a descendant that returns after its parent's own final message --
+// is now observable too: nothing will ever write into the dead parent, but the
+// child's own transcript goes terminal and quiet on its own, so a later collection
+// sees it done.
+//
+// THE CONSTANT IS A MEASUREMENT, not a round number. Sample: every sub-agent
+// transcript on this machine -- 1,388 files under
+// `~/.claude/projects/*/*/subagents/`, the same corpus lib/cost.ts prices -- scanned
+// for records agentFinished() would call finished-shape (assistant, content array,
+// a text block, no tool_use) that are NOT the last record in their file. That is
+// precisely the set of records this heuristic can be wrong about: 9,632 of them.
+// Split by what the agent did next:
+//
+//   * next record is `user` (43 samples): the agent HAD returned and was messaged
+//     again later. Not a failure -- the heuristic's answer was right at the time.
+//     These hold the largest gaps in the corpus (2,764s / 2,386s / 1,283s) and
+//     must be excluded, or the constant is tuned against SendMessage latency.
+//   * next record is the agent's OWN `thinking` / `tool_use` (9,589 samples): it
+//     narrated and kept working. THESE are the failures -- each is a skeptic that
+//     would be declared finished and have `.worktrees/review-<N>` pulled out from
+//     under it. p50 1.5s, p90 7.4s, p99 34s, and a long tail: 29 over 60s, 3 over
+//     180s (202s, 303s, 423s), 0 over 600s.
+//
+// So the real mid-work ceiling is 423s, and the 180s this shipped with was 0.43x
+// it, not the ~2x an earlier 87-transcript sample suggested -- the three transcripts
+// that break it are real and on this machine. Keeping the 2x rule against the
+// measured ceiling gives 846s; 900s is that rounded up. The asymmetry above is why
+// the margin goes this way and why the rounding goes up: waiting too long costs one
+// swept worktree at batch end (nothing waits on this flag -- z-loop/SKILL.md says
+// `false` means leave it and move on, and Step 7 sweeps), while cutting it short
+// costs a skeptic its workspace mid-run, which is #66's failure exactly.
+// tests/transcripts.test.ts pins this ratio so a future edit cannot quietly
+// re-introduce a constant below the measured ceiling.
+export const SUBTREE_QUIET_MS = 900_000;
+
+// The longest observed gap between a mid-work narration record and the agent's
+// next one, over the sample described above. SUBTREE_QUIET_MS must clear it with
+// margin; the gate test is the enforcement.
+export const MEASURED_MIDWORK_GAP_MS = 423_110;
+
+// The `stop_reason` values that END a turn. A record carrying one is the agent's
+// last word by definition -- the harness has nothing more to append until someone
+// messages it -- so it needs no quiet window at all.
+//
+// MEASURED, like every other constant here, over all 1,546 sub-agent transcripts
+// on this machine. Of the 1,532 that end on a final-answer-shaped record, 1,294
+// carry `end_turn`, 16 carry `stop_sequence`, and 222 carry `null` (the streaming
+// split the fixtures reproduce). Of the 10,517 final-answer-shaped records that
+// were NOT last in their file -- every case this heuristic can be wrong about --
+// 10,472 carry `null`, 44 carry `tool_use`, 1 carries `max_tokens`, and ZERO carry
+// either value below. So the fast path has no observed false positive, and the
+// quiet window still covers the 14.5% of real returns that land with `null`.
+//
+// This is what makes the batch sweep able to fire at all. Without it, an agent
+// that returned normally reads LIVE for the whole 15-minute window, so z-loop's
+// Step 7 -- which runs seconds after the merge stage returns, in the same
+// `subagents/` directory liveAgentsIn scans -- could never sweep anything.
+const TERMINAL_STOP_REASONS = new Set(["end_turn", "stop_sequence"]);
+
+// The longest observed gap between a NON-final-shaped record (the `tool_use` an
+// agent is blocked on, the `tool_result` it just took, a bare `thinking` chunk)
+// and that agent's next record: 135,373 samples over the same 1,546 transcripts.
+// p50 1.3s, p90 9.6s, p99 77s, 25 over 600s, 5 over 1800s, and one 13,004s Bash
+// call (the runner-up is 2,986s). That tail is dominated by permission prompts
+// and suspended machines rather than work, but it is real and it is measured, so
+// the ceiling below is taken against it.
+export const MEASURED_MAX_STALL_MS = 13_003_952;
+
+// When a transcript that is NOT resting on a final answer stops proving anything.
+//
+// The shape check alone can never be satisfied by an agent killed mid-tool-call
+// -- the watchdog/crash population #209 exists for -- so before this it read LIVE
+// at ANY age, forever. Measured across every sub-agent transcript on this machine,
+// 17 of 1,490 were permanently live that way, spread over 8 of 114 sessions (7%),
+// and ONE of them disables both `sweep-review` and reconcile's throwaway prunes
+// for that session with no way out: the documented escape hatch
+// (docs/user-guide/troubleshooting.md) is the thing that gets wedged.
+//
+// So silence itself eventually reads as finished, whatever the last record's
+// shape. The same 2x-the-measured-ceiling rule SUBTREE_QUIET_MS uses: 2 x
+// MEASURED_MAX_STALL_MS is 26,008s, rounded up to 8 hours. Long on purpose --
+// under this ceiling the ONLY cost of being wrong is a leftover scratch directory
+// -- and overridable per call (`--stale-ms`) for the operator who knows the
+// session is dead and wants the sweep now.
+export const SUBTREE_STALE_MS = 28_800_000;
+
+export interface LivenessWindow {
+  now?: number;
+  quietMs?: number;
+  staleMs?: number;
+}
+
+// The clock + both windows, defaults applied once so every caller in this file
+// asks the same question.
+function window(opts: LivenessWindow): { now: number; quietMs: number; staleMs: number } {
+  return { now: opts.now ?? Date.now(), quietMs: opts.quietMs ?? SUBTREE_QUIET_MS, staleMs: opts.staleMs ?? SUBTREE_STALE_MS };
+}
+
+// When this agent's transcript was last touched, for the staleness ceiling only.
+// The record's own `timestamp` is the primary source (copying a transcript, which
+// collection does, must never change the answer); the file's mtime is the fallback
+// for the unreadable/undated cases, where it can only ever say "recent" -- which
+// keeps them LIVE, the safe direction, until the ceiling clears them.
+function lastTouchedMs(subagentsDir: string, id: string, stamped: number): number | undefined {
+  if (Number.isFinite(stamped)) return stamped;
+  for (const f of [`agent-${id}.jsonl`, `agent-${id}.meta.json`]) {
+    try {
+      return statSync(join(subagentsDir, f)).mtimeMs;
+    } catch {
+      /* try the next one */
+    }
+  }
+  return undefined;
+}
+
+// Has this agent's own transcript come to rest? Three answers, in the order their
+// evidence is strongest: a turn-ending `stop_reason` (proof), silence past the
+// staleness ceiling (nothing is running behind a transcript nobody has written to
+// in 8 hours), and a final-answer shape that has been quiet for the settling
+// window. Everything else -- and every unreadable input -- is LIVE.
+function agentFinished(subagentsDir: string, id: string, now: number, quietMs: number, staleMs: number): boolean {
+  let text: string | undefined;
+  try {
+    text = readFileSync(join(subagentsDir, `agent-${id}.jsonl`), "utf8");
+  } catch {
+    text = undefined; // no transcript to prove anything with
+  }
+  let last: any;
+  if (text !== undefined) {
+    const lines = text.trimEnd().split("\n");
+    try {
+      last = JSON.parse(lines[lines.length - 1]);
+    } catch {
+      last = undefined; // a half-written final line IS the harness writing right now
+    }
+  }
+  const stamped = Date.parse(last?.timestamp ?? "");
+  // The ceiling comes first because it is the one answer that must hold for EVERY
+  // shape, including the mid-tool-call crash that can never satisfy the checks
+  // below. It is also the only check allowed to fall back to the file's mtime: a
+  // ceiling of hours cannot be fooled by a copy, while the settling window --
+  // seconds to minutes -- would be, so that one stays on the record's own stamp.
+  const touched = lastTouchedMs(subagentsDir, id, stamped);
+  if (touched !== undefined && now - touched >= staleMs) return true;
+  if (last?.type !== "assistant" || !Array.isArray(last.message?.content)) return false;
+  const blocks: string[] = last.message.content.map((b: any) => b?.type);
+  if (blocks.includes("tool_use") || !blocks.includes("text")) return false;
+  if (TERMINAL_STOP_REASONS.has(last.message.stop_reason)) return true;
+  return Number.isFinite(stamped) && now - stamped >= quietMs;
+}
+
+// Which of a stage's descendants have NOT been observed finishing, sorted.
+export function liveDescendants(
+  subagentsDir: string,
+  metas: AgentMeta[],
+  root: string,
+  opts: LivenessWindow = {}
+): string[] {
+  const { now, quietMs, staleMs } = window(opts);
+  return descendantsOf(metas, root).filter((id) => !agentFinished(subagentsDir, id, now, quietMs, staleMs));
+}
+
+// The agent id a skipped meta FILENAME describes. readAgentMetas only ever
+// pushes names its own `agent-<id>.meta.json` pattern matched, so this always
+// resolves for those; anything else is not an agent meta at all.
+function agentIdFromMetaName(file: string): string | undefined {
+  return /^agent-(.+)\.meta\.json$/.exec(file)?.[1];
+}
+
+// Agents whose PARENTAGE is unknown because their meta could not be parsed, and
+// whose own transcript does not prove they finished.
+//
+// This is the hole a subtree-liveness answer would otherwise have. readAgentMetas
+// SKIPS an unparseable sidecar (it must -- one bad file cannot cost a whole stage
+// its cost attribution), so descendantsOf never sees that agent and the liveness
+// walk never checks it: an unreadable meta would report the subtree DONE and
+// force-remove the worktree out from under a running skeptic, which is #66's
+// failure exactly. A half-written meta is likeliest at SPAWN, i.e. when the child
+// is youngest and most certainly still executing.
+//
+// So unknown parentage fails toward LIVE, like every other unreadable input here.
+// Not blindly, though: the child's own transcript is the same evidence
+// agentFinished already reads, and one that has come to rest cannot be reading
+// any worktree, whoever its parent was. Only the ones that fail that test block.
+export function liveUnknownParentage(
+  subagentsDir: string,
+  skippedMeta: string[],
+  opts: LivenessWindow = {}
+): string[] {
+  const { now, quietMs, staleMs } = window(opts);
+  const ids = skippedMeta.map(agentIdFromMetaName).filter((id): id is string => id !== undefined);
+  return ids.filter((id) => !agentFinished(subagentsDir, id, now, quietMs, staleMs)).sort();
+}
+
+// Every agent in the directory that has not been observed finishing, sorted --
+// parentage ignored entirely.
+//
+// The batch sweep's gate (lib/reconcile.ts sweep-review), which is a different
+// question from collect's: not "is THIS stage's subtree done" but "could ANY
+// agent of this session still be reading a review worktree". Parentage cannot
+// answer that one, because the sweep is handed a directory of leftover
+// `review-<N>` checkouts with no stage tag to trace back -- and it does not need
+// to: a session with nothing running has nobody to hurt, and that is checkable
+// without knowing who spawned whom (it also sidesteps unreadable metas by
+// construction, since no meta is read).
+//
+// A MISSING directory reads as no live agents, and that is evidence rather than a
+// fail-open: the harness creates `subagents/` when the session's first sub-agent
+// spawns, so its absence means this session has spawned none. That is precisely
+// the Step 0 case the unconditional sweep is for. (A second /z-loop in the SAME
+// session sees the first run's agents instead, and may well decline -- correct,
+// since those skeptics can still be executing; the leftovers just wait.)
+//
+// Cost is bounded and paid at most twice a run (Step 0, Step 7): one whole-file
+// read per sub-agent transcript in the session -- 174 files, ~650 KB at the
+// largest, in a real three-lane drain.
+export function liveAgentsIn(subagentsDir: string, opts: LivenessWindow = {}): string[] {
+  const { now, quietMs, staleMs } = window(opts);
+  let entries: string[];
+  try {
+    entries = readdirSync(subagentsDir);
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const f of entries) {
+    const m = /^agent-(.+)\.jsonl$/.exec(f);
+    if (!m) continue;
+    if (!agentFinished(subagentsDir, m[1], now, quietMs, staleMs)) out.push(m[1]);
+  }
+  return out.sort();
+}
+
 // -- collection ----------------------------------------------------------------
 
 export interface CollectedFile {
@@ -232,6 +511,14 @@ export interface CollectResult {
   files: CollectedFile[];
   descendants: number;
   skippedMeta: string[];
+  // #209: agents not observed finishing -- descendants of this stage, plus any
+  // whose meta was unreadable (parentage unknown, so possibly one of them) --
+  // and the teardown verdict derived from them, which is `false` whenever the
+  // set is non-empty. Collection already walks the subtree for the Actual, so
+  // the removal decision rides on that same walk instead of a second mechanism --
+  // which is also what orders it correctly: teardown happens after collection.
+  live: string[];
+  subtreeDone: boolean;
 }
 
 // Descendants are named by their AGENT ID, not by a 1..k counter. A counter is
@@ -252,6 +539,12 @@ export function collectTranscripts(opts: {
   tag: string;
   dest: string;
   name: string;
+  // #209: injected only by the liveness tests, which need a fixed clock to pin
+  // the quiet window's and the staleness ceiling's boundaries. Production always
+  // takes the defaults.
+  now?: number;
+  quietMs?: number;
+  staleMs?: number;
 }): CollectResult {
   const { metas, skipped } = readAgentMetas(opts.subagentsDir);
   const roots = findRootAgents(opts.subagentsDir, opts.tag, metas);
@@ -279,6 +572,19 @@ export function collectTranscripts(opts: {
     copyFileSync(join(opts.subagentsDir, `agent-${agentId}.jsonl`), join(opts.dest, file));
     files.push({ agentId, role, file });
   }
+  // Two sources of "maybe still running", unioned: the descendants the parentage
+  // walk found, and the agents whose meta could not be parsed at all (see
+  // liveUnknownParentage -- an unreadable sidecar hides its agent from the walk,
+  // so it must not read as a finished subtree). The union is what `subtreeDone`
+  // answers, so the teardown gate can never be told DONE on evidence this object
+  // was already holding in `skippedMeta` and ignoring.
+  const w: LivenessWindow = { now: opts.now, quietMs: opts.quietMs, staleMs: opts.staleMs };
+  const live = [
+    ...new Set([
+      ...liveDescendants(opts.subagentsDir, metas, root, w),
+      ...liveUnknownParentage(opts.subagentsDir, skipped, w),
+    ]),
+  ].sort();
   return {
     tag: opts.tag,
     root,
@@ -286,6 +592,8 @@ export function collectTranscripts(opts: {
     files,
     descendants: files.length - 1,
     skippedMeta: skipped,
+    live,
+    subtreeDone: live.length === 0,
   };
 }
 
@@ -304,7 +612,10 @@ const USAGE = `transcripts <command> [args]
         (transitively) into <dir>, as <name>.jsonl and
         <name>-sub-<agentId>.jsonl, and print a JSON manifest. --project-dir
         defaults to the current working directory (the orchestrator's cwd);
-        --subagents-dir overrides the resolved location outright.`;
+        --subagents-dir overrides the resolved location outright.
+        The manifest's \`subtreeDone\` (and \`live\`) answer whether every
+        descendant has finished -- the gate a stage worktree removal must pass,
+        since children outlive the parent that spawned them (#209).`;
 
 export function main(argv: string[]): number {
   const cmd = argv[0];

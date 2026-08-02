@@ -107,6 +107,92 @@ rebuilds fresh), and clears the stale lock, then starts normally. It never delet
 a branch, never removes a board comment, and never touches a ticket that still has
 a live lane.
 
+## A ticket was Skipped with a dead-worker note but its worktree has real uncommitted changes
+
+The stage agent died without emitting an exit marker. That parses as CONFUSED,
+which skips the ticket — the right answer when the agent could not do the job, the
+wrong one when it simply never said it did (a builder that backgrounds its own test
+run and stops to wait for it is the case that started this).
+
+What the loop does now: the dead-worker probe collects the lane worktree's
+`git status --porcelain --branch`, and a lane whose worker died holding uncommitted
+changes re-spawns that stage **once** — a fresh agent, told the prior attempt's
+changes are uncommitted and UNVERIFIED and that keeping, fixing, or dropping them
+is its own call. The budget is one re-spawn **per stage, per lane**, so a ticket
+whose builder was recovered this way still has a re-spawn left if its QA agent later
+dies the same way. Only after that stage's one re-spawn is spent does the skip
+apply, and that skip dumps the worktree's uncommitted state first:
+
+```bash
+git apply ~/.zstack/projects/<slug>/reports/uncommitted-<N>.patch   # in a fresh worktree
+```
+
+Do that **before** the next `/z-loop` run. Skipping releases the lane lock, and a
+lockless worktree is an orphan the next run's reconcile scan force-removes
+(`git worktree remove --force`, uncommitted work discarded) before the loop will
+start — so the patch, not the worktree, is the durable copy. Then return the ticket
+to Ready.
+
+If you are seeing this on a run that predates the fix, or the skip note says
+`worktree left for inspection` with no patch path, the worktree facts were never
+collected — recover by hand from `.worktrees/ticket-<N>` immediately, before the
+next run's orphan scan prunes it. The same note appears when `git status` in that
+worktree produced no output at all (a missing or broken checkout: git always
+prints its `## <branch>` header when it runs), which is treated as "nothing to
+recover" rather than re-spawning an agent into a directory that is not there.
+
+Two cases deliberately do **not** re-spawn even with changes in the worktree: a
+dead **merge** worker (its PR state is verified first, so it ends Merged or
+Blocked, never Skipped), and a ticket a human moved to Blocked/Questions during
+the run — that move is respected, so the lane just stops, keeps the human's status
+and its worktree, and spends nothing.
+
+If a stage keeps dying silently, the cause is usually upstream of the loop: check
+whether the ticket is large enough to exhaust the agent's context window, and
+whether the stage prompt's foreground rule is being honored (verification must
+finish before the final message — a backgrounded gate can never report back,
+because the loop sends each stage agent exactly one message by design).
+
+## `git worktree list` is full of leftover `review-*` worktrees
+
+Those are the reviewer's throwaway checkouts. They hold no work — each is a
+detached checkout of the head commit the reviewer and its skeptics read — so
+removing them is always safe.
+
+They pile up because in-run removal waits for the reviewer's whole spawn subtree
+to finish (the skeptics execute inside the worktree and outlive their parent;
+removing it under a live one is what #66 hit), and a skeptic that was still working
+when the reviewer returned holds it back. The loop sweeps them with a command on
+every exit path — batch cleanup on drain-complete, and Step 0 of the next run for
+the exits that never reach it — but a pack older than that fix, or a directory the
+loop no longer scans, can leave a backlog. Clear it by hand:
+
+```bash
+bun ~/.claude/skills/zstack/lib/reconcile.ts sweep-review
+```
+
+It removes `.worktrees/review-<N>` (and the `-lead`/`-base` variants) and nothing
+else: no board read, no locks, no slug. Run it from the repo root — `--worktrees`
+defaults to `<cwd>/.worktrees`, so from anywhere else it scans a directory that
+does not exist and reports 0 without saying why. It is safe to run at any time: it
+checks the same liveness evidence the in-run gate does and removes **nothing**
+while any sub-agent of the current session is still unproven, printing who is live
+instead.
+
+If it reports `swept 0` for that reason, look at the ids it named. An agent that
+returned normally does not hold the sweep back (its transcript ends on a
+turn-ending stop reason, which reads finished at once); one that was **killed
+mid-tool-call** never reports finished on shape at all, so it holds the sweep until
+its transcript goes stale — 8 hours by default. When you know the session is dead,
+say so:
+
+```bash
+bun ~/.claude/skills/zstack/lib/reconcile.ts sweep-review --stale-ms 1000
+```
+
+That treats any transcript untouched for a second as finished. Do not use it while
+a review is genuinely running: it is the same removal, without the protection.
+
 ## "Rates last checked … over the 14-day limit"
 
 `bin/z-estimate` / `bin/z-cost` warn when `references/rates.json`'s `checked_at`

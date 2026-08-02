@@ -115,6 +115,21 @@ read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMA
 bun "$PACK/lib/locks.ts" acquire --slug "$SLUG" --session "$SESSION" ${RECONCILE:+--reconcile} \
   || exit 1   # the CLI already printed which session holds it and what to do
 
+# a2) Sweep leftover throwaway review worktrees (#209). The command removes
+#     nothing while any sub-agent of THIS session is still unproven (a skeptic
+#     reading `.worktrees/review-<N>` must never have it pulled out from under it
+#     -- #66); the acquire above proves no OTHER loop is running. A fresh session
+#     has spawned nothing and sweeps everything, but /z-loop can also be invoked
+#     inside a session that already holds sub-agent transcripts (a context-clear
+#     resume keeps the session id), so this is a CHECK, not an assumption: read
+#     what it prints. It is the catch-all for the exits Step 7's batch cleanup
+#     never reaches -- a context-clear pause and any crash -- and it is not part
+#     of the orphan gate below: a scratch checkout nobody owns is leftover litter,
+#     never a wedge. Refusing to start over one would refuse to start almost
+#     always. `--worktrees` defaults to `<cwd>/.worktrees`, so run this from the
+#     repo root (a wrong cwd sweeps nothing and still reports 0).
+bun "$PACK/lib/reconcile.ts" sweep-review
+
 # b) Orphan scan: refuse if orphans exist and --reconcile was not passed.
 HAS_ORPHANS=$(bun "$PACK/lib/reconcile.ts" scan --slug "$SLUG" | jq -r .hasOrphans)
 if [ "$HAS_ORPHANS" = "true" ] && [ -z "$RECONCILE" ]; then
@@ -328,15 +343,48 @@ Perform exactly that action, then record it. Action → side effects:
 |---|---|
 | `claim N` | 1. `"$Z_BOARD" claim <N> "$ME"` **before anything else**. Claim lost → `bun "$PACK/lib/loop.ts" claim-lost "$STATE" <N>` and re-run `next` (next ticket). 2. **Deferred commit (#133) — move the ticket to its claimed stage's status, ONLY after the claim succeeds** (a claim loser must never move a ticket, same C7 reason as the lock below): `"$Z_BOARD" move <N> <status> --if-present --slug "$SLUG"` (`moved:false` → the ticket left the board between confirms: take the claim-lost path in step 1 and re-run `next`, claiming nothing) where `<status>` mirrors the reducer's `STATUS_FOR_STAGE[stage]` — `builder`→`Building`, `qa`→`QA`, `reviewer`→`Review`. A fresh `builder` claim moves Ready→Building (the old Step 2 up-front move, now deferred to here); a resume claim at `qa`/`reviewer` is already at its stage's status, so the move is a no-op. 3. **Write the lane lock** (C7 — a claim loser never leaves a lock): `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <stage> --session "$SESSION"`. 4. Worktree (skip if it exists — a resume claim at stage qa/reviewer reuses it): `TSLUG=$(bun -e "import {slugifyTitle} from '$PACK/lib/ticket-schema.ts'; console.log(slugifyTitle(process.argv[1]))" "<title>")` then `git worktree add ".worktrees/ticket-<N>" -b "z/ticket-<N>-$TSLUG" "$BASE"`. 4b. **Stamp the lane's git author (#66) — every commit this lane makes must be authored by the account `gh` is authed as, not by this machine's global git identity:** `git config extensions.worktreeConfig true` then `git -C ".worktrees/ticket-<N>" config --worktree user.name "$ME"` and `git -C ".worktrees/ticket-<N>" config --worktree user.email "$ME_EMAIL"`. **WARNING — `--worktree` is load-bearing, do not drop it.** Git worktrees SHARE the main repo's `.git/config`, so the plain `git -C <worktree> config user.name` form silently rewrites the identity of the human's OWN checkout too, re-authoring their personal commits in this repo. `--worktree` scopes the write to `.git/worktrees/<name>/config.worktree`, leaving the main checkout untouched; it hard-fails unless `extensions.worktreeConfig` is on, which is why that line comes first (idempotent, additive, and safe at repo format version 0 — verified on git 2.55). Re-running on an existing worktree (a resume claim) just rewrites the same two values. 5. Apply: write the action JSON to a file, `bun "$PACK/lib/loop.ts" apply "$STATE" action.json` (its `claim` reducer sets the state-file status to `STATUS_FOR_STAGE[stage]`, matching the board move above). 6. Spawn the action's stage (table below). |
 | `advance N to S` | **Re-stamp the lane lock** to the new stage: `bun "$PACK/lib/locks.ts" lane-write --slug "$SLUG" <N> <S> --session "$SESSION"`. Apply, then spawn stage S fresh. Before applying, read the lane's CURRENT stage from the state file: an advance to `builder` from `qa` passes the action's `note` as `qaNotes` (+ `investigateFirst`); from `reviewer`, as `reviewNotes`; from `builder` (the #177 commit re-spawn), as `commitNotes`. |
+| `respawn N at S` | #209: this lane's worker died without an exit marker while its worktree still holds uncommitted changes, so the stage is re-spawned ONCE at the SAME stage instead of the ticket being skipped with finished work in it. Re-stamp the lane lock at that same stage (`lane-write --slug "$SLUG" <N> <S> --session "$SESSION"`), tear down the dead agent if the harness still lists it, apply (the reducer spends this lane's one `respawns[S]` budget; there is **no board move** — the ticket never left this stage's status), then spawn stage S FRESH with the action's `note` passed as `respawnNotes` in the input JSON, and with `<attempt>` = the action's own `attempt` field (the dead spawn already used the previous number; a re-used spawn tag makes `transcripts collect` refuse and a re-used transcript name overwrites its predecessor). **The dead spawn is already priced** — the `check-worker` row collected its transcripts before the probe, while `loop attempt` still returned its number; do NOT re-run `collect` for it after applying (the attempt has moved on and the tag would name the spawn you are about to make). **Never SendMessage the dead agent** — a fresh spawn is the point: the guarantee that nothing latent travels between stages is worth more than the tokens a resume would save. The cap is **one re-spawn per stage per lane**: a second silent death at stage S skips the ticket (`next` returns `skip`), while a later death at a DIFFERENT stage of the same lane still gets its own — a builder that died silently is no evidence about the QA agent that runs after it. |
 | `park N Questions` | Comment the note as `## Needs input --` + the question, `"$Z_BOARD" move <N> Questions --if-present`, apply, then **remove the lane lock** (`bun "$PACK/lib/locks.ts" lane-remove --slug "$SLUG" <N>`). Tell the human in the comment which status to return the ticket to. Keep the worktree. **Notify** `human-pause` (`{ticket,title,note}`; see the Notify block below). |
-| `park N Blocked` | **First**, when the note begins `uncommitted work:` (#177's exhausted commit retry): salvage the lane worktree's uncommitted state BEFORE anything else — `git -C ".worktrees/ticket-<N>" add -A && git -C ".worktrees/ticket-<N>" diff --cached --binary HEAD > "$HOME/.zstack/projects/$SLUG/reports/uncommitted-<N>.patch"` (`add -A` so untracked files land in the patch too; the worktree is doomed, so mutating its index costs nothing). This is the ONE park whose only copy of real work is uncommitted — every other park's work is already committed on a branch, and branches are never deleted (issue #2) — and removing the lane lock below turns the worktree into an orphan the next run's reconcile scan force-removes. The note already names that patch path, so this dump is what makes the note true. Then: comment the note (what was wrong + recommended next steps), `move <N> Blocked --if-present`, apply, remove the lane lock. **Notify** `token-burn` (`{ticket,detail:note}`) when the note begins `Dependency deadlock:` (the step-6 deadlock break); otherwise `ticket-parked` (`{ticket,title,status:"Blocked",note}`). |
-| `skip N` | Comment the note (the confusion or the dead-worker evidence), `move <N> Skipped --if-present`, apply, remove the lane lock. (PROCESS.md global rule.) **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:note}`) when the note begins `Worker died mid-` (a watchdog dead-worker skip); otherwise `ticket-parked` (`{ticket,title,status:"Skipped",note}`). |
-| `stop-lane N` | A human moved #N to a stop status (Blocked/Questions/Skipped/Done) mid-run; the board already reflects it — do NOT move or comment it. Tear down the lane's background agent, remove the lane lock (`lane-remove`), keep the worktree for inspection, and apply (drops the lane, leaves the human's status). Other lanes are unaffected. |
-| `check-worker N` | Is the lane's background agent still running (harness task list)? Alive → `bun "$PACK/lib/loop.ts" probe "$STATE" <N> alive`. Dead with no final message: **if the lane's stage is `merge`, do NOT probe-dead/skip** — verify PR state first (H9): `gh pr view <branch> --json state,url -q '.state'`. If `MERGED`, the PR landed before the worker died, so record it as merged (`printf 'MERGED: %s\n' "$prUrl" > msg.txt; bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`) → the reducer completes it and counts it in `mergedThisRun` (so a stacked child still retargets and the batch-end branch delete can't close its PR). If NOT merged, record `printf 'BLOCKED: merge worker died with the PR unmerged (%s)\n' "$state" > msg.txt; outcome ...` → parks it Blocked for a human, and **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:"merge worker died with the PR unmerged"}`). For any OTHER stage, dead with no final message → `probe "$STATE" <N> dead` (the next `next` returns the skip). |
+| `park N Blocked` | **First**, when the action carries `"salvage": true` (#177's exhausted commit retry): run the **Salvage dump** block below before anything else. Then: comment the note (what was wrong + recommended next steps), `move <N> Blocked --if-present`, apply, remove the lane lock. Leave any `.worktrees/review-<N>` alone (**Removing a review worktree** below). **Notify** `token-burn` (`{ticket,detail:note}`) when the note begins `Dependency deadlock:` (the step-6 deadlock break); otherwise `ticket-parked` (`{ticket,title,status:"Blocked",note}`). |
+| `skip N` | **First**, when the action carries `"salvage": true` (#209's exhausted dead-worker respawn): run the **Salvage dump** block below before anything else. Then: comment the note (the confusion or the dead-worker evidence), `move <N> Skipped --if-present`, apply, remove the lane lock. Leave any `.worktrees/review-<N>` alone (**Removing a review worktree** below). (PROCESS.md global rule.) **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:note}`) when the note begins `Worker died mid-` (a watchdog dead-worker skip); otherwise `ticket-parked` (`{ticket,title,status:"Skipped",note}`). |
+| `stop-lane N` | A human moved #N to a stop status (Blocked/Questions/Skipped/Done) mid-run; the board already reflects it — do NOT move or comment it. **First**, when the action carries `"salvage": true` (#209 — the lane's worker died silently and its worktree held uncommitted work): run the **Salvage dump** block below. Then tear down the lane's background agent, remove the lane lock (`lane-remove`), and apply (drops the lane, leaves the human's status). Other lanes are unaffected, and any `.worktrees/review-<N>` is left alone (**Removing a review worktree** below). This also answers a lane whose worker died silently on a ticket a human had already parked (#209): the human's move wins over the dead-worker re-spawn, so no paid agent is spawned into it. The lane worktree is left in place, but **it is not durable** — releasing the lane lock makes it an orphan the next run's reconcile force-removes, which is why the salvage dump above is not optional when the flag is set. |
+| `check-worker N` | Is the lane's background agent still running (harness task list)? Alive → `bun "$PACK/lib/loop.ts" probe "$STATE" <N> alive`. Dead with no final message: **price the dead spawn FIRST, before the probe and before anything else (#209)** — run the **Per-stage Actual** block below (`attempt` → `tag` → `transcripts.ts collect --tag …`) for this lane's CURRENT stage, exactly as the `wait` row does for an agent that finished normally. A dead agent still spent money, and this is the LAST moment its spend is reachable: the tag is a digest of `<attempt>`, `loop attempt` still returns the dead spawn's number here, and the `respawn` apply that follows spends `respawns[<stage>]` and moves that number on — after which nothing can recompute the dead spawn's tag and its `.jsonl` never lands in the ticket's transcripts dir, so `z-cost`'s directory glob never sees it and the recovered ticket goes Done with an Actual covering only the spawn that survived (the same silent undercount #190 exists to prevent). Collect here and the recovery is priced whichever way it lands — `respawn` or `skip`. A non-zero `collect` is possible here and is NOT a reason to stop (the agent may have died before writing anything, or before the tag reached it): note it in the eventual comment and carry on to the probe. **Then:** **if the lane's stage is `merge`, do NOT probe-dead/skip** — verify PR state first (H9): `gh pr view <branch> --json state,url -q '.state'`. If `MERGED`, the PR landed before the worker died, so record it as merged (`printf 'MERGED: %s\n' "$prUrl" > msg.txt; bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt`) → the reducer completes it and counts it in `mergedThisRun` (so a stacked child still retargets and the batch-end branch delete can't close its PR). If NOT merged, record `printf 'BLOCKED: merge worker died with the PR unmerged (%s)\n' "$state" > msg.txt; outcome ...` → parks it Blocked for a human, and **Notify** `safety-violation` (`{control:"watchdog",ticket,detail:"merge worker died with the PR unmerged"}`). For any OTHER stage, dead with no final message → collect the lane worktree's own dirtiness FIRST, then probe dead with it (#209 — a stage that died holding finished work is re-spawned instead of skipped, and without this flag the lane can only ever be skipped): `git -C ".worktrees/ticket-<N>" status --porcelain --branch > "$TMP/porcelain-<N>.txt"` then `bun "$PACK/lib/loop.ts" probe "$STATE" <N> dead --porcelain "$TMP/porcelain-<N>.txt"`. `--branch` is load-bearing for the same reason as the BUILT verification above: the header is the proof git actually ran. A payload with output but no header is unreadable, not clean, and fails toward keeping the work (a re-spawn); an EMPTY file is neither — the redirect creates it before git runs, and git prints the header whenever it runs at all, so zero bytes means git failed outright, which is what a MISSING or broken worktree gives you. That records no work (the pre-#209 skip), because there is nothing there to recover and no worktree to spawn into. The next `next` returns `respawn` (dirty, respawn budget unspent), `stop-lane` (a human moved the ticket to a stop status mid-run — respected, no paid re-spawn), or `skip`. |
 | `complete N` | The completion flow — Step 6 — then apply, then **remove the lane lock**. |
 | `wait` | Block until a background stage agent finishes (the harness notifies you) or one minute passes, then re-run `next` — the watchdog only fires if `next` is called with a fresh clock. When an agent finishes: save its final message to a file and `bun "$PACK/lib/loop.ts" outcome "$STATE" <N> msg.txt` — a **builder** lane additionally requires the three git-fact flags (see **BUILT verification (#177)** above; the command refuses without them) — then update Actual (below), then re-run `next`. |
 | `context-clear` | The context ceiling (`contextTokenLimit`, #131) is reached, every lane is idle, and the batch still has unbuilt tickets — a mid-batch PAUSE, distinct from `drain-complete`. Apply it (a pure no-op on state). Then: release the loop lock (`bun "$PACK/lib/locks.ts" release --slug "$SLUG"`), **keep** every worktree/branch and `state.json` (the batch is un-drained — `batchTickets` still holds the unbuilt tickets), and **exit WITHOUT running Step 7 end-of-loop** (no regression, no deploy — the batch isn't done). Print the resume instruction: the operator (or harness) clears this session's context and re-invokes `/z-loop`; the fresh orchestrator reads a small context on its first tick, so the gate is open and Step 3's ingest (seeing the un-drained `state.json`, `startingFreshBatch` false) preserves `batchTickets` and resumes claiming the next flagged-but-unbuilt ticket. In-flight lanes are never cut short — `context-clear` only fires with all lanes idle. |
 | `drain-complete` | Step 7. |
+
+**Salvage dump (`"salvage": true`).** Three actions drop a lane — `park`, `skip`,
+`stop-lane` — and every one of them removes the lane lock, which turns
+`.worktrees/ticket-<N>` into an orphan the next run's reconcile scan force-removes
+(`git worktree remove --force`, uncommitted work discarded). When the lane worktree
+still holds uncommitted work at that moment, the action carries `"salvage": true`
+and you dump it FIRST, before the comment, the board move, the apply, or the lock
+removal:
+
+```bash
+git -C ".worktrees/ticket-<N>" add -A \
+  && git -C ".worktrees/ticket-<N>" diff --cached --binary HEAD \
+     > "$HOME/.zstack/projects/$SLUG/reports/uncommitted-<N>.patch"
+```
+
+`add -A` so untracked files land in the patch too; the worktree is doomed, so
+mutating its index costs nothing. The action's note already names that path, so
+this dump is what makes the note true. Read the flag off the action JSON — do NOT
+match a phrase in the note (#209): the stop-lane note contains the words
+"uncommitted work" and used to route to a row that dumped nothing, so one prose
+key meant two different things.
+
+**Removing a review worktree.** `.worktrees/review-<N>` is removed in exactly two
+places: the gated block in the **Per-stage Actual** step below, and
+`reconcile.ts sweep-review`. Nowhere else — not in a park, not in a skip, not in a
+stop-lane, not "while cleaning up". Both sanctioned paths first check that no agent
+of this session is still unproven, because the reviewer's skeptics execute inside
+that directory and outlive the reviewer that spawned them; a removal anywhere else
+is #66's failure (a skeptic watching its own workspace vanish mid-review) with a new
+trigger, and it was reproduced during this ticket's own review by a `park N Blocked`
+cleanup that force-removed `.worktrees/review-209` under a live skeptic. Leftovers
+are litter, never a wedge: leave them and let the sweep take them.
 
 **Notify (best-effort, one event per moment).** The park/skip/safety rows above
 each `send` exactly ONE Discord event through the single notification edge
@@ -382,16 +430,16 @@ the input file, never through your context; ticket #57, Leak 1):
    acceptanceCriteria, diff, worktreePath}` — `input-<N>.json`'s path is a
    constructor argument, not a key, so blindness is untouched.
 2. **Stamp the spawn, then build the prompt (1b).** `<attempt>` is that lane's
-   1-based spawn count for this stage, computed from the SAME state-file bounce
-   counters used elsewhere in this step: `qa` and `reviewer` are
-   `qaBounces`/`reviewBounces` + 1 (the `qa` row below already computes this as
-   `qaPass` — reuse it), `builder` is `qaBounces + reviewBounces + commitRetries + 1`
-   (any of the three re-spawns the builder; `commitRetries` is #177's commit
-   re-spawn and is absent from a state file that never spent one — read it as 0),
-   `merge` is always `1`.
+   1-based spawn count for its CURRENT stage. **Compute it, never count it in
+   prose** (#209) — it is arithmetic over five state-file counters that grows
+   every time a re-spawn route is added, and two spawns of one stage that compute
+   the same number mint the same tag (`collect` then refuses, unable to tell their
+   spend apart) and overwrite each other's transcript. Read it AFTER `apply`, so
+   the counter that re-spawn just spent is already in the file:
 
    ```bash
-   TAG=$(bun "$PACK/lib/transcripts.ts" tag --slug "$SLUG" --ticket <N> --stage <stage> --attempt <attempt>)
+   ATTEMPT=$(bun "$PACK/lib/loop.ts" attempt "$STATE" <N>)
+   TAG=$(bun "$PACK/lib/transcripts.ts" tag --slug "$SLUG" --ticket <N> --stage <stage> --attempt "$ATTEMPT")
    bun "$PACK/lib/stage-prompts.ts" prompt <stage> "$TMP/input-<N>.json" > "$TMP/prompt-<N>.txt"
    STUB=$(bun "$PACK/lib/stage-prompts.ts" stub <stage> "$TMP/prompt-<N>.txt" --spawn-tag "$TAG")
    ```
@@ -405,6 +453,22 @@ the input file, never through your context; ticket #57, Leak 1):
    is why step 2 writes it first. `--spawn-tag` moves to `stub` because the stub,
    not the prompt, is now the worker's first message and that is where
    `transcripts collect` looks for the marker.
+
+   `$ATTEMPT` is `stageAttempt` in `lib/loop.ts`, whose header carries the full
+   derivation — every arrow into every stage and the counter it spends. Do not
+   re-derive it here; three duplicate-tag defects have already come from a prose
+   copy drifting. For orientation only:
+   `builder` = `qaBounces + reviewBounces + commitRetries + respawns.builder + 1`,
+   `qa` = `qaBounces + reviewBounces + respawns.qa + 1` (a reviewer bounce sends the
+   lane back through the builder and into QA a second time, which is why
+   `reviewBounces` is in both), `reviewer` =
+   `reviewBounces + quorumRetries + respawns.reviewer + 1` (#191's quorum retry
+   re-spawns the reviewer at the same stage), `merge` = `respawns.merge + 1`
+   (nothing re-enters merge). `respawns` is keyed BY STAGE, so #209's builder
+   re-spawn never shifts QA's numbering. On a `respawn` action use the action's own
+   `attempt` field instead — the same number, without an extra call. The QA prompt's
+   `qaPass` is a different quantity (`qaBounces + 1`, the QA pass number) and is
+   unchanged.
 
    The tag is an opaque digest of those four facts and nothing else, so it is
    **recomputable** — the per-stage Actual step below re-runs the identical `tag`
@@ -444,20 +508,22 @@ the input file, never through your context; ticket #57, Leak 1):
 
 | Stage | Input JSON fields |
 |---|---|
-| `builder` | `ticketNumber`, `ticketTitle`, `ticketBody` (fresh `gh issue view` → `"$TMP/body-<N>.md"`, injected `--rawfile`), `worktreePath` (`.worktrees/ticket-<N>`), `branch`, `baseBranch`; on a bounce also `qaNotes`/`investigateFirst`, `reviewNotes`, or `commitNotes` per the advance row above. |
-| `qa` | `ticketNumber`, `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `worktreePath`, `branch`, `qaPass` (the lane's `qaBounces` in the state file + 1), `webTarget` (true when the ticket changes a web-served surface — your judgment; QA then drives gstack /qa). |
-| `reviewer` | **BLINDED — exactly** `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `acceptanceCriteria` (the `### Acceptance Criteria` section to a file: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$TMP/body-<N>.md" > "$TMP/ac-<N>.md"`, injected `--rawfile`), `diff` (exclude lockfiles to avoid flooding the reviewer with generated code: `git -C .worktrees/ticket-<N> diff "$BASE"...HEAD -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)pnpm-lock.yaml' ':(exclude)yarn.lock' > "$TMP/diff-<N>.txt"`; if the filtered diff is empty — a lockfile-only change — fall back to the unfiltered diff: `[ ! -s "$TMP/diff-<N>.txt" ] && git -C .worktrees/ticket-<N> diff "$BASE"...HEAD > "$TMP/diff-<N>.txt"`. Injected `--rawfile` so it never enters your context), `worktreePath` = a THROWAWAY worktree of the head commit, placed under the repo's own `.worktrees/` — NEVER under `$TMP` / `~/.zstack` (issue #118: the reviewer runs the full `bun test` suite in this worktree, and several tests write to/delete real `~/.zstack` subtrees via `homedir()`; a throwaway worktree rooted there lets that suite's cleanup destroy the loop's own live state.json/locks/transcripts mid-run) — `git worktree add ".worktrees/review-<N>" <head-sha>`; remove it after the stage (`git worktree remove ".worktrees/review-<N>" --force`). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. **Adversarial control (#59):** build this stage's prompt with two extra flags — `MODE=$("$Z_BOARD" ... )` the project's `adversarialMode` (read it from `~/.zstack/projects/$SLUG/config.json`; `loadConfig` defaults it to `non-trivial`) and `LABELS=$(gh issue view <N> --json labels -q '[.labels[].name]')` (a JSON array — labels live on the GitHub issue, NOT on the board item, so `board.list` never fetched them; get them here). Then `bun "$PACK/lib/stage-prompts.ts" prompt reviewer "$TMP/input-<N>.json" --adversarial-mode "$MODE" --labels "$LABELS" > "$TMP/prompt-<N>.txt"`, followed by the same `stub reviewer "$TMP/prompt-<N>.txt" --spawn-tag "$TAG"` every other stage runs (`--spawn-tag` rides on the stub per step 1b — required here like every other stage, and #190's skeptic transcripts are the reason it exists at all). The predicate (`adversarialActive`) reads the diff's own changed-line count from the blinded input — `always`/`non-trivial`-on-a-big-or-labeled diff spawns the skeptic fan-out (and stamps a `confidence=` token onto `REVIEW-FINDINGS` too); `off`/small-unlabeled is the single pass. Either way `REVIEW-APPROVE` always carries a `confidence=` token (issue #62's safety gate reads it regardless) — see `/z-loop`'s reviewer-confidence-gate section for what a sub-floor score does. Mode + labels ride as FLAGS; the four-key input JSON is untouched. |
+| `builder` | `ticketNumber`, `ticketTitle`, `ticketBody` (fresh `gh issue view` → `"$TMP/body-<N>.md"`, injected `--rawfile`), `worktreePath` (`.worktrees/ticket-<N>`), `branch`, `baseBranch`; on a bounce also `qaNotes`/`investigateFirst`, `reviewNotes`, or `commitNotes` per the advance row above; on a `respawn N at builder`, `respawnNotes` (the action's own `note`) per the respawn row above. |
+| `qa` | `ticketNumber`, `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `worktreePath`, `branch`, `qaPass` (the lane's `qaBounces` in the state file + 1), `webTarget` (true when the ticket changes a web-served surface — your judgment; QA then drives gstack /qa); on a `respawn N at qa`, `respawnNotes` (the action's own `note`) per the respawn row above. |
+| `reviewer` | **BLINDED — exactly** `ticketBody` (`--rawfile "$TMP/body-<N>.md"`), `acceptanceCriteria` (the `### Acceptance Criteria` section to a file: `awk '/^### Acceptance Criteria/{f=1;next} /^#/{f=0} f' "$TMP/body-<N>.md" > "$TMP/ac-<N>.md"`, injected `--rawfile`), `diff` (exclude lockfiles to avoid flooding the reviewer with generated code: `git -C .worktrees/ticket-<N> diff "$BASE"...HEAD -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)pnpm-lock.yaml' ':(exclude)yarn.lock' > "$TMP/diff-<N>.txt"`; if the filtered diff is empty — a lockfile-only change — fall back to the unfiltered diff: `[ ! -s "$TMP/diff-<N>.txt" ] && git -C .worktrees/ticket-<N> diff "$BASE"...HEAD > "$TMP/diff-<N>.txt"`. Injected `--rawfile` so it never enters your context), `worktreePath` = a THROWAWAY worktree of the head commit, placed under the repo's own `.worktrees/` — NEVER under `$TMP` / `~/.zstack` (issue #118: the reviewer runs the full `bun test` suite in this worktree, and several tests write to/delete real `~/.zstack` subtrees via `homedir()`; a throwaway worktree rooted there lets that suite's cleanup destroy the loop's own live state.json/locks/transcripts mid-run) — `git worktree add ".worktrees/review-<N>" <head-sha>`; remove it only once the whole spawn SUBTREE has finished, never when the reviewer itself returns (#209 — see **Per-stage Actual** below for the gate; the skeptics execute inside this worktree and outlive their parent, and #66's review removed it out from under two live skeptics). No PR description, no plan rationale, no transcripts — the constructor rejects any other key set. **Adversarial control (#59):** build this stage's prompt with two extra flags — `MODE=$("$Z_BOARD" ... )` the project's `adversarialMode` (read it from `~/.zstack/projects/$SLUG/config.json`; `loadConfig` defaults it to `non-trivial`) and `LABELS=$(gh issue view <N> --json labels -q '[.labels[].name]')` (a JSON array — labels live on the GitHub issue, NOT on the board item, so `board.list` never fetched them; get them here). Then `bun "$PACK/lib/stage-prompts.ts" prompt reviewer "$TMP/input-<N>.json" --adversarial-mode "$MODE" --labels "$LABELS" > "$TMP/prompt-<N>.txt"`, followed by the same `stub reviewer "$TMP/prompt-<N>.txt" --spawn-tag "$TAG"` every other stage runs (`--spawn-tag` rides on the stub per step 1b — required here like every other stage, and #190's skeptic transcripts are the reason it exists at all). The predicate (`adversarialActive`) reads the diff's own changed-line count from the blinded input — `always`/`non-trivial`-on-a-big-or-labeled diff spawns the skeptic fan-out (and stamps a `confidence=` token onto `REVIEW-FINDINGS` too); `off`/small-unlabeled is the single pass. Either way `REVIEW-APPROVE` always carries a `confidence=` token (issue #62's safety gate reads it regardless) — see `/z-loop`'s reviewer-confidence-gate section for what a sub-floor score does. Mode + labels ride as FLAGS; the four-key input JSON is untouched. |
 | `merge` | `ticketNumber`, `prTitle` (the ticket title), `branch`, `baseBranch`, `worktreePath`, `stackedOn` (from the advance action — parents whose branches this PR stacks on; the prompt carries the PROCESS.md step 18 chain rules: parents first, no branch deletion mid-batch, retarget, delete last). |
 
-**Per-stage Actual (every stage, no exceptions):** when a stage agent finishes,
+**Per-stage Actual (every stage, no exceptions):** when a stage agent finishes —
+or is found DEAD at `check-worker`, which spent money just the same (#209) —
 collect its transcripts with `lib/transcripts.ts` — never by picking files
 yourself. Recompute the same tag the spawn was stamped with (step 1b above; same
 four facts, same digest), then collect:
 
 ```bash
-TAG=$(bun "$PACK/lib/transcripts.ts" tag --slug "$SLUG" --ticket <N> --stage <stage> --attempt <attempt>)
+ATTEMPT=$(bun "$PACK/lib/loop.ts" attempt "$STATE" <N>)
+TAG=$(bun "$PACK/lib/transcripts.ts" tag --slug "$SLUG" --ticket <N> --stage <stage> --attempt "$ATTEMPT")
 bun "$PACK/lib/transcripts.ts" collect --tag "$TAG" \
-  --dest "$STATE_DIR/transcripts/ticket-<N>" --name "<stage>-<attempt>" >/dev/null
+  --dest "$STATE_DIR/transcripts/ticket-<N>" --name "<stage>-$ATTEMPT" > "$TMP/collected-<N>.json"
 ```
 
 `collect` finds the stage agent by its stamped tag and copies **it plus every
@@ -478,6 +544,62 @@ is exactly the silent undercount #190 filed. If it fails, the tag never reached
 the agent (step 1b was skipped, or `<attempt>` disagrees between the two calls):
 say so in the completion note instead of guessing a number, price whatever the
 directory does hold, and keep the drain moving.
+
+**Worktree teardown is gated on that manifest (#209).** Only the `reviewer` stage
+has a throwaway worktree, and this is where it goes — every other stage's worktree
+is the lane's own and survives the stage, so skip this block for `builder`/`qa`/
+`merge`. A stage's sub-agents outlive the stage: `.worktrees/review-<N>` was
+removed as soon as the reviewer returned, and in #66's review that fired while two
+of its three skeptics were still executing inside it (one reported the worktree
+vanishing from `git worktree list` mid-review — indistinguishable, from the
+outside, from a skeptic that simply failed). The subtree walk `collect` already
+does is the signal, so it also reports whether every descendant has been observed
+finishing — read from each descendant's OWN transcript, because the skeptics are
+background spawns and the reviewer's transcript holds only their spawn
+acknowledgements. Remove the reviewer's throwaway worktree only when it says so:
+
+```bash
+# reviewer stage only
+if [ "$(jq -r .subtreeDone "$TMP/collected-<N>.json")" = "true" ]; then
+  git worktree remove ".worktrees/review-<N>" --force
+fi   # else leave it: the two sweeps below remove it
+```
+
+Never poll or wait on that flag. A skeptic that is still working, one that is
+narrating between tool calls, one that died mid-tool-call, and one whose
+`agent-<id>.meta.json` could not be parsed (parentage unknown, so possibly one of
+these skeptics — and a half-written sidecar is likeliest at spawn, when the child
+is youngest) all read `false` — and `false` means leave it and move on, never
+retry. `true` is the common answer for a skeptic that actually returned: a
+turn-ending `stop_reason` in its own transcript is proof on its own and needs no
+settling window (measured: 1,310 of this machine's 1,532 finished sub-agent
+transcripts end that way, and ZERO of 10,517 mid-work records carry one). The
+15-minute window (`SUBTREE_QUIET_MS`) covers only the ~15% of real returns whose
+last record carries no stop reason, and an 8-hour ceiling (`SUBTREE_STALE_MS`)
+eventually clears a transcript nobody has written to at all — without it, one agent
+killed mid-tool-call held the sweep open forever. All three failure directions are
+the cheap one: the cost is a leftover directory, against destroying a running
+skeptic's workspace.
+
+The sweep that collects the leftovers is a **command, not a habit** (#209 — it used
+to be one sentence in Step 7 with nothing to run, and nine `review-*` worktrees had
+piled up in this repo by the time anyone counted). `bun "$PACK/lib/reconcile.ts"
+sweep-review` removes them and nothing else, and it **carries this same gate rather
+than working around it**: it removes nothing while any sub-agent of this session is
+still unproven, and prints who is live instead. That is not belt-and-braces — an
+ungated sweep would re-create #66's failure at a different moment, because a
+reviewer returning with skeptics still executing is the DESIGNED case: it checks
+each skeptic at most once and stops waiting. It is called twice so no exit path
+leaks: **Step 7's batch cleanup** on drain-complete, and **Step 0** of the next run,
+right after the loop-lock acquire proves no other loop is running. Neither call
+asserts the session is quiet — both ASK, and print what they found; a fresh session
+with no `subagents/` directory sweeps everything, a session mid-flight sweeps
+nothing and says who is live. Step 0 is also what covers the exits Step 7 never
+reaches, a `context-clear` pause and any crash. `reconcile apply` prunes them too
+(they are in the orphan scan now), under the same hold and never in place of the
+lane recovery it is there for; but they never count toward `hasOrphans`: a
+leftover scratch checkout is litter, not a wedge, and gating startup on one would
+refuse to start after almost every run.
 
 Then price the ticket's whole directory — the glob accumulates every stage so far,
 and z-cost dedupes by requestId, so its total IS the cumulative and you never add
@@ -547,8 +669,27 @@ bun "$PACK/lib/stage-prompts.ts" note "$TMP/note-<N>.json" > "$TMP/note-<N>.md"
 ## Step 7 — Exit (on `drain-complete`)
 
 1. **Batch cleanup:** every dependent PR has landed, so delete the merged
-   `z/ticket-*` branches now (PROCESS.md step 18: delete last), and remove any
-   leftover throwaway review worktrees.
+   `z/ticket-*` branches now (PROCESS.md step 18: delete last), then sweep the
+   leftover throwaway review worktrees with the command that owns them (#209 —
+   this used to be a sentence with nothing to run, and nine `review-*` worktrees
+   had piled up in this repo by the time anyone counted):
+
+   ```bash
+   bun "$PACK/lib/reconcile.ts" sweep-review
+   ```
+
+   No board read, no slug, no locks — it removes `.worktrees/review-<N>` (and the
+   `-lead`/`-base` variants) and nothing else, so it is safe with the loop lock
+   still held. Every LANE is finished by the time this runs, but their sub-agents
+   need not be: the last reviewer's skeptics can still be executing minutes later
+   (the reviewer checks each at most once and stops waiting), so the command
+   applies its own liveness gate here and prints `swept 0 …` instead of removing a
+   worktree out from under one. A stage agent that returned normally does NOT hold
+   it open — its transcript ends on a turn-ending `stop_reason`, which reads
+   finished immediately — so a genuinely quiet session sweeps here. Do not treat
+   `swept 0` as a failure and do not retry it: those leftovers go to Step 0 of the
+   next run. Exits that never reach Step 7 (`context-clear`, a crash) are covered
+   by that same Step 0 sweep and by its `reconcile apply`.
 2. **End-of-loop (PROCESS.md steps 22–23, C8):** run Step 7a below in full.
    It decides red/green from a real regression on the merged base, never
    deploys on red, walks the deploy chain in order on green, runs the Nth-loop
@@ -771,6 +912,16 @@ first clears the wedge, then the loop starts normally. Reconcile:
 - **parks tickets back to Ready** — `z-board move <N> Ready`;
 - **prunes worktrees** — `git worktree remove --force` (a crashed builder's
   uncommitted work is discarded; the ticket rebuilds fresh from Ready);
+- **prunes leftover throwaway review worktrees** — `.worktrees/review-<N>` and its
+  `-lead`/`-base` variants (#209). Prune only, never a release or a park: the
+  number names the ticket the review was FOR, which is very likely Done by now,
+  and there is no work inside to lose. Since #209 gates in-run removal on the
+  reviewer's whole spawn subtree going quiet, leftovers are the norm rather than
+  the exception, so this scan (plus the `sweep-review` calls at Step 0 and Step 7)
+  is what keeps them from accumulating across runs. These prunes take the same
+  liveness hold as `sweep-review` — held back, never the whole reconcile, if any
+  sub-agent of this session is still unproven — so no path removes a review
+  worktree while something may be inside it;
 - **removes stale lane locks** — and clears the stale `loop.lock`.
 
 Reconcile **never**: deletes a branch, deletes a board comment, or touches a

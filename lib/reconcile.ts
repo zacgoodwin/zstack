@@ -10,12 +10,13 @@
 // deletion. It releases claims, parks tickets back to Ready, prunes worktrees,
 // and removes stale lane locks -- nothing that a human can't cheaply redo.
 import { readdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { Board, ghExecutor } from "./board.ts";
-import { handleCliError, parseFlags, str } from "./cli.ts";
+import { handleCliError, parseFlags, str, type ParsedArgs } from "./cli.ts";
 import { DEFAULT_LOCK_STALENESS_MINUTES, TERMINAL_STATUSES, ZError, loadConfig } from "./config.ts";
 import { defaultLocksDir, inspectLoopLock, listLaneLocks, type LaneLock } from "./locks.ts";
 import { BOARD_STATUSES, type BoardStatus, type LaneState, type TicketSnapshot } from "./loop.ts";
+import { liveAgentsIn, subagentsDirFor } from "./transcripts.ts";
 
 // -- orphan scan --------------------------------------------------------------
 
@@ -57,25 +58,114 @@ export interface OrphanWorktree {
 export interface Orphans {
   crashedLanes: CrashedLane[];
   orphanWorktrees: OrphanWorktree[];
+  throwawayWorktrees: OrphanWorktree[]; // leftover `review-<N>` reviewer scratch checkouts (#209)
   buildingWithoutState: number[]; // Building on the board with neither lock nor worktree
 }
 
-// Worktree directories, one per `ticket-<N>`. Tolerates a missing dir.
-function listWorktrees(worktreesDir: string): { ticket: number; path: string }[] {
+// A lane's own worktree: exactly `ticket-<N>`.
+const LANE_WORKTREE_RE = /^ticket-(\d+)$/;
+
+// The reviewer's throwaway checkout (#209). `.worktrees/review-<N>`, plus the
+// suffixed variants a fanned-out review adds (`review-<N>-lead`, `-base`). It
+// belongs to no lane and holds no work -- it is a detached checkout of the head
+// commit the reviewer and its skeptics read -- so it is ALWAYS pruned and NEVER
+// parked or released: the number in the name is the ticket the review was for,
+// not a lane to recover.
+//
+// Reconcile owns these because #209 gated their in-run removal on the whole
+// reviewer subtree going quiet, which makes "left behind" the ordinary outcome
+// rather than the exception. The only other sweep is z-loop/SKILL.md Step 7's
+// batch cleanup, which a `context-clear` pause or any crash skips by design, and
+// before this scan matched nothing but `ticket-<N>` they were invisible here too
+// -- so they accumulated across runs (nine were sitting in this repo when #209's
+// QA looked).
+const THROWAWAY_WORKTREE_RE = /^review-(\d+)(?:-[A-Za-z0-9._-]+)?$/;
+
+// Worktree directories: the lanes' own `ticket-<N>` plus the reviewer's
+// throwaway `review-<N>` scratch checkouts. Tolerates a missing dir.
+function listWorktrees(worktreesDir: string): { ticket: number; path: string; throwaway: boolean }[] {
   let entries: import("node:fs").Dirent[];
   try {
     entries = readdirSync(worktreesDir, { withFileTypes: true });
   } catch {
     return [];
   }
-  const out: { ticket: number; path: string }[] = [];
+  const out: { ticket: number; path: string; throwaway: boolean }[] = [];
   for (const e of entries) {
     if (!e.isDirectory()) continue;
-    const m = e.name.match(/^ticket-(\d+)$/);
+    const lane = e.name.match(LANE_WORKTREE_RE);
+    const throwaway = lane ? null : e.name.match(THROWAWAY_WORKTREE_RE);
+    const m = lane ?? throwaway;
     if (!m) continue;
-    out.push({ ticket: Number(m[1]), path: join(worktreesDir, e.name) });
+    out.push({ ticket: Number(m[1]), path: join(worktreesDir, e.name), throwaway: throwaway !== null });
   }
-  return out.sort((a, b) => a.ticket - b.ticket);
+  // Two throwaways can share a ticket (`review-9`, `review-9-lead`), so the path
+  // breaks the tie and the order stays deterministic.
+  return out.sort((a, b) => a.ticket - b.ticket || a.path.localeCompare(b.path));
+}
+
+// The leftover reviewer scratch checkouts alone, for the batch-end sweep that
+// runs without a board snapshot (CLI `sweep-review`).
+export function listThrowawayWorktrees(worktreesDir: string): { ticket: number; path: string }[] {
+  return listWorktrees(worktreesDir)
+    .filter((w) => w.throwaway)
+    .map(({ ticket, path }) => ({ ticket, path }));
+}
+
+// Is this path one of the reviewer's throwaway checkouts? Used to hold those
+// prunes back while an agent of this session may still be inside one.
+export function isThrowawayWorktreePath(path: string): boolean {
+  return THROWAWAY_WORKTREE_RE.test(basename(path));
+}
+
+// What the review-worktree sweep may remove RIGHT NOW (#209).
+//
+// The removal itself is unconditional in the sense that a throwaway holds no
+// work -- but WHEN it may happen is the whole point of this ticket: `.worktrees/
+// review-<N>` is where the reviewer's skeptics execute, and they outlive the
+// parent that spawned them (the reviewer contract checks each skeptic at most
+// once and stops waiting, so returning with skeptics still running is the
+// DESIGNED case, not an anomaly). #66's review removed that worktree out from
+// under two live skeptics, and a sweep that ignores liveness is the same defect
+// with a different trigger: on the last lane, drain-complete fires minutes after
+// the reviewer returned.
+//
+// So the sweep is gated on the same evidence the in-stage teardown uses --
+// whether any agent of THIS session is still running (liveAgentsIn; parentage is
+// not needed and not available here, since a leftover directory carries no stage
+// tag). All-or-nothing rather than per-worktree, because a live agent's own
+// transcript does not say which checkout it is reading.
+//
+// The gate is what makes the two sanctioned call sites honest: Step 0, where the
+// session has spawned nothing yet (empty/absent subagents dir -> sweep proceeds,
+// and the loop lock it was just handed proves no OTHER loop is running), and
+// Step 7, where it now declines whenever anything is still live instead of
+// force-removing under it. Declining costs one leftover directory until the next
+// run's Step 0 -- the same cheap direction the in-stage gate fails in.
+// The same hold, applied to a reconcile plan: with anything of this session
+// still live, the throwaway prunes drop out and every other action still runs
+// (a wedged lane's recovery must not wait on a skeptic). Pure, so the rule is
+// gate-testable without a git worktree.
+export function holdLiveThrowawayPrunes(plan: ReconcileAction[], live: string[]): ReconcileAction[] {
+  if (live.length === 0) return plan;
+  return plan.filter((a) => !(a.kind === "prune-worktree" && isThrowawayWorktreePath(a.path)));
+}
+
+export function planReviewSweep(opts: {
+  worktreesDir: string;
+  // Undefined = no session transcript resolved for this cwd, i.e. no Claude Code
+  // session is running here to have spawned anything. Sweeps.
+  subagentsDir: string | undefined;
+  now?: number;
+  quietMs?: number;
+  staleMs?: number;
+}): { paths: string[]; live: string[] } {
+  const live =
+    opts.subagentsDir === undefined
+      ? []
+      : liveAgentsIn(opts.subagentsDir, { now: opts.now, quietMs: opts.quietMs, staleMs: opts.staleMs });
+  const found = listThrowawayWorktrees(opts.worktreesDir).map((w) => w.path);
+  return { paths: live.length > 0 ? [] : found, live };
 }
 
 // Cross-references three sets -- lane locks (L), worktrees (W), and Building
@@ -90,7 +180,8 @@ export function scanOrphans(
   nowMs: number
 ): Orphans {
   const locks = listLaneLocks(locksDir);
-  const worktrees = listWorktrees(worktreesDir);
+  const all = listWorktrees(worktreesDir);
+  const worktrees = all.filter((w) => !w.throwaway);
   const lockTickets = new Set(locks.map((l) => l.lock.ticket));
   const wtByTicket = new Map(worktrees.map((w) => [w.ticket, w]));
   const statusByTicket = new Map(boardSnapshot.map((t) => [t.number, t.status]));
@@ -108,14 +199,26 @@ export function scanOrphans(
     .filter((w) => !lockTickets.has(w.ticket))
     .map((w) => ({ ticket: w.ticket, worktreePath: w.path, boardStatus: statusByTicket.get(w.ticket) }));
 
+  // No lock lookup and no board status: a throwaway has neither by construction.
+  const throwawayWorktrees: OrphanWorktree[] = all
+    .filter((w) => w.throwaway)
+    .map((w) => ({ ticket: w.ticket, worktreePath: w.path }));
+
   const buildingWithoutState = boardSnapshot
     .filter((t) => t.status === "Building" && !lockTickets.has(t.number) && !wtByTicket.has(t.number))
     .map((t) => t.number)
     .sort((a, b) => a - b);
 
-  return { crashedLanes, orphanWorktrees, buildingWithoutState };
+  return { crashedLanes, orphanWorktrees, throwawayWorktrees, buildingWithoutState };
 }
 
+// Deliberately does NOT count throwawayWorktrees. hasOrphans is the startup
+// REFUSAL gate (z-loop/SKILL.md Step 0b: orphans + no --reconcile => refuse), and
+// a leftover `review-<N>` is not a wedge -- it is a scratch checkout nobody owns.
+// Since #209 made leftovers the ordinary outcome, counting them here would refuse
+// to start the loop after almost every run. They are still pruned by the plan
+// below whenever reconcile does run, and swept unconditionally by Step 0's
+// `sweep-review` and Step 7's batch cleanup.
 export function hasOrphans(o: Orphans): boolean {
   return o.crashedLanes.length > 0 || o.orphanWorktrees.length > 0 || o.buildingWithoutState.length > 0;
 }
@@ -165,6 +268,12 @@ export function reconcilePlan(orphans: Orphans): ReconcileAction[] {
         note: `Worktree without a lock while the board showed ${w.boardStatus}; returned to Ready.`,
       });
     }
+  }
+  // Throwaway reviewer checkouts: prune only. Never release or park -- the number
+  // in `review-<N>` names the ticket the review was for, and that ticket may well
+  // be Done (merged) by now; parking it back to Ready would rebuild landed work.
+  for (const w of orphans.throwawayWorktrees) {
+    actions.push({ kind: "prune-worktree", ticket: w.ticket, path: w.worktreePath });
   }
   for (const n of orphans.buildingWithoutState) {
     actions.push({ kind: "release-claim", ticket: n });
@@ -256,6 +365,22 @@ const USAGE = `reconcile <command> [args] --slug S
 
   scan   [--now MS]   scan orphans + build the plan; print JSON {hasOrphans, orphans, plan}
   plan   [--now MS]   print the reconcile action list as JSON
+  sweep-review [--worktrees D] [--project-dir D] [--subagents-dir D]
+               [--quiet-ms MS] [--stale-ms MS]
+                      remove leftover throwaway reviewer worktrees (.worktrees/review-<N>)
+                      and nothing else. No board read, no locks, no slug needed --
+                      z-loop/SKILL.md Step 0 / Step 7 cleanup, as a command instead of
+                      prose. Prints the paths removed, one per line, then a count.
+                      REMOVES NOTHING while any sub-agent of this session has not
+                      been observed finishing: the skeptics execute inside those
+                      worktrees and outlive the reviewer that spawned them (#209).
+                      --worktrees is the directory scanned, default <cwd>/.worktrees
+                      -- run it from the repo root or pass the flag, or it sweeps a
+                      directory that does not exist and reports 0 either way.
+                      --stale-ms is the ceiling past which a transcript nobody has
+                      written to reads finished whatever its last record was
+                      (default 8h, SUBTREE_STALE_MS): the override for a session
+                      holding an agent that was killed mid-tool-call.
   apply  [--now MS] [--session ID]
                       execute the plan: release claims, park to Ready, prune worktrees,
                       remove stale locks (never deletes branches or comments).
@@ -298,19 +423,75 @@ export function assertNotReconcilingLiveLoop(
   );
 }
 
+// Where the liveness gate looks for this session's sub-agent transcripts.
+// --subagents-dir wins outright (the gate tests point it at a fixture);
+// otherwise it is derived from --project-dir / cwd by the same resolver
+// `transcripts collect` uses, so the two can never consult different sessions.
+function reviewSweepSubagentsDir(flags: ParsedArgs["flags"]): string | undefined {
+  return str(flags, "subagents-dir") ?? subagentsDirFor(str(flags, "project-dir") ?? process.cwd());
+}
+
+// --quiet-ms / --stale-ms: the two liveness windows (lib/transcripts.ts). The
+// gate tests inject both to pin their boundaries; the operator override matters
+// for --stale-ms, which is the way out when a session holds an agent that was
+// killed mid-tool-call and would otherwise hold the sweep for its full ceiling.
+function msFlag(flags: ParsedArgs["flags"], name: string): number | undefined {
+  const v = str(flags, name);
+  if (v === undefined) return undefined;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) throw new ZError(`--${name} must be a non-negative number of milliseconds, got ${JSON.stringify(v)}.`);
+  return n;
+}
+
 export async function main(argv: string[]): Promise<number> {
   const cmd = argv[0];
   if (!cmd || cmd === "help" || cmd === "-h" || cmd === "--help") {
     console.log(USAGE);
     return cmd ? 0 : 1;
   }
-  if (!["scan", "plan", "apply"].includes(cmd)) {
+  if (!["scan", "plan", "apply", "sweep-review"].includes(cmd)) {
     console.error(`Unknown command "${cmd}".\n\n${USAGE}`);
     return 1;
   }
   try {
     const { flags } = parseFlags(argv.slice(1));
     const nowMs = Number(str(flags, "now") ?? Date.now());
+
+    // sweep-review touches nothing but throwaway reviewer checkouts, so it runs
+    // before the config load and the board client: Step 7 calls it with the loop
+    // lock still held, and a batch-end cleanup must not be able to fail on a
+    // GraphQL quota or a missing project config.
+    if (cmd === "sweep-review") {
+      const dir = str(flags, "worktrees") ?? join(process.cwd(), ".worktrees");
+      const { paths, live } = planReviewSweep({
+        worktreesDir: dir,
+        subagentsDir: reviewSweepSubagentsDir(flags),
+        now: nowMs,
+        quietMs: msFlag(flags, "quiet-ms"),
+        staleMs: msFlag(flags, "stale-ms"),
+      });
+      // Declining is a normal outcome, not an error: nothing waits on this sweep
+      // (a leftover scratch checkout is litter, never a wedge), and exiting
+      // non-zero here would fail a batch-end cleanup step for doing the safe
+      // thing. Say who is live so the operator can see why.
+      if (live.length > 0) {
+        console.log(
+          `swept 0 of ${listThrowawayWorktrees(dir).length} throwaway review worktree(s): ` +
+            `${live.length} agent(s) of this session have not been observed finishing (${live.join(", ")}), ` +
+            `and a skeptic still reading .worktrees/review-<N> must not have it removed underneath it (#209). ` +
+            `They wait for the next sweep that finds the session quiet. If you know it is not -- an agent killed ` +
+            `mid-tool-call never reports finished until its transcript goes stale -- re-run with --stale-ms.`
+        );
+        return 0;
+      }
+      for (const p of paths) {
+        pruneWorktreeReal(p);
+        console.log(p);
+      }
+      console.log(`swept ${paths.length} throwaway review worktree(s)`);
+      return 0;
+    }
+
     const cfg = loadConfig(str(flags, "slug"));
     const board = new Board(cfg, ghExecutor());
     const locksDir = str(flags, "dir") ?? defaultLocksDir(cfg.slug);
@@ -342,9 +523,28 @@ export async function main(argv: string[]): Promise<number> {
       console.log(JSON.stringify(plan, null, 2));
       return 0;
     }
-    await applyReconcile(plan, realEffects(board));
-    const counts = plan.reduce((m, a) => ((m[a.kind] = (m[a.kind] ?? 0) + 1), m), {} as Record<string, number>);
-    console.log(`reconciled: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(", ") || "nothing"}`);
+    // `apply` is the OTHER path that force-removes review worktrees, so it takes
+    // the same liveness hold as sweep-review (#209). Its own #198 guard proves no
+    // other loop is running, and the one sanctioned caller (Step 0, --session)
+    // has spawned nothing yet -- so in practice nothing is ever held here. That
+    // is the point of doing it anyway: the invariant is "no path removes a review
+    // worktree while an agent of this session might be inside one", and an
+    // invariant with one unchecked path is not one.
+    const live = planReviewSweep({
+      worktreesDir,
+      subagentsDir: reviewSweepSubagentsDir(flags),
+      now: nowMs,
+      quietMs: msFlag(flags, "quiet-ms"),
+      staleMs: msFlag(flags, "stale-ms"),
+    }).live;
+    const runnable = holdLiveThrowawayPrunes(plan, live);
+    await applyReconcile(runnable, realEffects(board));
+    const counts = runnable.reduce((m, a) => ((m[a.kind] = (m[a.kind] ?? 0) + 1), m), {} as Record<string, number>);
+    const held = plan.length - runnable.length;
+    console.log(
+      `reconciled: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(", ") || "nothing"}` +
+        (held > 0 ? ` (held ${held} review-worktree prune(s): ${live.length} agent(s) of this session still live)` : "")
+    );
     return 0;
   } catch (e) {
     return handleCliError(e);
