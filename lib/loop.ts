@@ -254,7 +254,8 @@ export interface LoopState {
   // THIS batch instead of the whole board. A ticket belongs here when it is
   // brand new to the snapshot (absent from the prior state's tickets -- covers
   // a Step-1 pre-commit park straight to Questions/Blocked/Skipped, same batch,
-  // #133 AC4) or currently Ready-and-unclaimed (the committed queue, same
+  // #133 AC4; only meaningful when there IS a prior state, #203) or currently
+  // Ready-and-unclaimed (the committed queue, same
   // filter initialReadyCount uses). A ticket already sitting Blocked/Skipped/
   // Questions from before this batch started, or a foreign claimedByOther
   // park, is neither, so it never inflates this batch's trip. undefined = a
@@ -1773,7 +1774,20 @@ export function ingestBoardItems(
   // unclaimed (the committed queue, same filter as readyCount above). This is
   // the predicate, not yet gated on startingFreshBatch -- applied below only
   // when a fresh batch is actually starting.
-  const isNewBatchTicket = (t: TicketSnapshot) => !prevByNumber.has(t.number) || (t.status === "Ready" && !t.claimedByOther);
+  //
+  // #203: "absent from the prior state" only means something when a prior state
+  // EXISTS. With prev === null there is nothing to be absent from, so that
+  // clause matched every ticket on the board -- every pre-existing Blocked/
+  // Skipped/Questions park included -- and humanNeededStatus's numerator became
+  // board-wide, tripping the gate at tick zero on a project's first run or any
+  // run after a state archive/reset (measured: 174 numbers captured against a
+  // real batch of 1). At ingest-time-zero with no prior state the batch IS the
+  // committed queue by definition, so only the Ready-and-unclaimed clause can
+  // apply. The cost is deliberate and one-sided: on a first run a Step-1 park is
+  // not counted, because it is indistinguishable from a park that predates the
+  // run; every later run has a prev and keeps #133 AC4 exactly as it was.
+  const isNewBatchTicket = (t: TicketSnapshot) =>
+    (prev != null && !prevByNumber.has(t.number)) || (t.status === "Ready" && !t.claimedByOther);
   // Whether the PRIOR batch drained is judged against ITS OWN allow-list (#131):
   // a leftover non-batch Ready ticket must not make prev look un-drained and so
   // block the next batch's capture (AC4/AC11 use the same batch scoping).

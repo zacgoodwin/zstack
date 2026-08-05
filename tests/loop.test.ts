@@ -2712,13 +2712,29 @@ describe("ingestBoardItems", () => {
   // Building-count one. Step 1 parks 3 of 10 planned to Questions; the 7
   // committed sit in Ready (they used to sit in Building after Step 2). Numerator
   // = 3 Questions in both models, denominator = 7 in both -> identical trip.
+  //
+  // #203 moved this onto the state file Step 1 actually leaves behind. The
+  // denominator claim is untouched (7 either way); the numerator claim needs a
+  // prev to exist, because that is the only way "new to the snapshot" can mean
+  // "this batch just filed it" rather than "there is nothing to compare
+  // against". Step 3's ingest runs after Step 1's board writes, so every run but
+  // a project's first has one.
   test("AC4 (#133): denominator equals the old Building-count semantics when Step 1 parks tickets to Questions", () => {
+    const prev: LoopState = {
+      tickets: [ticket(99, "Done")], // a drained prior batch
+      lanes: [],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      initialReadyCount: 1,
+      initialBatchTickets: [99],
+    };
     const items = [
+      { number: 99, title: "old", fields: { Status: "Done" } },
       ...[1, 2, 3, 4, 5, 6, 7].map((n) => ({ number: n, title: `r${n}`, fields: { Status: "Ready" } })),
       ...[8, 9, 10].map((n) => ({ number: n, title: `q${n}`, fields: { Status: "Questions" } })),
     ];
     const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
-    const s = ingestBoardItems(null, items, bodies, { humanNeededPercent: 30 });
+    const s = ingestBoardItems(prev, items, bodies, { humanNeededPercent: 30 });
     expect(s.initialReadyCount).toBe(7); // the 7 Ready committed, not counting the 3 parked Questions
     const hn = humanNeededStatus(s);
     expect(hn.questions).toBe(3);
@@ -3020,19 +3036,128 @@ describe("ingestBoardItems", () => {
 
   // #133 AC4's Step-1-park scenario still counts (genuinely this batch's own
   // planned tickets, just already parked at the very first observation) --
-  // #150 only excludes tickets that predate the batch. prev === null here means
-  // there is no "before this batch" for any of these 10, so all 10 count, same
-  // as pre-#150.
-  test("#150 regression: a Step-1 pre-commit park (prev === null, #133 AC4) still counts toward this batch's own numerator", () => {
+  // #150 only excludes tickets that predate the batch. #203 pins this to the
+  // path Step 1 actually runs on: Step 1's board writes land BEFORE Step 3's
+  // ingest, so on every run but the very first there IS a prev, and the
+  // "absent from prev" clause is what catches the parked ticket. (The old
+  // version of this case passed prev === null, which is not that path -- it is
+  // the fresh-state path #203 fixes, where a Questions ticket is
+  // indistinguishable from a pre-existing park. See the AC1/AC2 cases below.)
+  test("#150/#203 regression: a Step-1 pre-commit park (prev exists, #133 AC4) still counts toward this batch's own numerator", () => {
+    // The prior batch is fully drained -- 3 Done tickets, nothing workable.
+    const prev: LoopState = {
+      tickets: [ticket(1, "Done"), ticket(2, "Done"), ticket(3, "Done")],
+      lanes: [],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      initialReadyCount: 3,
+      initialBatchTickets: [1, 2, 3],
+      humanNeededNotified: true,
+    };
+    expect(drainComplete(prev.tickets, prev.lanes, prev.batchTickets)).toBe(true);
+
+    // Step 1 planned 10 new tickets and parked 3 of them straight to Questions
+    // before Step 3's ingest ever ran. All 10 are new to prev, so all 10 are
+    // this batch's.
     const items = [
-      ...[1, 2, 3, 4, 5, 6, 7].map((n) => ({ number: n, title: `r${n}`, fields: { Status: "Ready" } })),
-      ...[8, 9, 10].map((n) => ({ number: n, title: `q${n}`, fields: { Status: "Questions" } })),
+      ...[1, 2, 3].map((n) => ({ number: n, title: `old${n}`, fields: { Status: "Done" } })),
+      ...[11, 12, 13, 14, 15, 16, 17].map((n) => ({ number: n, title: `r${n}`, fields: { Status: "Ready" } })),
+      ...[18, 19, 20].map((n) => ({ number: n, title: `q${n}`, fields: { Status: "Questions" } })),
+    ];
+    const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
+    const s = ingestBoardItems(prev, items, bodies, { humanNeededPercent: 30 });
+    expect(s.initialBatchTickets).toEqual([11, 12, 13, 14, 15, 16, 17, 18, 19, 20]); // all 10, including the 3 parked at Step 1
+    expect(humanNeededStatus(s).questions).toBe(3);
+    expect(humanNeededStatus(s).tripped).toBe(true); // 3/7 = 42.9% >= 30
+  });
+
+  // -- issue #203: a fresh state file must not swallow the whole board --------
+  // The exact defect measured live: `bun lib/loop.ts human-needed
+  // ~/.zstack/projects/zstack/loop/state.json` on a fresh ingest returned
+  // tripped:true with initialBatchTickets holding all 174 board items against
+  // an initialReadyCount of 1, because `!prevByNumber.has(n)` is true for every
+  // ticket when prevByNumber is empty.
+  test("#203 AC1+AC2: a fresh state (prev === null) captures only the Ready queue -- pre-existing parks do not trip the gate at tick zero", () => {
+    // The board on a first run: 11 Ready (the committed queue) alongside 7
+    // Blocked and 3 Skipped that predate any batch, plus unrelated Done/Backlog.
+    const ready = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    const items = [
+      ...ready.map((n) => ({ number: n, title: `r${n}`, fields: { Status: "Ready" } })),
+      ...[20, 21, 22, 23, 24, 25, 26].map((n) => ({ number: n, title: `b${n}`, fields: { Status: "Blocked" } })),
+      ...[30, 31, 32].map((n) => ({ number: n, title: `s${n}`, fields: { Status: "Skipped" } })),
+      { number: 40, title: "done", fields: { Status: "Done" } },
+      { number: 41, title: "backlog", fields: { Status: "Backlog" } },
     ];
     const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
     const s = ingestBoardItems(null, items, bodies, { humanNeededPercent: 30 });
-    expect(s.initialBatchTickets).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]); // all 10, including the 3 parked at Step 1
-    expect(humanNeededStatus(s).questions).toBe(3);
-    expect(humanNeededStatus(s).tripped).toBe(true);
+
+    // AC2: exactly the Ready set. On main this was all 24.
+    expect(s.initialBatchTickets).toEqual(ready);
+    expect(s.initialReadyCount).toBe(11);
+
+    // AC1: the numerator is 0 -- this batch parked nothing. On main: 10/11 = 90.9%.
+    const hn = humanNeededStatus(s);
+    expect(hn.blocked).toBe(0);
+    expect(hn.skipped).toBe(0);
+    expect(hn.questions).toBe(0);
+    expect(hn.tripped).toBe(false);
+  });
+
+  // The two captures must agree on a fresh state: initialBatchTickets is now the
+  // same Ready-and-unclaimed filter initialReadyCount already used, so the
+  // numerator's scope and the denominator can no longer describe different sets.
+  // (claimedByOther cannot exist here by construction -- it originates only in
+  // markClaimLost and rides prev's tickets forward, so a fresh state has none.)
+  test("#203: on a fresh state initialBatchTickets and initialReadyCount describe the same set", () => {
+    const items = [
+      ...[1, 2, 3].map((n) => ({ number: n, title: `r${n}`, fields: { Status: "Ready" } })),
+      { number: 4, title: "q", fields: { Status: "Questions" } },
+      { number: 5, title: "building", fields: { Status: "Building" } },
+    ];
+    const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
+    const s = ingestBoardItems(null, items, bodies, { humanNeededPercent: 30 });
+    expect(s.initialBatchTickets).toEqual([1, 2, 3]); // not #4 (predates the batch), not #5 (not the committed queue)
+    expect(s.initialBatchTickets!.length).toBe(s.initialReadyCount!);
+    expect(humanNeededStatus(s).tripped).toBe(false);
+  });
+
+  test("#203 AC4: a batch that starts fresh and then parks 4 of its own 11 still trips the gate", () => {
+    const ready = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    const items1 = [
+      ...ready.map((n) => ({ number: n, title: `r${n}`, fields: { Status: "Ready" } })),
+      ...[20, 21, 22].map((n) => ({ number: n, title: `b${n}`, fields: { Status: "Blocked" } })),
+    ];
+    const bodies = Object.fromEntries(items1.map((it) => [String(it.number), "no deps"]));
+    let s = ingestBoardItems(null, items1, bodies, { humanNeededPercent: 30 });
+    expect(humanNeededStatus(s).tripped).toBe(false);
+
+    // 4 of the batch's own 11 genuinely break down mid-run.
+    const items2 = [
+      ...[1, 2, 3, 4].map((n) => ({ number: n, title: `r${n}`, fields: { Status: "Blocked" } })),
+      ...[5, 6, 7, 8, 9, 10, 11].map((n) => ({ number: n, title: `r${n}`, fields: { Status: "Building" } })),
+      ...[20, 21, 22].map((n) => ({ number: n, title: `b${n}`, fields: { Status: "Blocked" } })),
+    ];
+    s = ingestBoardItems(s, items2, bodies);
+    const hn = humanNeededStatus(s);
+    expect(hn.blocked).toBe(4); // the batch's own 4 -- the 3 pre-existing stay out
+    expect(hn.tripped).toBe(true); // 4/11 = 36.4% >= 30
+  });
+
+  // #203 AC4 (scope check): batchTickets does NOT share the defect. selectBatch
+  // never consults prev -- it filters isWorkableStatus && !claimedByOther -- so
+  // a fresh capture already excludes pre-existing parks. Pinned so a future
+  // change to selectBatch cannot quietly introduce the same blind spot.
+  test("#203: batchTickets on a fresh state already excludes pre-existing parks (selectBatch never reads prev)", () => {
+    const items = [
+      ...[1, 2, 3].map((n) => ({ number: n, title: `r${n}`, fields: { Status: "Ready" } })),
+      { number: 4, title: "blocked", fields: { Status: "Blocked" } },
+      { number: 5, title: "skipped", fields: { Status: "Skipped" } },
+      { number: 6, title: "questions", fields: { Status: "Questions" } },
+    ];
+    const bodies = Object.fromEntries(items.map((it) => [String(it.number), "no deps"]));
+    const s = ingestBoardItems(null, items, bodies, { ticketLimit: 10 });
+    expect(s.batchTickets).toEqual([1, 2, 3]); // Blocked/Skipped/Questions are not workable
+    expect(s.mergedThisRun).toEqual([]); // the sibling capture-once field: empty on a fresh batch
   });
 
   test("#150: a state file predating initialBatchTickets falls back to counting every ticket (graceful pre-feature decay)", () => {
