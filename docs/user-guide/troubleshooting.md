@@ -187,10 +187,34 @@ fixed, raising `watchdogMinutes` in `~/.zstack/projects/<slug>/config.json` is
 the safe stopgap — it costs nothing but a longer wait before a genuinely dead
 worker is noticed.
 
-Note the watchdog has no cumulative ceiling: a lane whose agent is registered in
-the harness task list but wedged answers ALIVE to every probe, and each ALIVE
-refreshes the baseline. Nothing terminates that on its own — a lane that has been
-probed alive for hours is a human's call to stop.
+## A lane was parked Blocked for passing the 480-minute stage ceiling
+
+The note reads "The `<stage>` stage has held this lane for N minutes, past the
+480-minute per-stage ceiling". Nothing is proven broken — that park is a bound,
+not a verdict.
+
+Why it exists: an ALIVE probe refreshes the silence baseline with no memory of
+the probes before it, so a worker that is wedged but still registered in the
+harness task list answers alive, the baseline resets, and the lane is probed
+again one budget later. Forever. Every other retry in the pack is outcome-driven
+(QA bounces, reviewer bounces, quorum retries, commit retries, re-spawns);
+elapsed time had none, so nothing ended that sequence but a human noticing a
+ticket that had been "in progress" since yesterday. The ceiling is the only
+thing in the loop that ends it.
+
+480 minutes is 2x the longest stage that ever finished normally on this machine
+(3.7 hours, measured over 939 stage agents), so a stage that was going to land is
+not parked by it.
+
+What to do: the branch and worktree are intact and any uncommitted work was
+dumped to `~/.zstack/projects/<slug>/reports/uncommitted-<N>.patch`. Look at what
+the agent actually did, then return the ticket to Ready. If it was a **merge**
+stage, check `gh pr view` first — the PR may have landed before the agent wedged,
+in which case the ticket is Done rather than Blocked, and the note says so.
+
+If healthy stages on your project genuinely run this long, the fix is not raising
+the ceiling: split the ticket. A stage that needs 8 hours has more in it than one
+agent's context window can hold.
 
 ## `git worktree list` is full of leftover `review-*` worktrees
 

@@ -161,7 +161,8 @@ What it **asks** — exactly two questions:
 | **`/z-update`** | Update the install: resolve the git clone backing it, `git pull --ff-only`, re-run `./setup` to refresh every registration. Refuses with reinstall instructions when no git source resolves; stops before touching setup if the pull fails. | — |
 
 Tunables live in `~/.zstack/projects/<slug>/config.json`: `maxLanes` (default 3),
-`watchdogMinutes` (default 15, measured as minutes of worker SILENCE — see
+`watchdogMinutes` (per stage — builder 25, qa 15, reviewer 40, merge 15 —
+measured as minutes of worker SILENCE, or one number for every stage; see
 [z-loop](docs/user-guide/z-loop.md)), `lockStalenessMinutes` (default 60),
 `maxQaPasses` (default 3), `qaInvestigateAfter` (default 2),
 `auditEveryNLoops` (default 5). See the

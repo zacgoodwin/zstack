@@ -128,12 +128,24 @@ re-running `/z-setup` with (or without) that flag is the supported way to
 change them.
 
 - `maxLanes` (default 3) — concurrent worktree lanes.
-- `watchdogMinutes` (default 15) — silent-worker timeout, measured as minutes in
-  which the lane's agent subtree appended nothing to its transcripts (not stage
-  age; #256). The default is 2x the longest measured mid-work gap between a
-  working agent's own records (423s), the same margin `SUBTREE_QUIET_MS` uses.
-  Raise it for a repo whose stages legitimately go quiet longer (a slow build
-  behind one tool call); lowering it below ~15 starts probing healthy agents.
+- `watchdogMinutes` — silent-worker timeout, measured as minutes in which the
+  lane's agent subtree appended nothing to its transcripts (not stage age;
+  #256). Two accepted shapes:
+  - **a number** — one budget for every stage, which is what every config
+    written before #256 carries and still means exactly that;
+  - **an object** — `{"builder": 25, "qa": 15, "reviewer": 40, "merge": 15}`,
+    the shipped default, written by `/z-setup` when you pass no
+    `--watchdog-minutes`. Any stage you leave out keeps the pack's default for
+    it, so `{"reviewer": 90}` is a one-stage override rather than a new table.
+    An unknown stage key is a config error, never a silently ignored line.
+
+  Each default is 2x that stage family's own measured worst silence, floored at
+  2x the longest measured mid-work gap of any single agent (423s → 15 minutes,
+  the same margin `SUBTREE_QUIET_MS` uses). Raise a stage for a repo whose
+  agents legitimately sit longer behind one slow tool call; going below 15
+  starts probing healthy agents. `0` is refused in both shapes — there is no
+  "disable the watchdog" value, because a stage with no watchdog runs until the
+  480-minute stage ceiling.
 - `lockStalenessMinutes` (default 60) — when a crashed loop's lock is judged stale.
 - `auditEveryNLoops` (default 5) — how often the end-of-loop stage runs the
   `/cso` + `/health` audits (`loopCount % auditEveryNLoops === 0`). Lower it

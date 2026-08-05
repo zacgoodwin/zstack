@@ -303,6 +303,52 @@ export const SUBTREE_QUIET_MS = 900_000;
 // margin; the gate test is the enforcement.
 export const MEASURED_MIDWORK_GAP_MS = 423_110;
 
+// The longest SILENCE a healthy stage of each kind actually produced -- the
+// quantity subtreeActivityMs() reports the newest end of, measured per stage
+// family so the per-stage watchdog budgets (lib/config.ts
+// DEFAULT_STAGE_WATCHDOG_MINUTES) are derived rather than guessed.
+//
+// Method, over every session on this machine: for each orchestrator-spawned
+// (parentless) agent plus its transitive descendants, merge their records into
+// one timeline -- exactly the series the watchdog observes, since a lane is
+// silent only when NOBODY in its subtree has appended -- and take the largest
+// gap between consecutive events. Gaps CLOSED by a `user` record on the root are
+// excluded for the reason #209 excludes them above: that is the orchestrator
+// messaging an agent that had already returned, which measures SendMessage
+// latency, not work. 1,143 subtrees: builder 259, qa 293, reviewer 497, merge 94.
+//
+//   builder   p50 70.6s  p90 196.1s  p99 479.7s  max 608.0s
+//   qa        p50 30.6s  p90  59.9s  p99  97.5s  max 174.8s
+//   reviewer  p50 36.9s  p90  94.3s  p99 186.0s  max 1161.1s
+//   merge     p50  8.6s  p90  30.2s  p99  97.1s  max  97.1s
+//
+// The reviewer's 19-minute outlier (Reviewer #178) is the shape that makes
+// per-stage budgets worth having at all: a reviewer blocked on three BACKGROUND
+// skeptics writes nothing itself, and its skeptics were each blocked on their own
+// long tool calls, so the whole subtree went quiet while working exactly as
+// designed. A single global budget must either clear that -- and be far too
+// patient for a merge stage that only runs `gh pr merge` -- or kill it.
+//
+// These are per-family CEILINGS from this repo's own loop runs; they are NOT a
+// floor for a budget. A family whose sample happens to hold no long quiet stretch
+// (qa's 174.8s over 293 subtrees) says nothing about the agent-level ceiling that
+// MEASURED_MIDWORK_GAP_MS measures over a 22x larger population, which is why
+// every shipped default clears BOTH (gate-tested in tests/loop.test.ts).
+export const MEASURED_STAGE_SILENCE_MS: Record<"builder" | "qa" | "reviewer" | "merge", number> = {
+  builder: 607_966,
+  qa: 174_847,
+  reviewer: 1_161_119,
+  merge: 97_130,
+};
+
+// The longest a stage agent that RETURNED NORMALLY has ever run on this machine:
+// 3.7 hours, a "Build C9 /z-status dashboard" builder, over 939 stage-described
+// parentless agents that came to rest on a final answer (p50 8.0m, p95 27.8m,
+// p99 48.6m, 6 over 60m, 2 over 120m). This is the population lib/loop.ts's
+// STAGE_CEILING_MINUTES must clear: a ceiling under it would park a stage that
+// was going to finish.
+export const MEASURED_MAX_STAGE_MS = 13_304_097;
+
 // The `stop_reason` values that END a turn. A record carrying one is the agent's
 // last word by definition -- the harness has nothing more to append until someone
 // messages it -- so it needs no quiet window at all.
