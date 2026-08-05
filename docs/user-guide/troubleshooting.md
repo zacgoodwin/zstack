@@ -281,11 +281,39 @@ closes them. If you want them to auto-close, that fights the loop — leave the
 You added a column to the board that is not one of the canonical nine, and a
 ticket is sitting in it. The line is informational: the loop skips that ticket
 for the whole run and touches nothing else. If the ticket was mid-flight when
-you moved it, its lane also stops — that is the intended way to pull a ticket
-out of a running batch by hand. Move it back to Ready to hand it to the loop.
+you moved it, its lane stops too — that is the intended way to pull a ticket out
+of a running batch by hand, and the run report will carry a `stop-lane` for it
+naming the column you moved it to. Move it back to Ready to hand it to the loop.
 
 If you did not expect the message, check the ticket's Status field for a typo or
 a renamed column: the loop matches status names exactly.
+
+## I moved a Building ticket to my own column and the loop finished without it, leaving a lock behind
+
+Fixed in #273; if you are on an older pack, update (`/z-update`).
+
+The symptom: you drag a mid-flight ticket into a column you added yourself. The
+loop prints the "does not drive" line above, the run then reports drained and
+runs its end-of-loop stage, and afterwards `~/.zstack/projects/<slug>/locks/`
+still holds a `ticket-<N>.json`. The next `/z-loop` refuses to start with
+"orphans present" and demands `--reconcile`, which then parks that ticket back to
+Ready — undoing the move you made on purpose. Meanwhile the ticket's builder was
+never stopped: it kept running and kept committing to `z/ticket-<N>-…`, a branch
+the end-of-loop cleanup deletes.
+
+The cause was that the loop removed such a lane by filtering it out of its own
+state file instead of emitting an action. Nothing tore the agent down, nothing
+removed the lock, and the drain — which measures "still running" by counting
+lanes — went true the moment the lane vanished.
+
+Now the loop keeps the lane, emits a `stop-lane` for it, and only removes it once
+that action has killed the background agent and released the lock. The drain
+cannot complete while one is outstanding.
+
+To clean up after an affected run: delete the stale `ticket-<N>.json` in the
+locks directory (or run `/z-loop --reconcile` and move the ticket back to your
+column afterwards), and check `git worktree list` for a leftover
+`.worktrees/ticket-<N>` — see "orphans present" above.
 
 ## setup: "already exists as a separate install; skipping" — and its uninstall mirror
 
