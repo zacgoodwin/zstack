@@ -424,8 +424,9 @@ Read-only, any time — before a loop, during one, or after:
 - Ticket counts across all nine statuses.
 - **Waiting on human**: the Questions and Blocked tickets by number and title —
   exactly what needs you before the next loop can make progress.
-- In-flight lanes with ticket, stage, and age (a lane older than the watchdog
-  is about to be probed).
+- In-flight lanes with ticket, stage, and lock age (age is not what the watchdog
+  reads — it fires on transcript silence — so a long-lived lane here is usually
+  just a long stage; 480 minutes is the ceiling past which it parks Blocked).
 - The last loop's report path and verdict line (GREEN or RED).
 - Estimate vs Actual totals, for calibration.
 

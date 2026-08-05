@@ -4018,9 +4018,12 @@ describe("loop CLI", () => {
       );
     }
 
-    function runHeartbeat(statePath: string, subagentsDir: string): { exitCode: number | null; stdout: string; stderr: string } {
+    // --now is passed explicitly: the verb clamps observations to the clock
+    // (clampToNow), so a test that let it read the wall clock would pass or fail
+    // depending on the hour its fixture timestamps landed on.
+    function runHeartbeat(statePath: string, subagentsDir: string, nowMs: number): { exitCode: number | null; stdout: string; stderr: string } {
       const proc = Bun.spawnSync(
-        ["bun", join(REPO_ROOT, "lib", "loop.ts"), "heartbeat", statePath, "--slug", "demo", "--subagents-dir", subagentsDir],
+        ["bun", join(REPO_ROOT, "lib", "loop.ts"), "heartbeat", statePath, "--slug", "demo", "--subagents-dir", subagentsDir, "--now", String(nowMs)],
         { stdout: "pipe", stderr: "pipe" }
       );
       return { exitCode: proc.exitCode, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
@@ -4041,7 +4044,7 @@ describe("loop CLI", () => {
       // attempt 1 for a lane with no bounces: the tag of the spawn running RIGHT NOW.
       writeAgent(subagents, "q1", { tag: spawnTag("demo", 1, "qa", 1) });
       writeAgent(subagents, "k1", { parent: "q1", at: new Date(appended).toISOString() });
-      const { exitCode, stdout } = runHeartbeat(statePath, subagents);
+      const { exitCode, stdout } = runHeartbeat(statePath, subagents, now);
       expect(exitCode).toBe(0);
       expect(stdout).toContain("#1 qa last append");
       expect(lanesOf(statePath)[0].lastActivityMs).toBe(appended);
@@ -4064,7 +4067,7 @@ describe("loop CLI", () => {
       writeFileSync(statePath, JSON.stringify(s));
       writeAgent(subagents, "old", { tag: spawnTag("demo", 1, "qa", 1), at: new Date(dead).toISOString() });
       writeAgent(subagents, "new", { tag: spawnTag("demo", 1, "qa", 2), at: new Date(alive).toISOString() });
-      expect(runHeartbeat(statePath, subagents).exitCode).toBe(0);
+      expect(runHeartbeat(statePath, subagents, alive + 60_000).exitCode).toBe(0);
       expect(lanesOf(statePath)[0].lastActivityMs).toBe(alive);
       rmSync(subagents, { recursive: true, force: true });
     });
@@ -4076,15 +4079,40 @@ describe("loop CLI", () => {
       const statePath = join(dir, "heartbeat-open-state.json");
       const before = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: 7 })]);
       writeFileSync(statePath, JSON.stringify(before));
-      const { exitCode, stdout } = runHeartbeat(statePath, subagents); // empty dir: no agent carries the tag
+      const NOW = Date.parse("2026-08-04T12:00:00.000Z");
+      const { exitCode, stdout } = runHeartbeat(statePath, subagents, NOW); // empty dir: no agent carries the tag
       expect(exitCode).toBe(0);
       expect(stdout).toContain("no subtree observed");
       expect(lanesOf(statePath)).toEqual(before.lanes);
       // ...and a directory that does not exist at all is the same answer, loudly.
-      const missing = runHeartbeat(statePath, join(subagents, "never-created"));
+      const missing = runHeartbeat(statePath, join(subagents, "never-created"), NOW);
       expect(missing.exitCode).toBe(0);
       expect(missing.stderr).toContain("every lane keeps its current watchdog baseline");
       expect(lanesOf(statePath)).toEqual(before.lanes);
+      rmSync(subagents, { recursive: true, force: true });
+    });
+
+    // A machine's clock moves -- an NTP correction or a suspend/resume can leave
+    // a transcript record dated ahead of `now`. Unclipped, that lands in
+    // lastActivityMs, `nowMs - lastActivityMs` goes NEGATIVE, and the watchdog is
+    // silently OFF for that lane for the length of the skew: the exact failure
+    // #256 removes, reintroduced through its own fix.
+    test("an observation dated in the future is clipped to the clock, never past it", () => {
+      const subagents = mkdtempSync(join(tmpdir(), "zstack-heartbeat-skew-"));
+      const statePath = join(dir, "heartbeat-skew-state.json");
+      const now = Date.parse("2026-08-04T12:00:00.000Z");
+      const s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: now - 30 * 60_000 })]);
+      writeFileSync(statePath, JSON.stringify(s));
+      writeAgent(subagents, "q1", { tag: spawnTag("demo", 1, "qa", 1), at: new Date(now + 3 * 60 * 60_000).toISOString() });
+      expect(runHeartbeat(statePath, subagents, now).exitCode).toBe(0);
+      expect(lanesOf(statePath)[0].lastActivityMs).toBe(now); // clipped, not now+3h
+      // ...so the lane is still watchdog-eligible on its own budget rather than
+      // being immune for three hours.
+      const proc = Bun.spawnSync(
+        ["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", statePath, "--now", String(now + 11 * 60_000)],
+        { stdout: "pipe", stderr: "pipe" }
+      );
+      expect(JSON.parse(proc.stdout.toString())).toEqual({ kind: "check-worker", ticket: 1 });
       rmSync(subagents, { recursive: true, force: true });
     });
 
