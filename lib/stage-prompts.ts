@@ -18,7 +18,7 @@
 // parameter, NOT a key of the input object, so the reviewer's exact-four-key
 // blindness gate is untouched.
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { handleCliError, parseFlags, str } from "./cli.ts";
 import { ADVERSARIAL_MODES, DEFAULT_ADVERSARIAL_MODE, ZError, type AdversarialMode } from "./config.ts";
 // Type-only: erased at build, so this cannot introduce a runtime cycle (and
@@ -402,6 +402,17 @@ export function shSingleQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
+// The loop-owned merge gate's CLI, by absolute path off THIS pack (#178). The
+// merge agent is told to shell it, never to read test output and judge green
+// itself -- the whole point of the gate is that no latent step decides it.
+// The prompt must never ASSERT that the gate already ran green: the loop does
+// gate this lane before the spawn (nextAction refuses to advance to merge
+// without a stamped green verdict), but a prompt that states it as fact would
+// be an unverifiable claim inside the agent's own context, and a claim is
+// exactly what this ticket replaces with a command. So the gate is Step 0,
+// unconditional, and the agent's own exit code is its permission to merge.
+const MERGE_GATE_CLI = join(import.meta.dir, "loop.ts");
+
 export interface MergePromptInput {
   ticketNumber: number;
   prTitle: string;
@@ -409,6 +420,13 @@ export interface MergePromptInput {
   baseBranch: string;
   worktreePath: string;
   stackedOn: number[]; // parent tickets in this batch (PROCESS.md step 18)
+  // The loop's state.json (#178). Present -> Step 0 renders the STAMPING form of
+  // the gate, so the verdict for the commit the agent is ACTUALLY merging --
+  // including the re-run after a conflict resolution, which the loop cannot
+  // interleave a tick into -- lands on the lane, naming that commit's sha,
+  // where the reducer and the run report can see it. Absent -> the read-only
+  // form: the exit code still gates the merge, only the audit trail is lost.
+  statePath?: string;
 }
 
 export function mergePrompt(i: MergePromptInput, inputPath: string, tag?: string): string {
@@ -416,16 +434,38 @@ export function mergePrompt(i: MergePromptInput, inputPath: string, tag?: string
     ? `\n## Stacked chain (PROCESS.md step 18 -- order is not optional)
 This branch stacks on ticket(s) #${i.stackedOn.join(", #")}. Their PRs merge FIRST, each WITHOUT deleting its branch (deleting a base branch closes every dependent PR). After each parent lands, retarget this PR to ${i.baseBranch} (gh pr edit --base ${i.baseBranch}). Delete branches only after the whole batch has landed.\n`
     : "";
+  // ABSOLUTE worktree path, always. The Workspace line names the worktree and
+  // step 2 tells the agent to resolve conflicts ON the branch, so it may well
+  // `cd` in there -- and a relative `.worktrees/ticket-<N>` argument then
+  // resolves against the WRONG root, the gate throws "worktree does not exist",
+  // and Step 0's own "ANY nonzero exit = BLOCKED" rule false-blocks a branch
+  // that was ready to land. resolve() runs in the orchestrator's cwd (the repo
+  // root), which is where the relative form was always meant to be read.
+  const worktree = resolve(i.worktreePath);
+  const gateStamp = i.statePath ? ` --state ${shSingleQuote(resolve(i.statePath))} --ticket ${i.ticketNumber}` : "";
   return `${spawnStamp(tag)}You are the MERGE stage for ticket #${i.ticketNumber}, running UNATTENDED inside the zstack dev loop. QA and adversarial review have both passed; your job is to land the branch cleanly.
 
 ## Workspace
-- Worktree: ${i.worktreePath}, branch ${i.branch}, base ${i.baseBranch}.
+- Worktree: ${worktree}, branch ${i.branch}, base ${i.baseBranch}.
 - Full stage input (numbers, PR title, branch, base, worktree, stacked chain) is in ${inputPath} if you need to re-read any field.
 ${stacked}
+## Step 0 -- run the green gate. It is NOT yours to judge (#178)
+Run this yourself, in THIS session, before any gh pr merge -- unconditionally, whatever you were told about earlier runs:
+
+bun ${shSingleQuote(MERGE_GATE_CLI)} merge-gate ${shSingleQuote(worktree)}${gateStamp}
+
+Every path in it is absolute, so it runs correctly from any directory -- including from inside the worktree. Copy it verbatim; do not substitute a relative path.
+
+Exit 0 = green, the only state in which gh pr merge may run. ANY nonzero exit = stop and exit BLOCKED with the gate's note, no matter what the output looks like to you. You never decide green vs red by reading test output: a merge agent that did exactly that landed a branch with 9 failing tests and broke ${i.baseBranch}.
+
+Give the command the largest timeout your shell tool allows (600000 ms), never a 120s default: it runs the worktree's test script plus its typecheck, and any red first attempt is retried once, adding a 15s wait and a second full run. The gate bounds itself to 570s of wall clock, so it answers inside that window; a killed command is not a verdict, re-run it.
+
+Run it AGAIN -- the same command, byte for byte -- after any change you make to the branch (a conflict resolution). The run before your change does not vouch for the code after it, and the verdict records the commit sha it tested, so the re-run is what puts your merged commit on the record.
+
 ## Steps
 1. Open the PR: gh pr create --base ${i.baseBranch} --head ${i.branch} --title ${shSingleQuote(i.prTitle)} with a body that links the ticket and summarizes what shipped.
-2. If ${i.branch} conflicts with ${i.baseBranch}: resolve ON the branch, then rerun the full gauntlet (typecheck + full test suite) before merging. Never resolve in the merge commit blind.
-3. Merge with gh pr merge only when everything is green. Never pass --delete-branch: branch cleanup happens once at batch end, after every dependent PR has landed.
+2. If ${i.branch} conflicts with ${i.baseBranch}: resolve ON the branch, then re-run Step 0's gate command exactly as written before merging (never in prose, never resolve in the merge commit blind). Gate nonzero -> exit BLOCKED with its note.
+3. Merge with gh pr merge only when the gate exited 0. Never pass --delete-branch: branch cleanup happens once at batch end, after every dependent PR has landed.
 4. Do not close the ticket issue and do not comment on it -- the orchestrator posts the completion note.
 
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):

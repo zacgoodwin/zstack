@@ -56,6 +56,7 @@ import {
   applyAction,
   ingestBoardItems,
   nextAction,
+  recordMergeGate,
   recordOutcome,
   type LaneState,
   type LoopState,
@@ -120,6 +121,9 @@ const HAPPY: Record<Stage, string> = {
   reviewer: "REVIEW-APPROVE: confidence=100 ok", // clears the default 70 floor (issue #62)
   merge: "MERGED: https://pr/1",
 };
+// The green verdict `loop merge-gate --state` stamps on a lane (#178): without
+// one, nextAction never advances a lane into the merge stage.
+const GREEN_GATE = { green: true, attempts: 1, failCount: 0, note: "merge gate GREEN on attempt 1: 0 fail, exit 0" };
 
 // ============================================================================
 // Control 1 -- second /z-loop refuses, naming the live session
@@ -1207,6 +1211,10 @@ describe("control 4: lane cap enforced at the locks layer", () => {
         s = recordOutcome(s, idle.ticket, HAPPY[idle.stage], 0);
         continue;
       }
+      if (a.kind === "merge-gate") {
+        s = recordMergeGate(s, a.ticket, GREEN_GATE, 0); // #178: the loop gates every merge; green here
+        continue;
+      }
       if (a.kind === "claim") writeLaneLock(locksDir, { ticket: a.ticket, stage: a.stage, session: "s", claimedAt: 0 });
       else if (a.kind === "advance") writeLaneLock(locksDir, { ticket: a.ticket, stage: a.to, session: "s", claimedAt: 0 });
       else if (a.kind === "park" || a.kind === "skip" || a.kind === "complete" || a.kind === "stop-lane") removeLaneLock(locksDir, a.ticket);
@@ -1425,6 +1433,10 @@ describe("control 6: wave reconciliation (mid-loop human moves)", () => {
       if (a.kind === "wait") {
         const idle = s.lanes.find((l) => !l.outcome)!;
         s = recordOutcome(s, idle.ticket, HAPPY[idle.stage], 0);
+        continue;
+      }
+      if (a.kind === "merge-gate") {
+        s = recordMergeGate(s, a.ticket, GREEN_GATE, 0);
         continue;
       }
       s = applyAction(s, a, 0);

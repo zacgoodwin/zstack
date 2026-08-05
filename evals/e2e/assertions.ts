@@ -16,6 +16,7 @@ import { join } from "node:path";
 import {
   applyAction,
   nextAction,
+  recordMergeGate,
   recordOutcome,
   type Action,
   type LaneState,
@@ -96,7 +97,13 @@ export function happyOutcome(stage: Stage, ticket: number): string {
 // carrying a counter, at which point the safety oracle cries "state leaked
 // between stages" about a scheduling field. The gate makes the second copy
 // impossible to forget.
-export const ALLOWED_LANE_KEYS = new Set(["ticket", "stage", "lastActivityMs", "stageStartedMs", "qaBounces", "reviewBounces", "quorumRetries", "commitRetries", "respawns", "workerDead", "worktreeDirty", "outcome", "lastWroteStatus", "goneReason"]);
+// mergeGate/mergeGateRuns/mergeGateBase (#178) are the loop's own mechanical
+// verdict on the lane's suite -- a fail count, an exit code, the commit it was
+// measured on, and the list of tickets already merged when that verdict was
+// taken -- nothing latent, and they are what makes "no merge without a green
+// gate, and never on a base or a commit that has since moved" enforceable in
+// the reducer.
+export const ALLOWED_LANE_KEYS = new Set(["ticket", "stage", "lastActivityMs", "stageStartedMs", "qaBounces", "reviewBounces", "quorumRetries", "commitRetries", "respawns", "workerDead", "worktreeDirty", "outcome", "lastWroteStatus", "goneReason", "mergeGate", "mergeGateRuns", "mergeGateBase"]);
 const FORBIDDEN_LANE_KEY = /conversation|session|context|thread|agent.?id|history|transcript/i;
 
 export interface SimTrace {
@@ -137,6 +144,13 @@ export function deriveRun(initial: LoopState, oracle = happyOutcome): SimTrace {
     if (action.kind === "drain-complete") return { statusHistory, maxObservedLanes, completionOrder, finalState: state, laneKeySets };
     if (action.kind === "wait" || action.kind === "check-worker") {
       throw new Error(`Happy-path derivation hit an unexpected "${action.kind}" -- the recorded run is not the clean success this checker models.`);
+    }
+    // #178: the loop's own merge gate stands between review-approve and the
+    // merge stage. A clean success is a green gauntlet, so stamp green and
+    // let the scheduler emit the advance it now guards.
+    if (action.kind === "merge-gate") {
+      state = recordMergeGate(state, action.ticket, { green: true, attempts: 1, failCount: 0, note: "merge gate GREEN on attempt 1: 0 fail, exit 0" }, now);
+      continue;
     }
     if (action.kind === "complete") completionOrder.push(action.ticket);
     state = applyAction(state, action, now);

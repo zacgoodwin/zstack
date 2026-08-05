@@ -149,6 +149,13 @@ records the result. It never re-derives a scheduling decision in prose.
   (`retry`), or is ignored entirely (`off`). A `REVIEW-APPROVE` with no
   parseable confidence is treated the same as a sub-floor score — fail-closed,
   never a silent merge — whenever the gate is on.
+- **A red suite does not merge, and the agent has no say.** Before a merge agent
+  is spawned, the loop itself runs the gauntlet in the lane's worktree and
+  judges it by the summary fail-count and the process exit code, never by an
+  agent's reading of the output. The verdict is stamped on the lane and the
+  scheduler refuses to advance a ticket into the merge stage without a green
+  one, so "was the gate even run?" is decided in code too. See
+  [The merge green gate](#the-merge-green-gate).
 - **A confidence with nobody behind it does not merge either.** The aggregated
   confidence is computed over the skeptics that actually *reported*, so ONE
   skeptic answering "cannot refute" is `confidence=100` — which clears the
@@ -364,6 +371,231 @@ the decision is a one-click human classification, not the builder's own call.
 The reviewer still runs: `skip-qa` skips QA, never the last correctness gate.
 Every ticket without the label runs the full builder → QA → reviewer → merge
 pipeline, and the QA bounce/investigate machinery is unchanged.
+
+## The merge green gate
+
+The last thing between a branch and `main` is mechanical, and the loop owns it —
+not the merge agent. A merge agent once read a suite that reported 9 failing
+tests, decided in prose that it was green, merged, and broke `main` (reverted in
+PR #158). "Is the suite green?" is deterministic space, so it is code now:
+
+```bash
+bun "$PACK/lib/loop.ts" merge-gate .worktrees/ticket-<N> --state "$STATE" --ticket <N>
+```
+
+What it does, in the lane's own worktree:
+
+1. Runs `bun run test`, then `bun run typecheck` if the tests were clean —
+   whichever of the two the worktree's own `package.json` defines (see *Which
+   commands run* below) — both with color pinned off (`NO_COLOR=1`,
+   `FORCE_COLOR=0`), because everything below is read off those bytes and bun
+   wraps its summary lines in escape codes the moment the ambient environment
+   asks for color. It runs the **script the repo defines**, not the `bun test`
+   builtin: pinning the builtin gated a command the repo never asked for.
+2. Judges the result by two machine-readable facts only — the `N fail` count on
+   the suite's **summary line** and the process **exit code**. Per-test `(fail)`
+   lines and prose like `tests/e2e-check.test.ts`'s intentional
+   `FAIL merge-order` self-test output are never read as a verdict; a summary
+   saying `0 fail` at exit 0 is green even when such a line is present. When two
+   summaries appear (a test that spawns a nested `bun test`), the higher fail
+   count wins. "Summary line" is exact in both directions: the match is anchored
+   at both ends (`^ N fail$`), because bun's line is that and nothing else, so a
+   line of *prose* that merely opens with digits — `3 fail-safe checks skipped`,
+   `12 fail: legacy counter` — is not a verdict either. Taking the higher count
+   is fail-closed against a missed summary, not against a phantom one: a phantom
+   makes a green suite red, the retry reproduces it, and the lane parks Blocked
+   with nothing to do about it.
+3. Checks that the summary it read is **this run's**. Every `bun test` run
+   brackets itself — a `bun test v…` banner when it starts, a
+   `Ran N tests across M files.` when it finishes — so the gate counts both. A
+   test that shells a nested `bun test` with inherited stdio writes that run's
+   banner *and* summary into the same stream; if the outer run then dies without
+   printing its own (a `process.exit(0)` inside a test), the only summary left
+   belongs to somebody else. Fewer finishes than starts is red, whatever the
+   fail count says. This is #132's "the suite did not run" shape wearing another
+   run's verdict, and it was reproducible end-to-end before the count existed.
+4. Allows **exactly one** retry, after a 15s wait, for **any** red first
+   attempt — see *The retry, and the clock* below.
+5. Prints the verdict as JSON (`{green, attempts, failCount, note, commit}`),
+   **exits 0 only when green**, and — with `--state`/`--ticket` — stamps the
+   verdict onto that lane. `commit` is the worktree HEAD the verdict vouches
+   for: a gate result is about one commit, so a re-run after a conflict
+   resolution stamps a verdict naming the *new* sha.
+
+Steps 2 and 3 read bun's own bookkeeping, so they apply where the manifest
+proves bun's runner is what the `test` script runs (`bun test`,
+`bun test --coverage`, `cross-env CI=1 bun test`, `bun test && bun run lint`).
+Where it does not — `jest --ci`, `vitest run` — that script's **exit code is the
+verdict**, because a runner that never prints a bun banner cannot be asked for
+one: demanding it would refuse every green merge on such a repo forever. The two
+fail-closed reads stay on everywhere, so a `N fail` summary reporting failures,
+or bun's `error: 0 test files matching`, is still red whoever printed it. And
+where the manifest *does* claim bun's runner, an exit 0 with no banner stays red
+— the detection is positive evidence for a skip, never a way to buy a green by
+renaming a script.
+
+Where the script is bun's runner and the output shows it ran nothing, the gate
+says *that* rather than the misleading "the suite did not run" — and the signal
+is not the missing banner: `bun test` prints `bun test v…` **before** it goes
+looking for test files, so a checkout holding only `main.go` still shows one
+banner. `error: 0 test files matching` is the line that means it, and the gate
+reads it *ahead* of the exit code, because bun exits 1 on it and the generic
+"gauntlet exited 1 with no test-summary line" buried the cause. A genuine
+contention kill — bannerless, and with no such line — keeps that honest
+exit-code note. The reordering is fail-closed by construction: it can only
+reword a verdict that is already red, since green requires a summary line and
+this branch requires there be none.
+
+### Which commands run
+
+The gauntlet's two limbs are detected from the merge worktree's own
+`package.json`, the same `HAS()` rule the end-of-loop regression pass uses —
+never assumed:
+
+| `scripts` in the worktree | What runs | Verdict read from |
+|---|---|---|
+| `test` **and** `typecheck` | both, typecheck only if the suite was clean | the suite summary + the exit code |
+| `test` only | `bun run test` | the suite summary + the exit code |
+| `typecheck` only | `bun run typecheck` | the exit code alone (no suite ran, so `failCount` is `null`) |
+| neither, or no readable `package.json` | **nothing** | refused before the first spawn |
+
+Pinning both by name made the gate unpassable on any repo without a `typecheck`
+script: `bun run typecheck` on a missing script exits 1 with `Script not found`,
+red is unbypassable by design, and so every lane on such a repo parked Blocked
+at the merge stage forever. Only a **provably absent** script is skipped — it is
+not run and not counted red — and `bun test` stays mandatory wherever it is
+defined, so everything above about the summary line is untouched. Skipping is
+never a bypass: a failing suite on a repo with no `typecheck` script is still
+red, and a missing or unparseable `package.json` proves nothing, so it refuses
+rather than skips.
+
+One limit is deliberate and unchanged: a checkout with no `package.json` at all
+(a Go repo, say) has no gate to detect and parks Blocked.
+
+### The retry, and the clock
+
+**Every** red first attempt is retried once, after a 15s wait. The retry used to
+fire only for a nonzero exit with *no* reported failures, on the theory that
+contention arrives bannerless. Measured on this repo it does not: contention
+arrives as **test timeouts**, which bun counts on the summary line — the full
+suite under load reports `2 fail`, both `this test timed out after 5000ms`,
+where the same file run alone reports 1. Every real contention case therefore
+took the "summary reports failures" branch, got no retry and an immediate
+Blocked. Retrying everything costs a second gauntlet on a genuinely red branch
+and weakens nothing: real failures reproduce, and it is the **second** run's
+count that becomes the verdict.
+
+The clock is code, not the SKILL's prose. The gate owns a **570s wall-clock
+budget** (`MERGE_GATE_BUDGET_MS`), 30s under the 600000 ms Bash timeout the
+SKILL mandates for the call. Attempt 1 gets the whole budget — 2.4x the slowest
+of three timed runs of this suite (128s, 193s, 234s) — and the retry gets what
+is left. A spawn killed by the budget reports exit 124 with the kill named in
+the output; it is never read as clean. That normalisation is load-bearing
+rather than cosmetic — a kill arrives as `exitCode: null`, and on the
+typecheck-only and foreign-runner rows of the table above the exit code is the
+*whole* verdict, so anything but a nonzero there hands merge permission to a
+gauntlet that never finished. `merge-gate` takes `--budget-ms` (like
+`--retry-wait-ms`) so that path is reachable in a test in seconds instead of
+570 of them.
+
+**The budget cannot cancel the retry.** It could, once, and it fired on this
+gate's own PR: the skip used to read "what is left cannot fit a run as long as
+the first one took", which is an attempt-1 *duration* cliff at
+`(budget - wait) / 2` — 262.5s at the then-540s budget, *below* this repo's own
+233.6s suite. A real gate run reported three timeout-shaped failures at
+attempt 1, took longer than the cliff, skipped the retry and refused a branch
+that ran `0 fail` in three separate runs. The only thing that skips the retry
+now is the budget being physically gone — attempt 1 having consumed all 570s of
+it, which means attempt 1 was itself killed at the cap and there is no wall
+clock left to run a second in. Reaching that takes an attempt 1 of 555s, 2.4x
+the measured suite. The extra 30s of budget goes straight to the retry: a 265s
+attempt 1 leaves it 290s, comfortably over the 238.9s a *loaded* run of this
+suite was measured at.
+
+One consequence lands on the repo being gated rather than on the gate: once a
+merge needs a green suite, a **per-test timeout tuned for an idle machine
+becomes a merge blocker**. Three of this pack's own spawn-heavy files crossed
+bun's 5000ms default as the suite grew — Windows process startup is ~1s a spawn
+— on a machine where nothing was broken. This repo's `test` script therefore
+runs `bun test --timeout 30000`, which is what the gate spawns, and the measured
+files also call `setDefaultTimeout(30_000)` so a bare `bun test` (which takes no
+flag from the script) stays green too. Bun 1.3.14 has no single switch that does
+both: a bunfig `[test] timeout` key is ignored, and `setDefaultTimeout` from a
+`[test] preload` is reset per test file.
+
+Mind the third form. `--timeout` sets a **default**, and a per-test timeout
+argument — `test("…", fn, 20000)` — silently beats it (measured). So a file that
+raised its own bound the per-test way was the one file the script flag could not
+reach, and its tests were the ones timing out under load. Use
+`setDefaultTimeout` at the top of the file instead; a gate test here walks
+`tests/` and fails on any per-test argument below the bound. If you adopt the
+loop on a repo with spawn-heavy or IO-heavy tests, set that bound before the
+first merge lane runs.
+
+### A verdict is about one base
+
+A green verdict vouches for one branch on top of **one base**, and every merge in
+a run moves that base under every lane still waiting. So the verdict records the
+run's merged set at stamping time, and `next` re-gates rather than advancing when
+that set has changed: two review-approved lanes stamped green at the same moment,
+#8 depending on #7, used to see #8 advance to merge on its *pre-#7* gauntlet —
+the reducer computed `stackedOn: [7]`, so it knew the base had moved, and handed
+out the permission anyway. The only re-gate left was the merge prompt's prose
+Step 0, which is the latent-compliance path this whole gate exists to delete.
+
+The rule is "the base moved", not the literal "this PR is stacked": a lane gated
+*after* its parent merged keeps `stackedOn: [parent]` right up until it merges
+itself, so the literal form would re-gate forever. Re-gating costs one extra
+gauntlet per lane per merge, and it terminates. Starting any gate run also drops
+the lane's previous verdict, so a stale green can never cover a run in flight.
+
+### Who runs it, and why it cannot be skipped
+
+The stamp is the enforcement. A review-approved lane at the front of the merge
+order gets its own scheduler action, `merge-gate N`, and `next` will not emit
+the `advance N to merge` that spawns a merge agent until the lane carries a
+**green** verdict:
+
+| Lane state | What `next` returns |
+|---|---|
+| No verdict stamped | `merge-gate N` — run the gate (again) |
+| Verdict green, but a lane has merged since it was stamped | `merge-gate N` — the base moved, so re-gate |
+| Verdict green | `advance N to merge` — the merge agent spawns |
+| Verdict red | `park N Blocked`, carrying the gate's own note (fail count included) |
+| Two gate runs started, neither finished | `park N Blocked` — a gate that never returns refuses the merge rather than spinning the drain |
+
+So an orchestrator that "forgets" the gate does not merge anything; it just gets
+`merge-gate N` back on the next tick. A gate that cannot even run (a missing
+worktree, say) stamps *red* rather than erroring out, so the lane parks for a
+human instead of retrying a command that will fail the same way.
+
+Run the command with a generous timeout — the SKILL specifies `600000` ms (the
+Bash tool's maximum) on the orchestrator's call, and the merge prompt asks the
+agent for the same. Measured on this repo the suite runs 128-234s and the
+typecheck ~1s, so the worst case (a retry after the 15s wait) is ~8.1 minutes; the
+harness's 120s default kills it inside the *first* attempt. That number is a
+convenience, not the safety property — the 570s budget above is what actually
+bounds the run, so the worst a short timeout can do is cost the lane an attempt,
+never merge something ungated.
+
+The merge agent runs the same command as its own **Step 0**, unconditionally,
+before any `gh pr merge` — and again after any conflict resolution, since the
+loop's run vouches for the commit it gated, not for code the agent changed
+afterwards. Its prompt never asserts that an earlier gate passed; it hands over
+a command and an exit code. Under no circumstance does a red suite merge.
+
+Two details of that command matter, because both once broke it:
+
+- **Every path in it is absolute**, the worktree included. The prompt tells the
+  agent to resolve conflicts *on the branch*, so it may well be sitting inside
+  the worktree when it runs Step 0 — and a relative `.worktrees/ticket-<N>`
+  read from there resolves to nothing, the gate exits nonzero, and the prompt's
+  own "any nonzero exit = BLOCKED" rule false-blocks a mergeable branch.
+- **It carries `--state`/`--ticket`**, so the agent's own run stamps too. The
+  loop cannot slip a tick between "conflict resolved" and `gh pr merge`, so the
+  conflict path is the one place a verdict could go unrecorded; stamping puts
+  it on the lane with the sha it tested, which is what makes "was the code I
+  merged the code that was gated?" a readable fact rather than a claim.
 
 ## Ticket and context limits
 
