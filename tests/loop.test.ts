@@ -42,6 +42,7 @@ import {
   type TicketSnapshot,
 } from "../lib/loop.ts";
 import { DEFAULT_MIN_SKEPTIC_QUORUM, ZError } from "../lib/config.ts";
+import { isWorkableStatus } from "../lib/lanes.ts";
 import { validateConfig } from "../lib/config-schema.ts";
 import {
   claimableTickets,
@@ -1950,17 +1951,29 @@ describe("#138 positive-evidence ingest: absence carries forward", () => {
     expect(code).not.toContain("items.length ===");
   });
 
-  // AC3: the H14 outcome survives, but ONLY on positive confirmation.
-  test("AC3: confirmedGone drops exactly that ticket and its lane, nothing else", () => {
+  // AC3: the H14 outcome survives, but ONLY on positive confirmation -- and
+  // since #273 it is reached by the stop-lane ACTION, not by the reducer. The
+  // ingest MARKS the lane; the apply is what removes ticket and lane together.
+  test("AC3: confirmedGone stops exactly that ticket's lane and removes the pair, nothing else", () => {
     const prev = prev68();
     const s = ingestBoardItems(prev, [{ number: 41, title: "Ticket 41", fields: { Status: "Done" } }], { "41": "" }, undefined, [40]);
-    expect(s.tickets.find((t) => t.number === 40)).toBeUndefined();
-    expect(s.lanes).toEqual([]); // the confirmed-gone ticket's lane is released
-    expect(s.tickets.length).toBe(67); // every other ticket untouched
+    // #273: the lane survives ingest carrying its reason, and so does a tombstone
+    // ticket -- the state machine's only handle on the lane it must tear down.
+    expect(s.lanes.map((l) => l.ticket)).toEqual([40]);
+    expect(s.lanes[0].goneReason).toEqual({ kind: "confirmed-gone" });
+    expect(s.tickets.find((t) => t.number === 40)).toBeDefined();
+    expect(s.tickets.length).toBe(68); // every other ticket untouched
     expect(s.tickets.find((t) => t.number === 39)).toEqual(prev.tickets.find((t) => t.number === 39)!);
+    // The action is the removal, and it is the FIRST thing nextAction returns.
+    const a = nextAction(s, 0);
+    expect(a.kind).toBe("stop-lane");
+    expect((a as { ticket: number }).ticket).toBe(40);
     // And the state stays usable: the old H14 failure was a later apply throwing
     // in findTicket on the orphaned lane.
-    expect(() => applyAction(s, nextAction(s, 0), 0)).not.toThrow();
+    const after = applyAction(s, a, 0);
+    expect(after.lanes).toEqual([]);
+    expect(after.tickets.find((t) => t.number === 40)).toBeUndefined();
+    expect(after.tickets.length).toBe(67);
   });
 
   // Without this, the confirm pass re-looks-up a ticket it already proved gone on
@@ -1970,7 +1983,14 @@ describe("#138 positive-evidence ingest: absence carries forward", () => {
     const prev = prev68();
     const s = ingestBoardItems(prev, [], {}, undefined, [40]);
     expect(s.batchTickets).toEqual([]);
-    expect(confirmTargets(s, [])).toEqual([]);
+    // #273: the lane is retained for exactly one tick so the stop-lane action can
+    // tear it down, and confirmTargets watches lanes -- so the "never re-confirmed"
+    // invariant is measured where it matters, AFTER that stop is applied. The
+    // one-tick window is self-healing anyway (a re-confirm re-proves the removal
+    // and lands on the same stop); what this pins is that the cost does not
+    // recur for the rest of the drain.
+    expect(confirmTargets(s, [])).toEqual([40]);
+    expect(confirmTargets(applyAction(s, nextAction(s, 0), 0), [])).toEqual([]);
     expect(prev.batchTickets).toEqual([40]); // and prev is untouched
     // The capture-once contract is otherwise intact: nothing was re-selected.
     expect(ingestBoardItems(prev, [], {}, undefined, []).batchTickets).toEqual([40]);
@@ -2091,7 +2111,11 @@ describe("#138 applyConfirmations", () => {
     expect(r.confirmedGone).toEqual([1]);
     expect(r.items.map((i) => i.number)).toEqual([5]);
     expect(r.notes[0]).toContain("gone from the board (not-on-project)");
-    expect(r.notes[0]).toContain("releasing its lane");
+    // #273: the note must not claim the confirm pass released anything -- it
+    // proves a removal, and a lane still holding the ticket is torn down by the
+    // stop-lane action that follows, not by this pass.
+    expect(r.notes[0]).not.toContain("releasing its lane");
+    expect(r.notes[0]).toContain("stopped by the next action");
   });
 
   test("a lookup for a ticket the read already showed, or one with no usable answer, changes nothing", () => {
@@ -2145,28 +2169,30 @@ describe("ingest preserves state on a transient empty snapshot (#127)", () => {
 // -- fresh-stage guarantee (AC4): lane state carries no conversation id -------
 
 describe("fresh-stage lane state", () => {
-  test("LaneState carries exactly its twelve scheduling fields and no session/conversation id", () => {
+  test("LaneState carries exactly its thirteen scheduling fields and no session/conversation id", () => {
     // Compile-time half: this constant stops typechecking if LaneState's key
-    // set ever drifts from the twelve named here (issue #76 added reviewBounces,
+    // set ever drifts from the thirteen named here (issue #76 added reviewBounces,
     // mirroring qaBounces; #125 added lastWroteStatus, the resync origin marker;
     // #191 added quorumRetries, a budget deliberately separate from
     // reviewBounces; #177 added commitRetries, separate for the same reason;
     // #209 added respawns -- a fourth separate budget -- and worktreeDirty, the
-    // probe-time git fact its transition reads). Every addition must be a
-    // deliberate edit here -- this gate is what keeps a conversation/session id
-    // from ever riding between stages.
+    // probe-time git fact its transition reads; #273 added goneReason, the mark
+    // that turns "this lane's ticket left the board" into a stop-lane action
+    // instead of a silent filter). Every addition must be a deliberate edit
+    // here -- this gate is what keeps a conversation/session id from ever riding
+    // between stages.
     type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
     const _laneKeysExact: Exact<
       keyof LaneState,
-      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "quorumRetries" | "commitRetries" | "respawns" | "workerDead" | "worktreeDirty" | "outcome" | "lastWroteStatus"
+      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "quorumRetries" | "commitRetries" | "respawns" | "workerDead" | "worktreeDirty" | "outcome" | "lastWroteStatus" | "goneReason"
     > = true;
     void _laneKeysExact;
     // Runtime half: a fully-populated lane exposes exactly those keys, and none
     // of them smells like a carried conversation.
     const full: Required<LaneState> = {
-      ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, quorumRetries: 0, commitRetries: 0, respawns: { builder: 0 }, workerDead: false, worktreeDirty: false, outcome: { kind: "built" }, lastWroteStatus: "Building",
+      ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, quorumRetries: 0, commitRetries: 0, respawns: { builder: 0 }, workerDead: false, worktreeDirty: false, outcome: { kind: "built" }, lastWroteStatus: "Building", goneReason: { kind: "confirmed-gone" },
     };
-    expect(Object.keys(full).sort()).toEqual(["commitRetries", "lastActivityMs", "lastWroteStatus", "outcome", "qaBounces", "quorumRetries", "respawns", "reviewBounces", "stage", "ticket", "workerDead", "worktreeDirty"]);
+    expect(Object.keys(full).sort()).toEqual(["commitRetries", "goneReason", "lastActivityMs", "lastWroteStatus", "outcome", "qaBounces", "quorumRetries", "respawns", "reviewBounces", "stage", "ticket", "workerDead", "worktreeDirty"]);
     for (const k of Object.keys(full)) {
       expect(k).not.toMatch(/conversation|session|context|transcript|agent/i);
     }
@@ -2580,11 +2606,16 @@ describe("ingestBoardItems", () => {
       expect(nextAction(s, 0).kind).not.toBe("claim");
     });
 
-    test("a laned ticket moved to an unknown status drops its lane (a human stop)", () => {
+    // #273 replaced the silent drop this used to assert. Dropping the lane inside
+    // the reducer left the lane's background agent running, its ticket-<N>.json
+    // lock on disk, and its worktree undecided -- with nothing in state left to
+    // name any of them. The lane is now MARKED and stopped by an action.
+    test("a laned ticket moved to an unknown status is stopped, not dropped, by ingest (#273)", () => {
       const prev: LoopState = { tickets: [ticket(1, "QA")], lanes: [lane(1, "qa")], maxLanes: 2, watchdogMinutes: 7 };
       const s = ingestBoardItems(prev, [staged(1)], { "1": "" });
-      expect(s.tickets).toEqual([]);
-      expect(s.lanes).toEqual([]);
+      expect(s.lanes.map((l) => l.ticket)).toEqual([1]);
+      expect(s.lanes[0].goneReason).toEqual({ kind: "unsupported-status", status: "Stage" });
+      expect(s.tickets.map((t) => t.number)).toEqual([1]); // the tombstone
     });
 
     test("a known-status ticket in the same read is unaffected", () => {
@@ -2608,6 +2639,200 @@ describe("ingestBoardItems", () => {
       expect(p.notes[0]).toContain("#1");
       expect(p.notes[0]).toContain('"Stage"');
       expect(p.notes[1]).toContain("(none)");
+    });
+  });
+
+  // ==========================================================================
+  // #273 -- a lane whose ticket leaves the loop's reach is STOPPED, not filtered
+  // ==========================================================================
+  // The defect: `gone` (an unknown board status OR a confirmed removal) deleted
+  // the ticket AND filtered the lane inside ingestBoardItems, emitting no action.
+  // Nothing tore down the lane's background agent, nothing removed its
+  // ticket-<N>.json lock, and drainComplete -- which reads lanes.length -- went
+  // true underneath a worker still committing to z/ticket-<N>, so Step 7 could
+  // delete that branch. Removal is now an ACTION the orchestrator executes.
+  describe("a gone ticket's lane is stopped by an action (#273)", () => {
+    const cancelled = (n: number) => ({ number: n, title: `t${n}`, fields: { Status: "Cancelled" } });
+
+    // AC1. On the pre-#273 code this state came back with no lane at all and the
+    // next action was drain-complete.
+    test("AC1: an unknown status stops its lane, naming the observed status", () => {
+      const prev: LoopState = { tickets: [ticket(5, "Building")], lanes: [lane(5, "builder")], maxLanes: 2, watchdogMinutes: 7 };
+      const s = ingestBoardItems(prev, [cancelled(5)], { "5": "" });
+      expect(s.lanes.map((l) => l.ticket)).toEqual([5]);
+      expect(s.lanes[0].goneReason).toEqual({ kind: "unsupported-status", status: "Cancelled" });
+
+      const a = nextAction(s, 0);
+      expect(a.kind).toBe("stop-lane");
+      expect((a as { ticket: number }).ticket).toBe(5);
+      expect((a as { note: string }).note).toContain('"Cancelled"');
+      expect((a as { note: string }).note).toContain("#5");
+      // The note must name the teardown the SKILL's stop-lane row performs --
+      // this is the whole reason the action exists rather than a filter.
+      expect((a as { note: string }).note).toMatch(/lane lock/i);
+    });
+
+    // The stop does NOT wait for a stage boundary, unlike the human-move stop:
+    // a gone ticket is not observable next tick, so there is no boundary coming.
+    test("AC1: the stop fires on a mid-stage lane with no recorded outcome", () => {
+      const prev: LoopState = { tickets: [ticket(5, "Building")], lanes: [lane(5, "builder")], maxLanes: 2, watchdogMinutes: 7 };
+      expect(prev.lanes[0].outcome).toBeUndefined();
+      const s = ingestBoardItems(prev, [cancelled(5)], { "5": "" });
+      expect(nextAction(s, 0).kind).toBe("stop-lane");
+    });
+
+    // AC2: the pair leaves state together, and only on the apply.
+    test("AC2: applying the stop drops the lane and the tombstone, leaving the rest alone", () => {
+      const prev: LoopState = {
+        tickets: [ticket(5, "Building"), ticket(6, "Ready")],
+        lanes: [lane(5, "builder")],
+        maxLanes: 2,
+        watchdogMinutes: 7,
+      };
+      const s = ingestBoardItems(prev, [cancelled(5), { number: 6, title: "t6", fields: { Status: "Ready" } }], { "5": "", "6": "" });
+      const after = applyAction(s, nextAction(s, 0), 0);
+      expect(after.lanes).toEqual([]);
+      expect(after.tickets.map((t) => t.number)).toEqual([6]);
+      // Everything else is untouched, and no board status was written for #5 --
+      // the human's column (or the removal) is not the loop's to overwrite.
+      expect(after.tickets.find((t) => t.number === 6)).toEqual(s.tickets.find((t) => t.number === 6)!);
+      expect({ ...after, tickets: [], lanes: [] }).toEqual({ ...s, tickets: [], lanes: [] });
+    });
+
+    // And it does not accumulate: a second ingest after the apply has no lane to
+    // re-mark and no tombstone to re-carry.
+    test("AC2: the tombstone does not survive into the next tick", () => {
+      const prev: LoopState = { tickets: [ticket(5, "Building")], lanes: [lane(5, "builder")], maxLanes: 2, watchdogMinutes: 7 };
+      const one = applyAction(ingestBoardItems(prev, [cancelled(5)], { "5": "" }), nextAction(ingestBoardItems(prev, [cancelled(5)], { "5": "" }), 0), 0);
+      const two = ingestBoardItems(one, [cancelled(5)], { "5": "" });
+      expect(two.tickets).toEqual([]);
+      expect(two.lanes).toEqual([]);
+    });
+
+    // AC3: the drain cannot declare itself finished under the live worker. On
+    // pre-#273 code this was true, which let Step 7 `git branch -D` the branch
+    // that worker was still committing to.
+    test("AC3: drainComplete is false while a gone lane is still outstanding", () => {
+      const prev: LoopState = {
+        tickets: [ticket(5, "Building"), ticket(6, "Done"), ticket(7, "Skipped")],
+        lanes: [lane(5, "builder")],
+        maxLanes: 2,
+        watchdogMinutes: 7,
+      };
+      const s = ingestBoardItems(prev, [cancelled(5)], { "5": "" });
+      expect(s.tickets.filter((t) => t.number !== 5).every((t) => !isWorkableStatus(t.status))).toBe(true);
+      expect(drainComplete(s.tickets, s.lanes, s.batchTickets)).toBe(false);
+      expect(nextAction(s, 0).kind).not.toBe("drain-complete");
+      // ...and it becomes true only once the stop has actually been applied.
+      const after = applyAction(s, nextAction(s, 0), 0);
+      expect(drainComplete(after.tickets, after.lanes, after.batchTickets)).toBe(true);
+    });
+
+    // AC4: the confirmed-gone arm takes the identical path, driven through the
+    // REAL confirm pass (applyConfirmations) rather than a hand-passed number.
+    test("AC4: a confirmed-gone ticket stops its lane too, naming the removal proof", () => {
+      const prev: LoopState = { tickets: [ticket(7, "QA")], lanes: [lane(7, "qa")], maxLanes: 2, watchdogMinutes: 7 };
+      const confirmed = applyConfirmations([], {}, [{ number: 7, present: false, reason: "not-on-project" }]);
+      expect(confirmed.confirmedGone).toEqual([7]);
+
+      const s = ingestBoardItems(prev, confirmed.items, confirmed.bodies, undefined, confirmed.confirmedGone);
+      expect(s.lanes.map((l) => l.ticket)).toEqual([7]);
+      expect(s.lanes[0].goneReason).toEqual({ kind: "confirmed-gone" });
+
+      const a = nextAction(s, 0);
+      expect(a.kind).toBe("stop-lane");
+      expect((a as { ticket: number }).ticket).toBe(7);
+      expect((a as { note: string }).note).toMatch(/no longer on the project board/i);
+      expect((a as { note: string }).note).toMatch(/lane lock/i);
+
+      const after = applyAction(s, a, 0);
+      expect(after.lanes).toEqual([]);
+      expect(after.tickets).toEqual([]);
+    });
+
+    // AC5: the LANELESS case is untouched. This is the #226 behavior the fix must
+    // not disturb -- there is no agent, no lock and no worktree to tear down, so
+    // there is nothing for an action to do and the plain removal stays right.
+    test("AC5: an unknown status on a laneless ticket still just removes it, with no action", () => {
+      const prev: LoopState = { tickets: [ticket(9, "Ready")], lanes: [], maxLanes: 2, watchdogMinutes: 7 };
+      const s = ingestBoardItems(prev, [cancelled(9)], { "9": "" });
+      expect(s.tickets).toEqual([]);
+      expect(s.lanes).toEqual([]);
+      expect(nextAction(s, 0).kind).toBe("drain-complete");
+      // The stderr note is still the only trace, and still one per ignored ticket.
+      expect(partitionKnownStatus([cancelled(9)]).notes).toHaveLength(1);
+    });
+
+    // A gone lane jumps the queue: it is checked before every other per-lane
+    // transition, including a finished stage sitting on the same lane.
+    test("a gone lane's stop outranks its own finished-stage advance", () => {
+      const prev: LoopState = {
+        tickets: [ticket(5, "Building")],
+        lanes: [lane(5, "builder", { outcome: { kind: "built" } })],
+        maxLanes: 2,
+        watchdogMinutes: 7,
+      };
+      const s = ingestBoardItems(prev, [cancelled(5)], { "5": "" });
+      expect(nextAction(s, 0).kind).toBe("stop-lane");
+    });
+
+    // A lane whose ticket was ALREADY missing from prev is the orphan-lane crash
+    // (#138's H14) the retention would otherwise re-introduce: nextAction and
+    // applyAction both index tickets by lane number and assume a hit.
+    test("a retained lane always gets a ticket, even when prev had none for it", () => {
+      const prev: LoopState = { tickets: [], lanes: [lane(5, "reviewer")], maxLanes: 2, watchdogMinutes: 7 };
+      const s = ingestBoardItems(prev, [], {}, undefined, [5]);
+      expect(s.tickets.map((t) => t.number)).toEqual([5]);
+      expect(s.tickets[0].status).toBe("Review"); // the lane's own stage status
+      expect(() => applyAction(s, nextAction(s, 0), 0)).not.toThrow();
+      expect(applyAction(s, nextAction(s, 0), 0).tickets).toEqual([]);
+    });
+
+    // A mark normally lives one tick. It can outlive that only if the run dies
+    // between the ingest that set it and the apply that consumes it -- and then
+    // it must not stop a lane the board has since proved workable again.
+    test("a stale goneReason is cleared when the ticket is observed back in a driven status", () => {
+      const crashed: LoopState = {
+        tickets: [ticket(5, "Building")],
+        lanes: [lane(5, "builder", { goneReason: { kind: "unsupported-status", status: "Cancelled" } })],
+        maxLanes: 2,
+        watchdogMinutes: 7,
+      };
+      const s = ingestBoardItems(crashed, [{ number: 5, title: "t5", fields: { Status: "Building" } }], { "5": "" });
+      expect(s.lanes[0].goneReason).toBeUndefined();
+      expect(nextAction(s, 0).kind).not.toBe("stop-lane");
+    });
+
+    // ...but an ABSENCE is not that proof (#138). A short page or a failed
+    // confirm lookup must leave a mark that was once positively earned alone,
+    // or a truncated read silently resurrects a lane the loop proved was gone.
+    test("a stale goneReason survives a read that simply does not show the ticket", () => {
+      const crashed: LoopState = {
+        tickets: [ticket(5, "Building")],
+        lanes: [lane(5, "builder", { goneReason: { kind: "confirmed-gone" } })],
+        maxLanes: 2,
+        watchdogMinutes: 7,
+      };
+      const s = ingestBoardItems(crashed, [], {});
+      expect(s.lanes[0].goneReason).toEqual({ kind: "confirmed-gone" });
+      expect(nextAction(s, 0).kind).toBe("stop-lane");
+    });
+
+    // The OTHER stop-lane (a human move to a terminal status) must keep its
+    // ticket: that ticket is real, still on the board, and drainComplete has to
+    // see its terminal status. Only a tombstone leaves with its lane.
+    test("a human-move stop-lane still leaves its ticket in state", () => {
+      const s: LoopState = {
+        tickets: [ticket(5, "Blocked")],
+        lanes: [lane(5, "builder", { outcome: { kind: "built" } })],
+        maxLanes: 2,
+        watchdogMinutes: 7,
+      };
+      const a = nextAction(s, 0);
+      expect(a.kind).toBe("stop-lane");
+      const after = applyAction(s, a, 0);
+      expect(after.lanes).toEqual([]);
+      expect(after.tickets).toEqual([ticket(5, "Blocked")]);
     });
   });
 

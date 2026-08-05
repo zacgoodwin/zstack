@@ -599,7 +599,7 @@ describe("z-loop-tick", () => {
     expect(log).not.toContain("releasing its lane");
   }, TICK_TIMEOUT_MS);
 
-  test("#138 AC5: the same read + a lookup that positively reports not-on-project -> #1 released, #2 untouched", () => {
+  test("#138 AC5: the same read + a lookup that positively reports not-on-project -> #1 stopped, #2 untouched", () => {
     const dir = mkTmp();
     const stub = writeStubZBoard(dir, MISSING_ONE_ITEMS, MISSING_ONE_BODIES, {
       1: { number: 1, present: false, reason: "not-on-project" },
@@ -616,14 +616,75 @@ describe("z-loop-tick", () => {
     expect(proc.exitCode).toBe(0);
 
     const state = JSON.parse(readFileSync(tickState, "utf8"));
-    expect(state.tickets.map((t: any) => t.number)).toEqual([2]); // confirmed gone
-    expect(state.lanes.map((l: any) => l.ticket)).toEqual([2]); // its lane released
-    expect(state.tickets[0].status).toBe("Building"); // #2 untouched
+    // #273: the tick MARKS the confirmed-gone lane, it no longer deletes it. The
+    // ticket survives as a tombstone and the lane as a stop-lane target -- both
+    // leave state together when the orchestrator applies that action, after it
+    // has torn the worker down and removed the lane lock.
+    expect(state.tickets.map((t: any) => t.number)).toEqual([1, 2]);
+    expect(state.lanes.map((l: any) => l.ticket)).toEqual([1, 2]);
+    expect(state.lanes.find((l: any) => l.ticket === 1).goneReason).toEqual({ kind: "confirmed-gone" });
+    expect(state.lanes.find((l: any) => l.ticket === 2).goneReason).toBeUndefined();
+    expect(state.tickets.find((t: any) => t.number === 2).status).toBe("Building"); // #2 untouched
+
+    // And the one Action line the tick prints IS that stop.
+    const lines = proc.stdout.toString().split(/\r?\n/).filter((l) => l.trim() !== "");
+    expect(lines.length).toBe(1);
+    const action = JSON.parse(lines[0]);
+    expect(action.kind).toBe("stop-lane");
+    expect(action.ticket).toBe(1);
+    expect(action.note).toMatch(/no longer on the project board/i);
 
     const log = proc.stderr.toString();
     expect(log).toContain("read missed #1");
     expect(log).toContain("gone from the board (not-on-project)");
-    expect(log).toContain("releasing its lane");
+    // The note must NOT claim the tick released the lane -- it did not (#273).
+    expect(log).not.toContain("releasing its lane");
+    expect(log).toContain("stopped by the next action");
+  }, TICK_TIMEOUT_MS);
+
+  // #273: the unknown-status arm, end to end through the real wrapper. A human
+  // drags laned #1 into a column the loop does not drive; the tick must still
+  // print EXACTLY one Action line -- the stop-lane that tears the lane down --
+  // with partitionKnownStatus's note on stderr and nothing extra on stdout.
+  test("#273: a laned ticket in an unknown status -> exactly one stop-lane Action line, note on stderr", () => {
+    const dir = mkTmp();
+    const stub = writeStubZBoard(
+      dir,
+      JSON.stringify([
+        { number: 1, title: "T1", url: "http://x/1", fields: { Status: "Cancelled" } },
+        { number: 2, title: "T2", url: "http://x/2", fields: { Status: "Building" } },
+      ]),
+      JSON.stringify({ "1": "no deps", "2": "no deps" })
+    );
+    const home = makeConfigHome();
+    const tickTmp = join(dir, "tick-tmp");
+    const tickState = join(dir, "tick-state.json");
+    writeLaneState(tickState);
+
+    const proc = Bun.spawnSync(
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp, "--session", "test-session"],
+      { env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
+    );
+    expect(proc.exitCode).toBe(0);
+
+    const lines = proc.stdout.toString().split(/\r?\n/).filter((l) => l.trim() !== "");
+    expect(lines.length).toBe(1); // stdout stays reserved for the one Action line
+    const action = JSON.parse(lines[0]);
+    expect(action.kind).toBe("stop-lane");
+    expect(action.ticket).toBe(1);
+    expect(action.note).toContain('"Cancelled"');
+
+    const state = JSON.parse(readFileSync(tickState, "utf8"));
+    expect(state.lanes.find((l: any) => l.ticket === 1).goneReason).toEqual({
+      kind: "unsupported-status",
+      status: "Cancelled",
+    });
+    expect(state.lanes.map((l: any) => l.ticket)).toEqual([1, 2]); // #2 keeps running
+
+    // partitionKnownStatus's note rides stderr, as it always has.
+    const log = proc.stderr.toString();
+    expect(log).toContain("does not drive");
+    expect(log).toContain('"Cancelled"');
   }, TICK_TIMEOUT_MS);
 
   test("#138: an unparseable lookup answer degrades to no confirmations, never a dead tick", () => {

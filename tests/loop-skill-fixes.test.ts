@@ -462,3 +462,51 @@ describe("Ticket #209: leftover review worktrees are swept by a command on every
     expect(md.match(/\(\*\*Removing a review worktree\*\* below\)/g)).toHaveLength(3);
   });
 });
+
+// ============================================================================
+// Ticket #273 -- the positive-evidence block routes a gone ticket's LANE through
+// stop-lane, instead of claiming the tick released it
+// ============================================================================
+// The prose was the other half of the defect. `lib/loop.ts` dropped the lane
+// inside ingest and emitted no action; the SKILL said a positively-gone ticket
+// had "its lane released", which read as "the tick already handled it" -- so no
+// step anywhere tore down the background agent or removed the ticket-<N>.json
+// lock. The reducer is fixed; this pins the instruction that has to match it,
+// because the orchestrator can only execute what the SKILL tells it.
+describe("Ticket #273: a gone ticket's lane is torn down by stop-lane, not by the tick", () => {
+  test("the confirm-pass sentence no longer promises the tick releases the lane", () => {
+    const md = zLoop();
+    expect(md).toContain("positively gone → removed from state");
+    expect(md).not.toContain("positively gone → its lane released");
+    // Nothing anywhere may still claim a lane is released as a side effect of a
+    // read; the release is only ever an applied action.
+    expect(md).not.toMatch(/its lane released/);
+  });
+
+  test("the block names both gone arms and routes them to the stop-lane row", () => {
+    const block = section(zLoop(), "**A gone ticket's LANE is stopped, never silently released (#273).**");
+    expect(block === "").toBe(false);
+    // Both positive observations that take a ticket out of reach.
+    expect(block.includes("partitionKnownStatus")).toBe(true);
+    expect(block.includes("does not drive")).toBe(true);
+    // The action, and the teardown the row performs.
+    expect(block.includes("`stop-lane`")).toBe(true);
+    expect(block.includes("lane-remove")).toBe(true);
+    expect(block.includes("background agent")).toBe(true);
+    // The laneless case stays a plain removal -- there is nothing to tear down.
+    expect(block.includes("no lane")).toBe(true);
+    // And the drain interlock is stated where the operator reads it.
+    expect(block.includes("drain-complete")).toBe(true);
+  });
+
+  test("the stop-lane row itself covers the gone case, not just a human move", () => {
+    const row = zLoop()
+      .split("\n")
+      .find((l) => l.startsWith("| `stop-lane N` |"));
+    expect(row).toBeDefined();
+    expect(row!).toContain("#273");
+    expect(row!).toContain("drops the ticket along with the lane");
+    // The teardown the reducer relies on is still spelled out in the row.
+    expect(row!).toContain("lane-remove");
+  });
+});

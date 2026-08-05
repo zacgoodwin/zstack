@@ -839,6 +839,49 @@ describe("control 2: orphan scan (crash recovery)", () => {
     expect(reconcilePlan(orphans)).toEqual([]);
   });
 
+  // -- #273 AC6: a lane stopped for a gone ticket releases its lock exactly once --
+  // The third failure the silent filter caused, and the one that outlives the run:
+  // ingest deleted the lane, so no action ever ran `lane-remove`, so
+  // `ticket-<N>.json` survived on disk. The NEXT run's Step 0 scan then reported a
+  // crashed lane and refused to start without `--reconcile` -- and reconcile's
+  // recovery release-claims and parks a ticket back to Ready whose custom column a
+  // human chose on purpose. This drives the real chain: ingest -> next ->
+  // (the SKILL's stop-lane row: lane-remove) -> apply, then the next run's scan.
+  test("#273: a lane stopped for a gone ticket leaves no lock, so the next run's scan is clean", () => {
+    const locksDir = tmp();
+    const worktreesDir = tmp();
+    // The live lane: a lock, a worktree, and a state file that knows about both.
+    writeLaneLock(locksDir, { ticket: 5, stage: "builder", session: "s1", claimedAt: 0 });
+    mkdirSync(join(worktreesDir, "ticket-5"));
+    const prev: LoopState = {
+      tickets: [ticket(5, "Building")],
+      lanes: [{ ticket: 5, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0 }],
+      maxLanes: 2,
+      watchdogMinutes: 10,
+    };
+
+    // A human drags #5 into a column the loop does not drive.
+    const s = ingestBoardItems(prev, [{ number: 5, title: "t5", fields: { Status: "Cancelled" } }], { "5": "" });
+    const action = nextAction(s, 0);
+    expect(action.kind).toBe("stop-lane");
+
+    // The stop-lane row's teardown: remove the lane lock, then apply.
+    removeLaneLock(locksDir, 5);
+    const after = applyAction(s, action, 0);
+    expect(after.lanes).toEqual([]);
+    expect(existsSync(join(locksDir, "ticket-5.json"))).toBe(false);
+
+    // Next run's Step 0. The board no longer reports #5 at all (it is not in a
+    // status the loop reads), so the scan sees only the leftover worktree: a
+    // prune, never a crashed lane, so Step 0 starts without --reconcile.
+    const orphans = scanOrphans(locksDir, worktreesDir, [], 0);
+    expect(orphans.crashedLanes).toEqual([]);
+    expect(reconcilePlan(orphans).filter((a) => a.kind === "remove-lock")).toEqual([]);
+    // ...and nothing tries to reopen the ticket the human moved on purpose.
+    expect(reconcilePlan(orphans).filter((a) => a.kind === "park-ready")).toEqual([]);
+    expect(reconcilePlan(orphans).filter((a) => a.kind === "release-claim")).toEqual([]);
+  });
+
   test("apply half executes each action: the lock file is actually removed", async () => {
     const locksDir = tmp();
     const worktreesDir = tmp();
