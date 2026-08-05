@@ -189,6 +189,24 @@ records the result. It never re-derives a scheduling decision in prose.
   of bouncing again. A worker silent past the watchdog (default 15 min) is
   probed and then Skipped with a note. Exception: a dead merge lane is verified
   via PR state and ends Merged or Blocked, never Skipped.
+- **Each stage gets its own budget, and no stage runs forever.** The shipped
+  defaults are builder **25**, qa **15**, reviewer **40**, merge **15** minutes,
+  each derived from that stage family's own measured worst silence over 1,143
+  real stage subtrees and floored at the 15 minutes every agent needs: a
+  reviewer blocked on three background skeptics legitimately goes 19 minutes
+  without anyone in its subtree writing, while a merge stage that runs
+  `gh pr merge` never goes 2. Set `watchdogMinutes` to a plain number to apply
+  one budget to every stage (what every config written before this did), or to
+  an object like `{"reviewer": 90}` to raise one stage and leave the rest on the
+  pack's defaults. Separately, a lane whose current stage has held it for
+  **480 minutes** parks Blocked whatever its worker says. That ceiling is what
+  makes the watchdog's alive path terminate: an ALIVE probe refreshes the
+  silence baseline with no memory of the probes before it, so a wedged-but-
+  registered agent was otherwise probed alive every budget-period forever,
+  holding its ticket, worktree, lock and one of the `maxLanes` slots. 480 is 2x
+  the longest stage that ever finished normally on this machine (3.7 hours), and
+  the park keeps the branch and worktree intact with a salvage patch — nothing
+  is skipped, a human just decides.
 - **The watchdog measures silence, not stage age.** `watchdogMinutes` counts
   minutes in which a lane's stage agent and every sub-agent it spawned appended
   NOTHING to their transcripts. Each tick reads that subtree and moves the lane's

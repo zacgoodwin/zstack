@@ -29,6 +29,7 @@ import {
   MAX_COMMIT_RETRIES,
   MAX_DEAD_RESPAWNS,
   MAX_QUORUM_RETRIES,
+  STAGE_CEILING_MINUTES,
   recordActivity,
   recordOutcome,
   recordProbe,
@@ -42,8 +43,21 @@ import {
   type StageOutcome,
   type TicketSnapshot,
 } from "../lib/loop.ts";
-import { DEFAULT_MIN_SKEPTIC_QUORUM, DEFAULT_WATCHDOG_MINUTES, ZError } from "../lib/config.ts";
-import { MEASURED_MIDWORK_GAP_MS, SUBTREE_QUIET_MS, spawnTag } from "../lib/transcripts.ts";
+import {
+  DEFAULT_MIN_SKEPTIC_QUORUM,
+  DEFAULT_STAGE_WATCHDOG_MINUTES,
+  DEFAULT_WATCHDOG_MINUTES,
+  resolveWatchdogMinutes,
+  ZError,
+} from "../lib/config.ts";
+import {
+  MEASURED_MAX_STAGE_MS,
+  MEASURED_MIDWORK_GAP_MS,
+  MEASURED_STAGE_SILENCE_MS,
+  SUBTREE_QUIET_MS,
+  SUBTREE_STALE_MS,
+  spawnTag,
+} from "../lib/transcripts.ts";
 import { SPAWN_TAG_MARKER } from "../lib/stage-prompts.ts";
 import { isWorkableStatus } from "../lib/lanes.ts";
 import { validateConfig } from "../lib/config-schema.ts";
@@ -349,6 +363,228 @@ describe("watchdog", () => {
       const s = recordActivity(state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: 0 })]), 1, 5 * MIN);
       expect(watchdogExpired(s.lanes[0], 15 * MIN, 10)).toBe(false);
       expect(watchdogExpired(s.lanes[0], 15 * MIN + 1, 10)).toBe(true);
+    });
+  });
+
+  // -- per-stage budgets (#256) ------------------------------------------------
+  //
+  // One global number had to serve a merge stage that runs `gh pr merge` and a
+  // reviewer that sits blocked on three background skeptics. Measured, those two
+  // are 12x apart in how long they legitimately go quiet (merge max 97s, reviewer
+  // max 1,161s), so a single budget is either far too patient for one or fatal to
+  // the other.
+  describe("per-stage watchdog budgets (#256)", () => {
+    const laneAt = (stage: Stage) => lane(1, stage, { lastActivityMs: 0 });
+
+    test("the object form applies each stage's own number", () => {
+      const s = state([ticket(1, "QA")], [], 3);
+      s.watchdogMinutes = { builder: 25, qa: 15, reviewer: 40, merge: 15 };
+      // Each stage is alive AT its own budget and expired one ms past it, and the
+      // numbers are genuinely different per stage -- a resolver that fell back to
+      // one value would fail at least three of these.
+      for (const [stage, budget] of [["builder", 25], ["qa", 15], ["reviewer", 40], ["merge", 15]] as const) {
+        const l = laneAt(stage);
+        expect(watchdogExpired(l, budget * MIN, resolveWatchdogMinutes(s.watchdogMinutes, stage))).toBe(false);
+        expect(watchdogExpired(l, budget * MIN + 1, resolveWatchdogMinutes(s.watchdogMinutes, stage))).toBe(true);
+      }
+    });
+
+    test("a scalar still applies to every stage, identical to pre-#256", () => {
+      const s = state([ticket(1, "QA")], [], 3);
+      s.watchdogMinutes = 10;
+      for (const stage of ["builder", "qa", "reviewer", "merge"] as const) {
+        expect(resolveWatchdogMinutes(s.watchdogMinutes, stage)).toBe(10);
+      }
+      // ...and end to end through nextAction, which is where it matters: a qa lane
+      // silent 10 minutes exactly is in budget, one ms later it is probed.
+      const s10 = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: 0 })]);
+      expect(nextAction(s10, 10 * MIN)).toEqual({ kind: "wait" });
+      expect(nextAction(s10, 10 * MIN + 1)).toEqual({ kind: "check-worker", ticket: 1 });
+    });
+
+    test("a partial object is a one-stage override; every other stage keeps its default", () => {
+      const partial = { reviewer: 90 };
+      expect(resolveWatchdogMinutes(partial, "reviewer")).toBe(90);
+      expect(resolveWatchdogMinutes(partial, "qa")).toBe(DEFAULT_STAGE_WATCHDOG_MINUTES.qa);
+      expect(resolveWatchdogMinutes(partial, "builder")).toBe(DEFAULT_STAGE_WATCHDOG_MINUTES.builder);
+      // No config at all is the whole table, not the scalar -- the case that would
+      // silently strand the derivation if ingest or loadConfig filled a number.
+      expect(resolveWatchdogMinutes(undefined, "merge")).toBe(DEFAULT_STAGE_WATCHDOG_MINUTES.merge);
+    });
+
+    test("an ingest with no --watchdog-minutes carries the per-stage table into state", () => {
+      const s = ingestBoardItems(null, [{ number: 1, title: "T", fields: { Status: "Ready" } }], { "1": "" });
+      expect(s.watchdogMinutes).toEqual(DEFAULT_STAGE_WATCHDOG_MINUTES);
+    });
+
+    // Both ceilings, per stage. The floor exists because a per-family sample is
+    // small: qa's 293 subtrees hold nothing longer than 174.8s, which says nothing
+    // about the agent-level 423.1s ceiling measured over a 22x larger population.
+    // Shipping 2 x 174.8s = 6 minutes for QA would kill any QA agent that sits on
+    // one slow build.
+    test("every shipped per-stage default clears BOTH measured ceilings by 2x", () => {
+      for (const stage of ["builder", "qa", "reviewer", "merge"] as const) {
+        const budgetMs = DEFAULT_STAGE_WATCHDOG_MINUTES[stage] * 60_000;
+        expect(budgetMs).toBeGreaterThanOrEqual(2 * MEASURED_MIDWORK_GAP_MS);
+        expect(budgetMs).toBeGreaterThanOrEqual(2 * MEASURED_STAGE_SILENCE_MS[stage]);
+      }
+      // The two stages whose own measurement is what sets them, so a future
+      // re-measurement that lowers them cannot silently pass on the floor alone.
+      expect(DEFAULT_STAGE_WATCHDOG_MINUTES.reviewer * 60_000).toBeGreaterThanOrEqual(2 * 1_161_119);
+      expect(DEFAULT_STAGE_WATCHDOG_MINUTES.builder * 60_000).toBeGreaterThanOrEqual(2 * 607_966);
+      // And no stage is quietly below the global floor.
+      for (const stage of ["builder", "qa", "reviewer", "merge"] as const) {
+        expect(DEFAULT_STAGE_WATCHDOG_MINUTES[stage]).toBeGreaterThanOrEqual(DEFAULT_WATCHDOG_MINUTES);
+      }
+    });
+
+    test("the dead-worker note names the stage's OWN budget, not a global one", () => {
+      let s = state([ticket(1, "Review")], [lane(1, "reviewer", { lastActivityMs: 0 })]);
+      s.watchdogMinutes = { reviewer: 40 };
+      const now = 41 * MIN;
+      expect(nextAction(s, now)).toEqual({ kind: "check-worker", ticket: 1 });
+      s = recordProbe(s, 1, false, now);
+      const skip = nextAction(s, now) as { note: string };
+      expect(skip.note).toContain("40-minute watchdog");
+    });
+  });
+
+  // -- the cumulative ceiling (#256) -------------------------------------------
+  //
+  // An ALIVE probe refreshes lastActivityMs with no memory of the probes before
+  // it, so a wedged-but-registered worker was probed alive every budget-period
+  // forever -- holding its ticket, worktree, lock and one of maxLanes slots. Every
+  // other retry in the pack is outcome-driven; elapsed time had no bound at all.
+  describe("STAGE_CEILING_MINUTES (#256)", () => {
+    const started = 0;
+    const overCeiling = STAGE_CEILING_MINUTES * MIN + 1;
+
+    test("a lane past the ceiling parks Blocked, naming the stage, the elapsed time and the ceiling", () => {
+      const s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: overCeiling, stageStartedMs: started })]);
+      const a = nextAction(s, overCeiling) as { kind: string; ticket: number; status: string; note: string; salvage?: true };
+      expect(a.kind).toBe("park");
+      expect(a.status).toBe("Blocked");
+      expect(a.ticket).toBe(1);
+      expect(a.note).toContain("qa stage");
+      expect(a.note).toContain(`${STAGE_CEILING_MINUTES}-minute`);
+      expect(a.note).toContain("480 minutes"); // the elapsed reading, in the note
+      // The lane may still be writing files it never committed, and parking
+      // releases the lane lock -- so the worktree is dumped, like every other
+      // action that strands one (#209's salvage contract).
+      expect(a.salvage).toBe(true);
+      // ...and the park is terminal for the lane.
+      const after = applyAction(s, a as Action, overCeiling);
+      expect(after.lanes).toEqual([]);
+      expect(after.tickets[0].status).toBe("Blocked");
+    });
+
+    // AC5 of the ticket, as the sequence it describes: probe ALIVE every budget
+    // period. On main this never terminates.
+    test("an alive-probe loop terminates instead of running forever", () => {
+      let s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: 0, stageStartedMs: 0 })]);
+      const budget = resolveWatchdogMinutes(s.watchdogMinutes, "qa");
+      let now = 0;
+      let probes = 0;
+      let parked = false;
+      // Generously more rounds than the ceiling allows, so a non-terminating
+      // machine fails this by exhausting the loop rather than by timing out.
+      for (let i = 0; i < 200; i++) {
+        now += budget * MIN + 1;
+        const a = nextAction(s, now);
+        if (a.kind === "park") {
+          parked = true;
+          expect((a as { status: string }).status).toBe("Blocked");
+          expect((a as { note: string }).note).toContain("ALIVE");
+          break;
+        }
+        expect(a).toEqual({ kind: "check-worker", ticket: 1 });
+        probes++;
+        s = recordProbe(s, 1, true, now); // the worker is registered: alive, forever
+      }
+      expect(parked).toBe(true);
+      // It probed for the whole ceiling first -- the bound is elapsed time, not a
+      // probe count, so a lane that answers alive is still given its full budget.
+      expect(probes).toBeGreaterThan(20);
+      expect(now).toBeGreaterThan(STAGE_CEILING_MINUTES * MIN);
+    });
+
+    test("the ceiling is checked even while the lane is NOT silent", () => {
+      // The failure mode a ceiling folded into the expiry branch would have: a
+      // worker probed alive one second ago is not silent, so an expiry-gated
+      // ceiling is unreachable on exactly the lanes it exists to end.
+      const s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: overCeiling, stageStartedMs: started })]);
+      expect(watchdogExpired(s.lanes[0], overCeiling, resolveWatchdogMinutes(s.watchdogMinutes, "qa"))).toBe(false);
+      expect(nextAction(s, overCeiling).kind).toBe("park");
+    });
+
+    test("exactly the ceiling is still in budget; one ms past parks", () => {
+      const s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: STAGE_CEILING_MINUTES * MIN, stageStartedMs: 0 })]);
+      expect(nextAction(s, STAGE_CEILING_MINUTES * MIN)).toEqual({ kind: "wait" });
+      expect(nextAction(s, STAGE_CEILING_MINUTES * MIN + 1).kind).toBe("park");
+    });
+
+    test("a lane with a recorded outcome is never ceiling-parked", () => {
+      // Its stage finished; the machine is about to advance it. Parking here would
+      // throw away work that is done and reported.
+      let s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: 0, stageStartedMs: 0 })]);
+      s = recordOutcome(s, 1, HAPPY.qa, overCeiling);
+      expect(nextAction(s, overCeiling)).toEqual({ kind: "advance", ticket: 1, to: "reviewer" });
+    });
+
+    test("a pre-#256 lane with no stageStartedMs is never parked (fail open)", () => {
+      const s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: 0 })]);
+      expect(s.lanes[0].stageStartedMs).toBeUndefined();
+      // Silent past its budget, so the watchdog still works -- but no ceiling.
+      expect(nextAction(s, 10 * 60 * MIN)).toEqual({ kind: "check-worker", ticket: 1 });
+    });
+
+    test("a merge lane's note carries the H9 warning instead of a bare return-to-Ready", () => {
+      const s = state([ticket(1, "Review")], [lane(1, "merge", { lastActivityMs: 0, stageStartedMs: 0 })]);
+      const a = nextAction(s, overCeiling) as { note: string };
+      expect(a.note).toContain("gh pr view");
+      expect(a.note).toContain("may have landed");
+    });
+
+    // stageStartedMs is the field the heartbeat must NOT touch. If recordActivity
+    // moved it, the ceiling would reset on every observation and bound nothing --
+    // which is the same defect as the alive probe, reintroduced through the fix.
+    test("only stage ENTRY moves stageStartedMs -- not the heartbeat, a probe, or an outcome", () => {
+      let s = state([ticket(1, "Building")], []);
+      s = applyAction(s, { kind: "claim", ticket: 1, stage: "builder" }, 1_000);
+      expect(s.lanes[0].stageStartedMs).toBe(1_000);
+      s = recordActivity(s, 1, 5_000);
+      expect(s.lanes[0].lastActivityMs).toBe(5_000);
+      expect(s.lanes[0].stageStartedMs).toBe(1_000); // unmoved
+      s = recordProbe(s, 1, true, 9_000);
+      expect(s.lanes[0].stageStartedMs).toBe(1_000); // unmoved
+      s = recordOutcome(s, 1, HAPPY.builder, 11_000, { porcelain: "## z/x\n", headSha: "a", baseSha: "b" });
+      expect(s.lanes[0].stageStartedMs).toBe(1_000); // unmoved
+      // An advance IS a new stage, so it resets -- a fresh agent gets a fresh
+      // ceiling, and a lane that bounces builder->qa->builder is not aged out by
+      // the time its predecessors spent.
+      s = applyAction(s, { kind: "advance", ticket: 1, to: "qa" }, 20_000);
+      expect(s.lanes[0].stageStartedMs).toBe(20_000);
+    });
+
+    test("a #209 re-spawn gets a fresh ceiling (a new agent, same stage)", () => {
+      let s = state([ticket(1, "Building")], [lane(1, "builder", { lastActivityMs: 0, stageStartedMs: 0, workerDead: true, worktreeDirty: true })]);
+      s = applyAction(s, { kind: "respawn", ticket: 1, stage: "builder", attempt: 2, note: "n" }, 7_000);
+      expect(s.lanes[0].stageStartedMs).toBe(7_000);
+    });
+
+    // The constant is a measurement like every other one in this pack.
+    test("the ceiling clears the longest stage that ever FINISHED by 2x", () => {
+      expect(MEASURED_MAX_STAGE_MS).toBe(13_304_097); // 3.7h, a real builder that returned
+      expect(STAGE_CEILING_MINUTES * 60_000).toBeGreaterThanOrEqual(2 * MEASURED_MAX_STAGE_MS);
+      // Same answer as the transcript-staleness ceiling, asked of the same corpus:
+      // 8 hours is already the age at which a transcript stops proving anything is
+      // running behind it.
+      expect(STAGE_CEILING_MINUTES * 60_000).toBe(SUBTREE_STALE_MS);
+      // And it is far above every per-stage watchdog budget -- the ceiling bounds
+      // the alive path, it must never preempt an ordinary expiry.
+      for (const stage of ["builder", "qa", "reviewer", "merge"] as const) {
+        expect(STAGE_CEILING_MINUTES).toBeGreaterThan(DEFAULT_STAGE_WATCHDOG_MINUTES[stage] * 4);
+      }
     });
   });
 
@@ -2272,30 +2508,32 @@ describe("ingest preserves state on a transient empty snapshot (#127)", () => {
 // -- fresh-stage guarantee (AC4): lane state carries no conversation id -------
 
 describe("fresh-stage lane state", () => {
-  test("LaneState carries exactly its thirteen scheduling fields and no session/conversation id", () => {
+  test("LaneState carries exactly its fourteen scheduling fields and no session/conversation id", () => {
     // Compile-time half: this constant stops typechecking if LaneState's key
-    // set ever drifts from the thirteen named here (issue #76 added reviewBounces,
+    // set ever drifts from the fourteen named here (issue #76 added reviewBounces,
     // mirroring qaBounces; #125 added lastWroteStatus, the resync origin marker;
     // #191 added quorumRetries, a budget deliberately separate from
     // reviewBounces; #177 added commitRetries, separate for the same reason;
     // #209 added respawns -- a fourth separate budget -- and worktreeDirty, the
     // probe-time git fact its transition reads; #273 added goneReason, the mark
     // that turns "this lane's ticket left the board" into a stop-lane action
-    // instead of a silent filter). Every addition must be a deliberate edit
-    // here -- this gate is what keeps a conversation/session id from ever riding
-    // between stages.
+    // instead of a silent filter; #256 added stageStartedMs, the one timestamp
+    // the heartbeat may NOT move, which is what bounds a lane whose worker keeps
+    // answering ALIVE). Every addition must be a deliberate edit here -- this
+    // gate is what keeps a conversation/session id from ever riding between
+    // stages.
     type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
     const _laneKeysExact: Exact<
       keyof LaneState,
-      "ticket" | "stage" | "lastActivityMs" | "qaBounces" | "reviewBounces" | "quorumRetries" | "commitRetries" | "respawns" | "workerDead" | "worktreeDirty" | "outcome" | "lastWroteStatus" | "goneReason"
+      "ticket" | "stage" | "lastActivityMs" | "stageStartedMs" | "qaBounces" | "reviewBounces" | "quorumRetries" | "commitRetries" | "respawns" | "workerDead" | "worktreeDirty" | "outcome" | "lastWroteStatus" | "goneReason"
     > = true;
     void _laneKeysExact;
     // Runtime half: a fully-populated lane exposes exactly those keys, and none
     // of them smells like a carried conversation.
     const full: Required<LaneState> = {
-      ticket: 1, stage: "builder", lastActivityMs: 0, qaBounces: 0, reviewBounces: 0, quorumRetries: 0, commitRetries: 0, respawns: { builder: 0 }, workerDead: false, worktreeDirty: false, outcome: { kind: "built" }, lastWroteStatus: "Building", goneReason: { kind: "confirmed-gone" },
+      ticket: 1, stage: "builder", lastActivityMs: 0, stageStartedMs: 0, qaBounces: 0, reviewBounces: 0, quorumRetries: 0, commitRetries: 0, respawns: { builder: 0 }, workerDead: false, worktreeDirty: false, outcome: { kind: "built" }, lastWroteStatus: "Building", goneReason: { kind: "confirmed-gone" },
     };
-    expect(Object.keys(full).sort()).toEqual(["commitRetries", "goneReason", "lastActivityMs", "lastWroteStatus", "outcome", "qaBounces", "quorumRetries", "respawns", "reviewBounces", "stage", "ticket", "workerDead", "worktreeDirty"]);
+    expect(Object.keys(full).sort()).toEqual(["commitRetries", "goneReason", "lastActivityMs", "lastWroteStatus", "outcome", "qaBounces", "quorumRetries", "respawns", "reviewBounces", "stage", "stageStartedMs", "ticket", "workerDead", "worktreeDirty"]);
     for (const k of Object.keys(full)) {
       expect(k).not.toMatch(/conversation|session|context|transcript|agent/i);
     }
@@ -3861,6 +4099,61 @@ describe("loop CLI", () => {
       expect(at(`loop.ts" heartbeat "$STATE"`)).toBeLessThan(at(`loop.ts" next "$STATE"`));
       // Never aborts the tick: a transcript-dir hiccup must not wedge a drain.
       expect(tick).toContain(`heartbeat "$STATE" --slug "$SLUG" --project-dir "$PWD" >/dev/null || true`);
+    });
+  });
+
+  // -- #256: --watchdog-minutes carries both shapes across the CLI edge --------
+  //
+  // z-loop/SKILL.md Step 3 passes whatever loadConfig resolved, JSON-stringified.
+  // If the flag could only parse a number, every project on the per-stage table
+  // would ingest NaN -- which compares false in `nowMs - base > NaN`, silently
+  // disabling the watchdog for the whole run.
+  describe("ingest --watchdog-minutes (#256)", () => {
+    const items = join(dir, "wd-items.json");
+    const bodies = join(dir, "wd-bodies.json");
+
+    function runIngestWith(statePath: string, value: string): { exitCode: number | null; stderr: string } {
+      writeFileSync(items, JSON.stringify([{ number: 1, title: "T", fields: { Status: "Ready" } }]));
+      writeFileSync(bodies, JSON.stringify({ "1": "no deps" }));
+      const proc = Bun.spawnSync(
+        ["bun", join(REPO_ROOT, "lib", "loop.ts"), "ingest", statePath, items, bodies, "--watchdog-minutes", value],
+        { stdout: "pipe", stderr: "pipe" }
+      );
+      return { exitCode: proc.exitCode, stderr: proc.stderr.toString() };
+    }
+
+    test("a per-stage JSON object survives the flag and lands in state", () => {
+      const statePath = join(dir, "wd-object-state.json");
+      const { exitCode } = runIngestWith(statePath, '{"builder":25,"qa":15,"reviewer":40,"merge":15}');
+      expect(exitCode).toBe(0);
+      expect((JSON.parse(readFileSync(statePath, "utf8")) as LoopState).watchdogMinutes).toEqual({
+        builder: 25, qa: 15, reviewer: 40, merge: 15,
+      });
+    });
+
+    test("a bare number still lands as a number", () => {
+      const statePath = join(dir, "wd-scalar-state.json");
+      expect(runIngestWith(statePath, "10").exitCode).toBe(0);
+      expect((JSON.parse(readFileSync(statePath, "utf8")) as LoopState).watchdogMinutes).toBe(10);
+    });
+
+    // The flag validates through the SAME function config.json does, so a typo'd
+    // stage cannot enter state by the back door -- and it fails at ingest, before
+    // any agent is spawned, rather than at the first watchdog decision.
+    test("a typo'd stage or a broken object is refused at the CLI edge", () => {
+      const statePath = join(dir, "wd-bad-state.json");
+      const typo = runIngestWith(statePath, '{"QA":20}');
+      expect(typo.exitCode).toBe(1);
+      expect(typo.stderr).toMatch(/is not a known stage/);
+      const broken = runIngestWith(statePath, '{"qa":');
+      expect(broken.exitCode).toBe(1);
+      expect(broken.stderr).toMatch(/looks like JSON but does not parse/);
+      const zero = runIngestWith(statePath, "0");
+      expect(zero.exitCode).toBe(1);
+      expect(zero.stderr).toMatch(/must be a positive number/);
+      // NaN was the silent failure this parser exists to stop: it must never
+      // become a state file.
+      expect(existsSync(statePath)).toBe(false);
     });
   });
 

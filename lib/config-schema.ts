@@ -135,9 +135,13 @@ export function validateConfig(cfg: unknown): BoardConfig {
   if (c.epicStyle !== undefined && c.epicStyle !== "milestones") {
     throw new ZError(`Config "epicStyle" must be "milestones", got ${JSON.stringify(c.epicStyle)}.`);
   }
-  for (const k of ["maxLanes", "watchdogMinutes", "lockStalenessMinutes", "maxQaPasses", "qaInvestigateAfter"]) {
+  for (const k of ["maxLanes", "lockStalenessMinutes", "maxQaPasses", "qaInvestigateAfter"]) {
     requirePositiveNumber(k, c[k]);
   }
+  // watchdogMinutes (#256) takes two shapes -- a scalar for every stage, or a
+  // per-stage object -- so it leaves the loop above. Both are validated here, the
+  // single enforcement point z-setup writes through and loadConfig reads through.
+  validateWatchdogMinutes(c.watchdogMinutes);
   // auditEveryNLoops (issue #18): the /cso + /health end-of-loop cadence, an
   // integer >= 1 -- not requirePositiveNumber alone, since that guard accepts
   // fractions like 2.5 ("every 2.5th loop" is meaningless).
@@ -293,6 +297,43 @@ export function validateNotifications(notifications: unknown): void {
         throw new ZError(`Config "notifications.events.${k}" must be a boolean.`);
       }
     }
+  }
+}
+
+// watchdogMinutes (#256): a scalar applied to every stage, or a per-stage object.
+//
+// Both shapes hold each budget to requirePositiveNumber's rule -- the same rule
+// the scalar has always had, so a config that predates this validates
+// byte-identically. Two refusals matter more than the arithmetic:
+//
+//  * an UNKNOWN KEY (`{"QA": 20}`, `{"builder2": 5}`) is an error, not a
+//    silently-ignored line. resolveWatchdogMinutes falls back to the shipped
+//    default for any stage it does not find, so a typo would otherwise read as
+//    "I raised QA's budget" while QA quietly kept the default -- the operator
+//    would learn it from a skipped ticket.
+//  * a value of 0 or a negative is refused (requirePositiveNumber), because
+//    "0 disables the watchdog" is the one reading this knob must never have: a
+//    stage with no watchdog can hang forever, which is what STAGE_CEILING_MINUTES
+//    exists to bound and this knob exists to detect.
+//
+// An EMPTY object is legal and means "every stage takes the shipped default" --
+// the shape z-setup writes into a config it is only partially filling.
+export function validateWatchdogMinutes(v: unknown): void {
+  if (v === undefined || typeof v === "number") {
+    requirePositiveNumber("watchdogMinutes", v);
+    return;
+  }
+  if (typeof v !== "object" || v === null || Array.isArray(v)) {
+    throw new ZError(
+      `Config "watchdogMinutes" must be a positive number (one budget for every stage) or an object of ` +
+        `{stage: minutes} over ${STAGE_NAMES.join(", ")}, got ${JSON.stringify(v)}.`
+    );
+  }
+  for (const [stage, minutes] of Object.entries(v as Record<string, unknown>)) {
+    if (!STAGE_NAMES.includes(stage)) {
+      throw new ZError(`Config "watchdogMinutes.${stage}" is not a known stage. Valid: ${STAGE_NAMES.join(", ")}.`);
+    }
+    requirePositiveNumber(`watchdogMinutes.${stage}`, minutes);
   }
 }
 

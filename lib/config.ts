@@ -93,6 +93,16 @@ export interface IdentityRecord {
 // distinction before the resolver ever sees it.
 export type StageModels = Partial<Record<"builder" | "qa" | "reviewer" | "merge", string>>;
 
+// Per-stage watchdog budgets (#256), in minutes of observed subtree SILENCE. The
+// four literal names are duplicated for the same reason StageModels duplicates
+// them: importing Stage from lib/loop.ts would cycle back through this file.
+//
+// UNLIKE StageModels, an absent key here IS defaulted (resolveWatchdogMinutes
+// falls back to DEFAULT_STAGE_WATCHDOG_MINUTES). There is no "explicit opt-out"
+// reading to preserve: a stage with no watchdog at all is a stage that can hang
+// forever, which is the failure this whole knob exists to bound.
+export type StageWatchdogMinutes = Partial<Record<"builder" | "qa" | "reviewer" | "merge", number>>;
+
 export interface BoardConfig {
   slug: string;
   owner: string; // repo owner, for repository/issue lookups
@@ -106,8 +116,16 @@ export interface BoardConfig {
   maxLanes?: number; // max concurrent workers (PROCESS.md: no more than 3)
   // Minutes of observed worker SILENCE before the loop probes a lane (#256: the
   // baseline is the newest append in the stage's spawn subtree, not the moment
-  // the stage started). See DEFAULT_WATCHDOG_MINUTES for the derivation.
-  watchdogMinutes?: number;
+  // the stage started). See DEFAULT_STAGE_WATCHDOG_MINUTES for the derivation.
+  //
+  // Two accepted shapes. A NUMBER applies one budget to every stage (what every
+  // config written before #256 carries, and still byte-identical in behavior). An
+  // OBJECT gives each stage its own, which is what the measurements actually
+  // support: a reviewer blocked on three background skeptics legitimately goes 19
+  // minutes silent, while a merge stage that runs `gh pr merge` never goes 2. An
+  // absent stage key falls back to that stage's shipped default, so
+  // `{"reviewer": 60}` is a one-stage override, not a redefinition of the table.
+  watchdogMinutes?: number | StageWatchdogMinutes;
   // A project loop lock (lib/locks.ts) with no verifiable pid and older than this
   // is judged stale rather than live, so a crashed loop's lock never wedges the
   // next /z-loop (C7, issue #2). Sized well above a realistic batch so two near-
@@ -226,7 +244,58 @@ export const DEFAULT_MAX_LANES = 3;
 // on the decision that DISCARDS A WHOLE TICKET, where SUBTREE_QUIET_MS's 2x only
 // risks leaving one scratch worktree behind. tests/loop.test.ts pins the ratio so
 // a future edit cannot quietly drop back under it.
+//
+// This is the FLOOR every per-stage budget below is held to, and the value a
+// scalar `watchdogMinutes` in an existing config keeps meaning for every stage.
 export const DEFAULT_WATCHDOG_MINUTES = 15;
+
+// Per-stage silence budgets (#256), each derived from two measured ceilings and
+// held to whichever is larger:
+//
+//   1. the AGENT-level ceiling, MEASURED_MIDWORK_GAP_MS = 423,110 ms over 9,589
+//      mid-work samples across 1,388 sub-agent transcripts -- the floor above,
+//      2x-ed and rounded to 15 minutes. It applies to every stage because any
+//      agent can produce it; a smaller per-family sample never licenses going
+//      under it.
+//   2. that stage family's OWN measured worst silence,
+//      MEASURED_STAGE_SILENCE_MS (lib/transcripts.ts), over 1,143 real stage
+//      subtrees from this repo's loop runs.
+//
+// So: minutes = round-up(max(2 x 423,110 ms, 2 x that family's max)), and the
+// rounding goes UP to the next 5 minutes for the same asymmetry SUBTREE_QUIET_MS
+// rounds up on -- being too patient costs a longer wait before a dead worker is
+// noticed, being too tight discards a healthy ticket's work.
+//
+//   builder   2 x 607,966 ms   = 20.3 min -> 25
+//   qa        2 x 174,847 ms   =  5.8 min -> the 15-minute floor wins
+//   reviewer  2 x 1,161,119 ms = 38.7 min -> 40
+//   merge     2 x  97,130 ms   =  3.2 min -> the 15-minute floor wins
+//
+// The qa and merge rows are the point of the floor: their families' samples hold
+// no long quiet stretch, and shipping 6 and 4 would kill any QA agent that sits
+// on one slow build. tests/loop.test.ts pins every row against BOTH ceilings.
+export const DEFAULT_STAGE_WATCHDOG_MINUTES: Required<StageWatchdogMinutes> = {
+  builder: 25,
+  qa: 15,
+  reviewer: 40,
+  merge: 15,
+};
+
+// The budget for one stage, from either accepted config shape (#256). A number
+// applies to every stage (pre-#256 behavior, byte-identical); an object gives
+// each stage its own with a per-key fallback to the shipped default; absent is
+// the shipped default outright.
+//
+// One resolver, called by the state machine at the moment it judges ONE lane --
+// so a config that changes shape can never leave half the loop reading a number
+// the other half resolved differently.
+export function resolveWatchdogMinutes(
+  value: number | StageWatchdogMinutes | undefined,
+  stage: keyof StageWatchdogMinutes
+): number {
+  if (typeof value === "number") return value;
+  return value?.[stage] ?? DEFAULT_STAGE_WATCHDOG_MINUTES[stage];
+}
 export const DEFAULT_LOCK_STALENESS_MINUTES = 60;
 export const DEFAULT_AUDIT_EVERY_N_LOOPS = 5;
 export const DEFAULT_MAX_QA_PASSES = 3;
@@ -334,7 +403,13 @@ export function loadConfig(slug?: string, home = homedir()): BoardConfig {
   cfg.quota = { ...DEFAULT_QUOTA, ...(cfg.quota ?? {}) };
   cfg.epicStyle = cfg.epicStyle ?? DEFAULT_EPIC_STYLE;
   cfg.maxLanes = cfg.maxLanes ?? DEFAULT_MAX_LANES;
-  cfg.watchdogMinutes = cfg.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES;
+  // #256: the per-stage TABLE, not the scalar, so a project that never set this
+  // knob actually gets the four derived budgets. A scalar already on disk is left
+  // exactly as written (one budget for every stage, pre-#256 behavior), and a
+  // partial object is left partial -- resolveWatchdogMinutes fills each missing
+  // stage, which is what makes `{"reviewer": 60}` a one-stage override that keeps
+  // tracking the pack's defaults for the other three.
+  cfg.watchdogMinutes = cfg.watchdogMinutes ?? { ...DEFAULT_STAGE_WATCHDOG_MINUTES };
   cfg.lockStalenessMinutes = cfg.lockStalenessMinutes ?? DEFAULT_LOCK_STALENESS_MINUTES;
   cfg.auditEveryNLoops = cfg.auditEveryNLoops ?? DEFAULT_AUDIT_EVERY_N_LOOPS;
   cfg.maxQaPasses = cfg.maxQaPasses ?? DEFAULT_MAX_QA_PASSES;

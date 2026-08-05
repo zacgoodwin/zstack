@@ -96,7 +96,7 @@ export function happyOutcome(stage: Stage, ticket: number): string {
 // carrying a counter, at which point the safety oracle cries "state leaked
 // between stages" about a scheduling field. The gate makes the second copy
 // impossible to forget.
-export const ALLOWED_LANE_KEYS = new Set(["ticket", "stage", "lastActivityMs", "qaBounces", "reviewBounces", "quorumRetries", "commitRetries", "respawns", "workerDead", "worktreeDirty", "outcome", "lastWroteStatus", "goneReason"]);
+export const ALLOWED_LANE_KEYS = new Set(["ticket", "stage", "lastActivityMs", "stageStartedMs", "qaBounces", "reviewBounces", "quorumRetries", "commitRetries", "respawns", "workerDead", "worktreeDirty", "outcome", "lastWroteStatus", "goneReason"]);
 const FORBIDDEN_LANE_KEY = /conversation|session|context|thread|agent.?id|history|transcript/i;
 
 export interface SimTrace {

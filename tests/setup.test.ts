@@ -19,7 +19,7 @@ import {
   type FieldState,
   type ProjectState,
 } from "../lib/setup-board.ts";
-import { DEFAULT_WATCHDOG_MINUTES, loadConfig, type BoardConfig } from "../lib/config.ts";
+import { DEFAULT_STAGE_WATCHDOG_MINUTES, loadConfig, type BoardConfig } from "../lib/config.ts";
 import { validateConfig } from "../lib/config-schema.ts";
 import { loadBoardTemplate, deriveShape, DEFAULT_TEMPLATE } from "../lib/board-template.ts";
 import type { GraphQLData, GraphQLExecutor } from "../lib/board.ts";
@@ -367,10 +367,12 @@ describe("SetupBoard.apply — creation path", () => {
     expect(cfg.repositoryId).toBe("R_1");
     expect(cfg.epicStyle).toBe("milestones");
     expect(cfg.maxLanes).toBe(3);
-    // The pack default, not a literal: #256 re-derived it (10 -> 15) off the same
-    // measured mid-work gap SUBTREE_QUIET_MS uses, and what this test is pinning
-    // is that setup writes whatever that derivation says, not the number itself.
-    expect(cfg.watchdogMinutes).toBe(DEFAULT_WATCHDOG_MINUTES);
+    // The pack default TABLE, not a literal: #256 re-derived the watchdog off
+    // measured silence (10 -> a per-stage table), and what this pins is that
+    // setup writes whatever that derivation says rather than a number of its own.
+    // Writing a scalar here instead would make the four budgets dead on arrival
+    // for every project created after that change.
+    expect(cfg.watchdogMinutes).toEqual(DEFAULT_STAGE_WATCHDOG_MINUTES);
     expect(Object.keys(cfg.statusField.options!)).toEqual([...STATUS_OPTIONS]);
     expect(Object.keys(cfg.fields)).toEqual(["Model", "Model Effort", "Estimate", "Actual"]);
     expect(typeof cfg.fields.Model.options!.opus).toBe("string");
@@ -1047,6 +1049,57 @@ describe("validateConfig", () => {
       expect(() => validateConfig(cfg)).not.toThrow();
       delete cfg[key];
       expect(() => validateConfig(cfg)).not.toThrow();
+    });
+
+    // #256: watchdogMinutes is the one knob with two shapes. The scalar rows above
+    // still run against it (it stays in NUMERIC_KEYS), which is the point -- a
+    // config written before this change validates byte-identically.
+    describe("watchdogMinutes accepts a scalar OR a per-stage object (#256)", () => {
+      test("a full and a partial per-stage object both validate", () => {
+        for (const shape of [{ builder: 25, qa: 15, reviewer: 40, merge: 15 }, { reviewer: 90 }, {}]) {
+          const cfg = goodConfig() as any;
+          cfg.watchdogMinutes = shape;
+          expect(() => validateConfig(cfg)).not.toThrow();
+        }
+      });
+
+      // The refusal that matters most: resolveWatchdogMinutes falls back to the
+      // shipped default for any stage it does not find, so a typo'd key would read
+      // as "I raised QA's budget" while QA quietly kept the default -- and the
+      // operator would learn it from a skipped ticket, not from the config.
+      test("an unknown stage key is refused by name, never silently ignored", () => {
+        for (const bad of [{ QA: 20 }, { builder2: 5 }, { qa: 15, reviwer: 40 }]) {
+          const cfg = goodConfig() as any;
+          cfg.watchdogMinutes = bad;
+          expect(() => validateConfig(cfg)).toThrow(/is not a known stage\. Valid: builder, qa, reviewer, merge/);
+        }
+      });
+
+      test("a per-stage value takes the same positive-number rule as the scalar", () => {
+        for (const bad of [0, -5, "20", NaN, null]) {
+          const cfg = goodConfig() as any;
+          cfg.watchdogMinutes = { qa: bad };
+          expect(() => validateConfig(cfg)).toThrow(/"watchdogMinutes\.qa" must be a positive number/);
+        }
+      });
+
+      // 0 has to stay refused for this knob specifically: "0 disables the
+      // watchdog" is the one reading it must never have, since a stage with no
+      // watchdog can hang until STAGE_CEILING_MINUTES and burn a lane for hours.
+      test("0 is refused in both shapes -- there is no disable value here", () => {
+        const scalar = goodConfig() as any;
+        scalar.watchdogMinutes = 0;
+        expect(() => validateConfig(scalar)).toThrow(/"watchdogMinutes" must be a positive number/);
+        const perStage = goodConfig() as any;
+        perStage.watchdogMinutes = { merge: 0 };
+        expect(() => validateConfig(perStage)).toThrow(/"watchdogMinutes\.merge" must be a positive number/);
+      });
+
+      test("an array is refused, not read as an object", () => {
+        const cfg = goodConfig() as any;
+        cfg.watchdogMinutes = [15, 15, 15, 15];
+        expect(() => validateConfig(cfg)).toThrow(/must be a positive number .* or an object of/);
+      });
     });
 
     test("projectNumber rejects NaN and a float, not just a string", () => {

@@ -21,9 +21,12 @@ import {
   DEFAULT_REVIEWER_BELOW_THRESHOLD_ACTION,
   DEFAULT_TICKET_LIMIT,
   DEFAULT_WATCHDOG_MINUTES,
+  DEFAULT_STAGE_WATCHDOG_MINUTES,
   loadConfig,
+  resolveWatchdogMinutes,
   ZError,
   type BoardStatus,
+  type StageWatchdogMinutes,
 } from "./config.ts";
 import {
   claimStage,
@@ -36,6 +39,10 @@ import {
   watchdogExpired,
 } from "./lanes.ts";
 import { reconcileBoardMoves } from "./reconcile.ts";
+// #256: the CLI's --watchdog-minutes takes the same two shapes config.json does,
+// so it validates through the same function rather than a looser second parser.
+// No cycle: config-schema.ts reaches only config.ts / estimate.ts / notify.ts.
+import { validateWatchdogMinutes } from "./config-schema.ts";
 // #256: the watchdog's silence baseline is read off the harness's own sub-agent
 // transcripts. Runtime-safe in this direction -- transcripts.ts reaches back into
 // this file only through stage-prompts.ts's `import type { Stage }`, which is
@@ -182,6 +189,21 @@ export interface LaneState {
   // degrades to exactly that stage-age behavior and the watchdog can only be
   // made more patient by an observation, never less.
   lastActivityMs: number;
+  // #256: when the CURRENT stage spawn began -- set by the three actions that
+  // place an agent on this lane (claim, advance, respawn) and by nothing else.
+  //
+  // Deliberately NOT the same field as lastActivityMs, which the heartbeat moves
+  // forward: this one must stay still, because it is the only thing that can
+  // bound a lane whose worker answers ALIVE to every probe. Each ALIVE resets the
+  // silence baseline with no cumulative limit (recordProbe), so before this a
+  // wedged-but-registered agent was probed alive every budget-period forever.
+  // STAGE_CEILING_MINUTES reads it; see stageCeilingAction.
+  //
+  // Optional so state files written before #256 load unchanged. Absent means the
+  // ceiling cannot be evaluated for that lane, which reads as "no ceiling" -- the
+  // pre-#256 behavior, and the fail-open direction: a lane the loop cannot age
+  // must never be parked on a number it does not have.
+  stageStartedMs?: number;
   qaBounces: number; // completed QA passes that found bugs
   reviewBounces: number; // completed reviewer->builder bounces (issue #76)
   // #191: reviewer->REVIEWER re-spawns this lane has spent on a short skeptic
@@ -253,7 +275,10 @@ export interface LoopState {
   tickets: TicketSnapshot[];
   lanes: LaneState[];
   maxLanes: number;
-  watchdogMinutes: number;
+  // #256: a scalar (one budget for every stage, every pre-#256 state file) or the
+  // per-stage object. Never read directly -- resolveWatchdogMinutes(state, stage)
+  // is the only reader, so both shapes reach the decision as one number.
+  watchdogMinutes: number | StageWatchdogMinutes;
   // QA bounce knobs (issue #41). Optional on the type so hand-built fixtures
   // that predate this ticket keep compiling; ingestBoardItems always fills a
   // concrete value (cfg -> preserved-from-prev -> DEFAULT_*, same fallback
@@ -839,6 +864,68 @@ function deadRespawnNote(lane: LaneState): string {
   );
 }
 
+// The cumulative wall-clock a single stage spawn may occupy a lane, however
+// alive it keeps answering (#256). 8 hours.
+//
+// This bound is what makes the watchdog's alive path TERMINATE. An ALIVE probe
+// refreshes lastActivityMs (recordProbe) with no memory of how many probes came
+// before, so a worker that is wedged but still registered in the harness task
+// list answers alive, the baseline resets, and the same lane is probed again one
+// budget later -- forever, holding its ticket, its worktree, its lane lock and
+// one of maxLanes slots. Every other retry in the pack is outcome-driven
+// (qaBounces, reviewBounces, quorumRetries, commitRetries, respawns); elapsed
+// time had none, so nothing ended that sequence but a human noticing.
+//
+// A MEASUREMENT, like every other constant here. The population: every
+// orchestrator-spawned agent on this machine that came to rest on a final answer
+// -- 939 stage-described ones, p50 8.0m, p95 27.8m, p99 48.6m, and a long tail of
+// 6 over an hour topping out at MEASURED_MAX_STAGE_MS = 13,304,097 ms (3.7 hours,
+// a "Build C9 /z-status dashboard" builder). Those are stages that FINISHED, so a
+// ceiling under them would park work that was going to land. 2 x 3.7h = 7.4h,
+// rounded up to 8 -- which is SUBTREE_STALE_MS exactly, and that agreement is
+// worth keeping: 8 hours is already the age at which lib/transcripts.ts stops
+// believing a transcript proves anything is running behind it, so it is the same
+// answer to the same question asked of the same corpus.
+//
+// The asymmetry runs the other way from the watchdog's. A watchdog that fires
+// early costs a paid re-spawn or a discarded ticket; this one parks BLOCKED, so
+// being wrong costs a human one look at a ticket that is sitting there with its
+// branch and worktree intact. Being too generous costs a held lane for the rest
+// of the run, which is why it is bounded at all.
+export const STAGE_CEILING_MINUTES = 480;
+
+// A lane whose CURRENT stage has occupied it past STAGE_CEILING_MINUTES (#256).
+// Parks Blocked, naming the stage, the elapsed minutes and the ceiling, so the
+// note is self-explaining to the human who has to decide what to do with it.
+//
+// `salvage: true` unconditionally, unlike the dead-worker paths above which set
+// it only on a proven-dirty worktree. There is no probe here and so no worktree
+// facts: this fires on a lane the loop has watched for 8 hours and may still be
+// writing files it never committed, and parking releases the lane lock, which
+// makes that worktree an orphan the next run's reconcile force-removes. An empty
+// salvage patch costs one file; a discarded 8-hour worktree costs the ticket.
+function stageCeilingAction(lane: LaneState, elapsedMs: number): Action {
+  const minutes = Math.floor(elapsedMs / 60_000);
+  return {
+    kind: "park",
+    ticket: lane.ticket,
+    status: "Blocked",
+    salvage: true,
+    note:
+      `The ${lane.stage} stage has held this lane for ${minutes} minutes, past the ${STAGE_CEILING_MINUTES}-minute ` +
+      `per-stage ceiling, so the loop is parking it rather than probing it alive again. An agent that keeps ` +
+      `answering ALIVE refreshes the watchdog forever, so elapsed time is the only thing that can end this. ` +
+      `Nothing here is proven broken and nothing was skipped: the branch and worktree are intact, and any ` +
+      `uncommitted work was dumped to \`~/.zstack/projects/<slug>/reports/uncommitted-${lane.ticket}.patch\` ` +
+      `(re-apply with \`git apply\`) because releasing the lane lock leaves the worktree an orphan the next ` +
+      `run's reconcile force-removes.` +
+      (lane.stage === "merge"
+        ? ` This was a MERGE stage: check \`gh pr view\` before returning the ticket -- the PR may have landed ` +
+          `before the agent wedged, in which case the ticket is Done rather than Blocked.`
+        : ` Return it to Ready once you have decided what to keep.`),
+  };
+}
+
 // A lane whose worker is silent past the watchdog AND not alive on probe (#209).
 //
 // Before this, the machine's only answer was `skip` -- correct when the agent
@@ -1119,7 +1206,10 @@ function withResync(action: Action, resyncStatus: Map<number, BoardStatus>): Act
 export function nextAction(state: LoopState, nowMs: number): Action {
   const { tickets, lanes } = state;
   const maxLanes = state.maxLanes ?? DEFAULT_MAX_LANES;
-  const wd = state.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES;
+  // #256: resolved PER LANE at the watchdog step below, not once here -- the
+  // budget is a property of the stage, and a lane's stage is not known until the
+  // loop reaches that lane.
+  const budgetFor = (stage: Stage): number => resolveWatchdogMinutes(state.watchdogMinutes, stage);
   const qaLimits: QaBounceLimits = {
     maxQaPasses: state.maxQaPasses ?? DEFAULT_MAX_QA_PASSES,
     qaInvestigateAfter: state.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER,
@@ -1308,6 +1398,17 @@ export function nextAction(state: LoopState, nowMs: number): Action {
   // 3. Watchdog on silent lanes (an unresolved merge approval is not silent).
   for (const lane of lanes) {
     if (lane.outcome) continue;
+    // 3a. The per-stage CEILING comes first, and it is checked for every lane
+    //     whether or not that lane is currently silent (#256). A wedged worker
+    //     that answers ALIVE is never silent by construction -- each probe resets
+    //     the baseline -- so a ceiling evaluated only inside the expiry branch
+    //     below would be unreachable on precisely the lanes it exists to end.
+    //     Absent stageStartedMs (a pre-#256 state file) means no ceiling.
+    const startedMs = lane.stageStartedMs;
+    if (startedMs !== undefined && nowMs - startedMs > STAGE_CEILING_MINUTES * 60_000) {
+      return stageCeilingAction(lane, nowMs - startedMs);
+    }
+    const wd = budgetFor(lane.stage);
     if (!watchdogExpired(lane, nowMs, wd)) continue;
     // A dead worker resolves to a merge-stage hold (H9), a clean stop when a
     // human already took the ticket off the board mid-run, a same-stage re-spawn
@@ -1510,7 +1611,10 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
       setStatus(t, STATUS_FOR_STAGE[action.stage]);
       // #125: record the status we just wrote as the lane's origin marker (see
       // LaneState.lastWroteStatus); ingest clears it once the board shows it land.
-      next.lanes.push({ ticket: action.ticket, stage: action.stage, lastActivityMs: nowMs, qaBounces: 0, reviewBounces: 0, lastWroteStatus: STATUS_FOR_STAGE[action.stage] });
+      // #256: stageStartedMs is stamped alongside lastActivityMs at every stage
+      // ENTRY (here, advance, respawn) and never again -- the heartbeat moves the
+      // activity baseline, the ceiling needs one that does not move.
+      next.lanes.push({ ticket: action.ticket, stage: action.stage, lastActivityMs: nowMs, stageStartedMs: nowMs, qaBounces: 0, reviewBounces: 0, lastWroteStatus: STATUS_FOR_STAGE[action.stage] });
       return next;
     }
     case "advance": {
@@ -1528,6 +1632,7 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
       if (action.to === "builder" && lane.stage === "builder") lane.commitRetries = (lane.commitRetries ?? 0) + 1;
       lane.stage = action.to;
       lane.lastActivityMs = nowMs;
+      lane.stageStartedMs = nowMs; // #256: a new stage is a new ceiling
       delete lane.outcome;
       delete lane.workerDead;
       // #209: worktreeDirty describes ONE probe of ONE stage's leftovers, so it
@@ -1576,6 +1681,11 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
       }
       lane.respawns = { ...lane.respawns, [lane.stage]: respawnsAt(lane, lane.stage) + 1 };
       lane.lastActivityMs = nowMs;
+      // #256: a re-spawn is a FRESH agent at the same stage, so it gets a fresh
+      // ceiling. Bounded by MAX_DEAD_RESPAWNS (one per stage per lane), so this
+      // cannot be used to extend a lane indefinitely -- and the predecessor it
+      // replaces was dead on probe, not running long.
+      lane.stageStartedMs = nowMs;
       delete lane.outcome;
       delete lane.workerDead;
       delete lane.worktreeDirty;
@@ -1809,7 +1919,7 @@ export function ingestBoardItems(
   bodies: Record<string, string>,
   cfg?: {
     maxLanes?: number;
-    watchdogMinutes?: number;
+    watchdogMinutes?: number | StageWatchdogMinutes; // #256: scalar or per-stage
     maxQaPasses?: number;
     qaInvestigateAfter?: number;
     minReviewerConfidence?: number;
@@ -2044,7 +2154,10 @@ export function ingestBoardItems(
     tickets,
     lanes: structuredClone(lanes),
     maxLanes: cfg?.maxLanes ?? prev?.maxLanes ?? DEFAULT_MAX_LANES,
-    watchdogMinutes: cfg?.watchdogMinutes ?? prev?.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES,
+    // #256: the per-stage TABLE is the last-resort default, not the scalar, so a
+    // state built with no config flag at all still gets the four derived budgets.
+    // Same cfg -> preserved-from-prev -> default chain as every knob beside it.
+    watchdogMinutes: cfg?.watchdogMinutes ?? prev?.watchdogMinutes ?? { ...DEFAULT_STAGE_WATCHDOG_MINUTES },
     maxQaPasses: cfg?.maxQaPasses ?? prev?.maxQaPasses ?? DEFAULT_MAX_QA_PASSES,
     qaInvestigateAfter: cfg?.qaInvestigateAfter ?? prev?.qaInvestigateAfter ?? DEFAULT_QA_INVESTIGATE_AFTER,
     minReviewerConfidence: cfg?.minReviewerConfidence ?? prev?.minReviewerConfidence ?? DEFAULT_MIN_REVIEWER_CONFIDENCE,
@@ -2243,7 +2356,9 @@ function readPrevState(path: string): LoopState | null {
 // not a read + a ternary + a call-site line.
 const INGEST_NUMBERS = [
   "max-lanes",
-  "watchdog-minutes",
+  // watchdog-minutes is NOT here: since #256 it carries either a number or a
+  // per-stage JSON object, and Number("{\"qa\":15}") is NaN. Parsed by
+  // watchdogFromFlag below, which is the one place that tells the shapes apart.
   "max-qa-passes",
   "qa-investigate-after",
   "human-needed-percent",
@@ -2257,6 +2372,37 @@ const INGEST_NUMBERS = [
 
 // kebab-case CLI flag -> the camelCase key ingestBoardItems takes.
 const camel = (flag: string): string => flag.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+
+// `--watchdog-minutes` in either accepted shape (#256): `25`, or the per-stage
+// object `{"builder":25,"qa":15,"reviewer":40,"merge":15}` as one JSON argument.
+// z-loop/SKILL.md Step 3 passes whatever `loadConfig` resolved, JSON-stringified,
+// and compact JSON has no spaces -- so it survives the SKILL's `read -r` word
+// splitting as a single token.
+//
+// The object is validated by the SAME function that validates it in config.json
+// (validateWatchdogMinutes), so a typo'd stage rejects identically whether it
+// arrived through a config file or a flag -- there is no second, looser path into
+// the state file.
+function watchdogFromFlag(raw: string | undefined): number | StageWatchdogMinutes | undefined {
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith("{")) {
+    const n = Number(trimmed);
+    validateWatchdogMinutes(n);
+    return n;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (e) {
+    throw new ZError(
+      `--watchdog-minutes looks like JSON but does not parse (${(e as Error).message}): ${JSON.stringify(raw)}. ` +
+        `Pass a number for every stage, or {"builder":25,"qa":15,"reviewer":40,"merge":15}.`
+    );
+  }
+  validateWatchdogMinutes(parsed);
+  return parsed as StageWatchdogMinutes;
+}
 
 // readJson's contract for plain text: a missing/unreadable file at the CLI edge is
 // an actionable usage failure (exit 1 with the path), not a rethrown stack.
@@ -2492,8 +2638,12 @@ export function main(argv: string[]): number {
       ) {
         throw new ZError(`--reviewer-below-threshold-action must be "block", "retry", or "off", got ${JSON.stringify(reviewerBelowThresholdAction)}.`);
       }
-      const cfg: Record<string, number | string | undefined> = {
+      const cfg: Record<string, number | string | StageWatchdogMinutes | undefined> = {
         reviewerBelowThresholdAction,
+        // #256: parsed on its own, since it is the one knob that is not a number.
+        // `undefined` (flag absent) leaves ingestBoardItems' preserve-then-default
+        // chain untouched, exactly like every numeric flag below.
+        watchdogMinutes: watchdogFromFlag(str(flags, "watchdog-minutes")),
       };
       for (const flag of INGEST_NUMBERS) {
         const raw = str(flags, flag);

@@ -22,7 +22,8 @@ import {
   DEFAULT_EPIC_STYLE,
   DEFAULT_MAX_LANES,
   DEFAULT_QUOTA,
-  DEFAULT_WATCHDOG_MINUTES,
+  DEFAULT_STAGE_WATCHDOG_MINUTES,
+  type StageWatchdogMinutes,
   FieldConfig,
   FieldDataType,
   configPath,
@@ -36,6 +37,7 @@ import {
   validateNotifications,
   validateQuota,
   validateStageModels,
+  validateWatchdogMinutes,
 } from "./config-schema.ts";
 import { ghExecutor, paginate, type GraphQLData, type GraphQLExecutor } from "./board.ts";
 import {
@@ -319,7 +321,9 @@ export interface ApplyOptions {
   title: string;
   projectNumber?: number; // adopt this exact project instead of searching by title
   maxLanes?: number;
-  watchdogMinutes?: number;
+  // #256: a scalar (one budget for every stage) or the per-stage object. The
+  // `--watchdog-minutes` CLI flag below only ever produces the scalar.
+  watchdogMinutes?: number | StageWatchdogMinutes;
   force?: boolean; // adopt even when non-canonical single-select options still hold items
   // Override for where ~/.zstack lives (issue #97: buildConfig reads the prior
   // config.json from here to preserve hand-added optional fields). Tests pass
@@ -596,7 +600,10 @@ function validateApplyOptions(opts: ApplyOptions): void {
     throw new ZError(`Config "slug" must be a non-empty string.`);
   }
   requirePositiveNumber("maxLanes", opts.maxLanes);
-  requirePositiveNumber("watchdogMinutes", opts.watchdogMinutes);
+  // #256: the same validator config.json reads through, so `--watchdog-minutes`
+  // is held to one rule whichever shape it arrives in (the CLI flag below only
+  // ever produces a scalar; a caller of apply() may pass the per-stage object).
+  validateWatchdogMinutes(opts.watchdogMinutes);
   if (opts.projectNumber !== undefined && !Number.isInteger(opts.projectNumber)) {
     throw new ZError(`"projectNumber" must be an integer, got ${JSON.stringify(opts.projectNumber)}.`);
   }
@@ -698,7 +705,12 @@ function buildConfig(
     // "milestones" is the only style; config-schema.ts rejects any other on read.
     epicStyle: DEFAULT_EPIC_STYLE,
     maxLanes: ctx.maxLanes ?? DEFAULT_MAX_LANES,
-    watchdogMinutes: ctx.watchdogMinutes ?? DEFAULT_WATCHDOG_MINUTES,
+    // #256: the per-stage TABLE by default, not the scalar. Writing 15 for every
+    // stage here would make the four derived budgets dead on arrival for every
+    // project set up after this change, and the operator would have no visible
+    // knob to discover. `--watchdog-minutes N` still writes N, which keeps its
+    // pre-#256 meaning exactly: one budget for every stage.
+    watchdogMinutes: ctx.watchdogMinutes ?? { ...DEFAULT_STAGE_WATCHDOG_MINUTES },
     quota: { ...DEFAULT_QUOTA },
     // Issue #82, revised by #156: this default used to be written ONLY for a
     // brand-new project (the caller passed created === true) -- an
