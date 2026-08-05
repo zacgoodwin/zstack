@@ -412,6 +412,19 @@ describe("watchdog", () => {
       expect(resolveWatchdogMinutes(undefined, "merge")).toBe(DEFAULT_STAGE_WATCHDOG_MINUTES.merge);
     });
 
+    // A budget of `undefined` would make `nowMs - base > undefined * 60_000`
+    // evaluate NaN, and `x > NaN` is false -- the watchdog silently off for that
+    // lane. Reachable only from a hand-edited or half-written state.json, and
+    // silent enough to be worth the floor.
+    test("an unknown stage on a corrupt state resolves to the floor, never undefined", () => {
+      const bogus = "qa2" as unknown as Stage;
+      expect(resolveWatchdogMinutes({ qa: 15 }, bogus)).toBe(DEFAULT_WATCHDOG_MINUTES);
+      expect(resolveWatchdogMinutes(undefined, bogus)).toBe(DEFAULT_WATCHDOG_MINUTES);
+      // ...and the lane still expires rather than living forever.
+      const l = lane(1, bogus, { lastActivityMs: 0 });
+      expect(watchdogExpired(l, DEFAULT_WATCHDOG_MINUTES * MIN + 1, resolveWatchdogMinutes(undefined, bogus))).toBe(true);
+    });
+
     test("an ingest with no --watchdog-minutes carries the per-stage table into state", () => {
       const s = ingestBoardItems(null, [{ number: 1, title: "T", fields: { Status: "Ready" } }], { "1": "" });
       expect(s.watchdogMinutes).toEqual(DEFAULT_STAGE_WATCHDOG_MINUTES);

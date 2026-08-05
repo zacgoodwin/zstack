@@ -289,12 +289,19 @@ export const DEFAULT_STAGE_WATCHDOG_MINUTES: Required<StageWatchdogMinutes> = {
 // One resolver, called by the state machine at the moment it judges ONE lane --
 // so a config that changes shape can never leave half the loop reading a number
 // the other half resolved differently.
+// The final `?? DEFAULT_WATCHDOG_MINUTES` is not dead code: `stage` is typed, but
+// it arrives from a state.json on disk, and a hand-edited or half-written one can
+// carry a stage name the table has no row for. Returning `undefined` there would
+// make `watchdogExpired`'s `nowMs - base > undefined * 60_000` evaluate NaN, and
+// `x > NaN` is FALSE -- the watchdog silently off for that lane, which is the
+// class of failure this whole ticket exists to remove. An unknown stage instead
+// gets the floor.
 export function resolveWatchdogMinutes(
   value: number | StageWatchdogMinutes | undefined,
   stage: keyof StageWatchdogMinutes
 ): number {
   if (typeof value === "number") return value;
-  return value?.[stage] ?? DEFAULT_STAGE_WATCHDOG_MINUTES[stage];
+  return value?.[stage] ?? DEFAULT_STAGE_WATCHDOG_MINUTES[stage] ?? DEFAULT_WATCHDOG_MINUTES;
 }
 export const DEFAULT_LOCK_STALENESS_MINUTES = 60;
 export const DEFAULT_AUDIT_EVERY_N_LOOPS = 5;
