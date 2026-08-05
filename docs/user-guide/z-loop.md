@@ -422,17 +422,39 @@ What it does, in the lane's own worktree:
    for: a gate result is about one commit, so a re-run after a conflict
    resolution stamps a verdict naming the *new* sha.
 
-Steps 2 and 3 read bun's own bookkeeping, so they apply where the manifest
-proves bun's runner is what the `test` script runs (`bun test`,
-`bun test --coverage`, `cross-env CI=1 bun test`, `bun test && bun run lint`).
-Where it does not — `jest --ci`, `vitest run` — that script's **exit code is the
-verdict**, because a runner that never prints a bun banner cannot be asked for
-one: demanding it would refuse every green merge on such a repo forever. The two
-fail-closed reads stay on everywhere, so a `N fail` summary reporting failures,
-or bun's `error: 0 test files matching`, is still red whoever printed it. And
-where the manifest *does* claim bun's runner, an exit 0 with no banner stays red
-— the detection is positive evidence for a skip, never a way to buy a green by
-renaming a script.
+Steps 2 and 3 read bun's own bookkeeping, so they apply where bun's runner is
+what the `test` script runs (`bun test`, `bun test --coverage`,
+`cross-env CI=1 bun test`, `bun test && bun run lint`). Where it is not —
+`jest --ci`, `vitest run` — that script's **exit code is the verdict**, because
+a runner that never prints a bun banner cannot be asked for one: demanding it
+would refuse every green merge on such a repo forever. The two fail-closed reads
+stay on everywhere, so a `N fail` summary reporting failures, or bun's
+`error: 0 test files matching`, is still red whoever printed it.
+
+"Is bun's runner what runs?" is answered twice over, because getting it wrong in
+the *foreign* direction is what refuted this gate's own AC1 once. Three fixtures
+with byte-identical contents — a failing test plus a test calling
+`process.exit(0)` — differing only in the script string came back:
+
+```
+{"test":"bun test"}                                 exit 1  {"green":false}
+{"test":"bun run inner","inner":"bun test"}         exit 0  {"green":true}   ← #132's shape
+{"test":"bun run test:unit","test:unit":"bun test"} exit 0  {"green":true}
+```
+
+Reading only the literal token classified bun-reached-indirectly as foreign,
+which switched off all three anti-#132 guards at once. So:
+
+- the manifest read **follows `bun run <name>` hops** through the same `scripts`
+  block, every hop in a chain, with a cycle guard; and
+- a `bun test v…` **banner in the output overrides the manifest**. Static
+  resolution cannot see through `npm test`, a shell wrapper, or a generated
+  command, and the banner is bun stating that its runner started here.
+
+The reverse mistake is harmless and stays harmless: a foreign runner that prints
+no banner still merges on its own exit code. And where bun's runner *did* run,
+an exit 0 with no summary stays red — the detection is positive evidence for a
+skip, never a way to buy a green by renaming a script.
 
 Where the script is bun's runner and the output shows it ran nothing, the gate
 says *that* rather than the misleading "the suite did not run" — and the signal
@@ -468,6 +490,11 @@ defined, so everything above about the summary line is untouched. Skipping is
 never a bypass: a failing suite on a repo with no `typecheck` script is still
 red, and a missing or unparseable `package.json` proves nothing, so it refuses
 rather than skips.
+
+A skipped limb is a **documented absence, not a pass**. Every green verdict that
+ran less than the full gauntlet says which script was missing and that the limb
+was not run, so a green measured on half of it reads differently from one
+measured on all of it — in the note, in the stamped lane, and in the report.
 
 One limit is deliberate and unchanged: a checkout with no `package.json` at all
 (a Go repo, say) has no gate to detect and parks Blocked.
@@ -513,24 +540,16 @@ attempt 1 leaves it 290s, comfortably over the 238.9s a *loaded* run of this
 suite was measured at.
 
 One consequence lands on the repo being gated rather than on the gate: once a
-merge needs a green suite, a **per-test timeout tuned for an idle machine
-becomes a merge blocker**. Three of this pack's own spawn-heavy files crossed
-bun's 5000ms default as the suite grew — Windows process startup is ~1s a spawn
-— on a machine where nothing was broken. This repo's `test` script therefore
-runs `bun test --timeout 30000`, which is what the gate spawns, and the measured
-files also call `setDefaultTimeout(30_000)` so a bare `bun test` (which takes no
-flag from the script) stays green too. Bun 1.3.14 has no single switch that does
-both: a bunfig `[test] timeout` key is ignored, and `setDefaultTimeout` from a
-`[test] preload` is reset per test file.
-
-Mind the third form. `--timeout` sets a **default**, and a per-test timeout
-argument — `test("…", fn, 20000)` — silently beats it (measured). So a file that
-raised its own bound the per-test way was the one file the script flag could not
-reach, and its tests were the ones timing out under load. Use
-`setDefaultTimeout` at the top of the file instead; a gate test here walks
-`tests/` and fails on any per-test argument below the bound. If you adopt the
-loop on a repo with spawn-heavy or IO-heavy tests, set that bound before the
-first merge lane runs.
+merge needs a green suite, a **test timeout tuned for an idle machine becomes a
+merge blocker**. Spawn-heavy files here crossed bun's 5000ms default as the
+suite grew — Windows process startup is ~1s a spawn — on a machine where nothing
+was broken, and three consecutive runs of one such file produced 9, then 5, then
+2 failures, every one a timeout and never an assertion. This pack's answer is a
+per-file measured constant (`tests/z-loop-tick.test.ts`'s `TICK_TIMEOUT_MS`,
+carrying its measurement and a raise-it-only-with-a-fresh-measurement rule in
+the comment), not a global default. If you adopt the loop on a repo with
+spawn-heavy or IO-heavy tests, set that bound **before** the first merge lane
+runs: after the gate lands, every load flake costs a lane an attempt.
 
 ### A verdict is about one base
 
@@ -549,6 +568,40 @@ itself, so the literal form would re-gate forever. Re-gating costs one extra
 gauntlet per lane per merge, and it terminates. Starting any gate run also drops
 the lane's previous verdict, so a stale green can never cover a run in flight.
 
+### …and about one commit
+
+The base check above catches the ground moving under a stamp. The other half is
+the stamp not being about this branch at all: `commit` — the worktree HEAD the
+gauntlet ran on — was written by the gate and read by **nobody**, so a green
+stamp taken on commit A authorised a merge of commit B. The merge agent re-runs
+the stamping form after resolving a conflict, so in practice a fresh verdict
+usually landed; "usually" is exactly the prose-compliance dependency this gate
+exists to delete.
+
+`next` now reads it. Before emitting `advance N to merge` it reads the lane's
+own branch head and compares:
+
+- The path is **derived**, never supplied — `.worktrees/ticket-<N>` from the
+  ticket number, the same path the claim row creates. `merge-gate` takes a
+  `<worktreePath>` argument, so a verdict could be measured against some other
+  checkout entirely and stamped onto lane N; that verdict now carries the other
+  checkout's sha and fails this comparison.
+- The read is `git rev-parse HEAD`, done by the loop inside the `next` command
+  itself. Nothing an orchestrator can forget to pass, and no `gh` call —
+  `lib/board.ts` remains the pack's only one.
+- A mismatch is a **refusal**, not a re-gate. The base-move case re-gates
+  because a sibling merging is normal and the next gauntlet resolves it; a
+  commit mismatch means the verdict was never about this branch, so asking the
+  same producer for it again would reproduce it forever — a stalled drain, which
+  PROCESS.md ranks alongside a bad merge. The park names both shas.
+- Unprovable is refused too: a green verdict carrying **no** `commit`, or a lane
+  whose worktree head could not be read, parks rather than passing. A verdict
+  that cannot be tied to the commit being merged is not a gate.
+
+Verdicts measured by the pure `mergeGate()` function carry no sha (it never
+shells git); the `merge-gate` command is what fills the field, and the merge
+decision is where the absence is caught.
+
 ### Who runs it, and why it cannot be skipped
 
 The stamp is the enforcement. A review-approved lane at the front of the merge
@@ -560,7 +613,9 @@ the `advance N to merge` that spawns a merge agent until the lane carries a
 |---|---|
 | No verdict stamped | `merge-gate N` — run the gate (again) |
 | Verdict green, but a lane has merged since it was stamped | `merge-gate N` — the base moved, so re-gate |
-| Verdict green | `advance N to merge` — the merge agent spawns |
+| Verdict green, but its `commit` is not the branch's head | `park N Blocked` — the verdict is about other code |
+| Verdict green with no `commit`, or the head cannot be read | `park N Blocked` — an unbindable verdict is not a gate |
+| Verdict green, `commit` is the head | `advance N to merge` — the merge agent spawns |
 | Verdict red | `park N Blocked`, carrying the gate's own note (fail count included) |
 | Two gate runs started, neither finished | `park N Blocked` — a gate that never returns refuses the merge rather than spinning the drain |
 

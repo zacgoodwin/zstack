@@ -1232,7 +1232,17 @@ function withResync(action: Action, resyncStatus: Map<number, BoardStatus>): Act
 // The knobs come straight off the state the caller already holds -- there is no
 // second options shape to keep in sync with LoopState (every caller used to
 // re-spread the same nine fields into one).
-export function nextAction(state: LoopState, nowMs: number): Action {
+//
+// `laneHeads` (#248) is the one FACT the merge decision cannot derive from
+// state: the sha a lane's branch actually sits at right now. It is passed in as
+// data, the same way BuilderCommitFacts is, so this stays pure and gate-testable
+// with no real repository -- but unlike those, no agent supplies it: the `next`
+// CLI reads it itself out of `.worktrees/ticket-<N>`, derived from the ticket
+// number. Absent (a reducer-only caller: unit tests, the e2e sim) means no
+// observation was made this tick and the commit binding is not checked; a lane
+// MISSING from a supplied map means the loop looked and could not read a head,
+// which is checked and refused.
+export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHeadFacts): Action {
   const { tickets, lanes } = state;
   const maxLanes = state.maxLanes ?? DEFAULT_MAX_LANES;
   // #256: resolved PER LANE at the watchdog step below, not once here -- the
@@ -1450,6 +1460,36 @@ export function nextAction(state: LoopState, nowMs: number): Action {
     // costs one re-gate per waiting lane.
     if ((firstLane.mergeGateBase ?? "") !== mergeGateBaseKey(state)) {
       return { kind: "merge-gate", ticket: first.ticket };
+    }
+    // #248: and a green verdict vouches for one BRANCH HEAD. The base check
+    // above catches the base moving under a stamp; this catches the stamp's own
+    // commit not being the code about to be merged -- a verdict measured on a
+    // different worktree, or on a branch that has since taken a commit. Until
+    // this read existed, `commit` was written by the gate and read by nobody,
+    // so a green stamp for commit A authorized a merge of commit B and the only
+    // thing standing in between was the merge prompt's prose telling the agent
+    // to re-run the gate after resolving a conflict.
+    //
+    // A REFUSAL, not a re-gate. The base-move case re-gates because it is the
+    // normal consequence of a sibling merging and the next gauntlet resolves it
+    // -- but a commit mismatch here means the verdict on the lane was never
+    // about this branch, and re-gating would ask for it again from whatever
+    // produced the mismatch, which on the reproduced case (a gate run against
+    // an arbitrary `<worktreePath>`) reproduces it forever. Park is terminal
+    // and names the two shas, which is what a human needs (PROCESS.md: park,
+    // never stall).
+    if (laneHeads !== undefined) {
+      const observed = laneHeads[first.ticket];
+      const note = (why: string): Action => ({ kind: "park", ticket: first.ticket, status: "Blocked", note: `${why} Refusing the merge: a gate verdict that cannot be tied to the commit being merged is not a gate (#248).` });
+      if (gate.commit === undefined) {
+        return note(`The merge gate's green verdict for #${first.ticket} names no commit, so nothing proves it was measured on the code about to merge.`);
+      }
+      if (observed === undefined || observed === null) {
+        return note(`The merge gate's green verdict for #${first.ticket} names commit ${gate.commit}, but the loop could not read a HEAD from that lane's worktree to compare it against.`);
+      }
+      if (observed !== gate.commit) {
+        return note(`The merge gate's green verdict for #${first.ticket} was measured on commit ${gate.commit}, but that lane's branch is now at ${observed}.`);
+      }
     }
     // A stacked parent is one merging concurrently OR already merged this run
     // (its branch survives until batch-end cleanup, so the child's PR still
@@ -1801,7 +1841,23 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
       // `gone` filter, since the item is still in the read -- but the ticket must
       // still go HERE, in one write with the lane, or the state briefly says the
       // loop owns work it has already torn the worker down for.)
+      //
+      // #178: a lane dropped at the MERGE stage whose ticket the board already
+      // shows Done landed its PR -- a human dragging the merging card to Done
+      // mid-run is the reachable case (nextAction:1329's parkedByHuman
+      // stop-lane). `complete` is the only other resolution that records into
+      // `mergedThisRun`, so without this the base every OTHER lane's green
+      // verdict is bound to never moves, and each of them keeps a pre-parent
+      // gauntlet as live merge permission. Derived from state rather than
+      // carried on the action on purpose: the SKILL hand-builds stop-lane rows,
+      // and a fact a hand-builder can omit is a fact that will be omitted.
+      const stopping = next.lanes.find((l) => l.ticket === action.ticket);
+      const landed =
+        stopping?.stage === "merge" && next.tickets.find((t) => t.number === action.ticket)?.status === "Done";
       dropLane(next, action.ticket);
+      if (landed && !(next.mergedThisRun ?? []).includes(action.ticket)) {
+        (next.mergedThisRun ??= []).push(action.ticket);
+      }
       if (action.dropTicket) next.tickets = next.tickets.filter((t) => t.number !== action.ticket);
       return next;
     }
@@ -2378,6 +2434,40 @@ export const ALL_GATE_SCRIPTS: GateScripts = { test: true, typecheck: true, bunT
 // while `cross-env CI=1 bun test` and `bun test && tsc` do.
 const BUN_TEST_SCRIPT = /(?:^|[\s;&|(])bun\s+(?:-\S+\s+|--\S+\s+)*test(?:\s|$)/;
 
+// `bun run <name>` as a HOP to another entry in the same `scripts` block. The
+// literal match above sees only the first command; a skeptic drove three
+// byte-identical fixtures through the shipped CLI and got the whole point of
+// this gate reversed by the script string alone:
+//
+//   {"test":"bun test"}                                 -> exit 1, red
+//   {"test":"bun run inner","inner":"bun test"}         -> exit 0, GREEN
+//   {"test":"bun run test:unit","test:unit":"bun test"} -> exit 0, GREEN
+//
+// The two indirect fixtures print `bun test v1.3.14` and `(fail) really
+// broken` and still read green, because `bunTest:false` switched off all three
+// anti-#132 guards at once (the banner count, the fail count, and the
+// started-vs-finished check). That is #132's exact shape with merge permission
+// attached. Every `bun run <name>` in the script is followed, not just a lone
+// one, because `"bun run test:unit && bun run test:e2e"` is the shape that
+// measured `bunTest:false` while running bun's runner in both limbs.
+const BUN_RUN_REF = /(?:^|[\s;&|(])bun\s+run\s+(?:-\S+\s+|--\S+\s+)*([^\s;&|()]+)/g;
+
+// Does this script reach bun's own test runner, directly or through `bun run`
+// hops within the same `scripts` block? `seen` is the cycle guard: a manifest
+// may name itself (`{"test":"bun run test"}`) or ring, and a gate that hangs
+// on a hand-edited package.json is a stalled drain.
+function reachesBunTest(script: string, scripts: Record<string, string>, seen: Set<string>): boolean {
+  if (BUN_TEST_SCRIPT.test(script)) return true;
+  for (const m of script.matchAll(BUN_RUN_REF)) {
+    const name = m[1]!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const next = scripts[name];
+    if (typeof next === "string" && reachesBunTest(next, scripts, seen)) return true;
+  }
+  return false;
+}
+
 // `package.json`'s `scripts` as the gate reads it. Unreadable, unparseable, or
 // absent all mean "no scripts proven present", which the gate turns into a
 // refusal rather than a skip -- exactly the reading a Go checkout gets.
@@ -2393,7 +2483,15 @@ export function detectGateScripts(packageJsonText: string | null): GateScripts {
       ? ((scripts as Record<string, string>)[name] as string)
       : null;
   const test = read("test");
-  return { test: test !== null, typecheck: read("typecheck") !== null, bunTest: test !== null && BUN_TEST_SCRIPT.test(test) };
+  const table: Record<string, string> =
+    typeof scripts === "object" && scripts !== null
+      ? Object.fromEntries(Object.entries(scripts as Record<string, unknown>).filter((e): e is [string, string] => typeof e[1] === "string"))
+      : {};
+  return {
+    test: test !== null,
+    typecheck: read("typecheck") !== null,
+    bunTest: test !== null && reachesBunTest(test, table, new Set(["test"])),
+  };
 }
 
 export function readGateScripts(worktree: string): GateScripts {
@@ -2409,13 +2507,17 @@ export interface MergeGateVerdict {
   attempts: number; // 1 or 2 -- exactly one retry is allowed, for contention
   failCount: number | null; // summary fail-count of the deciding run (null = no summary line)
   note: string; // one line; goes verbatim into the lane's BLOCKED note
-  // The worktree HEAD this verdict vouches for. A gate result is only ever
-  // about ONE commit, and the merge agent may change the branch under it (a
-  // conflict resolution) after the loop's own pre-merge run: re-running the
-  // STAMPING form then lands a verdict naming the NEW sha, which is what makes
-  // "was the code I merged the code that was gated?" a readable fact instead of
-  // a prose claim. Optional: provenance, never permission -- a gate that cannot
-  // shell git still returns a real green/red.
+  // The worktree HEAD this verdict vouches for, and the whole of what it
+  // vouches for. A gate result is only ever about ONE commit, so nextAction's
+  // merge step compares this against the sha it OBSERVES on the lane's own
+  // worktree and refuses when they differ (#248) -- without that read this
+  // field was written and never read, and a green stamp taken on commit A
+  // authorized a merge of commit B.
+  //
+  // Optional on the type because the pure `mergeGate()` never shells git; the
+  // `merge-gate` CLI is what fills it. A verdict that reaches the merge
+  // decision WITHOUT one is refused there rather than waved through: an
+  // unbindable verdict is exactly the thing #248 says is not a gate.
   commit?: string;
 }
 
@@ -2538,6 +2640,13 @@ function judgeSuiteRun(run: SuiteRun, attempt: number, scripts: GateScripts = AL
         };
   }
   const red = (why: string): MergeGateVerdict => ({ green: false, attempts: attempt, failCount, note: `${why} -- refusing the merge` });
+  // A limb the manifest proves absent is SKIPPED, and every green verdict says
+  // so. The amended Plan allows the skip; what makes it readable afterwards is
+  // that the absence is documented rather than folded into a bare "green" --
+  // an operator (or the next reviewer of a merge that went wrong) can tell a
+  // gate that ran both commands from one that ran one. The `test`-absent case
+  // carries its own wording above; only `typecheck` can be missing here.
+  const skipped = scripts.typecheck ? "" : " (no `typecheck` script in package.json -- that limb was not run)";
   // Names which of the two it is instead of the blanket "the suite did not run"
   // or "gauntlet exited N": this gate shells `bun test` then `bun run
   // typecheck`, so a project on another runner runs no tests at all and every
@@ -2567,22 +2676,31 @@ function judgeSuiteRun(run: SuiteRun, attempt: number, scripts: GateScripts = AL
     return red(`merge gate RED on attempt ${attempt}: gauntlet exited ${run.exitCode}${failCount === null ? " with no test-summary line" : " with 0 fail (typecheck or a crashed run)"}`);
   }
   // Everything below reads bun's own test-run bookkeeping, so it only applies
-  // where the manifest proves bun's runner is what the `test` script runs. A
-  // jest/vitest/pytest-through-npm suite prints none of it; its exit 0 IS the
-  // verdict, and demanding a banner it never emits would refuse every green
-  // merge on that repo forever. The two reads ABOVE stay unconditional because
-  // they are fail-closed anywhere: `^N fail` and bun's `0 test files` line are
-  // bun-shaped text that a foreign runner does not print, so on such a repo
-  // they simply never fire.
-  if (!scripts.bunTest) {
+  // where bun's runner is what the `test` script runs. A jest/vitest/
+  // pytest-through-npm suite prints none of it; its exit 0 IS the verdict, and
+  // demanding a banner it never emits would refuse every green merge on that
+  // repo forever. The two reads ABOVE stay unconditional because they are
+  // fail-closed anywhere: `^N fail` and bun's `0 test files` line are bun-shaped
+  // text that a foreign runner does not print, so on such a repo they never fire.
+  const runs = countSuiteRuns(run.output);
+  // "Is bun's runner what ran?" is answered by the OUTPUT first and the manifest
+  // only second. detectGateScripts now follows `bun run <name>` hops, but static
+  // resolution cannot see through every indirection a script can express (`npm
+  // test`, a shell wrapper, a script that execs a generated command), and the
+  // cost of guessing wrong is asymmetric: guessing "foreign" on a real bun run
+  // hands exit 0 a free pass with all three anti-#132 guards off, which is the
+  // refuted-AC1 hole. A banner in the stream is bun's own statement that its
+  // runner started here, so it OVERRIDES the manifest reading. The reverse
+  // mistake is harmless: a foreign runner that prints no banner still takes the
+  // shortcut below and merges on its own exit code.
+  if (!scripts.bunTest && runs.started === 0) {
     return {
       green: true,
       attempts: attempt,
       failCount,
-      note: `merge gate GREEN on attempt ${attempt}: exit 0 (the worktree's \`test\` script is not \`bun test\`, so the scripts' own exit codes are the verdict)`,
+      note: `merge gate GREEN on attempt ${attempt}: exit 0 (the worktree's \`test\` script is not \`bun test\`, so the scripts' own exit codes are the verdict)${skipped}`,
     };
   }
-  const runs = countSuiteRuns(run.output);
   if (runs.started === 0) {
     // Exit 0 with no banner: nothing bun ran produced this output. Fail-closed
     // in both directions -- a foreign runner that printed nothing parseable,
@@ -2598,7 +2716,7 @@ function judgeSuiteRun(run: SuiteRun, attempt: number, scripts: GateScripts = AL
       `merge gate RED on attempt ${attempt}: ${runs.started} \`bun test\` run(s) started in this output but only ${runs.finished} finished -- a run died without reporting (a \`process.exit\` inside a test), so the ${failCount} fail on the summary line is a different run's verdict, not this one's`
     );
   }
-  return { green: true, attempts: attempt, failCount: 0, note: `merge gate GREEN on attempt ${attempt}: 0 fail, exit 0` };
+  return { green: true, attempts: attempt, failCount: 0, note: `merge gate GREEN on attempt ${attempt}: 0 fail, exit 0${skipped}` };
 }
 
 // The gate. `runAttempt` runs the gauntlet once in the merge worktree, within
@@ -2711,13 +2829,47 @@ function runGauntlet(cwd: string, scripts: GateScripts = ALL_GATE_SCRIPTS, timeo
   return { exitCode: tc.code, output: testOut + tc.out };
 }
 
-// The worktree's HEAD sha, for the verdict's `commit`. Best-effort by design:
-// the sha is provenance, so a checkout where `git` cannot be shelled still gets
-// a real green/red rather than a gate that refuses to answer.
+// The worktree's HEAD sha -- the verdict's `commit` when the gate stamps one,
+// and the fact nextAction compares it against when the merge decision is made.
+// `undefined` means git could not answer (no worktree, no git); both readers
+// treat that as unprovable rather than fine, so it never silently passes.
 function gitHead(cwd: string): string | undefined {
   const p = Bun.spawnSync(["git", "-C", cwd, "rev-parse", "HEAD"], { stdout: "pipe", stderr: "pipe" });
   if (p.exitCode !== 0) return undefined;
   return new TextDecoder().decode(p.stdout).trim() || undefined;
+}
+
+// #248: what `next` observed about each lane's branch this tick. `null` is a
+// LOOKED-AND-COULD-NOT-READ, which the merge step refuses; a lane absent from
+// the map was never looked at (it carries no verdict to bind).
+export interface LaneHeadFacts {
+  [ticket: number]: string | null | undefined;
+}
+
+// A lane's worktree, DERIVED from the ticket number rather than taken from
+// anyone. z-loop/SKILL.md's claim row creates exactly this path
+// (`git worktree add ".worktrees/ticket-<N>"`), so the loop can find a lane's
+// code without an agent naming it -- which is the point: the last latent step
+// between changed code and `gh pr merge` used to be "did the agent type the
+// right path" into `merge-gate <worktreePath>`. It cannot be any more, because
+// a verdict stamped from some other checkout carries that checkout's sha and
+// fails the comparison above.
+export function laneWorktreePath(ticket: number, root: string = process.cwd()): string {
+  return join(root, ".worktrees", `ticket-${ticket}`);
+}
+
+// Reads the branch head of every lane carrying a gate verdict. Only those: a
+// lane with no stamp is re-gated by nextAction regardless, so spending a `git`
+// spawn on it would buy nothing, and `next` runs on every tick of the drain.
+// git, never gh -- lib/board.ts is the pack's sole gh caller (tests/board.test.ts
+// pins it), and a branch head is a local fact that needs no API call.
+export function observeLaneHeads(state: LoopState, root: string = process.cwd()): LaneHeadFacts {
+  const facts: LaneHeadFacts = {};
+  for (const lane of state.lanes ?? []) {
+    if (!lane.mergeGate) continue;
+    facts[lane.ticket] = gitHead(laneWorktreePath(lane.ticket, root)) ?? null;
+  }
+  return facts;
 }
 
 // -- #138 targeted confirm pass ----------------------------------------------
@@ -3105,7 +3257,10 @@ export function main(argv: string[]): number {
 
     if (cmd === "next") {
       const state = readJson(statePath) as LoopState;
-      console.log(JSON.stringify(nextAction(state, nowMs)));
+      // #248: the heads are read HERE, by the loop, not passed in by whoever
+      // called it. That is what makes the commit binding an enforcement rather
+      // than another thing the orchestrator could forget to do.
+      console.log(JSON.stringify(nextAction(state, nowMs, observeLaneHeads(state))));
       return 0;
     }
     if (cmd === "apply") {

@@ -24,8 +24,10 @@ import {
   countSuiteRuns,
   detectGateScripts,
   foundNoTestFiles,
+  laneWorktreePath,
   mergeGate,
   mergeGateBaseKey,
+  observeLaneHeads,
   MERGE_GATE_BUDGET_MS,
   MERGE_GATE_MAX_RUNS,
   MERGE_GATE_RETRY_WAIT_MS,
@@ -5490,11 +5492,55 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
       expect(bunTest("rebun testify")).toBe(false);
     });
 
+    // The refuted-AC1 shapes. A skeptic ran three byte-identical fixtures (a
+    // failing `a-broken.test.ts` plus a `z-exit.test.ts` calling
+    // `process.exit(0)`) through the shipped CLI, differing ONLY in the script
+    // string, and the two indirect ones came back
+    // `{"green":true,"attempts":1,"failCount":null}` exit 0 -- merge permission
+    // on a branch with a failing test, #132's exact shape. Root cause: a
+    // literal-only `bun test` match classified bun's runner reached through a
+    // hop as foreign, which switched off all three anti-#132 guards at once.
+    test("detectGateScripts follows `bun run <name>` hops -- an indirect bun runner is still bun's", () => {
+      const bunTest = (scripts: Record<string, string>) => detectGateScripts(JSON.stringify({ scripts })).bunTest;
+      expect(bunTest({ test: "bun run inner", inner: "bun test" })).toBe(true);
+      expect(bunTest({ test: "bun run test:unit", "test:unit": "bun test" })).toBe(true);
+      // Both limbs of a chain are followed, not just the first.
+      expect(bunTest({ test: "bun run test:e2e && bun run test:unit", "test:e2e": "echo e2e", "test:unit": "bun test" })).toBe(true);
+      // Multi-hop.
+      expect(bunTest({ test: "bun run a", a: "bun run b", b: "bun test" })).toBe(true);
+      // A hop that lands somewhere foreign stays foreign -- the resolver adds
+      // positive evidence, it does not assume any indirection means bun.
+      expect(bunTest({ test: "bun run inner", inner: "jest --ci" })).toBe(false);
+      // A hop naming a script that does not exist proves nothing.
+      expect(bunTest({ test: "bun run missing" })).toBe(false);
+    });
+
+    // A hand-edited manifest must not hang the gate: a stalled drain is the
+    // failure PROCESS.md ranks alongside a bad merge.
+    test("a self-referential or ringed script table terminates instead of recursing forever", () => {
+      const bunTest = (scripts: Record<string, string>) => detectGateScripts(JSON.stringify({ scripts })).bunTest;
+      expect(bunTest({ test: "bun run test" })).toBe(false);
+      expect(bunTest({ test: "bun run a", a: "bun run b", b: "bun run a" })).toBe(false);
+      // ...and a ring that DOES reach bun's runner still reports it.
+      expect(bunTest({ test: "bun run a", a: "bun run b", b: "bun run a && bun test" })).toBe(true);
+    });
+
     test("`test` defined, `typecheck` absent: the suite alone reads GREEN", () => {
       const { verdict, attempts, waits } = driveGate([{ exitCode: 0, output: suiteTail(1261, 0) }], { test: true, typecheck: false, bunTest: true });
       expect(verdict).toMatchObject({ green: true, attempts: 1, failCount: 0 });
       expect(attempts).toEqual([1]); // no retry burned on a script that is simply not there
       expect(waits).toEqual([]);
+      // A DOCUMENTED absence, not a silent pass: the verdict names the limb it
+      // did not run, so a green measured on half the gauntlet can be told from
+      // one measured on all of it. The skip is only defensible while it says so.
+      expect(verdict.note).toContain("no `typecheck` script in package.json");
+      expect(verdict.note).toContain("not run");
+    });
+
+    test("a green measured on BOTH limbs claims no absence", () => {
+      const { verdict } = driveGate([{ exitCode: 0, output: suiteTail(1261, 0) }], { test: true, typecheck: true, bunTest: true });
+      expect(verdict.green).toBe(true);
+      expect(verdict.note).not.toContain("not run");
     });
 
     test("`test` defined, `typecheck` absent: a failing suite is still RED -- the skip is not a bypass", () => {
@@ -5570,6 +5616,40 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
     test("where the script IS `bun test`, a bannerless exit 0 stays red", () => {
       const bare = { exitCode: 0, output: "PASS tests/foo.spec.js\nTests: 12 passed\n" };
       expect(driveGate([bare, bare]).verdict).toMatchObject({ green: false });
+    });
+
+    // The other half of the refuted-AC1 fix, and the half that does not depend
+    // on static resolution being complete. `detectGateScripts` now follows
+    // `bun run <name>` hops, but no manifest read can see through `npm test`, a
+    // shell wrapper, or a script that execs a generated command -- and guessing
+    // "foreign" on a real bun run is the expensive mistake: it hands exit 0 a
+    // pass with the banner count, the fail count and the started-vs-finished
+    // check all switched off. A banner in the stream is bun saying its runner
+    // started here, so it beats whatever the manifest suggested.
+    test("a bun banner in the output overrides a foreign manifest reading -- exit 0 with no summary is RED", () => {
+      // The skeptic's fixture B, byte-shaped: bun's banner, a failing test line,
+      // and a `process.exit(0)` before the summary ever prints.
+      const exitEarly = { exitCode: 0, output: `${SUITE_BANNER}(fail) really broken\n` };
+      const { verdict } = driveGate([exitEarly, exitEarly], FOREIGN);
+      expect(verdict).toMatchObject({ green: false });
+      expect(verdict.note).toContain("the suite did not run");
+    });
+
+    test("a bun banner in the output overrides a foreign manifest reading -- a nested run's summary does not vouch", () => {
+      // Two runs started, one finished: the surviving ` 0 fail` belongs to the
+      // nested run, not to the one that died. Reachable ONLY once the banner
+      // overrides the manifest -- the foreign shortcut returned green here.
+      const donated = { exitCode: 0, output: `${SUITE_BANNER}${suiteTail(4, 0)}` };
+      const { verdict } = driveGate([donated, donated], FOREIGN);
+      expect(verdict).toMatchObject({ green: false });
+      expect(verdict.note).toContain("finished");
+    });
+
+    test("...and a genuinely foreign runner that prints no banner is unaffected", () => {
+      // The safe direction of the same rule: no banner, no bun bookkeeping
+      // demanded, the repo's own exit code is the verdict.
+      const { verdict } = driveGate([{ exitCode: 0, output: "ok 12 - all good\n" }], FOREIGN);
+      expect(verdict).toMatchObject({ green: true, attempts: 1 });
     });
   });
 
@@ -5714,14 +5794,30 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
     // the merge, breaking AC1's "merges under NO circumstance while red".
     // Mutating `code: 124` to `code: 0` left the whole suite green before this.
     // --budget-ms is the only way to reach the kill without waiting 570s.
+    //
+    // The two numbers below are a MEASURED pair, not taste. This started at a
+    // 1500ms budget against a 5000ms sleep and failed 2 of 6 full-trio runs
+    // (green 4/4 in isolation): bun's own process startup on this Windows
+    // machine is ~1s (#252 measured eight sequential bun spawns at ~2s a tick,
+    // tests/z-loop-tick.test.ts:31-51), so 1500ms left ~500ms of headroom, and
+    // under load attempt 1 sometimes returned a plain nonzero BEFORE the kill
+    // -- which the gate then retried, and `attempts: 1` went red on a machine
+    // where nothing was broken. It matters more than a normal flake because
+    // this diff makes the suite an unbypassable merge blocker: a load-flaky
+    // test inside it costs a lane an attempt every time it fires.
+    //
+    // 3000ms is 3x the measured startup, and the sleep is raised to 20s so the
+    // limb is still running by a wide margin when the budget kills it. The test
+    // costs ~3s of wall clock by construction (it waits out its own budget).
+    // Move either number only with a fresh measurement written here.
     test("a limb killed at the wall-clock budget is RED, never a clean exit 0", () => {
       const p = project("budget-kill", null, "bun slow.ts", { typecheck: "bun slow.ts" });
       // Steps out of the worktree before blocking. The budget kills `bun run
       // typecheck`, not the grandchild it spawned, and on Windows a live
       // process's cwd cannot be removed -- without the chdir this fixture's
       // directory survives its own afterAll with EBUSY.
-      writeFileSync(join(p, "slow.ts"), 'process.chdir(require("node:os").tmpdir());\nBun.sleepSync(5000);\n');
-      const proc = runGate(p, "--retry-wait-ms", "0", "--budget-ms", "1500");
+      writeFileSync(join(p, "slow.ts"), 'process.chdir(require("node:os").tmpdir());\nBun.sleepSync(20000);\n');
+      const proc = runGate(p, "--retry-wait-ms", "0", "--budget-ms", "3000");
       expect(proc.exitCode).toBe(1);
       const verdict = JSON.parse(proc.stdout.toString());
       expect(verdict).toMatchObject({ green: false, attempts: 1 });
@@ -5824,6 +5920,96 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
       }
       const head = new TextDecoder().decode(Bun.spawnSync(["git", "-C", p, "rev-parse", "HEAD"], { stdout: "pipe" }).stdout).trim();
       expect(JSON.parse(runGate(p).stdout.toString()).commit).toBe(head);
+    });
+
+    // The refuted-AC1 repro, end to end on the real deployed path. Three
+    // byte-identical fixtures differing ONLY in the script string used to come
+    // back exit 1 / exit 0 / exit 0 -- the two indirect ones handing merge
+    // permission to a tree with a failing test. All three are red now.
+    // BOTH fixture files matter, which is why they are written together. A
+    // failing test ALONE prints ` 1 fail` on the summary line, and that read is
+    // unconditional -- so an indirect script is red there whatever the manifest
+    // said, and a fixture with only the failing test proves nothing about this
+    // fix. `z-exit.test.ts` is what makes the repro discriminating: it calls
+    // `process.exit(0)`, killing the run before its summary prints, so the
+    // whole gauntlet exits 0 with a banner, a `(fail)` line and no verdict of
+    // its own -- #132's "the suite did not run" shape. Only the bun-bookkeeping
+    // checks catch that, and those are exactly what a `bunTest: false` reading
+    // switches off.
+    test("a bun suite reached INDIRECTLY through `bun run` is still gated (refuted AC1)", () => {
+      const shapes: Array<[string, Record<string, string>]> = [
+        ["direct", { test: "bun test", typecheck: "bun --version" }],
+        ["one-hop", { test: "bun run inner", inner: "bun test", typecheck: "bun --version" }],
+        ["named-hop", { test: "bun run test:unit", "test:unit": "bun test", typecheck: "bun --version" }],
+      ];
+      for (const [name, scripts] of shapes) {
+        const p = project(`indirect-${name}`, 'import {test,expect} from "bun:test";\ntest("really broken",()=>{expect(1).toBe(2)});\n', "bun --version", scripts);
+        writeFileSync(join(p, "z-exit.test.ts"), 'import {test} from "bun:test";\ntest("exit",()=>{process.exit(0)});\n');
+        const proc = runGate(p, "--retry-wait-ms", "0");
+        expect([name, proc.exitCode]).toEqual([name, 1]);
+        expect([name, JSON.parse(proc.stdout.toString()).green]).toEqual([name, false]);
+      }
+    });
+
+    // -- #248 end to end: `next` binds the verdict to the branch it observes --
+    //
+    // The reducer tests below drive both arms with synthetic shas. This is the
+    // deployed path: a real repo, a real lane worktree at `.worktrees/ticket-7`
+    // whose path the loop DERIVES from the ticket number, and the real `next`
+    // command reading its own facts. Without it, "the CLI actually supplies the
+    // heads" would be prose.
+    describe("`next` reads the lane worktree's own HEAD (#248)", () => {
+      const repo = join(dir, "bind");
+      const wt = join(repo, ".worktrees", "ticket-7");
+      const git = (...args: string[]) => {
+        const p = Bun.spawnSync(["git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t", ...args], { stdout: "pipe", stderr: "pipe" });
+        if (p.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${p.stderr.toString()}`);
+        return new TextDecoder().decode(p.stdout).trim();
+      };
+      const headOf = (d: string) => new TextDecoder().decode(Bun.spawnSync(["git", "-C", d, "rev-parse", "HEAD"], { stdout: "pipe" }).stdout).trim();
+
+      // One fixture, both arms: the verdict is stamped on `gated`, then the
+      // branch takes another commit under it.
+      let gated = "";
+      let moved = "";
+      function setup(): void {
+        if (gated) return;
+        mkdirSync(repo, { recursive: true });
+        git("init", "-q");
+        writeFileSync(join(repo, "a.txt"), "one\n");
+        git("add", "-A");
+        git("commit", "-qm", "base");
+        git("worktree", "add", "-q", join(".worktrees", "ticket-7"), "-b", "z/ticket-7");
+        gated = headOf(wt);
+        writeFileSync(join(wt, "a.txt"), "two\n");
+        expect(Bun.spawnSync(["git", "-C", wt, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-aqm", "after the gate"]).exitCode).toBe(0);
+        moved = headOf(wt);
+        expect(moved).not.toBe(gated);
+      }
+
+      // `next` run FROM the repo root, exactly as z-loop/SKILL.md runs it.
+      const runNext = (commit: string) => {
+        setup();
+        const sp = join(repo, `next-${commit.slice(0, 7)}.json`);
+        writeFileSync(sp, JSON.stringify(state([ticket(7, "Review")], [lane(7, "reviewer", { outcome: approve(100), mergeGate: { ...GREEN_GATE, commit } })])));
+        const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", sp], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+        expect(proc.exitCode).toBe(0);
+        return JSON.parse(proc.stdout.toString()) as Action;
+      };
+
+      test("a verdict naming the branch's current HEAD advances to merge", () => {
+        setup();
+        expect(runNext(moved)).toMatchObject({ kind: "advance", ticket: 7, to: "merge" });
+      });
+
+      test("a verdict naming the commit the branch has since MOVED off refuses", () => {
+        setup();
+        const a = runNext(gated);
+        expect(a).toMatchObject({ kind: "park", ticket: 7, status: "Blocked" });
+        expect(a.kind).not.toBe("advance");
+        expect((a as { note: string }).note).toContain(gated);
+        expect((a as { note: string }).note).toContain(moved);
+      });
     });
 
     // -- the stamping form: the verdict lands on the lane, which is what makes
@@ -6057,6 +6243,45 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
         expect(nextAction(s, 0)).toEqual({ kind: "park", ticket: 8, status: "Blocked", note: red.note });
       });
 
+      // The base-move check reads `mergedThisRun`, which `complete` was the only
+      // writer of -- so a merge that resolved through `stop-lane` instead (a
+      // human dragging the merging card to Done mid-run) dropped the lane
+      // without recording it, the base key stayed "", and every waiting lane's
+      // pre-parent green stayed live merge permission. Reproduced end to end:
+      // #8 depends on #7, both stamped at t0, #7 resolved by stop-lane, and #8
+      // still advanced with `stackedOn:[]` -- the reducer no longer even aware
+      // its parent had landed.
+      test("a merge that resolves through stop-lane still moves the base (it is not only `complete`)", () => {
+        // #7 is in the merge stage and its card is already Done -- the human
+        // moved it mid-run, so the lane resolves by stop-lane rather than by
+        // `complete`. #8 depends on it and was stamped green at t0.
+        let s = state(
+          [ticket(7, "Done"), ticket(8, "Review", [7])],
+          [lane(7, "merge", { outcome: { kind: "merged", note: "https://x/1" } }), lane(8, "reviewer", { outcome: approve(100) })]
+        );
+        s = recordMergeGate(s, 8, GREEN_GATE, 0);
+        expect(s.lanes[1].mergeGateBase).toBe("");
+        const stop = nextAction(s, 0);
+        expect(stop).toMatchObject({ kind: "stop-lane", ticket: 7 });
+        s = applyAction(s, stop, 0);
+        expect(s.mergedThisRun).toEqual([7]); // the landing is recorded, not lost with the lane
+        expect(nextAction(s, 0)).toEqual({ kind: "merge-gate", ticket: 8 }); // ...so #8 re-gates
+      });
+
+      test("a stop-lane at any OTHER stage records nothing -- only a merge-stage lane on a Done ticket landed", () => {
+        const s = state([ticket(7, "Done")], [lane(7, "qa", { outcome: { kind: "qa-pass" } })]);
+        const stop = nextAction(s, 0);
+        expect(stop).toMatchObject({ kind: "stop-lane", ticket: 7 });
+        expect(applyAction(s, stop, 0).mergedThisRun ?? []).toEqual([]);
+      });
+
+      test("...and a merge-stage lane whose ticket is NOT Done records nothing either", () => {
+        const s = state([ticket(7, "Blocked")], [lane(7, "merge", { outcome: { kind: "merged", note: "https://x/1" } })]);
+        const stop = nextAction(s, 0);
+        expect(stop).toMatchObject({ kind: "stop-lane", ticket: 7 });
+        expect(applyAction(s, stop, 0).mergedThisRun ?? []).toEqual([]);
+      });
+
       // MERGE_GATE_MAX_RUNS bounds CONSECUTIVE silent attempts. Without the
       // reset, a lane legitimately re-gated once per base move would trip the
       // "started N times and never returned a verdict" park on the strength of
@@ -6069,6 +6294,94 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
         s = recordMergeGate(s, 7, GREEN_GATE, 0); // ...but this one answered
         expect(s.lanes[0].mergeGateRuns).toBeUndefined();
         expect(nextAction(s, 0)).toMatchObject({ kind: "advance", ticket: 7, to: "merge" });
+      });
+    });
+
+    // -- #248: the verdict is bound to the commit it was measured on ----------
+    //
+    // `MergeGateVerdict.commit` was written by the gate and read by NOBODY, so
+    // a green stamp taken on commit A authorized a merge of commit B. The base
+    // check above covers the base moving under a stamp; this covers the stamp
+    // not being about this branch at all -- reproduced by running
+    // `merge-gate <someOtherWorktree> --state st.json --ticket 8` and watching
+    // `next` hand out {"kind":"advance","ticket":8,"to":"merge"} on it.
+    describe("a green verdict measured on a different commit is not permission to merge (#248)", () => {
+      const HEAD = "a".repeat(40);
+      const OTHER = "b".repeat(40);
+      const gateOn = (commit: string) => ({ ...GREEN_GATE, commit });
+
+      test("the stamped commit IS the head: advance, unchanged", () => {
+        const s = approved({ mergeGate: gateOn(HEAD) });
+        expect(nextAction(s, 0, { 7: HEAD })).toEqual({ kind: "advance", ticket: 7, to: "merge", stackedOn: [] });
+      });
+
+      test("the stamped commit is NOT the head: no advance, a park naming both shas", () => {
+        const s = approved({ mergeGate: gateOn(OTHER) });
+        const a = nextAction(s, 0, { 7: HEAD });
+        expect(a).toMatchObject({ kind: "park", ticket: 7, status: "Blocked" });
+        expect((a as { note: string }).note).toContain(OTHER);
+        expect((a as { note: string }).note).toContain(HEAD);
+        // The whole point: it is not merely "not advanced", it is never `merge`.
+        expect(a.kind).not.toBe("advance");
+      });
+
+      // A refusal rather than a re-gate, deliberately. The mismatch's reachable
+      // cause is a verdict measured somewhere other than this lane's worktree,
+      // and asking the same producer for the same verdict again reproduces it
+      // forever -- a stall, which PROCESS.md forbids as firmly as a bad merge.
+      test("the refusal is terminal: repeating the tick keeps parking, it never becomes an advance", () => {
+        const s = approved({ mergeGate: gateOn(OTHER) });
+        for (let i = 0; i < 3; i++) {
+          expect(nextAction(s, 0, { 7: HEAD })).toMatchObject({ kind: "park", status: "Blocked" });
+        }
+      });
+
+      // Fail-closed in both unprovable directions. Neither is a silent pass:
+      // an unbindable verdict is precisely what #248 says is not a gate.
+      test("a verdict carrying NO commit is refused, not waved through", () => {
+        const a = nextAction(approved({ mergeGate: GREEN_GATE }), 0, { 7: HEAD });
+        expect(a).toMatchObject({ kind: "park", ticket: 7, status: "Blocked" });
+        expect((a as { note: string }).note).toContain("names no commit");
+      });
+
+      test("a head the loop LOOKED for and could not read is refused, not waved through", () => {
+        const a = nextAction(approved({ mergeGate: gateOn(HEAD) }), 0, { 7: null });
+        expect(a).toMatchObject({ kind: "park", ticket: 7, status: "Blocked" });
+        expect((a as { note: string }).note).toContain("could not read a HEAD");
+      });
+
+      // The absent-argument arm: reducer-only callers (this suite's own several
+      // hundred nextAction calls, the e2e sim) made no observation, so there is
+      // nothing to compare and the check does not fire. The production path
+      // never lands here -- the `next` CLI always supplies the map, which the
+      // CLI test below drives against a real git worktree.
+      test("no observation supplied means the binding is not checked (and nothing else changes)", () => {
+        expect(nextAction(approved({ mergeGate: gateOn(OTHER) }), 0)).toMatchObject({ kind: "advance", to: "merge" });
+      });
+
+      // Ordering pin: RED loses to nothing. A red verdict must park on its own
+      // note whatever the commit binding says, or the operator reads "the
+      // branch moved" for a lane that actually has 9 failing tests.
+      test("a RED verdict parks on the gate's own note even when the commit also mismatches", () => {
+        const red = { green: false, attempts: 2, failCount: 9, note: "merge gate RED on attempt 2: suite summary reports 9 fail (exit 1) -- refusing the merge", commit: OTHER };
+        expect(nextAction(approved({ mergeGate: red }), 0, { 7: HEAD })).toEqual({ kind: "park", ticket: 7, status: "Blocked", note: red.note });
+      });
+
+      // observeLaneHeads is the seam's IO half: it must spend a `git` spawn on
+      // exactly the lanes whose verdict can be bound, since `next` runs every
+      // tick of the drain.
+      test("observeLaneHeads reads only lanes carrying a verdict", () => {
+        const s = state(
+          [ticket(7, "Review"), ticket(8, "Review")],
+          [lane(7, "reviewer", { outcome: approve(100), mergeGate: gateOn(HEAD) }), lane(8, "reviewer", { outcome: approve(100) })]
+        );
+        const heads = observeLaneHeads(s, join(tmpdir(), "zstack-no-such-repo"));
+        expect(Object.keys(heads)).toEqual(["7"]); // #8 has no stamp: nothing to bind, no spawn
+        expect(heads[7]).toBeNull(); // looked, could not read -- NOT "fine"
+      });
+
+      test("the lane worktree is derived from the ticket number, never taken from a caller", () => {
+        expect(laneWorktreePath(7, join("R"))).toBe(join("R", ".worktrees", "ticket-7"));
       });
     });
 
