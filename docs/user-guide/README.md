@@ -357,9 +357,14 @@ The next batch is the next invocation.
    Nothing latent travels between stages — each is a new agent built from a
    pure prompt constructor. The reviewer can't be talked into leniency by the
    builder because it never sees the builder.
-5. **Watchdog.** A worker silent past `watchdogMinutes` (default 10) is probed;
-   if dead, the ticket is Skipped with a note (except a dead merge lane, where
-   the loop first checks whether the PR actually landed before deciding).
+5. **Watchdog.** A lane whose agent subtree has appended nothing to its
+   transcripts for that stage's `watchdogMinutes` (builder 25, qa 15,
+   reviewer 40, merge 15 by default) is probed; if dead, the ticket is Skipped
+   with a note (except a dead merge lane, where the loop first checks whether
+   the PR actually landed before deciding). It is silence that is measured, not
+   how long the stage has been running, so a stage that works for an hour is
+   never probed for being slow — but no stage holds a lane past 480 minutes,
+   which is what stops a wedged worker from answering ALIVE forever.
 6. **Costs.** After every stage, the ticket's transcripts are priced by
    `bin/z-cost` (deduped by request id) and written to its Actual field. By
    Done, Actual is the ticket's real cumulative dollar cost.
@@ -419,8 +424,9 @@ Read-only, any time — before a loop, during one, or after:
 - Ticket counts across all nine statuses.
 - **Waiting on human**: the Questions and Blocked tickets by number and title —
   exactly what needs you before the next loop can make progress.
-- In-flight lanes with ticket, stage, and age (a lane older than the watchdog
-  is about to be probed).
+- In-flight lanes with ticket, stage, and lock age (age is not what the watchdog
+  reads — it fires on transcript silence — so a long-lived lane here is usually
+  just a long stage; 480 minutes is the ceiling past which it parks Blocked).
 - The last loop's report path and verdict line (GREEN or RED).
 - Estimate vs Actual totals, for calibration.
 
@@ -458,7 +464,7 @@ are managed by setup; don't hand-edit them. The tunables:
 | --- | --- | --- |
 | `epicStyle` | `"milestones"` | How epics are modeled. Only `milestones` is supported today. |
 | `maxLanes` | `3` | Max concurrent lanes in a loop run. |
-| `watchdogMinutes` | `10` | Minutes of worker silence before the loop probes and, if dead, skips the lane. |
+| `watchdogMinutes` | `{"builder":25,"qa":15,"reviewer":40,"merge":15}` | Minutes in which a lane's agent subtree appended nothing to its transcripts before the loop probes and, if dead, skips the lane. Per stage, each 2x that stage's measured worst silence, floored at 2x the longest measured gap of any single agent (423s). A plain number applies one budget to every stage; an object with only some stages set overrides those and defaults the rest. |
 | `lockStalenessMinutes` | `60` | Age past which a crashed loop's lock is judged stale (also stale immediately when its pid is dead on the same host). |
 | `maxQaPasses` | `3` | QA passes on a ticket before it parks Blocked instead of bouncing to a fresh builder. |
 | `qaInvestigateAfter` | `2` | QA-bounce count at/after which the rebuild runs `/investigate` first. |

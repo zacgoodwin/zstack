@@ -21,9 +21,13 @@ what a finished loop left behind:
 - **Waiting on human** — the Questions and Blocked tickets by number + title;
   exactly what needs a decision before the next loop can make progress.
 - **In-flight lanes** — when a loop is live, each lane's ticket, current stage,
-  and age since its last activity (from the lock timestamps). A lane older than the
-  watchdog is about to be marked dead by the orchestrator. "None (board is idle)"
-  when nothing is running.
+  and how long its lane lock has been held. That age is **not** the watchdog's
+  input: since #256 the watchdog fires on transcript SILENCE, not on how long a
+  stage has been running, so a long-lived lane here is usually just a long stage
+  and is not about to be marked dead. A lane approaching 480 minutes is the one
+  worth a look — that is the per-stage ceiling, past which the loop parks it
+  Blocked whatever its worker reports. "None (board is idle)" when nothing is
+  running.
 - **Last loop** — the path to the newest `reports/loop-*.md` and its verdict line
   (GREEN = deployed, RED = regressions filed, no deploy).
 - **Milestone Totals** — Estimate vs Actual, grouped by milestone (the epic

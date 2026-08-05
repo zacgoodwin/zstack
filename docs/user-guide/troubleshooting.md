@@ -153,6 +153,69 @@ whether the stage prompt's foreground rule is being honored (verification must
 finish before the final message — a backgrounded gate can never report back,
 because the loop sends each stage agent exactly one message by design).
 
+## A healthy stage was probed (or Skipped) while it was still working
+
+Before #256 this was the expected behavior, not a fault: `watchdogMinutes` was
+compared against the moment the stage STARTED, because nothing in the pack ever
+observed a worker. So the timer fired that many minutes after the claim however
+hard the agent was working, and a QA stage — ordered to run typecheck, the full
+suite, and the build before touching its first acceptance criterion, which is
+121s idle and 234s under load on this repo — routinely crossed the old 10-minute
+default while perfectly healthy. If the harness had already forgotten the agent
+by then, the probe answered dead and the ticket was Skipped with real work in it.
+
+Now the baseline is real silence. Every tick reads the newest transcript record
+across the lane's stage agent and every sub-agent it spawned, and moves the
+lane's baseline forward to it, so only a lane that has written nothing for
+`watchdogMinutes` is probed. The default is 15, derived as 2x the longest
+measured gap between a working agent's own records (423s over 9,589 mid-work
+samples).
+
+If you still see a working stage probed, read the tick's stderr for:
+
+```text
+loop heartbeat: no session transcript directory resolved; every lane keeps its current watchdog baseline.
+#<N> <stage> no subtree observed; baseline unchanged
+```
+
+Either line means the observation is not happening for that lane and it has
+fallen back to the old stage-age timer. The usual causes: the loop is running in
+a directory whose Claude Code session transcript cannot be resolved, or the stage
+was spawned without its `--spawn-tag` stub (the tag is how a lane finds its own
+agent among every other lane's in one flat `subagents/` directory). Until it is
+fixed, raising `watchdogMinutes` in `~/.zstack/projects/<slug>/config.json` is
+the safe stopgap — it costs nothing but a longer wait before a genuinely dead
+worker is noticed.
+
+## A lane was parked Blocked for passing the 480-minute stage ceiling
+
+The note reads "The `<stage>` stage has held this lane for N minutes, past the
+480-minute per-stage ceiling". Nothing is proven broken — that park is a bound,
+not a verdict.
+
+Why it exists: an ALIVE probe refreshes the silence baseline with no memory of
+the probes before it, so a worker that is wedged but still registered in the
+harness task list answers alive, the baseline resets, and the lane is probed
+again one budget later. Forever. Every other retry in the pack is outcome-driven
+(QA bounces, reviewer bounces, quorum retries, commit retries, re-spawns);
+elapsed time had none, so nothing ended that sequence but a human noticing a
+ticket that had been "in progress" since yesterday. The ceiling is the only
+thing in the loop that ends it.
+
+480 minutes is 2x the longest stage that ever finished normally on this machine
+(3.7 hours, measured over 939 stage agents), so a stage that was going to land is
+not parked by it.
+
+What to do: the branch and worktree are intact and any uncommitted work was
+dumped to `~/.zstack/projects/<slug>/reports/uncommitted-<N>.patch`. Look at what
+the agent actually did, then return the ticket to Ready. If it was a **merge**
+stage, check `gh pr view` first — the PR may have landed before the agent wedged,
+in which case the ticket is Done rather than Blocked, and the note says so.
+
+If healthy stages on your project genuinely run this long, the fix is not raising
+the ceiling: split the ticket. A stage that needs 8 hours has more in it than one
+agent's context window can hold.
+
 ## `git worktree list` is full of leftover `review-*` worktrees
 
 Those are the reviewer's throwaway checkouts. They hold no work — each is a

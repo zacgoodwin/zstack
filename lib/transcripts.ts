@@ -303,6 +303,52 @@ export const SUBTREE_QUIET_MS = 900_000;
 // margin; the gate test is the enforcement.
 export const MEASURED_MIDWORK_GAP_MS = 423_110;
 
+// The longest SILENCE a healthy stage of each kind actually produced -- the
+// quantity subtreeActivityMs() reports the newest end of, measured per stage
+// family so the per-stage watchdog budgets (lib/config.ts
+// DEFAULT_STAGE_WATCHDOG_MINUTES) are derived rather than guessed.
+//
+// Method, over every session on this machine: for each orchestrator-spawned
+// (parentless) agent plus its transitive descendants, merge their records into
+// one timeline -- exactly the series the watchdog observes, since a lane is
+// silent only when NOBODY in its subtree has appended -- and take the largest
+// gap between consecutive events. Gaps CLOSED by a `user` record on the root are
+// excluded for the reason #209 excludes them above: that is the orchestrator
+// messaging an agent that had already returned, which measures SendMessage
+// latency, not work. 1,143 subtrees: builder 259, qa 293, reviewer 497, merge 94.
+//
+//   builder   p50 70.6s  p90 196.1s  p99 479.7s  max 608.0s
+//   qa        p50 30.6s  p90  59.9s  p99  97.5s  max 174.8s
+//   reviewer  p50 36.9s  p90  94.3s  p99 186.0s  max 1161.1s
+//   merge     p50  8.6s  p90  30.2s  p99  97.1s  max  97.1s
+//
+// The reviewer's 19-minute outlier (Reviewer #178) is the shape that makes
+// per-stage budgets worth having at all: a reviewer blocked on three BACKGROUND
+// skeptics writes nothing itself, and its skeptics were each blocked on their own
+// long tool calls, so the whole subtree went quiet while working exactly as
+// designed. A single global budget must either clear that -- and be far too
+// patient for a merge stage that only runs `gh pr merge` -- or kill it.
+//
+// These are per-family CEILINGS from this repo's own loop runs; they are NOT a
+// floor for a budget. A family whose sample happens to hold no long quiet stretch
+// (qa's 174.8s over 293 subtrees) says nothing about the agent-level ceiling that
+// MEASURED_MIDWORK_GAP_MS measures over a 22x larger population, which is why
+// every shipped default clears BOTH (gate-tested in tests/loop.test.ts).
+export const MEASURED_STAGE_SILENCE_MS: Record<"builder" | "qa" | "reviewer" | "merge", number> = {
+  builder: 607_966,
+  qa: 174_847,
+  reviewer: 1_161_119,
+  merge: 97_130,
+};
+
+// The longest a stage agent that RETURNED NORMALLY has ever run on this machine:
+// 3.7 hours, a "Build C9 /z-status dashboard" builder, over 939 stage-described
+// parentless agents that came to rest on a final answer (p50 8.0m, p95 27.8m,
+// p99 48.6m, 6 over 60m, 2 over 120m). This is the population lib/loop.ts's
+// STAGE_CEILING_MINUTES must clear: a ceiling under it would park a stage that
+// was going to finish.
+export const MEASURED_MAX_STAGE_MS = 13_304_097;
+
 // The `stop_reason` values that END a turn. A record carrying one is the agent's
 // last word by definition -- the harness has nothing more to append until someone
 // messages it -- so it needs no quiet window at all.
@@ -378,26 +424,36 @@ function lastTouchedMs(subagentsDir: string, id: string, stamped: number): numbe
   return undefined;
 }
 
+// One agent's transcript as its JSONL lines, oldest first. Never throws: a
+// missing, unreadable, or empty transcript yields no lines, and every caller here
+// treats "no lines" as "this file proves nothing" rather than as evidence.
+//
+// Shared by the two readers below (agentFinished's shape check and
+// lastRecordStampMs's activity scan) so a transcript is parsed one way in this
+// file, not two -- #256 needed the tail of the same file #209 already reads.
+function transcriptLines(subagentsDir: string, id: string): string[] {
+  let text: string;
+  try {
+    text = readFileSync(join(subagentsDir, `agent-${id}.jsonl`), "utf8");
+  } catch {
+    return [];
+  }
+  const trimmed = text.trimEnd();
+  return trimmed === "" ? [] : trimmed.split("\n");
+}
+
 // Has this agent's own transcript come to rest? Three answers, in the order their
 // evidence is strongest: a turn-ending `stop_reason` (proof), silence past the
 // staleness ceiling (nothing is running behind a transcript nobody has written to
 // in 8 hours), and a final-answer shape that has been quiet for the settling
 // window. Everything else -- and every unreadable input -- is LIVE.
 function agentFinished(subagentsDir: string, id: string, now: number, quietMs: number, staleMs: number): boolean {
-  let text: string | undefined;
-  try {
-    text = readFileSync(join(subagentsDir, `agent-${id}.jsonl`), "utf8");
-  } catch {
-    text = undefined; // no transcript to prove anything with
-  }
+  const lines = transcriptLines(subagentsDir, id);
   let last: any;
-  if (text !== undefined) {
-    const lines = text.trimEnd().split("\n");
-    try {
-      last = JSON.parse(lines[lines.length - 1]);
-    } catch {
-      last = undefined; // a half-written final line IS the harness writing right now
-    }
+  try {
+    last = JSON.parse(lines[lines.length - 1]);
+  } catch {
+    last = undefined; // a half-written final line IS the harness writing right now
   }
   const stamped = Date.parse(last?.timestamp ?? "");
   // The ceiling comes first because it is the one answer that must hold for EVERY
@@ -494,6 +550,91 @@ export function liveAgentsIn(subagentsDir: string, opts: LivenessWindow = {}): s
     if (!agentFinished(subagentsDir, m[1], now, quietMs, staleMs)) out.push(m[1]);
   }
   return out.sort();
+}
+
+// -- subtree activity (#256) ---------------------------------------------------
+
+// When this agent last APPENDED anything, by the record's own clock.
+//
+// Scans backwards for the newest record that carries a parseable `timestamp`,
+// rather than reading only the last line, because the two shapes that make a
+// last line undatable are both shapes a WORKING agent produces: a final line
+// caught half-written (the harness is appending right now) and a record with no
+// timestamp field at all. Reading only the tail would call those "no activity"
+// and hand the watchdog a silence it did not observe. The scan is bounded by the
+// file and stops at the first datable record, so the normal case reads one line.
+//
+// The record's OWN timestamp, never the file's mtime -- the same rule
+// agentFinished's settling window follows and for the same reason: collection
+// COPIES transcripts (collectTranscripts above), and an mtime would make a copied
+// transcript look freshly active. Here that would be worse than in the liveness
+// check, because this number is what tells the watchdog a wedged stage is wedged.
+function lastRecordStampMs(subagentsDir: string, id: string): number | undefined {
+  const lines = transcriptLines(subagentsDir, id);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let rec: any;
+    try {
+      rec = JSON.parse(lines[i]);
+    } catch {
+      continue;
+    }
+    const stamp = Date.parse(rec?.timestamp ?? "");
+    if (Number.isFinite(stamp)) return stamp;
+  }
+  return undefined;
+}
+
+// The newest transcript append anywhere in ONE stage spawn's subtree: the stage
+// agent itself plus every descendant, transitively. This is the signal
+// LaneState.lastActivityMs claimed to hold and never did (#256) -- the watchdog
+// was comparing `now` against the moment the STAGE STARTED, so it fired
+// watchdogMinutes after a claim however hard the agent was working, and a QA
+// stage crossed the 10-minute default while still running the mandatory suite.
+//
+// The whole SUBTREE, not just the stage agent: the reviewer's three skeptics do
+// the work of the reviewer stage (#190 prices them as that stage's spend for the
+// same reason), and a reviewer blocked on three live skeptics writes nothing of
+// its own for as long as they run. Taking the newest stamp across the subtree
+// makes "someone in this stage is working" the thing observed, which is what the
+// watchdog is actually asking.
+//
+// FAILS OPEN, always: `undefined` means "no observation", never "silent". Every
+// unresolvable input lands there -- no session transcript directory, a tag no
+// parentless agent carries (the spawn has not written its first line yet, or the
+// prompt was built without --spawn-tag), a tag carried by more than one root (the
+// ambiguity collectTranscripts refuses to guess at), an unreadable subtree.
+// The caller must then keep whatever baseline it already had, which is today's
+// stage-age behavior: a fail-closed reading here would park a healthy lane on a
+// missing sidecar, and this signal exists to stop exactly that class of loss.
+//
+// An agent whose meta could not be parsed is NOT counted (readAgentMetas skipped
+// it, so descendantsOf never sees it) -- the opposite of liveUnknownParentage's
+// rule, on purpose. There, an unknown agent must read LIVE because being wrong
+// costs a running skeptic its worktree; here, counting a stranger's appends as
+// this stage's would silence the watchdog on a wedged lane, which is the run-10
+// mis-attribution defect wearing a safety label. Being wrong this way costs one
+// probe, which a live lane answers ALIVE.
+//
+// Cost is one `readdir` + one meta parse per agent (shareable via `metas`) + one
+// bounded first-line read per parentless agent + one read per subtree member.
+// Paid once per live lane per tick, against the same directory liveAgentsIn
+// scans twice a run.
+export function subtreeActivityMs(subagentsDir: string, tag: string, metas?: AgentMeta[]): number | undefined {
+  let resolved: AgentMeta[];
+  let roots: string[];
+  try {
+    resolved = metas ?? readAgentMetas(subagentsDir).metas;
+    roots = findRootAgents(subagentsDir, tag, resolved);
+  } catch {
+    return undefined; // an unreadable subagents dir observes nothing
+  }
+  if (roots.length !== 1) return undefined;
+  let newest: number | undefined;
+  for (const id of [roots[0], ...descendantsOf(resolved, roots[0])]) {
+    const stamp = lastRecordStampMs(subagentsDir, id);
+    if (stamp !== undefined && (newest === undefined || stamp > newest)) newest = stamp;
+  }
+  return newest;
 }
 
 // -- collection ----------------------------------------------------------------

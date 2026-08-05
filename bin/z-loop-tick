@@ -117,6 +117,20 @@ jq -s '.' "$TMP/lookups.jsonl" > "$TMP/lookups.json" 2>/dev/null \
 #    what was actually proven about a missing ticket, and they belong in the
 #    operator's tick output.
 bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" --lookups "$TMP/lookups.json" --context-tokens "$CTX" >/dev/null
+# 2a. Watchdog heartbeat (issue #256): observe each live lane's stage-spawn
+#     subtree and move its watchdog baseline forward to the newest transcript
+#     append. Without this the baseline is only ever stamped by stage EVENTS
+#     (claim / advance / respawn / outcome / an alive probe), so `watchdogExpired`
+#     measures stage AGE and fires on a healthy stage -- a QA agent spends 2-4
+#     minutes on its mandatory suite alone. The transcript reads belong out here
+#     for the same reason the board read does: lib/loop.ts's decision functions
+#     stay pure and network/disk-free, and the reducer is handed a number.
+#     Placed AFTER the ingest (which is what settles the lane list this walks) and
+#     BEFORE `next` (which is what reads the baseline). Never aborts the tick
+#     (`|| true`) and never discards stderr -- an unresolvable transcript dir means
+#     the watchdog silently degrades to its pre-#256 stage-age behavior, which is
+#     exactly what an operator debugging a healthy-but-skipped stage must see.
+bun "$PACK/lib/loop.ts" heartbeat "$STATE" --slug "$SLUG" --project-dir "$PWD" >/dev/null || true
 # 2b. Human-needed safety control (issue #63): recompute the parked-tickets
 # breakdown every tick (read-only) and fire the ONE-TIME mid-run breakdown
 # notification the instant it first crosses BoardConfig.humanNeededPercent.

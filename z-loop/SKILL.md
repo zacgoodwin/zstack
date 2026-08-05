@@ -91,7 +91,11 @@ mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports" 
    succeeds. If not, run /z-setup first.
 2. **gh authenticated** with the project scope (`gh auth status` clean).
 3. **bun present:** `command -v bun`.
-4. Read the loop knobs from config (defaults 3 lanes / 10 minutes / audits
+4. Read the loop knobs from config (defaults 3 lanes / per-stage watchdog
+   budgets — builder 25, qa 15, reviewer 40, merge 15 minutes of subtree
+   SILENCE (#256), which `$WATCHDOG` carries as compact JSON and passes to
+   `ingest` verbatim; a project whose config holds a plain number keeps that one
+   budget for every stage / audits
    every 5th loop / 3 QA passes before Blocked / investigate from QA bounce 2 /
    human-needed at 30% parked / reviewer-confidence floor 70, block a
    sub-floor approve / 2 reviewer->builder bounces before Blocked / 2 of 3
@@ -100,7 +104,7 @@ mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports" 
 
 ```bash
 read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMAN_NEEDED_PERCENT MIN_REVIEWER_CONFIDENCE REVIEWER_BELOW_ACTION MAX_REVIEW_BOUNCES MIN_SKEPTIC_QUORUM TICKET_LIMIT CONTEXT_TOKEN_LIMIT <<<"$(bun -e "import {loadConfig} from '$PACK/lib/config.ts';
-  const c = loadConfig('$SLUG'); console.log(c.maxLanes, c.watchdogMinutes, c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.humanNeededPercent, c.minReviewerConfidence, c.reviewerBelowThresholdAction, c.maxReviewBounces, c.minSkepticQuorum, c.ticketLimit, c.contextTokenLimit)")"
+  const c = loadConfig('$SLUG'); console.log(c.maxLanes, JSON.stringify(c.watchdogMinutes), c.auditEveryNLoops, c.maxQaPasses, c.qaInvestigateAfter, c.humanNeededPercent, c.minReviewerConfidence, c.reviewerBelowThresholdAction, c.maxReviewBounces, c.minSkepticQuorum, c.ticketLimit, c.contextTokenLimit)")"
 ```
 
 5. **Startup orphan scan (C7).** A crashed prior loop leaves lane locks in
@@ -641,6 +645,36 @@ The expiry decision is inside `next` (silent past `watchdogMinutes` →
 from the harness's task list, and never let a lane idle unprobed. A stage that
 returns a `CONFUSED:` final message routes to `skip` automatically — comment
 its confusion note into the ticket when you execute the skip.
+
+**Per-stage budgets and the ceiling (#256).** `watchdogMinutes` is resolved per
+STAGE, not once per run: the shipped defaults are builder 25 / qa 15 /
+reviewer 40 / merge 15 minutes, each derived from that stage family's own
+measured worst silence and floored at the 15 minutes every agent needs (a
+reviewer blocked on three background skeptics legitimately goes 19 minutes
+quiet; a merge stage never goes 2). A config holding a plain number still means
+one budget for every stage. Nothing here is yours to compute — `next` resolves
+it. Separately, a lane whose CURRENT stage has held it for
+**480 minutes** parks Blocked no matter how many times its worker answered
+ALIVE; that park is what makes the alive path terminate, and its note names the
+stage, the elapsed minutes and the ceiling. Run it like any other `park N
+Blocked` row (it carries `"salvage": true`, so dump the worktree patch first).
+
+**Silence, not stage age (#256).** `watchdogMinutes` measures how long a lane's
+stage-spawn subtree has appended NOTHING to its transcripts — not how long the
+stage has been running. `z-loop-tick` reads that for you: every tick, after the
+ingest and before `next`, it runs
+`bun "$PACK/lib/loop.ts" heartbeat "$STATE" --slug "$SLUG" --project-dir "$PWD"`,
+which resolves each live lane's spawn tag (`spawnTag(slug, ticket, stage,
+attempt)` — recomputed from the lane, never stored) and moves its baseline
+forward to the newest record in that subtree, the stage agent's own plus every
+descendant's. Nothing here is yours to judge and there is no extra command to
+run. Two properties worth knowing when you read a tick's stderr: the move is
+**monotonic** (an observation older than the baseline changes nothing), and an
+unresolvable subtree is a **no-op that says so on stderr** — that lane silently
+falls back to the pre-#256 stage-age behavior, which is why the note is worth
+reading rather than ignoring. Before this, a healthy QA stage crossed the budget
+on age alone (its mandatory typecheck + suite + build runs 121s idle, 234s
+loaded) and got probed while working.
 
 **Merge lanes are the one exception (H9):** `next` never auto-skips a dead
 `merge` lane (it returns `check-worker` instead), because `gh pr merge` may have

@@ -530,3 +530,57 @@ describe("Ticket #273: a gone ticket's lane is torn down by stop-lane, not by th
     expect(block.includes("claim")).toBe(true);
   });
 });
+
+// ============================================================================
+// #256 -- the watchdog measures SILENCE, and the SKILL says where it comes from
+// ============================================================================
+describe("#256: Step 5 documents the per-tick heartbeat, not a stage-age timer", () => {
+  // The orchestrator does not run this by hand -- z-loop-tick does it (pinned in
+  // tests/loop.test.ts). What Step 5 must carry is the MEANING, because the
+  // operator reading a `check-worker` needs to know whether the loop observed
+  // silence or just counted minutes, and because a tick's stderr note ("no
+  // subtree observed") is the signal that a lane has silently degraded to the
+  // old behavior.
+  test("Step 5 states the baseline is subtree silence and names the heartbeat verb", () => {
+    const step5 = section(zLoop(), "## Step 5 — Watchdog");
+    expect(step5).not.toBe("");
+    expect(step5).toContain("#256");
+    expect(step5).toContain('loop.ts" heartbeat "$STATE"');
+    expect(step5).toMatch(/silence, not stage age/i);
+    // Both properties an operator can be surprised by.
+    expect(step5).toMatch(/monotonic/i);
+    expect(step5).toMatch(/stderr/);
+  });
+});
+
+// ============================================================================
+// #256 (follow-up) -- per-stage budgets reach the state file, and the ceiling
+// is a row the orchestrator can actually run
+// ============================================================================
+describe("#256: per-stage watchdog budgets and the stage ceiling", () => {
+  // The defect this pins is silent and total: `console.log(c.watchdogMinutes)`
+  // on an OBJECT prints "[object Object]", which `--watchdog-minutes` then
+  // rejects (or, before the parser, coerced to NaN -- and `elapsed > NaN` is
+  // false, so the watchdog would be OFF for the whole run with no error).
+  test("Step 0 JSON-stringifies watchdogMinutes so the per-stage object survives the shell", () => {
+    const md = zLoop();
+    expect(md).toContain("JSON.stringify(c.watchdogMinutes)");
+    // And it still rides into the ingest as one token.
+    expect(md).toContain('--watchdog-minutes "$WATCHDOG"');
+  });
+
+  test("Step 5 states the budgets are per stage and names the ceiling", () => {
+    const step5 = section(zLoop(), "## Step 5 — Watchdog");
+    expect(step5).toContain("#256");
+    expect(step5).toMatch(/per\s*stage/i);
+    // The four shipped defaults, so a change to the table cannot leave the SKILL
+    // telling the operator a number the code no longer uses.
+    for (const s of ["builder 25", "qa 15", "reviewer 40", "merge 15"]) {
+      expect(step5).toContain(s);
+    }
+    // The ceiling, and the fact that it is a park the operator executes.
+    expect(step5).toContain("480 minutes");
+    expect(step5).toMatch(/ALIVE/);
+    expect(step5).toContain('"salvage": true');
+  });
+});
