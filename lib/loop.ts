@@ -1470,25 +1470,35 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
     // thing standing in between was the merge prompt's prose telling the agent
     // to re-run the gate after resolving a conflict.
     //
-    // A REFUSAL, not a re-gate. The base-move case re-gates because it is the
-    // normal consequence of a sibling merging and the next gauntlet resolves it
-    // -- but a commit mismatch here means the verdict on the lane was never
-    // about this branch, and re-gating would ask for it again from whatever
-    // produced the mismatch, which on the reproduced case (a gate run against
-    // an arbitrary `<worktreePath>`) reproduces it forever. Park is terminal
-    // and names the two shas, which is what a human needs (PROCESS.md: park,
-    // never stall).
+    // A mismatch RE-GATES, the same shape the base check above uses, and for
+    // the same reason: a branch that moved is a recoverable condition, and the
+    // fresh gauntlet resolves it. Parking here instead would take out the whole
+    // dependency CHAIN, not just this lane -- `deadMergeReady` above parks
+    // every dependent of a Blocked ticket, so one recoverable mismatch at the
+    // head of a stack ends the drain for everything behind it.
+    //
+    // It terminates because the CLI refuses to stamp a verdict measured on a
+    // tree that is not this lane's own worktree (`isLaneBranch`). That was the
+    // one producer that could hand back the same mismatching verdict forever;
+    // with it gone, every re-gate measures the head the loop just observed, so
+    // the sequence ends as soon as nothing is committing to the branch.
+    //
+    // The two UNPROVABLE arms below still park, because a re-gate cannot fix
+    // either: a gate that could not read a head stamps `commit: undefined`
+    // again, and a lane whose worktree cannot be read will not become readable
+    // by running the gauntlet in it. Those are broken-checkout facts, not
+    // moved-branch facts (PROCESS.md: park, never stall).
     if (laneHeads !== undefined) {
       const observed = laneHeads[first.ticket];
-      const note = (why: string): Action => ({ kind: "park", ticket: first.ticket, status: "Blocked", note: `${why} Refusing the merge: a gate verdict that cannot be tied to the commit being merged is not a gate (#248).` });
+      const park = (why: string): Action => ({ kind: "park", ticket: first.ticket, status: "Blocked", note: `${why} Refusing the merge: a gate verdict that cannot be tied to the commit being merged is not a gate (#248).` });
       if (gate.commit === undefined) {
-        return note(`The merge gate's green verdict for #${first.ticket} names no commit, so nothing proves it was measured on the code about to merge.`);
+        return park(`The merge gate's green verdict for #${first.ticket} names no commit, so nothing proves it was measured on the code about to merge.`);
       }
       if (observed === undefined || observed === null) {
-        return note(`The merge gate's green verdict for #${first.ticket} names commit ${gate.commit}, but the loop could not read a HEAD from that lane's worktree to compare it against.`);
+        return park(`The merge gate's green verdict for #${first.ticket} names commit ${gate.commit}, but the loop could not read a HEAD from that lane's worktree to compare it against.`);
       }
       if (observed !== gate.commit) {
-        return note(`The merge gate's green verdict for #${first.ticket} was measured on commit ${gate.commit}, but that lane's branch is now at ${observed}.`);
+        return { kind: "merge-gate", ticket: first.ticket };
       }
     }
     // A stacked parent is one merging concurrently OR already merged this run
@@ -2858,6 +2868,32 @@ export function laneWorktreePath(ticket: number, root: string = process.cwd()): 
   return join(root, ".worktrees", `ticket-${ticket}`);
 }
 
+// The worktree's checked-out branch, for the lane bind below. Same best-effort
+// shape as gitHead: `undefined` when git cannot answer, which the caller treats
+// as unprovable rather than fine.
+function gitBranch(cwd: string): string | undefined {
+  const p = Bun.spawnSync(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], { stdout: "pipe", stderr: "pipe" });
+  if (p.exitCode !== 0) return undefined;
+  const b = new TextDecoder().decode(p.stdout).trim();
+  return b && b !== "HEAD" ? b : undefined; // a detached checkout names no branch
+}
+
+// Is this the branch lane N's worktree is supposed to be on? z-loop/SKILL.md's
+// claim row creates `z/ticket-<N>-<slug>`, and the slug is not knowable here,
+// so the bind is on the ticket-numbered prefix -- which is the part that names
+// the lane. `z/ticket-1-` never matches `z/ticket-12-x`, because the character
+// after the number has to be the separator.
+//
+// Bound by BRANCH rather than by path on purpose. The obvious check is
+// "`<worktreePath>` resolves to `.worktrees/ticket-<N>`", but that is relative
+// to the process's cwd, and the merge prompt runs the gate's stamping form from
+// INSIDE the worktree after resolving a conflict -- so a cwd-relative
+// comparison would refuse the one re-gate that matters most. A branch name is
+// the same fact read from somewhere that does not move.
+export function isLaneBranch(branch: string, ticket: number): boolean {
+  return branch === `z/ticket-${ticket}` || branch.startsWith(`z/ticket-${ticket}-`);
+}
+
 // Reads the branch head of every lane carrying a gate verdict. Only those: a
 // lane with no stamp is re-gated by nextAction regardless, so spending a `git`
 // spawn on it would buy nothing, and `next` runs on every tick of the drain.
@@ -3224,6 +3260,27 @@ export function main(argv: string[]): number {
       let verdict: MergeGateVerdict;
       try {
         if (!existsSync(worktree)) throw new ZError(`Merge gate: worktree ${worktree} does not exist.`);
+        // #248: the STAMPING form writes a verdict onto lane N, so the tree it
+        // measured has to BE lane N's. Without this the argument was free --
+        // `merge-gate <anyDirectory> --state st.json --ticket 8` stamped a
+        // green onto #8, reproduced end to end -- and the last latent step
+        // before `gh pr merge` was "did the agent type the right path".
+        //
+        // It also buys the termination that lets a commit mismatch RE-GATE
+        // instead of parking: with a foreign tree refused here, the only thing
+        // left that can move a verdict off its branch head is the branch
+        // itself moving, and each re-gate then measures the new head. Refusing
+        // here rather than in the reducer is what keeps a stacked chain
+        // draining in dependency order instead of parking on a recoverable
+        // condition.
+        if (gateTicket !== undefined) {
+          const branch = gitBranch(worktree);
+          if (branch === undefined || !isLaneBranch(branch, gateTicket)) {
+            throw new ZError(
+              `Merge gate: ${worktree} is on ${branch === undefined ? "no branch (detached, or not a git worktree)" : `branch ${branch}`}, not #${gateTicket}'s lane branch \`z/ticket-${gateTicket}-<slug>\`. A verdict stamped on lane #${gateTicket} has to be measured on lane #${gateTicket}'s own worktree.`
+            );
+          }
+        }
         // Which limbs to run is read off the worktree's own package.json, once,
         // before any spawn -- the same detection the end-of-loop regression pass
         // does, so an absent script is skipped instead of exiting 1 and parking

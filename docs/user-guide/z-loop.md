@@ -436,7 +436,7 @@ the *foreign* direction is what refuted this gate's own AC1 once. Three fixtures
 with byte-identical contents — a failing test plus a test calling
 `process.exit(0)` — differing only in the script string came back:
 
-```
+```text
 {"test":"bun test"}                                 exit 1  {"green":false}
 {"test":"bun run inner","inner":"bun test"}         exit 0  {"green":true}   ← #132's shape
 {"test":"bun run test:unit","test:unit":"bun test"} exit 0  {"green":true}
@@ -582,25 +582,57 @@ exists to delete.
 own branch head and compares:
 
 - The path is **derived**, never supplied — `.worktrees/ticket-<N>` from the
-  ticket number, the same path the claim row creates. `merge-gate` takes a
-  `<worktreePath>` argument, so a verdict could be measured against some other
-  checkout entirely and stamped onto lane N; that verdict now carries the other
-  checkout's sha and fails this comparison.
+  ticket number, the same path the claim row creates.
 - The read is `git rev-parse HEAD`, done by the loop inside the `next` command
   itself. Nothing an orchestrator can forget to pass, and no `gh` call —
   `lib/board.ts` remains the pack's only one.
-- A mismatch is a **refusal**, not a re-gate. The base-move case re-gates
-  because a sibling merging is normal and the next gauntlet resolves it; a
-  commit mismatch means the verdict was never about this branch, so asking the
-  same producer for it again would reproduce it forever — a stalled drain, which
-  PROCESS.md ranks alongside a bad merge. The park names both shas.
-- Unprovable is refused too: a green verdict carrying **no** `commit`, or a lane
-  whose worktree head could not be read, parks rather than passing. A verdict
-  that cannot be tied to the commit being merged is not a gate.
+- A mismatch **re-gates**, the same shape the base check uses. A branch that
+  moved is recoverable and the fresh gauntlet resolves it; see *Why a re-gate
+  and not a park* below.
+- Unprovable is refused: a green verdict carrying **no** `commit`, or a lane
+  whose worktree head could not be read, parks rather than passing. A re-gate
+  cannot fix either — a gate that could not read a head stamps no sha the
+  second time either — and a verdict that cannot be tied to the commit being
+  merged is not a gate.
 
 Verdicts measured by the pure `mergeGate()` function carry no sha (it never
 shells git); the `merge-gate` command is what fills the field, and the merge
 decision is where the absence is caught.
+
+### The verdict is bound to the lane, at the command
+
+`merge-gate` takes a `<worktreePath>` argument, so a verdict could be measured
+against some other checkout entirely and stamped onto lane N — reproduced end to
+end, a gate run against an unrelated directory followed by `next` returning
+`{"kind":"advance","ticket":8,"to":"merge"}`. The last latent step before
+`gh pr merge` was *"did the agent type the right path"*.
+
+So the **stamping** form (`--state`/`--ticket N`) refuses any worktree that is
+not on lane N's own branch, `z/ticket-<N>-<slug>`. A refusal stamps **red**,
+like every other "the gate could not run" case, so the lane parks with the real
+cause rather than the command erroring out of the tick. The read-only form is
+unaffected: it vouches for nothing and writes nowhere, so pointing it at any
+tree to ask "is this green?" is exactly what it is for.
+
+The bind is on the **branch**, not on the path. The obvious check is
+"`<worktreePath>` resolves to `.worktrees/ticket-<N>`" — but that is relative to
+the process's cwd, and the merge prompt runs the stamping form from *inside* the
+worktree after resolving a conflict, so a cwd-relative comparison would refuse
+the one re-gate that matters most. A branch name is the same fact read from
+somewhere that does not move.
+
+### Why a re-gate and not a park
+
+Because parking costs the **chain**, not the lane. A dependent whose dependency
+is Blocked can never merge in that batch, so `next` parks it too — one
+recoverable mismatch at the head of a stack would end the drain for everything
+behind it, which is the opposite of draining in dependency order.
+
+And the re-gate terminates, because of the lane bind above. A gate that cannot
+be run against a foreign tree is a gate that cannot keep returning the same
+mismatching verdict; what is left is the branch genuinely moving, and every
+re-gate measures the head the loop just observed. Same argument as the base-move
+re-gate, which has the same shape.
 
 ### Who runs it, and why it cannot be skipped
 
@@ -613,8 +645,9 @@ the `advance N to merge` that spawns a merge agent until the lane carries a
 |---|---|
 | No verdict stamped | `merge-gate N` — run the gate (again) |
 | Verdict green, but a lane has merged since it was stamped | `merge-gate N` — the base moved, so re-gate |
-| Verdict green, but its `commit` is not the branch's head | `park N Blocked` — the verdict is about other code |
+| Verdict green, but its `commit` is not the branch's head | `merge-gate N` — the branch moved, so re-gate |
 | Verdict green with no `commit`, or the head cannot be read | `park N Blocked` — an unbindable verdict is not a gate |
+| A stamping run pointed at a worktree that is not this lane's branch | `park N Blocked` — the gate stamped red rather than vouching for another tree |
 | Verdict green, `commit` is the head | `advance N to merge` — the merge agent spawns |
 | Verdict red | `park N Blocked`, carrying the gate's own note (fail count included) |
 | Two gate runs started, neither finished | `park N Blocked` — a gate that never returns refuses the merge rather than spinning the drain |

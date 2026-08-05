@@ -24,6 +24,7 @@ import {
   countSuiteRuns,
   detectGateScripts,
   foundNoTestFiles,
+  isLaneBranch,
   laneWorktreePath,
   mergeGate,
   mergeGateBaseKey,
@@ -6002,13 +6003,33 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
         expect(runNext(moved)).toMatchObject({ kind: "advance", ticket: 7, to: "merge" });
       });
 
-      test("a verdict naming the commit the branch has since MOVED off refuses", () => {
+      test("a verdict naming the commit the branch has since MOVED off does not advance -- it re-gates", () => {
         setup();
         const a = runNext(gated);
-        expect(a).toMatchObject({ kind: "park", ticket: 7, status: "Blocked" });
-        expect(a.kind).not.toBe("advance");
-        expect((a as { note: string }).note).toContain(gated);
-        expect((a as { note: string }).note).toContain(moved);
+        expect(a).toEqual({ kind: "merge-gate", ticket: 7 });
+      });
+
+      // The lane bind, on the deployed path: this repo's OWN worktree is at
+      // `.worktrees/ticket-7` on `z/ticket-7`, and a gate pointed anywhere else
+      // cannot stamp #7 -- which is what stops the re-gate above from becoming
+      // a loop.
+      test("the stamping form accepts this lane's worktree and refuses the repo root", () => {
+        setup();
+        const sp = join(repo, "bind-state.json");
+        const write = () => writeFileSync(sp, JSON.stringify(state([ticket(7, "Review")], [lane(7, "reviewer", { outcome: approve(100) })])));
+        const gate = (target: string) =>
+          Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "merge-gate", target, "--state", sp, "--ticket", "7", "--retry-wait-ms", "0"], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+
+        write();
+        // The repo root is on the DEFAULT branch, not #7's lane branch.
+        expect(gate(repo).exitCode).toBe(1);
+        expect(JSON.parse(readFileSync(sp, "utf8")).lanes[0].mergeGate.note).toContain("z/ticket-7-");
+
+        write();
+        // The lane's own worktree is accepted (green: it defines no scripts, so
+        // the gate refuses for THAT reason -- what matters is which reason).
+        const own = JSON.parse(gate(wt).stdout.toString());
+        expect(own.note).not.toContain("z/ticket-7-");
       });
     });
 
@@ -6022,9 +6043,20 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
     }
     const readState = (p: string): LoopState => JSON.parse(readFileSync(p, "utf8"));
 
+    // #248: the stamping form writes onto a LANE, so it only accepts that
+    // lane's own worktree -- which means every fixture below that stamps has to
+    // be a real git checkout on `z/ticket-<N>-<slug>`, exactly like the real one.
+    function laneProject(name: string, body: string | null, ticket = 7): string {
+      const p = project(name, body);
+      for (const args of [["init", "-q"], ["checkout", "-q", "-b", `z/ticket-${ticket}-${name}`], ["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]]) {
+        expect(Bun.spawnSync(["git", "-C", p, ...args], { stdout: "pipe", stderr: "pipe" }).exitCode).toBe(0);
+      }
+      return p;
+    }
+
     test("--state/--ticket stamps a GREEN verdict on the lane and the scheduler then advances it to merge", () => {
       const sp = stateFile("stamp-green");
-      const proc = runGate(project("stamp-green", PASSING), "--state", sp, "--ticket", "7");
+      const proc = runGate(laneProject("stamp-green", PASSING), "--state", sp, "--ticket", "7");
       expect(proc.exitCode).toBe(0);
       const laneAfter = readState(sp).lanes[0];
       expect(laneAfter.mergeGate).toMatchObject({ green: true, failCount: 0 });
@@ -6037,7 +6069,7 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
 
     test("--state/--ticket stamps a RED verdict and the scheduler parks the lane Blocked with the gate's note", () => {
       const sp = stateFile("stamp-red");
-      const proc = runGate(project("stamp-red", FAILING), "--state", sp, "--ticket", "7", "--retry-wait-ms", "0");
+      const proc = runGate(laneProject("stamp-red", FAILING), "--state", sp, "--ticket", "7", "--retry-wait-ms", "0");
       expect(proc.exitCode).toBe(1);
       const laneAfter = readState(sp).lanes[0];
       expect(laneAfter.mergeGate).toMatchObject({ green: false, failCount: 1 });
@@ -6056,6 +6088,39 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
       expect(readState(sp).lanes[0].mergeGate).toMatchObject({ green: false });
       expect(readState(sp).lanes[0].mergeGate!.note).toContain("could not run");
       expect(nextAction(readState(sp), 0)).toMatchObject({ kind: "park", ticket: 7, status: "Blocked" });
+    });
+
+    // Blocker 2 of the review, closed where it was raised: `merge-gate` took an
+    // arbitrary `<worktreePath>` and stamped its verdict onto whatever
+    // `--ticket N` named, so the last latent step before `gh pr merge` was
+    // "did the agent type the right path". Reproduced end to end -- a gate run
+    // against an unrelated directory, then `next` returning
+    // {"kind":"advance","ticket":7,"to":"merge"} on it.
+    test("the stamping form refuses a worktree that is not the lane's own branch", () => {
+      const sp = stateFile("stamp-foreign");
+      // A perfectly green project -- and on someone else's lane branch.
+      const proc = runGate(laneProject("stamp-foreign", PASSING, 999), "--state", sp, "--ticket", "7");
+      expect(proc.exitCode).toBe(1);
+      const stamped = readState(sp).lanes[0].mergeGate!;
+      expect(stamped.green).toBe(false); // a green tree does NOT buy #7 a green
+      expect(stamped.note).toContain("z/ticket-7-");
+      expect(nextAction(readState(sp), 0)).toMatchObject({ kind: "park", ticket: 7, status: "Blocked" });
+    });
+
+    test("...and a detached checkout, which names no branch at all, is refused the same way", () => {
+      const sp = stateFile("stamp-detached");
+      // Not a git repo: `rev-parse --abbrev-ref HEAD` answers nothing, which is
+      // unprovable, which is refused rather than assumed fine.
+      const proc = runGate(project("stamp-detached", PASSING), "--state", sp, "--ticket", "7");
+      expect(proc.exitCode).toBe(1);
+      expect(readState(sp).lanes[0].mergeGate).toMatchObject({ green: false });
+    });
+
+    // The bind is on the STAMPING form only. The read-only form vouches for
+    // nothing and writes nowhere, so a merge agent (or a human) can point it at
+    // any tree to ask "is this green?" -- which is what it is for.
+    test("the read-only form takes any worktree, since it stamps no lane", () => {
+      expect(runGate(project("readonly-any", PASSING)).exitCode).toBe(0);
     });
 
     test("--state without --ticket (or the reverse) is a usage error, never a half-stamped lane", () => {
@@ -6315,25 +6380,36 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
         expect(nextAction(s, 0, { 7: HEAD })).toEqual({ kind: "advance", ticket: 7, to: "merge", stackedOn: [] });
       });
 
-      test("the stamped commit is NOT the head: no advance, a park naming both shas", () => {
+      test("the stamped commit is NOT the head: no advance, a re-gate", () => {
         const s = approved({ mergeGate: gateOn(OTHER) });
-        const a = nextAction(s, 0, { 7: HEAD });
-        expect(a).toMatchObject({ kind: "park", ticket: 7, status: "Blocked" });
-        expect((a as { note: string }).note).toContain(OTHER);
-        expect((a as { note: string }).note).toContain(HEAD);
         // The whole point: it is not merely "not advanced", it is never `merge`.
-        expect(a.kind).not.toBe("advance");
+        expect(nextAction(s, 0, { 7: HEAD })).toEqual({ kind: "merge-gate", ticket: 7 });
       });
 
-      // A refusal rather than a re-gate, deliberately. The mismatch's reachable
-      // cause is a verdict measured somewhere other than this lane's worktree,
-      // and asking the same producer for the same verdict again reproduces it
-      // forever -- a stall, which PROCESS.md forbids as firmly as a bad merge.
-      test("the refusal is terminal: repeating the tick keeps parking, it never becomes an advance", () => {
-        const s = approved({ mergeGate: gateOn(OTHER) });
-        for (let i = 0; i < 3; i++) {
-          expect(nextAction(s, 0, { 7: HEAD })).toMatchObject({ kind: "park", status: "Blocked" });
-        }
+      // A re-gate rather than a park, and the reason is the CHAIN. Parking here
+      // does not cost one lane, it costs every lane behind it: `deadMergeReady`
+      // parks each dependent of a Blocked ticket, so one recoverable mismatch
+      // at the head of a stack ends the drain for the whole stack. A branch
+      // that moved is recoverable; the fresh gauntlet resolves it.
+      test("the re-gate's fresh verdict on the observed head then advances -- the chain keeps draining", () => {
+        let s = approved({ mergeGate: gateOn(OTHER) });
+        expect(nextAction(s, 0, { 7: HEAD })).toEqual({ kind: "merge-gate", ticket: 7 });
+        s = recordMergeGate(s, 7, null, 0); // the re-gate starts...
+        s = recordMergeGate(s, 7, gateOn(HEAD), 0); // ...and answers on the head the loop observed
+        expect(nextAction(s, 0, { 7: HEAD })).toMatchObject({ kind: "advance", ticket: 7, to: "merge" });
+      });
+
+      // Termination is bought at the CLI, not here: the stamping form refuses a
+      // worktree that is not this lane's own (`isLaneBranch`), so the one
+      // producer that could hand back the same mismatching verdict forever is
+      // gone. What is left is the branch moving, and every re-gate measures the
+      // head the loop just observed.
+      test("the lane bind is what makes the re-gate terminate, and it is by branch not by path", () => {
+        expect(isLaneBranch("z/ticket-7-enforce-the-merge-gate", 7)).toBe(true);
+        expect(isLaneBranch("z/ticket-7", 7)).toBe(true);
+        expect(isLaneBranch("z/ticket-12-other", 7)).toBe(false); // the separator is load-bearing
+        expect(isLaneBranch("main", 7)).toBe(false);
+        expect(isLaneBranch("z/ticket-7-x", 8)).toBe(false);
       });
 
       // Fail-closed in both unprovable directions. Neither is a silent pass:
@@ -6357,6 +6433,27 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
       // CLI test below drives against a real git worktree.
       test("no observation supplied means the binding is not checked (and nothing else changes)", () => {
         expect(nextAction(approved({ mergeGate: gateOn(OTHER) }), 0)).toMatchObject({ kind: "advance", to: "merge" });
+      });
+
+      // The cascade this re-gate exists to avoid, driven through the reducer:
+      // #8 depends on #7, and parking #7 for a moved branch would park #8 too
+      // (`deadMergeReady`), ending the drain for the whole chain instead of the
+      // one lane. With the re-gate, #7 recovers and #8 merges behind it.
+      test("a mismatch at the head of a dependency chain does not take the chain down with it", () => {
+        let s = state(
+          [ticket(7, "Review"), ticket(8, "Review", [7])],
+          [lane(7, "reviewer", { outcome: approve(100), mergeGate: gateOn(OTHER) }), lane(8, "reviewer", { outcome: approve(100), mergeGate: gateOn(HEAD) })]
+        );
+        const heads = { 7: HEAD, 8: HEAD };
+        expect(nextAction(s, 0, heads)).toEqual({ kind: "merge-gate", ticket: 7 });
+        // Had #7 parked, #8 would be next -- and it would park too, on its
+        // dependency rather than on anything about its own code.
+        const parked = applyAction(s, { kind: "park", ticket: 7, status: "Blocked", note: "x" }, 0);
+        expect(nextAction(parked, 0, heads)).toMatchObject({ kind: "park", ticket: 8, status: "Blocked" });
+        // Instead: #7 re-gates, merges, and #8 follows it in dependency order.
+        s = recordMergeGate(s, 7, null, 0);
+        s = recordMergeGate(s, 7, gateOn(HEAD), 0);
+        expect(nextAction(s, 0, heads)).toMatchObject({ kind: "advance", ticket: 7, to: "merge" });
       });
 
       // Ordering pin: RED loses to nothing. A red verdict must park on its own
