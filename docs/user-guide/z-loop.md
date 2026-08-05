@@ -634,6 +634,17 @@ from the Ready count and carried across every re-ingest for the rest of that
 batch. The instant this percentage first exceeds `humanNeededPercent`, the
 control trips.
 
+**The numerator is this batch's own parks, never the board's.** Only tickets
+this batch itself parked are counted: a ticket already sitting in
+Blocked/Skipped/Questions before the batch started, and a `claimedByOther`
+ticket parked by another session, are both excluded. That holds on a project's
+**first** run too — with no prior `state.json`, the batch is exactly the
+unclaimed Ready queue at ingest-time-zero, so a board carrying old parked work
+starts the run at 0%, not tripped. (One deliberate consequence on that first run
+only: a ticket the planning pass parks straight to Questions before the first
+ingest is indistinguishable from an older park, so it is not counted either.
+Every later run has a prior state and does count it.)
+
 **Once per batch.** The first tick that trips the control fires exactly one
 `human-needed` Discord notification — the exact parked counts and which
 ticket numbers — through the same `lib/notify.ts` transport as the other

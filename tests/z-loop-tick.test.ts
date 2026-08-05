@@ -68,6 +68,28 @@ const TRIPPED_ITEMS = JSON.stringify([
 ]);
 const TRIPPED_BODIES = JSON.stringify({ "1": "no deps", "2": "no deps", "3": "no deps", "4": "no deps" });
 
+// #203: those 3 parks only belong to THIS batch's numerator if the batch filed
+// them -- which requires a prior state to be new against. Written to --state
+// before the tick, this is a drained prior batch (one Done ticket, no lanes, no
+// batchTickets, so the tick's own ingest starts a fresh batch): every ticket on
+// TRIPPED_ITEMS is then new to prev, exactly the #133 AC4 shape the parks are
+// standing in for. Without it the tick ingests a fresh state and the 3 parks are
+// indistinguishable from work parked before the run, which is the false trip
+// #203 removed.
+function seedDrainedPrevState(statePath: string): void {
+  writeFileSync(
+    statePath,
+    JSON.stringify({
+      tickets: [{ number: 9, title: "prior", status: "Done", dependsOn: [] }],
+      lanes: [],
+      maxLanes: 3,
+      watchdogMinutes: 10,
+      initialReadyCount: 1,
+      initialBatchTickets: [9],
+    })
+  );
+}
+
 const dirs: string[] = [];
 function mkTmp(): string {
   const d = mkdtempSync(join(tmpdir(), "z-loop-tick-"));
@@ -333,6 +355,7 @@ describe("z-loop-tick", () => {
     const home = makeConfigHome();
     const tickTmp = join(dir, "tick-tmp");
     const tickState = join(dir, "tick-state.json");
+    seedDrainedPrevState(tickState); // #203: makes the 3 parks this batch's own
 
     const proc = Bun.spawnSync(
       ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp, "--session", "test-session"],
@@ -357,6 +380,35 @@ describe("z-loop-tick", () => {
     // the real notification still fires once the project IS configured.
     const written = JSON.parse(readFileSync(tickState, "utf8"));
     expect(written.humanNeededNotified).not.toBe(true);
+  }, TICK_TIMEOUT_MS);
+
+  // #203, the live repro through the real wrapper: the SAME board as the test
+  // above, but with no --state file at all (a project's first run, or any run
+  // after a state archive/reset). The 3 parks predate the run, so the batch is
+  // the 1 Ready ticket and the control must read 0% -- on main this wrote
+  // tripped:true at 300% before a single lane had run, and would have fired a
+  // false human-needed page on a configured project.
+  test("#203: a tick from a FRESH state file scopes the batch to the Ready queue and does not trip on pre-existing parks", () => {
+    const dir = mkTmp();
+    const stub = writeStubZBoard(dir, TRIPPED_ITEMS, TRIPPED_BODIES);
+    const home = makeConfigHome();
+    const tickTmp = join(dir, "tick-tmp");
+    const tickState = join(dir, "tick-state.json"); // deliberately NOT seeded
+
+    const proc = Bun.spawnSync(
+      ["bash", Z_LOOP_TICK, "--slug", "demo", "--state", tickState, "--tmp", tickTmp, "--session", "test-session"],
+      { env: { ...process.env, Z_BOARD: stub, HOME: home, USERPROFILE: home }, stdout: "pipe", stderr: "pipe" }
+    );
+    expect(proc.exitCode).toBe(0);
+
+    const written = JSON.parse(readFileSync(tickState, "utf8"));
+    expect(written.initialBatchTickets).toEqual([1]); // the Ready queue, not all 4 board items
+    expect(written.initialReadyCount).toBe(1);
+
+    const hn = JSON.parse(readFileSync(join(tickTmp, "human-needed.json"), "utf8"));
+    expect(hn.blocked).toBe(0);
+    expect(hn.skipped).toBe(0);
+    expect(hn.tripped).toBe(false);
   }, TICK_TIMEOUT_MS);
 
   // #150: driven through two REAL wrapper ticks against the same --state file
@@ -433,6 +485,7 @@ describe("z-loop-tick", () => {
     const stub = writeStubZBoard(dir, TRIPPED_ITEMS, TRIPPED_BODIES);
     const tickTmp = join(dir, "tick-tmp");
     const tickState = join(dir, "tick-state.json");
+    seedDrainedPrevState(tickState); // #203: makes the 3 parks this batch's own
 
     let hits = 0;
     const server = Bun.serve({
