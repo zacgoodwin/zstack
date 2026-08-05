@@ -2258,6 +2258,26 @@ const INGEST_NUMBERS = [
 // kebab-case CLI flag -> the camelCase key ingestBoardItems takes.
 const camel = (flag: string): string => flag.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 
+// An observed append can never have happened in the future, so a transcript
+// timestamp ahead of the clock is clipped to it (#256).
+//
+// Not paranoia about a hostile file -- these stamps are written by the same
+// machine's Claude Code, and the machine's clock moves: an NTP correction or a
+// suspend/resume can leave a record dated ahead of `now`. Unclipped, that lands
+// in lastActivityMs, `nowMs - lastActivityMs` goes NEGATIVE, and
+// `watchdogExpired` is false until the wall clock catches up -- the watchdog
+// silently OFF for that lane for the length of the skew, which is exactly the
+// failure #256 exists to remove, reintroduced through its own fix.
+//
+// Clipped at the CLI edge rather than inside recordActivity for the same reason
+// the read itself lives here: the reducer takes no clock, and giving it one to
+// support this would put `nowMs` into a function whose whole contract is that it
+// only ever sees numbers the caller already resolved.
+function clampToNow(activityMs: number | undefined, nowMs: number): number | undefined {
+  if (activityMs === undefined || !Number.isFinite(activityMs)) return undefined;
+  return Math.min(activityMs, nowMs);
+}
+
 // readJson's contract for plain text: a missing/unreadable file at the CLI edge is
 // an actionable usage failure (exit 1 with the path), not a rethrown stack.
 function readText(path: string): string {
@@ -2394,7 +2414,7 @@ export function main(argv: string[]): number {
       if (explicit !== undefined) {
         const ticket = Number(str(flags, "ticket"));
         if (!Number.isInteger(ticket)) throw new ZError("Usage: loop heartbeat <state.json> --activity-ms <n> --ticket <N>");
-        atomicWrite(statePath, JSON.stringify(recordActivity(state, ticket, Number(explicit)), null, 2));
+        atomicWrite(statePath, JSON.stringify(recordActivity(state, ticket, clampToNow(Number(explicit), nowMs)), null, 2));
         console.log(`#${ticket} activity ${explicit}`);
         return 0;
       }
@@ -2424,7 +2444,8 @@ export function main(argv: string[]): number {
       }
       let next = state;
       for (const lane of state.lanes ?? []) {
-        const activity = subtreeActivityMs(subagentsDir, spawnTag(slug, lane.ticket, lane.stage, stageAttempt(lane)), metas);
+        const observed = subtreeActivityMs(subagentsDir, spawnTag(slug, lane.ticket, lane.stage, stageAttempt(lane)), metas);
+        const activity = clampToNow(observed, nowMs);
         next = recordActivity(next, lane.ticket, activity);
         const after = next.lanes.find((l) => l.ticket === lane.ticket)!;
         console.log(
