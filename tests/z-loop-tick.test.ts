@@ -32,9 +32,10 @@ const Z_LOOP_TICK = join(REPO_ROOT, "bin", "z-loop-tick");
 // 5000ms default. MEASURED on this Windows machine, idle, with --timeout 120000
 // so nothing was cut short: the nine tick-driving tests run 1.98s-4.86s, and the
 // slowest (#150, which drives TWO ticks) lands within 3% of the default. One
-// tick costs ~2s because bin/z-loop-tick runs seven sequential `bun` subprocess
+// tick costs ~2s because bin/z-loop-tick runs eight sequential `bun` subprocess
 // spawns on every iteration -- throttle wait, locks beat, context-budget
-// current, loop confirm-targets, loop ingest, loop human-needed, loop next --
+// current, loop confirm-targets, loop ingest, loop heartbeat (#256), loop
+// human-needed, loop next --
 // plus the stubbed z-board and two jq calls, and process spawn on Windows is far
 // more expensive than on POSIX.
 //

@@ -530,3 +530,25 @@ describe("Ticket #273: a gone ticket's lane is torn down by stop-lane, not by th
     expect(block.includes("claim")).toBe(true);
   });
 });
+
+// ============================================================================
+// #256 -- the watchdog measures SILENCE, and the SKILL says where it comes from
+// ============================================================================
+describe("#256: Step 5 documents the per-tick heartbeat, not a stage-age timer", () => {
+  // The orchestrator does not run this by hand -- z-loop-tick does it (pinned in
+  // tests/loop.test.ts). What Step 5 must carry is the MEANING, because the
+  // operator reading a `check-worker` needs to know whether the loop observed
+  // silence or just counted minutes, and because a tick's stderr note ("no
+  // subtree observed") is the signal that a lane has silently degraded to the
+  // old behavior.
+  test("Step 5 states the baseline is subtree silence and names the heartbeat verb", () => {
+    const step5 = section(zLoop(), "## Step 5 — Watchdog");
+    expect(step5).not.toBe("");
+    expect(step5).toContain("#256");
+    expect(step5).toContain('loop.ts" heartbeat "$STATE"');
+    expect(step5).toMatch(/silence, not stage age/i);
+    // Both properties an operator can be surprised by.
+    expect(step5).toMatch(/monotonic/i);
+    expect(step5).toMatch(/stderr/);
+  });
+});

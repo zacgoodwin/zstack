@@ -29,6 +29,7 @@ import {
   MAX_COMMIT_RETRIES,
   MAX_DEAD_RESPAWNS,
   MAX_QUORUM_RETRIES,
+  recordActivity,
   recordOutcome,
   recordProbe,
   resolveStageModel,
@@ -41,7 +42,9 @@ import {
   type StageOutcome,
   type TicketSnapshot,
 } from "../lib/loop.ts";
-import { DEFAULT_MIN_SKEPTIC_QUORUM, ZError } from "../lib/config.ts";
+import { DEFAULT_MIN_SKEPTIC_QUORUM, DEFAULT_WATCHDOG_MINUTES, ZError } from "../lib/config.ts";
+import { MEASURED_MIDWORK_GAP_MS, SUBTREE_QUIET_MS, spawnTag } from "../lib/transcripts.ts";
+import { SPAWN_TAG_MARKER } from "../lib/stage-prompts.ts";
 import { isWorkableStatus } from "../lib/lanes.ts";
 import { validateConfig } from "../lib/config-schema.ts";
 import {
@@ -260,6 +263,107 @@ describe("watchdog", () => {
     expect(nextAction(s, now).kind).toBe("check-worker");
     s = recordProbe(s, 1, true, now);
     expect(nextAction(s, now)).toEqual({ kind: "wait" });
+  });
+
+  // -- silence, not stage age (#256) ------------------------------------------
+  //
+  // The defect: lastActivityMs was written ONLY by stage events (claim, advance,
+  // respawn, outcome, an alive probe), so the subtraction above measured how long
+  // ago the stage STARTED. A QA stage is ordered to run typecheck + the full suite
+  // + the build before it touches an acceptance criterion -- 121s idle, 234s
+  // loaded on this repo -- so every QA stage crossed the default budget while
+  // perfectly healthy, and the machine's answers are check-worker and, on a dead
+  // probe, a skip that discards the ticket.
+  //
+  // recordActivity is what makes the number mean what its name says. The
+  // observation itself (lib/transcripts.ts subtreeActivityMs) is a filesystem
+  // read, so it happens at the tick boundary and the reducer takes a number --
+  // same split as nowMs.
+  describe("recordActivity (#256)", () => {
+    const CLAIMED = 0;
+    const NOW = 25 * MIN; // a QA stage 25 minutes into its work
+
+    test("AC1: a stage well past the budget whose subtree is still appending is NOT probed", () => {
+      const s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: CLAIMED })]);
+      // Before the heartbeat this is the defect, verbatim: 25 minutes of stage age
+      // against a 10-minute budget, and the machine reaches for the worker.
+      expect(nextAction(s, NOW)).toEqual({ kind: "check-worker", ticket: 1 });
+      // Its subtree appended 30 seconds ago -- the agent is working.
+      const beat = recordActivity(s, 1, NOW - 30_000);
+      expect(beat.lanes[0].lastActivityMs).toBe(NOW - 30_000);
+      expect(nextAction(beat, NOW)).toEqual({ kind: "wait" });
+      // pure: the input state is untouched
+      expect(s.lanes[0].lastActivityMs).toBe(CLAIMED);
+    });
+
+    test("AC2: a stage whose subtree went silent still expires, and the dead-probe skip is unchanged", () => {
+      let s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: CLAIMED })]);
+      // Newest append 40 minutes ago: silence, whatever the stage's age.
+      s = recordActivity(s, 1, NOW - 40 * MIN);
+      expect(nextAction(s, NOW)).toEqual({ kind: "check-worker", ticket: 1 });
+      s = recordProbe(s, 1, false, NOW);
+      const skip = nextAction(s, NOW);
+      // Byte-identical to the note the pre-#256 machine produced for this lane.
+      expect(skip).toEqual({
+        kind: "skip",
+        ticket: 1,
+        note: "Worker died mid-qa: silent past the 10-minute watchdog and not alive on probe. Skipped per the PROCESS.md no-token-burn rule; worktree left for inspection.",
+      });
+    });
+
+    test("AC3: the heartbeat is monotonic -- an older observation never moves the baseline back", () => {
+      const s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: 20 * MIN })]);
+      // A subtree whose newest record predates the lane's own baseline (a stage
+      // that has written nothing since it was claimed, or a re-spawn reading its
+      // dead predecessor's transcripts). Moving backwards here would EXPIRE a lane
+      // the stage-age reading considers alive -- strictly worse than today.
+      expect(recordActivity(s, 1, 5 * MIN).lanes[0].lastActivityMs).toBe(20 * MIN);
+      expect(recordActivity(s, 1, 20 * MIN).lanes[0].lastActivityMs).toBe(20 * MIN);
+      expect(recordActivity(s, 1, 20 * MIN + 1).lanes[0].lastActivityMs).toBe(20 * MIN + 1);
+    });
+
+    test("AC3: an unobservable subtree is a no-op, not a park -- the lane keeps its stage-age behavior", () => {
+      const s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: CLAIMED })]);
+      // Every fail-open answer subtreeActivityMs can give arrives here as one of
+      // these, and none of them may change a thing.
+      for (const bad of [undefined, NaN, Infinity, -Infinity]) {
+        const after = recordActivity(s, 1, bad);
+        expect(after.lanes[0].lastActivityMs).toBe(CLAIMED);
+        expect(after).toEqual(s);
+      }
+      // ...so the watchdog still fires on stage age alone, exactly as it did before
+      // this ticket. Degrading, never parking, is the whole fail-open contract.
+      expect(nextAction(recordActivity(s, 1, undefined), NOW)).toEqual({ kind: "check-worker", ticket: 1 });
+    });
+
+    test("a heartbeat for a ticket no lane holds is a loud error, not a silent write", () => {
+      const s = state([ticket(1, "QA")], [lane(1, "qa")]);
+      expect(() => recordActivity(s, 9, 1)).toThrow(ZError);
+      expect(() => recordActivity(s, 9, 1)).toThrow("No lane holds #9");
+    });
+
+    // The boundary AC2 of the ticket keeps: exactly the budget is still in budget.
+    // Restated over an OBSERVED baseline rather than a stage-start one, since that
+    // is what the number means now.
+    test("the expiry boundary holds on an observed baseline", () => {
+      const s = recordActivity(state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: 0 })]), 1, 5 * MIN);
+      expect(watchdogExpired(s.lanes[0], 15 * MIN, 10)).toBe(false);
+      expect(watchdogExpired(s.lanes[0], 15 * MIN + 1, 10)).toBe(true);
+    });
+  });
+
+  // The default is a MEASUREMENT once the baseline is real silence, and it is the
+  // same measurement lib/transcripts.ts derives SUBTREE_QUIET_MS from: the longest
+  // gap between a working agent's own transcript records, 9,589 mid-work samples
+  // over 1,388 sub-agent transcripts. A budget under that ceiling declares a
+  // healthy agent dead. The pre-#256 10 cleared it by 1.42x -- on the decision
+  // that discards a whole ticket, where SUBTREE_QUIET_MS's 2x only risks leaving a
+  // scratch worktree behind.
+  test("#256: the default watchdog clears the measured mid-work gap by 2x", () => {
+    expect(MEASURED_MIDWORK_GAP_MS).toBe(423_110);
+    expect(DEFAULT_WATCHDOG_MINUTES * 60_000).toBeGreaterThanOrEqual(2 * MEASURED_MIDWORK_GAP_MS);
+    // Same question, same evidence, same answer as the liveness window's.
+    expect(DEFAULT_WATCHDOG_MINUTES * 60_000).toBe(SUBTREE_QUIET_MS);
   });
 });
 
@@ -3646,6 +3750,118 @@ describe("loop CLI", () => {
     const { exitCode } = runIngest(statePath);
     expect(exitCode).toBe(0);
     expect(existsSync(statePath)).toBe(true);
+  });
+
+  // -- #256: the `heartbeat` verb, the ingest-boundary half of the fix ---------
+  //
+  // The reducer takes a number; THIS is where the number comes from, and the wire
+  // it rides is the spawn tag -- a digest of slug/ticket/stage/attempt that is
+  // never stored on the lane, only recomputed from it (`stageAttempt`). A test
+  // that stubbed the tag would prove nothing, so these build the transcript
+  // directory the harness writes and let the verb resolve it for itself.
+  describe("heartbeat (#256)", () => {
+    // The harness's on-disk pair for one sub-agent. `tag` present = a stage agent
+    // (the orchestrator's own spawn stamps it into the prompt's first line);
+    // `parent` = a descendant, exactly as lib/transcripts.ts walks them.
+    function writeAgent(subagentsDir: string, id: string, opts: { tag?: string; parent?: string; at?: string }): void {
+      const first = JSON.stringify({
+        type: "user",
+        agentId: id,
+        message: { role: "user", content: opts.tag === undefined ? `a prompt for ${id}` : `prompt\n${SPAWN_TAG_MARKER} ${opts.tag}\n` },
+      });
+      const lines = [first];
+      if (opts.at !== undefined) {
+        lines.push(JSON.stringify({ type: "assistant", agentId: id, message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", name: "Bash", input: {} }] }, timestamp: opts.at }));
+      }
+      writeFileSync(join(subagentsDir, `agent-${id}.jsonl`), lines.join("\n") + "\n");
+      writeFileSync(
+        join(subagentsDir, `agent-${id}.meta.json`),
+        JSON.stringify({ agentType: "general-purpose", description: id, spawnDepth: opts.parent === undefined ? 1 : 2, ...(opts.parent === undefined ? {} : { parentAgentId: opts.parent }) })
+      );
+    }
+
+    function runHeartbeat(statePath: string, subagentsDir: string): { exitCode: number | null; stdout: string; stderr: string } {
+      const proc = Bun.spawnSync(
+        ["bun", join(REPO_ROOT, "lib", "loop.ts"), "heartbeat", statePath, "--slug", "demo", "--subagents-dir", subagentsDir],
+        { stdout: "pipe", stderr: "pipe" }
+      );
+      return { exitCode: proc.exitCode, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
+    }
+
+    function lanesOf(statePath: string): LaneState[] {
+      return (JSON.parse(readFileSync(statePath, "utf8")) as LoopState).lanes;
+    }
+
+    test("moves the baseline to the subtree's newest append, and the lane stops being probed", () => {
+      const subagents = mkdtempSync(join(tmpdir(), "zstack-heartbeat-"));
+      const statePath = join(dir, "heartbeat-state.json");
+      const appended = Date.parse("2026-08-04T12:00:00.000Z");
+      // The lane is 25 minutes into QA, i.e. long past the budget on stage age.
+      const now = appended + 30_000;
+      const s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: now - 25 * 60_000 })]);
+      writeFileSync(statePath, JSON.stringify(s));
+      // attempt 1 for a lane with no bounces: the tag of the spawn running RIGHT NOW.
+      writeAgent(subagents, "q1", { tag: spawnTag("demo", 1, "qa", 1) });
+      writeAgent(subagents, "k1", { parent: "q1", at: new Date(appended).toISOString() });
+      const { exitCode, stdout } = runHeartbeat(statePath, subagents);
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain("#1 qa last append");
+      expect(lanesOf(statePath)[0].lastActivityMs).toBe(appended);
+      // End to end: `next` no longer reaches for the worker.
+      const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", statePath, "--now", String(now)], { stdout: "pipe", stderr: "pipe" });
+      expect(JSON.parse(proc.stdout.toString())).toEqual({ kind: "wait" });
+      rmSync(subagents, { recursive: true, force: true });
+    });
+
+    // The attempt is half the tag, and it MOVES: a QA bounce spawns a fresh agent
+    // under a new tag. Reading the previous attempt's transcript would keep
+    // vouching for a stage that no longer exists -- so the verb must recompute it
+    // from the lane (stageAttempt), and this is what catches a hardcoded 1.
+    test("reads the CURRENT attempt's subtree, not the first one's", () => {
+      const subagents = mkdtempSync(join(tmpdir(), "zstack-heartbeat-attempt-"));
+      const statePath = join(dir, "heartbeat-attempt-state.json");
+      const dead = Date.parse("2026-08-04T12:00:00.000Z"); // attempt 1's last word
+      const alive = dead + 10 * 60_000; // attempt 2, still writing
+      const s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: 0, qaBounces: 1 })]);
+      writeFileSync(statePath, JSON.stringify(s));
+      writeAgent(subagents, "old", { tag: spawnTag("demo", 1, "qa", 1), at: new Date(dead).toISOString() });
+      writeAgent(subagents, "new", { tag: spawnTag("demo", 1, "qa", 2), at: new Date(alive).toISOString() });
+      expect(runHeartbeat(statePath, subagents).exitCode).toBe(0);
+      expect(lanesOf(statePath)[0].lastActivityMs).toBe(alive);
+      rmSync(subagents, { recursive: true, force: true });
+    });
+
+    // Fail-open at the boundary, which is where a drain would actually die: an
+    // unresolvable subtree must cost the lane nothing and the tick nothing.
+    test("an unresolvable subtree leaves every lane exactly as it was, exit 0", () => {
+      const subagents = mkdtempSync(join(tmpdir(), "zstack-heartbeat-open-"));
+      const statePath = join(dir, "heartbeat-open-state.json");
+      const before = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: 7 })]);
+      writeFileSync(statePath, JSON.stringify(before));
+      const { exitCode, stdout } = runHeartbeat(statePath, subagents); // empty dir: no agent carries the tag
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain("no subtree observed");
+      expect(lanesOf(statePath)).toEqual(before.lanes);
+      // ...and a directory that does not exist at all is the same answer, loudly.
+      const missing = runHeartbeat(statePath, join(subagents, "never-created"));
+      expect(missing.exitCode).toBe(0);
+      expect(missing.stderr).toContain("every lane keeps its current watchdog baseline");
+      expect(lanesOf(statePath)).toEqual(before.lanes);
+      rmSync(subagents, { recursive: true, force: true });
+    });
+
+    // bin/z-loop-tick's wiring, pinned where it can rot: the observation is
+    // worthless unless it lands between the ingest that settles the lane list and
+    // the `next` that reads the baseline.
+    test("bin/z-loop-tick runs the heartbeat after the ingest and before next", () => {
+      const tick = readFileSync(join(REPO_ROOT, "bin", "z-loop-tick"), "utf8");
+      const at = (s: string) => tick.indexOf(s);
+      expect(at(`loop.ts" heartbeat "$STATE"`)).toBeGreaterThan(-1);
+      expect(at(`loop.ts" heartbeat "$STATE"`)).toBeGreaterThan(at(`loop.ts" ingest "$STATE"`));
+      expect(at(`loop.ts" heartbeat "$STATE"`)).toBeLessThan(at(`loop.ts" next "$STATE"`));
+      // Never aborts the tick: a transcript-dir hiccup must not wedge a drain.
+      expect(tick).toContain(`heartbeat "$STATE" --slug "$SLUG" --project-dir "$PWD" >/dev/null || true`);
+    });
   });
 
   // -- AC13: `human-needed` / `human-needed-ack` CLI verbs ---------------------

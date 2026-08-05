@@ -642,6 +642,23 @@ from the harness's task list, and never let a lane idle unprobed. A stage that
 returns a `CONFUSED:` final message routes to `skip` automatically — comment
 its confusion note into the ticket when you execute the skip.
 
+**Silence, not stage age (#256).** `watchdogMinutes` measures how long a lane's
+stage-spawn subtree has appended NOTHING to its transcripts — not how long the
+stage has been running. `z-loop-tick` reads that for you: every tick, after the
+ingest and before `next`, it runs
+`bun "$PACK/lib/loop.ts" heartbeat "$STATE" --slug "$SLUG" --project-dir "$PWD"`,
+which resolves each live lane's spawn tag (`spawnTag(slug, ticket, stage,
+attempt)` — recomputed from the lane, never stored) and moves its baseline
+forward to the newest record in that subtree, the stage agent's own plus every
+descendant's. Nothing here is yours to judge and there is no extra command to
+run. Two properties worth knowing when you read a tick's stderr: the move is
+**monotonic** (an observation older than the baseline changes nothing), and an
+unresolvable subtree is a **no-op that says so on stderr** — that lane silently
+falls back to the pre-#256 stage-age behavior, which is why the note is worth
+reading rather than ignoring. Before this, a healthy QA stage crossed the budget
+on age alone (its mandatory typecheck + suite + build runs 121s idle, 234s
+loaded) and got probed while working.
+
 **Merge lanes are the one exception (H9):** `next` never auto-skips a dead
 `merge` lane (it returns `check-worker` instead), because `gh pr merge` may have
 landed the PR before the worker died. Resolve a dead merge lane by verifying PR

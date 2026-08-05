@@ -186,9 +186,25 @@ records the result. It never re-derives a scheduling decision in prose.
   Skipped. QA bugs bounce to a fresh builder: from QA-bounce config
   `qaInvestigateAfter` (default 2) onward, the rebuild runs `/investigate`
   first; at config `maxQaPasses` (default 3), the ticket parks Blocked instead
-  of bouncing again. A worker silent past the watchdog (default 10 min) is
+  of bouncing again. A worker silent past the watchdog (default 15 min) is
   probed and then Skipped with a note. Exception: a dead merge lane is verified
   via PR state and ends Merged or Blocked, never Skipped.
+- **The watchdog measures silence, not stage age.** `watchdogMinutes` counts
+  minutes in which a lane's stage agent and every sub-agent it spawned appended
+  NOTHING to their transcripts. Each tick reads that subtree and moves the lane's
+  baseline forward, so a stage that works for an hour is never probed while a
+  stage that goes quiet is. Until #256 nothing observed a worker at all: the
+  baseline was stamped only when a stage STARTED, so the timer fired
+  `watchdogMinutes` after a claim however hard the agent was working — and every
+  QA stage crossed it while healthy, since its mandatory typecheck + full suite +
+  build takes 121s idle and 234s under load on this repo before it reaches the
+  first acceptance criterion. The default is derived, not chosen: the longest
+  measured gap between a working agent's own transcript records is 423s (9,589
+  mid-work samples over 1,388 sub-agent transcripts), and a silence budget must
+  clear that ceiling by 2x, which is 15 minutes. If a lane's subtree cannot be
+  resolved (no session transcript yet, a stage spawned without its tag), the tick
+  says so on stderr and that lane falls back to the old stage-age behavior — the
+  observation never parks a lane on its own absence.
 - **A stage that died without ever reporting can still be recovered.** A stage
   agent's exit contract is parsed from its final message, so a worker that ends
   its turn with no marker reads as CONFUSED — and a CONFUSED skips the ticket.

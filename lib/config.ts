@@ -104,7 +104,10 @@ export interface BoardConfig {
   fields: Record<string, FieldConfig>; // Model | Model Effort | Estimate | Actual
   epicStyle?: EpicStyle; // set at /z-setup; defaults to "milestones"
   maxLanes?: number; // max concurrent workers (PROCESS.md: no more than 3)
-  watchdogMinutes?: number; // stuck-worker timeout in minutes (PROCESS.md: 10)
+  // Minutes of observed worker SILENCE before the loop probes a lane (#256: the
+  // baseline is the newest append in the stage's spawn subtree, not the moment
+  // the stage started). See DEFAULT_WATCHDOG_MINUTES for the derivation.
+  watchdogMinutes?: number;
   // A project loop lock (lib/locks.ts) with no verifiable pid and older than this
   // is judged stale rather than live, so a crashed loop's lock never wedges the
   // next /z-loop (C7, issue #2). Sized well above a realistic batch so two near-
@@ -206,7 +209,24 @@ export interface BoardConfig {
 export const DEFAULT_QUOTA: QuotaConfig = { threshold: 100, mode: "sleep" };
 export const DEFAULT_EPIC_STYLE: EpicStyle = "milestones";
 export const DEFAULT_MAX_LANES = 3;
-export const DEFAULT_WATCHDOG_MINUTES = 10;
+// Minutes of subtree SILENCE that expire a stage. A MEASUREMENT, not a round
+// number, and it is only meaningful at all since #256 made lastActivityMs a
+// silence baseline instead of a stage-age one.
+//
+// The population is the same one lib/transcripts.ts derives SUBTREE_QUIET_MS
+// from: the longest gap between a WORKING agent's own transcript records, over
+// 9,589 mid-work samples across 1,388 sub-agent transcripts on this machine --
+// MEASURED_MIDWORK_GAP_MS = 423,110 ms (p50 1.5s, p90 7.4s, p99 34s). A silence
+// budget under that ceiling declares a healthy agent dead, so this pack clears it
+// by 2x wherever it decides something on silence: 2 x 423,110 = 846,220 ms
+// = 14.1 min, rounded up to 15. Identical to SUBTREE_QUIET_MS by construction,
+// because it is the same question asked of the same evidence.
+//
+// The old 10 predates the measurement and cleared that ceiling by only 1.42x --
+// on the decision that DISCARDS A WHOLE TICKET, where SUBTREE_QUIET_MS's 2x only
+// risks leaving one scratch worktree behind. tests/loop.test.ts pins the ratio so
+// a future edit cannot quietly drop back under it.
+export const DEFAULT_WATCHDOG_MINUTES = 15;
 export const DEFAULT_LOCK_STALENESS_MINUTES = 60;
 export const DEFAULT_AUDIT_EVERY_N_LOOPS = 5;
 export const DEFAULT_MAX_QA_PASSES = 3;

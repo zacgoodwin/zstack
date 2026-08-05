@@ -35,6 +35,7 @@ import {
   readAgentMetas,
   spawnTag,
   subagentsDirFor,
+  subtreeActivityMs,
 } from "../lib/transcripts.ts";
 
 const tmpPaths: string[] = [];
@@ -700,6 +701,116 @@ describe("subtree liveness (#209)", () => {
     expect(has(`git worktree remove ".worktrees/review-<N>" --force`)).toBe(true);
     // The unconditional "remove it after the stage" form is what #66 hit.
     expect(has(`remove it after the stage (\`git worktree remove ".worktrees/review-<N>" --force\`)`)).toBe(false);
+  });
+});
+
+// The watchdog's silence baseline (#256). Same corpus shapes as the liveness
+// block above, asking the other question: not "has this subtree come to rest" but
+// "when did anyone in it last write". The defect it replaces is that NOTHING
+// asked either -- lastActivityMs was stamped only by stage events, so
+// watchdogExpired measured stage age and probed a healthy QA stage that was still
+// running its mandatory suite.
+describe("subtreeActivityMs (#256)", () => {
+  // A tagged stage agent with `kids` beneath it, none of them having written
+  // anything yet. Returns the tag.
+  function stageWithKids(dir: string, ticket: number, stage: "builder" | "qa" | "reviewer", kids: string[], root: string): string {
+    const tag = spawnTag("zstack", ticket, stage, 1);
+    writeAgent(dir, root, { prompt: stagePromptWithTag(tag), description: `Stage ${stage} of ${ticket}` });
+    for (const k of kids) writeAgent(dir, k, { parent: root, description: `child ${k} of ${root}` });
+    return tag;
+  }
+
+  test("the newest append anywhere in the subtree wins, root or descendant", () => {
+    const dir = mkTmp();
+    const tag = stageWithKids(dir, 151, "reviewer", ["k1", "k2"], "r1");
+    appendRunning(dir, "r1", QUIET); // the reviewer blocked on its skeptics 30 min ago
+    appendRunning(dir, "k1", QUIET);
+    expect(subtreeActivityMs(dir, tag)).toBe(Date.parse(QUIET));
+    // One skeptic writes: the STAGE is working, even though its own agent is not.
+    // This is the reviewer case #190 already prices as one stage's spend.
+    appendRunning(dir, "k2", RECENT);
+    expect(subtreeActivityMs(dir, tag)).toBe(Date.parse(RECENT));
+  });
+
+  // Run 10's flat directory: three lanes concurrent, every stage agent and every
+  // skeptic in ONE `subagents/`. A busy neighbour must never vouch for this lane,
+  // or the watchdog goes blind on exactly the wedged stage it exists to catch.
+  test("a sibling stage's activity is not this stage's", () => {
+    const dir = mkTmp();
+    const mine = stageWithKids(dir, 151, "qa", ["mine-k"], "q1");
+    stageWithKids(dir, 164, "reviewer", ["theirs-k"], "r2");
+    appendRunning(dir, "q1", QUIET);
+    appendRunning(dir, "mine-k", QUIET);
+    appendRunning(dir, "r2", RECENT);
+    appendRunning(dir, "theirs-k", RECENT);
+    expect(subtreeActivityMs(dir, mine)).toBe(Date.parse(QUIET));
+  });
+
+  // Every fail-open path, one per line. Each must be `undefined` -- "no
+  // observation" -- because the caller reads that as "keep the baseline you have",
+  // i.e. the pre-#256 stage-age behavior. Answering "silent" here would park a
+  // healthy lane on a missing sidecar.
+  test("every unresolvable input observes nothing instead of throwing", () => {
+    const dir = mkTmp();
+    const tag = stageWithKids(dir, 151, "qa", [], "q1");
+    appendRunning(dir, "q1", RECENT);
+    // a directory that does not exist at all (no session sub-agent dir yet)
+    expect(subtreeActivityMs(join(dir, "never-created"), tag)).toBeUndefined();
+    // a tag no parentless agent carries (prompt built without --spawn-tag, or the
+    // spawn has not written its first line yet)
+    expect(subtreeActivityMs(dir, spawnTag("zstack", 999, "qa", 1))).toBeUndefined();
+    // a subtree that has written nothing datable at all
+    const undated = stageWithKids(dir, 152, "qa", [], "q2");
+    expect(subtreeActivityMs(dir, undated)).toBeUndefined();
+    // the same tag on two parentless agents -- the ambiguity collectTranscripts
+    // refuses to guess at, refused identically here
+    writeAgent(dir, "dup", { prompt: stagePromptWithTag(tag), description: "a second spawn of the same tag" });
+    appendRunning(dir, "dup", RECENT);
+    expect(subtreeActivityMs(dir, tag)).toBeUndefined();
+  });
+
+  // readAgentMetas' rule: one bad sidecar is named on stderr and skipped, never
+  // thrown. Its agent is then not walked as a child, so its appends do NOT count
+  // as this stage's activity -- the opposite of liveUnknownParentage's rule for
+  // worktree removal, and deliberately so. There, counting an unknown agent as
+  // live costs one swept worktree; here, counting a stranger's appends would
+  // silence the watchdog on a wedged lane, which is the run-10 mis-attribution
+  // defect wearing a safety label. Not counting costs one probe the lane answers
+  // ALIVE.
+  test("an unreadable meta sidecar is skipped, not thrown, and not attributed", () => {
+    const dir = mkTmp();
+    const tag = stageWithKids(dir, 151, "reviewer", ["k1"], "r1");
+    writeAgent(dir, "k2", { parent: "r1", meta: "{ not json" });
+    appendRunning(dir, "r1", QUIET);
+    appendRunning(dir, "k1", QUIET);
+    appendRunning(dir, "k2", RECENT);
+    expect(captureStderr(() => expect(subtreeActivityMs(dir, tag)).toBe(Date.parse(QUIET)))).toContain("skipping agent-k2.meta.json");
+  });
+
+  // The two undatable tails a WORKING agent produces: a final line caught
+  // half-written (the harness appending right now) and a record with no timestamp
+  // field. Reading only the last line would call both of those silence.
+  test("scans back past a half-written or undated tail", () => {
+    const dir = mkTmp();
+    const tag = stageWithKids(dir, 151, "qa", [], "q1");
+    appendRunning(dir, "q1", RECENT);
+    append(dir, "q1", { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "no stamp" }] } });
+    expect(subtreeActivityMs(dir, tag)).toBe(Date.parse(RECENT));
+    writeFileSync(join(dir, "agent-q1.jsonl"), readFileSync(join(dir, "agent-q1.jsonl"), "utf8") + '{"type":"assist');
+    expect(subtreeActivityMs(dir, tag)).toBe(Date.parse(RECENT));
+  });
+
+  // The record's OWN clock, never the file's mtime -- collectTranscripts COPIES
+  // transcripts, and a copy's mtime is `now`. On an mtime this would report a
+  // wedged stage as freshly active every time its transcripts were collected.
+  test("a freshly touched file with old records still reads old", () => {
+    const dir = mkTmp();
+    const tag = stageWithKids(dir, 151, "qa", [], "q1");
+    appendRunning(dir, "q1", QUIET);
+    const now = new Date();
+    utimesSync(join(dir, `agent-q1.jsonl`), now, now);
+    expect(statSync(join(dir, "agent-q1.jsonl")).mtimeMs).toBeGreaterThan(Date.parse(QUIET));
+    expect(subtreeActivityMs(dir, tag)).toBe(Date.parse(QUIET));
   });
 });
 

@@ -128,7 +128,12 @@ re-running `/z-setup` with (or without) that flag is the supported way to
 change them.
 
 - `maxLanes` (default 3) — concurrent worktree lanes.
-- `watchdogMinutes` (default 10) — silent-worker timeout.
+- `watchdogMinutes` (default 15) — silent-worker timeout, measured as minutes in
+  which the lane's agent subtree appended nothing to its transcripts (not stage
+  age; #256). The default is 2x the longest measured mid-work gap between a
+  working agent's own records (423s), the same margin `SUBTREE_QUIET_MS` uses.
+  Raise it for a repo whose stages legitimately go quiet longer (a slow build
+  behind one tool call); lowering it below ~15 starts probing healthy agents.
 - `lockStalenessMinutes` (default 60) — when a crashed loop's lock is judged stale.
 - `auditEveryNLoops` (default 5) — how often the end-of-loop stage runs the
   `/cso` + `/health` audits (`loopCount % auditEveryNLoops === 0`). Lower it

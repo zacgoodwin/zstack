@@ -153,6 +153,45 @@ whether the stage prompt's foreground rule is being honored (verification must
 finish before the final message — a backgrounded gate can never report back,
 because the loop sends each stage agent exactly one message by design).
 
+## A healthy stage was probed (or Skipped) while it was still working
+
+Before #256 this was the expected behavior, not a fault: `watchdogMinutes` was
+compared against the moment the stage STARTED, because nothing in the pack ever
+observed a worker. So the timer fired that many minutes after the claim however
+hard the agent was working, and a QA stage — ordered to run typecheck, the full
+suite, and the build before touching its first acceptance criterion, which is
+121s idle and 234s under load on this repo — routinely crossed the old 10-minute
+default while perfectly healthy. If the harness had already forgotten the agent
+by then, the probe answered dead and the ticket was Skipped with real work in it.
+
+Now the baseline is real silence. Every tick reads the newest transcript record
+across the lane's stage agent and every sub-agent it spawned, and moves the
+lane's baseline forward to it, so only a lane that has written nothing for
+`watchdogMinutes` is probed. The default is 15, derived as 2x the longest
+measured gap between a working agent's own records (423s over 9,589 mid-work
+samples).
+
+If you still see a working stage probed, read the tick's stderr for:
+
+```text
+loop heartbeat: no session transcript directory resolved; every lane keeps its current watchdog baseline.
+#<N> <stage> no subtree observed; baseline unchanged
+```
+
+Either line means the observation is not happening for that lane and it has
+fallen back to the old stage-age timer. The usual causes: the loop is running in
+a directory whose Claude Code session transcript cannot be resolved, or the stage
+was spawned without its `--spawn-tag` stub (the tag is how a lane finds its own
+agent among every other lane's in one flat `subagents/` directory). Until it is
+fixed, raising `watchdogMinutes` in `~/.zstack/projects/<slug>/config.json` is
+the safe stopgap — it costs nothing but a longer wait before a genuinely dead
+worker is noticed.
+
+Note the watchdog has no cumulative ceiling: a lane whose agent is registered in
+the harness task list but wedged answers ALIVE to every probe, and each ALIVE
+refreshes the baseline. Nothing terminates that on its own — a lane that has been
+probed alive for hours is a human's call to stop.
+
 ## `git worktree list` is full of leftover `review-*` worktrees
 
 Those are the reviewer's throwaway checkouts. They hold no work — each is a

@@ -19,7 +19,7 @@ import {
   type FieldState,
   type ProjectState,
 } from "../lib/setup-board.ts";
-import { loadConfig, type BoardConfig } from "../lib/config.ts";
+import { DEFAULT_WATCHDOG_MINUTES, loadConfig, type BoardConfig } from "../lib/config.ts";
 import { validateConfig } from "../lib/config-schema.ts";
 import { loadBoardTemplate, deriveShape, DEFAULT_TEMPLATE } from "../lib/board-template.ts";
 import type { GraphQLData, GraphQLExecutor } from "../lib/board.ts";
@@ -367,7 +367,10 @@ describe("SetupBoard.apply — creation path", () => {
     expect(cfg.repositoryId).toBe("R_1");
     expect(cfg.epicStyle).toBe("milestones");
     expect(cfg.maxLanes).toBe(3);
-    expect(cfg.watchdogMinutes).toBe(10);
+    // The pack default, not a literal: #256 re-derived it (10 -> 15) off the same
+    // measured mid-work gap SUBTREE_QUIET_MS uses, and what this test is pinning
+    // is that setup writes whatever that derivation says, not the number itself.
+    expect(cfg.watchdogMinutes).toBe(DEFAULT_WATCHDOG_MINUTES);
     expect(Object.keys(cfg.statusField.options!)).toEqual([...STATUS_OPTIONS]);
     expect(Object.keys(cfg.fields)).toEqual(["Model", "Model Effort", "Estimate", "Actual"]);
     expect(typeof cfg.fields.Model.options!.opus).toBe("string");

@@ -167,6 +167,15 @@ export function claimableTickets(tickets: TicketSnapshot[], lanes: LaneState[], 
 // A stage is expired when it has been silent for LONGER than the budget --
 // exactly watchdogMinutes of silence is still in budget. Clock injected: the
 // caller passes nowMs, so tests pin expiry to the millisecond.
+//
+// `lastActivityMs` is a real silence baseline since #256: the newest transcript
+// append observed anywhere in the lane's stage-spawn subtree, floored at the
+// moment the stage started (loop.ts recordActivity). Until then nothing in the
+// pack observed a worker at all, so the subtraction below measured STAGE AGE and
+// this fired watchdogMinutes after a claim however hard the agent was working --
+// which every QA stage crossed while healthy, since its mandatory suite alone
+// runs 121s idle / 234s loaded against a 10-minute default. Neither the signature
+// nor this boundary changed with that fix; only the meaning of the baseline did.
 export function watchdogExpired(lane: LaneState, nowMs: number, watchdogMinutes: number): boolean {
   return nowMs - lane.lastActivityMs > watchdogMinutes * 60_000;
 }

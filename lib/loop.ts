@@ -36,6 +36,11 @@ import {
   watchdogExpired,
 } from "./lanes.ts";
 import { reconcileBoardMoves } from "./reconcile.ts";
+// #256: the watchdog's silence baseline is read off the harness's own sub-agent
+// transcripts. Runtime-safe in this direction -- transcripts.ts reaches back into
+// this file only through stage-prompts.ts's `import type { Stage }`, which is
+// erased, so there is no import cycle at run time.
+import { readAgentMetas, subagentsDirFor, subtreeActivityMs, spawnTag, type AgentMeta } from "./transcripts.ts";
 
 // -- ticket states ------------------------------------------------------------
 
@@ -165,7 +170,18 @@ export interface TicketSnapshot {
 export interface LaneState {
   ticket: number;
   stage: Stage;
-  lastActivityMs: number; // last observed worker output (watchdog baseline)
+  // The watchdog baseline: the newest transcript append observed anywhere in this
+  // lane's stage-spawn subtree (#256, recordActivity below), floored at the
+  // moment the stage started. Before #256 nothing observed a worker at all: every
+  // writer was a stage EVENT -- the claim, an advance, a #209 re-spawn, a
+  // recorded outcome, an ALIVE probe -- so `watchdogExpired` was a stage-age
+  // timer that fired watchdogMinutes after the stage began however hard the agent
+  // was working.
+  // The floor is deliberate and one-directional: a heartbeat only ever moves this
+  // FORWARD (never backwards, see recordActivity), so an unobservable subtree
+  // degrades to exactly that stage-age behavior and the watchdog can only be
+  // made more patient by an observation, never less.
+  lastActivityMs: number;
   qaBounces: number; // completed QA passes that found bugs
   reviewBounces: number; // completed reviewer->builder bounces (issue #76)
   // #191: reviewer->REVIEWER re-spawns this lane has spent on a short skeptic
@@ -1693,6 +1709,34 @@ export function recordProbe(
   return next;
 }
 
+// Records observed worker activity on a lane: the newest transcript append in its
+// stage-spawn subtree, read at the tick boundary and handed in as a number (pure).
+//
+// MONOTONIC, and that is the safety property. `activityMs` only ever moves the
+// baseline FORWARD, so:
+//
+//   * an observation older than the baseline (a stage that has written nothing
+//     since it was claimed, a subtree whose newest record predates a re-spawn)
+//     changes nothing, and the lane keeps its stage-start floor -- the pre-#256
+//     stage-age behavior, which is the conservative direction;
+//   * `undefined` -- every fail-open answer subtreeActivityMs can give -- is a
+//     no-op for the same reason, so a missing session transcript or an unresolved
+//     spawn tag can never park a healthy lane NOR silence the watchdog on a dead
+//     one.
+//
+// The observation itself is a filesystem read, so it happens at the CLI edge (the
+// `heartbeat` verb below) and the reducer only ever sees the number -- the same
+// split as `nowMs`, and the reason the state machine stays free of `node:fs`.
+export function recordActivity(state: LoopState, ticket: number, activityMs: number | undefined): LoopState {
+  const next = structuredClone(state);
+  const lane = next.lanes.find((l) => l.ticket === ticket);
+  if (!lane) throw new ZError(`No lane holds #${ticket} to record activity on.`);
+  if (activityMs !== undefined && Number.isFinite(activityMs) && activityMs > lane.lastActivityMs) {
+    lane.lastActivityMs = activityMs;
+  }
+  return next;
+}
+
 // A lost z-board claim: another session owns the ticket; it leaves our batch.
 export function markClaimLost(state: LoopState, ticket: number): LoopState {
   const next = structuredClone(state);
@@ -2135,6 +2179,14 @@ const USAGE = `loop <command> [args]
   attempt <state.json> <ticket>                      print the lane's 1-based spawn count for its CURRENT
                                                      stage -- the <attempt> for "transcripts tag" and the
                                                      <stage>-<attempt> transcript name. Read it AFTER apply.
+  heartbeat <state.json> [--slug <s>] [--project-dir <d>] [--subagents-dir <d>] [--activity-ms <n> --ticket <N>]
+                                                     observe every live lane's stage-spawn subtree and move its
+                                                     watchdog baseline forward to the newest transcript append
+                                                     (#256). Silence, not stage age. Fail-open: a lane whose
+                                                     subtree cannot be resolved is left exactly as it was.
+                                                     --activity-ms with --ticket skips the read and hands the
+                                                     number straight to the reducer (tests, and a caller that
+                                                     already has it).
   claim-lost <state.json> <ticket>                   mark a ticket claimed by another session
   human-needed <state.json>                          print the breakdown + tripped/alreadyNotified (no writes)
   human-needed-ack <state.json>                       mark the mid-run notification as sent (fire-once flag)
@@ -2331,6 +2383,57 @@ export function main(argv: string[]): number {
       const lane = state.lanes?.find((l) => l.ticket === ticket);
       if (!lane) throw new ZError(`No lane holds #${ticket}, so it has no stage to count spawns for.`);
       console.log(stageAttempt(lane));
+      return 0;
+    }
+    if (cmd === "heartbeat") {
+      const state = readJson(statePath) as LoopState;
+      // The explicit form: the caller already has the number, so nothing is read
+      // off disk. Used by the gate tests and available to any caller that
+      // observed the subtree itself.
+      const explicit = str(flags, "activity-ms");
+      if (explicit !== undefined) {
+        const ticket = Number(str(flags, "ticket"));
+        if (!Number.isInteger(ticket)) throw new ZError("Usage: loop heartbeat <state.json> --activity-ms <n> --ticket <N>");
+        atomicWrite(statePath, JSON.stringify(recordActivity(state, ticket, Number(explicit)), null, 2));
+        console.log(`#${ticket} activity ${explicit}`);
+        return 0;
+      }
+      // The read is bounded by what the lane already knows: a stage spawn's tag
+      // is a digest of slug/ticket/stage/attempt (transcripts.spawnTag) and
+      // stageAttempt() returns the attempt of the spawn RUNNING RIGHT NOW, so the
+      // tag never has to be stored on the lane and can never name a spawn that
+      // already ended. Same three facts the orchestrator stamped into the prompt.
+      const slug = str(flags, "slug") ?? loadConfig(undefined).slug;
+      const subagentsDir = str(flags, "subagents-dir") ?? subagentsDirFor(str(flags, "project-dir") ?? process.cwd());
+      if (subagentsDir === undefined) {
+        // No session transcript resolved: nothing to observe, nothing to change.
+        // Loud on stderr (an operator debugging a skipped-but-healthy stage needs
+        // to know the observation is not happening) and exit 0 -- the drain must
+        // never stop because a sidecar directory is missing.
+        console.error("loop heartbeat: no session transcript directory resolved; every lane keeps its current watchdog baseline.");
+        return 0;
+      }
+      // One directory scan for every lane instead of one per lane: the metas are
+      // the same list whichever tag is being resolved.
+      let metas: AgentMeta[] | undefined;
+      try {
+        metas = readAgentMetas(subagentsDir).metas;
+      } catch (e) {
+        console.error(`loop heartbeat: ${(e as Error).message}; every lane keeps its current watchdog baseline.`);
+        return 0;
+      }
+      let next = state;
+      for (const lane of state.lanes ?? []) {
+        const activity = subtreeActivityMs(subagentsDir, spawnTag(slug, lane.ticket, lane.stage, stageAttempt(lane)), metas);
+        next = recordActivity(next, lane.ticket, activity);
+        const after = next.lanes.find((l) => l.ticket === lane.ticket)!;
+        console.log(
+          activity === undefined
+            ? `#${lane.ticket} ${lane.stage} no subtree observed; baseline unchanged`
+            : `#${lane.ticket} ${lane.stage} last append ${activity}${after.lastActivityMs === activity ? "" : " (older than the baseline; unchanged)"}`
+        );
+      }
+      atomicWrite(statePath, JSON.stringify(next, null, 2));
       return 0;
     }
     if (cmd === "claim-lost") {
