@@ -1983,13 +1983,12 @@ describe("#138 positive-evidence ingest: absence carries forward", () => {
     const prev = prev68();
     const s = ingestBoardItems(prev, [], {}, undefined, [40]);
     expect(s.batchTickets).toEqual([]);
-    // #273: the lane is retained for exactly one tick so the stop-lane action can
-    // tear it down, and confirmTargets watches lanes -- so the "never re-confirmed"
-    // invariant is measured where it matters, AFTER that stop is applied. The
-    // one-tick window is self-healing anyway (a re-confirm re-proves the removal
-    // and lands on the same stop); what this pins is that the cost does not
-    // recur for the rest of the drain.
-    expect(confirmTargets(s, [])).toEqual([40]);
+    // #273: the lane is retained until its stop-lane is applied, and confirmTargets
+    // watches lanes -- so the number would come back onto the target list for that
+    // window. It does not: a lane already carrying a goneReason is skipped, because
+    // it was marked BY a positive observation and a lookup can prove nothing new.
+    // Zero wasted lookups both before the stop and after it.
+    expect(confirmTargets(s, [])).toEqual([]);
     expect(confirmTargets(applyAction(s, nextAction(s, 0), 0), [])).toEqual([]);
     expect(prev.batchTickets).toEqual([40]); // and prev is untouched
     // The capture-once contract is otherwise intact: nothing was re-selected.
@@ -2670,6 +2669,88 @@ describe("ingestBoardItems", () => {
       // The note must name the teardown the SKILL's stop-lane row performs --
       // this is the whole reason the action exists rather than a filter.
       expect((a as { note: string }).note).toMatch(/lane lock/i);
+      // Both structural flags, read off the action JSON and never off the note
+      // (#209's rule). dropTicket is what makes applyAction remove the ticket;
+      // salvage is required because this is the one stop-lane that fires
+      // MID-STAGE, so the worktree may hold work no boundary ever committed.
+      expect((a as { dropTicket?: true }).dropTicket).toBe(true);
+      expect((a as { salvage?: true }).salvage).toBe(true);
+      expect((a as { note: string }).note).toContain("uncommitted-5.patch");
+    });
+
+    // The bug the single-lane fixtures above could not see: the stop used to live
+    // inside the shared per-lane loop, so a LOWER-INDEXED lane with a finished
+    // stage returned first and #5's live agent kept running for another tick (and
+    // another, for as long as its neighbours had work). Step 1a is its own pass.
+    test("AC1: a gone lane's stop outranks a DIFFERENT lane's finished stage", () => {
+      const prev: LoopState = {
+        tickets: [ticket(4, "Building"), ticket(5, "Building")],
+        lanes: [lane(4, "builder", { outcome: { kind: "built" } }), lane(5, "builder")],
+        maxLanes: 3,
+        watchdogMinutes: 10,
+      };
+      const s = ingestBoardItems(prev, [
+        { number: 4, title: "t4", fields: { Status: "Building" } },
+        cancelled(5),
+      ], { "4": "", "5": "" });
+      const a = nextAction(s, 0);
+      expect(a.kind).toBe("stop-lane");
+      expect((a as { ticket: number }).ticket).toBe(5);
+    });
+
+    // Deterministic when two lanes go gone at once: lowest ticket number first.
+    test("two gone lanes stop in ticket order, one per tick", () => {
+      const prev: LoopState = {
+        tickets: [ticket(5, "Building"), ticket(9, "QA")],
+        lanes: [lane(9, "qa"), lane(5, "builder")],
+        maxLanes: 3,
+        watchdogMinutes: 10,
+      };
+      const s = ingestBoardItems(prev, [cancelled(5), cancelled(9)], { "5": "", "9": "" });
+      const first = nextAction(s, 0);
+      expect((first as { ticket: number }).ticket).toBe(5);
+      const second = nextAction(applyAction(s, first, 0), 0);
+      expect(second.kind).toBe("stop-lane");
+      expect((second as { ticket: number }).ticket).toBe(9);
+    });
+
+    // The two goneReason sources have a documented precedence -- an observed
+    // status is the newer evidence -- and swapping the two loops in ingest would
+    // flip it with nothing failing.
+    test("an observed unsupported status outranks a stale confirmed-gone answer", () => {
+      const prev: LoopState = { tickets: [ticket(5, "Building")], lanes: [lane(5, "builder")], maxLanes: 2, watchdogMinutes: 7 };
+      const s = ingestBoardItems(prev, [cancelled(5)], { "5": "" }, undefined, [5]);
+      expect(s.lanes[0].goneReason).toEqual({ kind: "unsupported-status", status: "Cancelled" });
+      expect((nextAction(s, 0) as { note: string }).note).toContain('"Cancelled"');
+    });
+
+    // An item with no Status field renders "(none)", not an empty pair of quotes.
+    test("a missing Status field is named (none) in the stop note", () => {
+      const prev: LoopState = { tickets: [ticket(5, "Building")], lanes: [lane(5, "builder")], maxLanes: 2, watchdogMinutes: 7 };
+      const s = ingestBoardItems(prev, [{ number: 5, title: "t5", fields: {} }], { "5": "" });
+      expect(s.lanes[0].goneReason).toEqual({ kind: "unsupported-status", status: "" });
+      const note = (nextAction(s, 0) as { note: string }).note;
+      expect(note).toContain("(none)");
+      expect(note).not.toContain('""');
+    });
+
+    // A state.json written by a future version (or hand-edited) must still stop
+    // the lane -- but must NOT borrow either proof. Fabricating "a lookup proved
+    // it gone" for evidence nobody gathered is the #138 failure with a new face.
+    test("an unrecognized goneReason kind stops the lane without fabricating evidence", () => {
+      const s: LoopState = {
+        tickets: [ticket(5, "Building")],
+        lanes: [lane(5, "builder", { goneReason: { kind: "some-future-kind" } as never })],
+        maxLanes: 2,
+        watchdogMinutes: 7,
+      };
+      const a = nextAction(s, 0);
+      expect(a.kind).toBe("stop-lane");
+      expect((a as { dropTicket?: true }).dropTicket).toBe(true);
+      const note = (a as { note: string }).note;
+      expect(note).toMatch(/does not recognize/i);
+      expect(note).not.toMatch(/single-ticket lookup/i);
+      expect(note).not.toMatch(/does not drive/i);
     });
 
     // The stop does NOT wait for a stage boundary, unlike the human-move stop:
@@ -2794,13 +2875,19 @@ describe("ingestBoardItems", () => {
     test("a stale goneReason is cleared when the ticket is observed back in a driven status", () => {
       const crashed: LoopState = {
         tickets: [ticket(5, "Building")],
-        lanes: [lane(5, "builder", { goneReason: { kind: "unsupported-status", status: "Cancelled" } })],
+        lanes: [lane(5, "builder", { goneReason: { kind: "unsupported-status", status: "Cancelled" }, lastWroteStatus: "Building" })],
         maxLanes: 2,
         watchdogMinutes: 7,
       };
       const s = ingestBoardItems(crashed, [{ number: 5, title: "t5", fields: { Status: "Building" } }], { "5": "" });
       expect(s.lanes[0].goneReason).toBeUndefined();
       expect(nextAction(s, 0).kind).not.toBe("stop-lane");
+      // A revived lane gets the SAME treatment every other lane on this read
+      // gets: #125's origin marker is cleared too, because the board has been
+      // observed showing the status the loop last wrote. An earlier cut returned
+      // early here and left it set, which tells the next tick's desync guard to
+      // resync a lag that does not exist instead of honoring a human's move-back.
+      expect(s.lanes[0].lastWroteStatus).toBeUndefined();
     });
 
     // ...but an ABSENCE is not that proof (#138). A short page or a failed
@@ -2816,6 +2903,43 @@ describe("ingestBoardItems", () => {
       const s = ingestBoardItems(crashed, [], {});
       expect(s.lanes[0].goneReason).toEqual({ kind: "confirmed-gone" });
       expect(nextAction(s, 0).kind).toBe("stop-lane");
+    });
+
+    // #273: the discriminator is the ACTION's `dropTicket`, never `lane.goneReason`.
+    // The SKILL hand-builds a stop-lane of this kind itself (the `--if-present`
+    // moved:false row) for a lane that never went through a marking ingest, so a
+    // reducer that consulted hidden lane state left THAT path's ticket behind at a
+    // workable status -- and the next `next` returned a `claim`, spawning a paid
+    // agent into a ticket the board had just proved it does not have.
+    test("a hand-built stop-lane with dropTicket removes the ticket, with no lane mark", () => {
+      const s: LoopState = { tickets: [ticket(7, "Building")], lanes: [lane(7, "builder")], maxLanes: 2, watchdogMinutes: 7 };
+      expect(s.lanes[0].goneReason).toBeUndefined(); // never ingested, never marked
+      const after = applyAction(
+        s,
+        { kind: "stop-lane", ticket: 7, dropTicket: true, note: "#7 is no longer on the project board; releasing its lane." },
+        0
+      );
+      expect(after.lanes).toEqual([]);
+      expect(after.tickets).toEqual([]);
+      // The regression this pins: without the flag the next tick re-claimed it.
+      expect(nextAction(after, 0).kind).not.toBe("claim");
+    });
+
+    // Applying a replayed/duplicate stop-lane must not delete a live ticket.
+    test("a stop-lane for a lane that is already gone is a safe no-op", () => {
+      const s: LoopState = { tickets: [ticket(5, "Blocked")], lanes: [], maxLanes: 2, watchdogMinutes: 7 };
+      const after = applyAction(s, { kind: "stop-lane", ticket: 5, note: "replayed" }, 0);
+      expect(after.tickets).toEqual([ticket(5, "Blocked")]);
+      expect(after.lanes).toEqual([]);
+    });
+
+    // A confirmed-gone lane awaiting its stop must not be re-looked-up: it was
+    // marked BY a positive observation, so the lookup can prove nothing new.
+    test("a marked lane is dropped from the confirm pass's target list", () => {
+      const prev: LoopState = { tickets: [ticket(7, "QA")], lanes: [lane(7, "qa")], maxLanes: 2, watchdogMinutes: 7 };
+      const s = ingestBoardItems(prev, [], {}, undefined, [7]);
+      expect(s.lanes[0].goneReason).toEqual({ kind: "confirmed-gone" });
+      expect(confirmTargets(s, [])).toEqual([]);
     });
 
     // The OTHER stop-lane (a human move to a terminal status) must keep its

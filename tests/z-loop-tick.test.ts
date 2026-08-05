@@ -633,6 +633,8 @@ describe("z-loop-tick", () => {
     expect(action.kind).toBe("stop-lane");
     expect(action.ticket).toBe(1);
     expect(action.note).toMatch(/no longer on the project board/i);
+    expect(action.dropTicket).toBe(true);
+    expect(action.salvage).toBe(true);
 
     const log = proc.stderr.toString();
     expect(log).toContain("read missed #1");
@@ -673,6 +675,8 @@ describe("z-loop-tick", () => {
     expect(action.kind).toBe("stop-lane");
     expect(action.ticket).toBe(1);
     expect(action.note).toContain('"Cancelled"');
+    expect(action.dropTicket).toBe(true);
+    expect(action.salvage).toBe(true);
 
     const state = JSON.parse(readFileSync(tickState, "utf8"));
     expect(state.lanes.find((l: any) => l.ticket === 1).goneReason).toEqual({

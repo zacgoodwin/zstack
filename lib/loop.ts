@@ -223,10 +223,13 @@ export interface LaneState {
   // wedged the next run's Step 0, and a drain free to declare itself finished
   // and delete that worker's branch out from under it.
   //
-  // A lane only ever carries this for the one tick between the ingest that sets
-  // it and the stop-lane that applies: nextAction returns that stop before any
-  // other lane work, and applyAction drops the lane and its tombstone ticket in
-  // the same write.
+  // Lifetime: normally ONE tick -- the ingest that sets it, the `next` that
+  // returns its stop (step 1a, its own pass ahead of every other per-lane
+  // transition, so no neighbouring lane can defer it), the apply that drops lane
+  // and tombstone together. It survives longer only when a run dies between that
+  // ingest and that apply, which is why ingestBoardItems also CLEARS it on
+  // positive proof the ticket is back in a driven status (see the revival clause
+  // there); an absence never clears it.
   goneReason?: { kind: "unsupported-status"; status: string } | { kind: "confirmed-gone" };
 }
 
@@ -583,9 +586,22 @@ export type Action =
   // key meant two different things one edit apart. The orchestrator now reads
   // `.salvage` off the action JSON -- one structural key, three rows, no
   // substring in it.
+  // `dropTicket` (#273): this stop-lane is stopping a lane whose TICKET has left
+  // the loop's reach -- proved off the board, or observed in a status the loop
+  // does not drive -- so applying it must remove the ticket from state along with
+  // the lane. Without it the ticket lingers at whatever workable status it last
+  // held and the very next `next` returns a `claim` for it: a fresh PAID agent
+  // spawned into a ticket that is not on the board.
+  //
+  // A FIELD on the action, for the same reason `salvage` is one directly above:
+  // the two stop-lane kinds are otherwise indistinguishable to the orchestrator,
+  // and the SKILL hand-builds a stop-lane of this kind itself (the `--if-present`
+  // moved:false row) where no lane state exists to consult. Keying off hidden
+  // state -- `lane.goneReason` -- made the same real-world event resolve two
+  // different ways depending on which path reached it.
   | { kind: "park"; ticket: number; status: "Questions" | "Blocked"; note: string; salvage?: true }
   | { kind: "skip"; ticket: number; note: string; salvage?: true }
-  | { kind: "stop-lane"; ticket: number; note: string; salvage?: true }
+  | { kind: "stop-lane"; ticket: number; note: string; salvage?: true; dropTicket?: true }
   | { kind: "check-worker"; ticket: number }
   | { kind: "complete"; ticket: number; note: string }
   | { kind: "wait" }
@@ -1114,29 +1130,64 @@ export function nextAction(state: LoopState, nowMs: number): Action {
   //    records its outcome, and is caught here on the following tick. Merge
   //    approvals still wait for the gate below.
   const parkedByHuman = reconcileBoardMoves(tickets, lanes);
+
+  // 1a. #273: lanes whose TICKET left the loop's reach -- a human dragged it into
+  //     a column the loop does not drive, or a confirm-pass lookup proved it off
+  //     the board. Its OWN PASS, ahead of every other per-lane transition below,
+  //     and deliberately not gated on `lane.outcome` the way every other stop
+  //     here is. Two reasons, and they are not the same reason:
+  //
+  //     - There is no boundary coming. The human-move stop below waits for one
+  //       because its ticket is still on the board and still observable next
+  //       tick; a gone ticket is not observable at all, so waiting for a report
+  //       that may never arrive IS the unsupervised-worker window this stop
+  //       exists to close.
+  //     - Inside the shared loop it lost to any LOWER-INDEXED lane with a
+  //       finished stage (measured: lanes [#4 built, #5 gone] returned
+  //       `advance #4`), so a gone lane's live agent kept running for as many
+  //       ticks as its neighbours had work. The drain could not complete
+  //       meanwhile -- the retained lane keeps `lanes.length` non-zero -- so
+  //       nothing was ever unsafe, but the window it exists to close stayed open.
+  //
+  //     Lowest ticket number first so the choice is deterministic when two lanes
+  //     go at once. This cannot starve the rest of the loop: each pass removes
+  //     one gone lane for good, and there are finitely many.
+  const goneLane = lanes
+    .filter((l) => l.goneReason !== undefined)
+    .sort((a, b) => a.ticket - b.ticket)[0];
+  if (goneLane) {
+    const reason = goneLane.goneReason!;
+    const why =
+      reason.kind === "unsupported-status"
+        ? `now sits in board status ${reason.status ? JSON.stringify(reason.status) : "(none)"}, which the loop does not drive`
+        : reason.kind === "confirmed-gone"
+          ? `is no longer on the project board (proved by a single-ticket lookup)`
+          : // An unrecognized kind still stops the lane, but must NOT borrow either
+            // proof: a hand-edited or forward-version state.json is not evidence
+            // that a lookup ran. Naming what we do not know beats fabricating it.
+            `left the loop's reach for a reason this version does not recognize`;
+    return {
+      kind: "stop-lane",
+      ticket: goneLane.ticket,
+      // #273: unlike every other stop-lane, this one fires MID-STAGE -- the
+      // worker may be halfway through writing files it has not committed. The
+      // teardown removes the lane lock, which makes the worktree an orphan the
+      // next run's reconcile force-removes, so the dump is the only thing
+      // standing between a human's column drag and a builder's lost work.
+      // Unconditional rather than gated on `worktreeDirty`: that flag is only
+      // ever set by a dead-worker probe, and this stop does not wait for one. A
+      // dump of a clean tree is an empty patch and costs nothing.
+      salvage: true,
+      dropTicket: true,
+      note:
+        `#${goneLane.ticket} ${why}; stopping its ${goneLane.stage} lane so its agent is torn down and its lane lock ` +
+        `released. Its worktree may hold uncommitted work, dumped to ` +
+        `\`~/.zstack/projects/<slug>/reports/uncommitted-${goneLane.ticket}.patch\` (re-apply with \`git apply\`) because ` +
+        `releasing the lane lock leaves the worktree an orphan the next run's reconcile force-removes (other lanes continue).`,
+    };
+  }
+
   for (const lane of lanes) {
-    // #273: the lane's ticket left the loop's reach entirely -- a human dragged
-    // it into a column the loop does not drive, or a confirm-pass lookup proved
-    // it off the board. Deliberately checked BEFORE the `!lane.outcome` skip
-    // that gates every other stop here: the human-move stop below can afford to
-    // wait for a stage boundary because that ticket is still on the board and
-    // still observable next tick, but a gone ticket is not observable at all.
-    // Waiting for a boundary that may never come IS the unsupervised-worker
-    // window this stop exists to close, and -- since the retained lane keeps
-    // drainComplete false -- a worker that never reports would wedge the drain
-    // forever. Teardown is the SKILL's stop-lane row: kill the background agent,
-    // remove the lane lock, leave the worktree.
-    if (lane.goneReason) {
-      const why =
-        lane.goneReason.kind === "unsupported-status"
-          ? `now sits in board status ${lane.goneReason.status ? JSON.stringify(lane.goneReason.status) : "(none)"}, which the loop does not drive`
-          : `is no longer on the project board (proved by a single-ticket lookup)`;
-      return {
-        kind: "stop-lane",
-        ticket: lane.ticket,
-        note: `#${lane.ticket} ${why}; stopping its ${lane.stage} lane so its agent is torn down and its lane lock released (other lanes continue).`,
-      };
-    }
     if (!lane.outcome) continue;
     if (parkedByHuman.has(lane.ticket)) {
       return {
@@ -1528,19 +1579,29 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
       // A human already set the board status; honor it, just drop our lane. No
       // setStatus (the ticket is not ours to move anymore).
       //
-      // #273: when the lane is stopping because its TICKET left the loop's reach
-      // (goneReason), the ticket sitting in state is only the tombstone ingest
-      // kept so this action could name the lane. It goes in the SAME write as
-      // the lane, and only here -- that ordering is the whole fix. The reducer
-      // used to delete the ticket at ingest and strand the lane; now the ticket
-      // leaves state exactly when its worker and lock are torn down. Dropping it
-      // is also what stops tombstones accumulating: nothing on the board can
-      // ever refresh one, so a tombstone left behind would be re-carried by
-      // every later ingest forever. Read the lane BEFORE dropping it -- the
-      // reason is the only record of which kind of stop this is.
-      const lane = next.lanes.find((l) => l.ticket === action.ticket);
+      // #273: when the action carries `dropTicket`, its TICKET has left the
+      // loop's reach and the ticket in state is only the tombstone ingest kept so
+      // the action could name the lane. It goes in the SAME write as the lane,
+      // and only here -- that ordering is the whole fix. The reducer used to
+      // delete the ticket at ingest and strand the lane; now the ticket leaves
+      // state exactly when its worker and lock are torn down.
+      //
+      // Keyed off the ACTION, never off `lane.goneReason`: the SKILL hand-builds
+      // a stop-lane of this kind itself (the `--if-present` moved:false row) for
+      // a lane that never went through a marking ingest, and reading hidden lane
+      // state left that path's ticket behind at a workable status -- so the next
+      // `next` returned a `claim` for it and spawned a paid agent into a ticket
+      // proved off the board.
+      //
+      // Leaving the tombstone is not survivable in the confirmed-gone case: the
+      // board cannot re-observe that ticket, and once its lane is gone nothing
+      // watches it, so it would carry forward through every later ingest forever.
+      // (The unsupported-status case would in fact be swept by the next ingest's
+      // `gone` filter, since the item is still in the read -- but the ticket must
+      // still go HERE, in one write with the lane, or the state briefly says the
+      // loop owns work it has already torn the worker down for.)
       dropLane(next, action.ticket);
-      if (lane?.goneReason) next.tickets = next.tickets.filter((t) => t.number !== action.ticket);
+      if (action.dropTicket) next.tickets = next.tickets.filter((t) => t.number !== action.ticket);
       return next;
     }
     case "complete": {
@@ -1775,9 +1836,11 @@ export function ingestBoardItems(
   // stop-lane ACTION tears those down; deleting the ticket (and filtering the
   // lane, below) took the state machine's only handle on that lane away and left
   // every one of those resources behind. So the ticket stays as a minimal
-  // TOMBSTONE -- carried forward exactly as it was, never refreshed, since the
-  // board has nothing left to refresh it from -- purely so nextAction can name
-  // the lane it is about to stop. applyAction's stop-lane drops the pair.
+  // TOMBSTONE -- the prev snapshot carried forward unchanged, deliberately not
+  // refreshed even in the unsupported-status case where the item IS still in the
+  // read (it is in `ignored`, not `observed`, and a status the loop does not
+  // drive is not a status worth recording) -- purely so nextAction can name the
+  // lane it is about to stop. applyAction's stop-lane drops the pair.
   const lanedGone = new Set((prev?.lanes ?? []).map((l) => l.ticket).filter((n) => gone.has(n)));
   const merged = new Map<number, TicketSnapshot>();
   for (const t of prev?.tickets ?? []) merged.set(t.number, structuredClone(t));
@@ -1816,28 +1879,33 @@ export function ingestBoardItems(
   // action that actually performs the teardown, and keeps the lane visible to
   // drainComplete (lanes.length) until that action is applied -- so Step 7
   // cannot delete the branch a still-running worker is committing to.
+  //
+  // ONE mutable copy, then each marker cleared on its own evidence and returned
+  // once. An earlier cut returned early from the revival branch, which silently
+  // skipped the lastWroteStatus clear below that every other lane on the same
+  // read gets -- leaving a revived lane carrying a stale "our write is still in
+  // flight" marker, which is exactly what tells the next tick's desync guard to
+  // resync a lag that does not exist instead of honoring a human's move-back.
   const lanes = (prev?.lanes ?? []).map((l) => {
+    const next = { ...l };
     const reason = goneReasons.get(l.ticket);
-    if (reason) return { ...l, goneReason: reason };
-    // A mark normally lives one tick, but a run that dies between the ingest
-    // that set it and the apply that consumes it leaves it on disk. If the human
-    // then moves the ticket back into a status the loop drives, THAT read is
-    // positive proof the lane is workable again, so the stale mark is cleared --
-    // the same discipline lastWroteStatus follows below. `statusByNumber` is the
+    if (reason) {
+      next.goneReason = reason;
+      return next;
+    }
+    // A mark normally lives one tick -- ingest sets it, the next `next` returns
+    // its stop, the apply drops it. It outlives that only when a run dies in
+    // between and leaves it on disk. If the human then moves the ticket back
+    // into a status the loop drives, THAT read is positive proof the lane is
+    // workable again, so the stale mark is cleared. `statusByNumber` is the
     // OBSERVED set, deliberately, not the merged one: an absence still proves
     // nothing (#138), so a short page or a failed confirm lookup leaves a mark
     // that was once positively earned exactly where it is, and the stop stands.
-    if (l.goneReason !== undefined && statusByNumber.has(l.ticket)) {
-      const revived = { ...l };
-      delete revived.goneReason;
-      return revived;
+    if (next.goneReason !== undefined && statusByNumber.has(l.ticket)) delete next.goneReason;
+    if (next.lastWroteStatus !== undefined && statusByNumber.get(l.ticket) === next.lastWroteStatus) {
+      delete next.lastWroteStatus;
     }
-    if (l.lastWroteStatus !== undefined && statusByNumber.get(l.ticket) === l.lastWroteStatus) {
-      const cleared = { ...l };
-      delete cleared.lastWroteStatus;
-      return cleared;
-    }
-    return l;
+    return next;
   });
 
   // Safety control (issue #63): initialReadyCount/humanNeededNotified are
@@ -1990,8 +2058,14 @@ export function ingestBoardItems(
 export function confirmTargets(prev: LoopState | null, items: BoardItemLike[]): number[] {
   if (!prev) return [];
   const present = new Set(items.map((it) => it.number));
+  // #273: a lane already carrying a goneReason is awaiting its stop-lane, and a
+  // lookup can prove nothing new about it -- it was marked BY a positive
+  // observation. Spending one on it re-buys evidence already in hand, which is
+  // the same "one lookup and one log line each" waste the batchTickets
+  // subtraction below exists to prevent.
+  const marked = new Set((prev.lanes ?? []).filter((l) => l.goneReason !== undefined).map((l) => l.ticket));
   const watched = new Set<number>([...(prev.lanes ?? []).map((l) => l.ticket), ...(prev.batchTickets ?? [])]);
-  return [...watched].filter((n) => !present.has(n)).sort((a, b) => a - b);
+  return [...watched].filter((n) => !present.has(n) && !marked.has(n)).sort((a, b) => a - b);
 }
 
 // One single-ticket lookup's answer (lib/board.ts `item` prints exactly this).

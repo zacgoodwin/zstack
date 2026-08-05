@@ -505,8 +505,28 @@ describe("Ticket #273: a gone ticket's lane is torn down by stop-lane, not by th
       .find((l) => l.startsWith("| `stop-lane N` |"));
     expect(row).toBeDefined();
     expect(row!).toContain("#273");
-    expect(row!).toContain("drops the ticket along with the lane");
+    // Both structural flags are named, and named as FIELDS read off the action
+    // JSON -- #209's rule, because a prose trigger is matched by whatever
+    // sentence happens to contain it.
+    expect(row!).toContain('`"dropTicket": true`');
+    expect(row!).toContain('`"salvage": true`');
+    expect(row!).toMatch(/never off the note/i);
     // The teardown the reducer relies on is still spelled out in the row.
     expect(row!).toContain("lane-remove");
+  });
+
+  // The other half of the same contract, and the one that was silently wrong:
+  // the SKILL HAND-BUILDS a stop-lane for a ticket a `--if-present` move just
+  // proved is off the project. Without dropTicket that ticket stays in state at a
+  // workable status and the next tick spawns a paid agent into it.
+  test("the --if-present recovery hand-builds its stop-lane WITH dropTicket", () => {
+    const md = zLoop();
+    const line = md.split("\n").find((l) => l.includes('"kind":"stop-lane"'));
+    expect(line).toBeDefined();
+    expect(line!).toContain('"dropTicket":true');
+    // And the reason is written down where the operator reads it, not implied.
+    const block = section(md, "**Lane moves are `--if-present` (#138).**");
+    expect(block.includes("not optional here")).toBe(true);
+    expect(block.includes("claim")).toBe(true);
   });
 });

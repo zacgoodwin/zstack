@@ -90,15 +90,21 @@ records the result. It never re-derives a scheduling decision in prose.
   board, or a move into a column the loop does not drive — take the same path
   when the ticket has a **lane**. The tick does not quietly forget the lane; it
   marks it and the next `next` returns a **`stop-lane`** naming the observed
-  status or the removal proof. The orchestrator then does the teardown that only
-  an action can do: kill that lane's background agent, remove its
-  `locks/ticket-<N>.json`, and apply — which drops the lane and the ticket
-  together. The lane counts as *running* until then, so `drain-complete` cannot
+  status or the removal proof, ahead of every other lane's work so the stray
+  agent is torn down first. The orchestrator then does what only an action can
+  do: kill that lane's background agent, remove its `locks/ticket-<N>.json`, and
+  apply — which drops the lane and the ticket together (`"dropTicket": true` on
+  the action; without it the ticket would linger at a workable status and the
+  next tick would claim it, spawning a paid agent into a ticket the board does
+  not have). The lane counts as *running* until then, so `drain-complete` cannot
   fire and the end-of-loop branch cleanup cannot delete a branch a live worker is
-  still committing to. A ticket with **no** lane needs none of this: there is
-  nothing to tear down, so it is simply removed with its one stderr note. The
-  lane's worktree is left in place either way (the next run's reconcile scan
-  prunes it, as with any other stopped lane).
+  still committing to. This is the one `stop-lane` that fires **mid-stage** rather
+  than at a stage boundary, so it also carries `"salvage": true`: the worker may
+  be halfway through writing files it never committed, and releasing the lane lock
+  makes the worktree an orphan the next reconcile force-removes — the dump to
+  `reports/uncommitted-<N>.patch` is what stands between your column drag and a
+  builder's lost work. A ticket with **no** lane needs none of this: there is
+  nothing to tear down, so it is simply removed with its one stderr note.
 - **A `BUILT` that shipped nothing does not reach QA.** `BUILT` is a claim, and
   the loop verifies it against the lane worktree's own git facts before the lane
   advances: `git status --porcelain --branch` must report a clean tree, untracked
