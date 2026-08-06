@@ -149,6 +149,25 @@ const Q_ISSUE_LOOKUP = `query IssueLookup($owner: String!, $repo: String!, $numb
   }
 }`;
 
+// Was the PR on this branch merged? (#272) Reconcile's crash recovery needs it:
+// a crash between `gh pr merge` returning and the loop recording its MERGED
+// marker leaves a lane lock on a ticket the board still shows as Review, and
+// requeuing that ticket rebuilds work that is already on main.
+//
+// `states:` is deliberately absent and `first: 20` deliberately generous: the
+// question is "what happened to the PR for this branch", so a filtered query that
+// returned nothing would be indistinguishable from "no PR at all" -- and #138's
+// rule is that absence is never evidence. Ordered newest-first so a re-opened /
+// re-created branch reports its current PR, not its first.
+const Q_PR_STATE = `query PrState($owner: String!, $repo: String!, $branch: String!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequests(headRefName: $branch, first: 20, orderBy: { field: CREATED_AT, direction: DESC }) {
+      pageInfo { hasNextPage }
+      nodes { number url state }
+    }
+  }
+}`;
+
 // Single-ticket board lookup (#138). Deliberately NOT a filtered form of
 // Q_PROJECT_ITEMS: that query pages the whole board, and a short page is
 // indistinguishable from a removed ticket, so absence from it proves nothing.
@@ -847,6 +866,36 @@ export class Board {
     return item;
   }
 
+  // What happened to the PR on `branch`, or undefined when the branch has none
+  // (#272). Goes through the same executor as every other call here, so
+  // lib/board.ts stays the pack's only `gh` caller.
+  //
+  // A MERGED PR WINS over a newer one. The nodes arrive newest-first, but "newest"
+  // is not the question -- "did this branch's work land" is. A branch that was
+  // merged and then had a second PR opened and closed on it (a follow-up, a
+  // reverted retarget) would report that CLOSED one, which lib/reconcile.ts reads
+  // as "open" and requeues a ticket whose code is already on main: exactly the
+  // outcome #272 exists to prevent. A merge is positive evidence and nothing later
+  // un-merges it, so evidence beats recency here; otherwise the newest PR answers.
+  //
+  // undefined means "no PR found", and the caller must NOT read that as "not
+  // merged" -- a network failure throws, but a branch whose PR was never opened
+  // and a branch whose PR list we simply could not see look the same from here.
+  // lib/reconcile.ts fails closed on undefined for exactly that reason (#138).
+  async prState(branch: string): Promise<{ state: string; url: string; number: number } | undefined> {
+    const data = await this.gql(Q_PR_STATE, {
+      owner: this.cfg.owner,
+      repo: this.cfg.repo,
+      branch,
+    });
+    const prs = data.repository?.pullRequests;
+    if (!prs) return undefined;
+    assertSinglePage(prs, `pullRequests for branch "${branch}" (ceiling: 20 PRs per branch)`);
+    const nodes: any[] = prs.nodes ?? [];
+    const pr = nodes.find((n) => String(n?.state) === "MERGED") ?? nodes[0];
+    return pr ? { state: String(pr.state), url: String(pr.url), number: Number(pr.number) } : undefined;
+  }
+
   private async userId(login: string): Promise<string> {
     const data = await this.gql(Q_USER_ID, { login });
     const id = data.user?.id;
@@ -1095,6 +1144,14 @@ const USAGE = `z-board <command> [args]
   link <N> <M>                      record N depends on M (both directions)
   claim <N> <assignee>             atomic assignee claim
   release <N>                      remove every assignee (reconcile a stale claim)
+  pr-state <branch>                what happened to this branch's PR, as JSON:
+                                   {branch,found:true,state,url,number} or
+                                   {branch,found:false}. A MERGED PR wins over a
+                                   newer one -- the question is whether the work
+                                   LANDED, not which PR is most recent. found:false
+                                   is NOT proof of an unmerged PR (#138); both the
+                                   H9 watchdog and reconcile's #272 recovery must
+                                   fail closed on it rather than skip or requeue.
   quota                            remaining GraphQL points
 
   --slug <name>                     which ~/.zstack/projects/<slug> to use`;
@@ -1111,6 +1168,7 @@ const COMMANDS = new Set([
   "link",
   "claim",
   "release",
+  "pr-state",
   "quota",
 ]);
 
@@ -1266,6 +1324,20 @@ export async function main(
         const n = requireInt(positionals[0], "issue");
         const removed = await board.release(n);
         console.log(removed.length ? `released #${n} from ${removed.join(", ")}` : `#${n} had no assignees`);
+        return 0;
+      }
+      // "Is this branch's PR merged?" through the SAME code as reconcile's #272
+      // recovery. Both the H9 watchdog (z-loop/SKILL.md's check-worker row, a dead
+      // merge worker) and reconcile (a crashed merge lane) answer that question
+      // about the same lane in the same failure shape, and two implementations of
+      // it can classify the same branch differently. This verb is also what keeps
+      // lib/board.ts the pack's sole `gh` caller: the SKILL row used to shell out
+      // to `gh pr view` directly.
+      case "pr-state": {
+        const branch = positionals[0];
+        if (!branch) throw new ZError("Usage: z-board pr-state <branch>");
+        const pr = await board.prState(branch);
+        console.log(JSON.stringify(pr ? { branch, found: true, ...pr } : { branch, found: false }));
         return 0;
       }
       case "quota": {

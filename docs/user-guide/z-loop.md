@@ -1208,9 +1208,51 @@ Leftover throwaway review worktrees (`.worktrees/review-<N>` and its
 refuses startup — they hold no work and belong to no lane, and every run sweeps
 them at Step 0 anyway.
 
+### What a park leaves behind
+
+`park N Questions`, `skip N` and `stop-lane N` keep their worktree and drop their
+lane lock, so lock-absence alone cannot tell a park from a crash. Each of them now
+records its intent beside the lane locks, as
+`~/.zstack/projects/<slug>/locks/worktree-<N>.json`:
+
+| record | who writes it | what reconcile does |
+| --- | --- | --- |
+| `retained` | a park/skip/stop-lane with no `salvage` flag | nothing, ever. Not an orphan, does not refuse startup, never pruned. |
+| `disposable` | the salvage parks (exhausted commit retry, exhausted dead-worker respawn) | force-prunes it, exactly as before — which is why those parks dump a patch first. |
+| *(absent)* | nobody: this is a crash | force-prunes it, exactly as before. |
+
+So a batch that only parked tickets starts again with a plain `/z-loop` — before
+this, its retained worktrees read as orphans, startup refused, and the
+`--reconcile` it demanded deleted them. Retained worktrees are listed under
+`orphans.retainedWorktrees` in `reconcile scan`, and removed only when you say so:
+
+```bash
+bun ~/.claude/skills/zstack/lib/reconcile.ts clean-retained --slug <slug>
+```
+
+### An already-merged crash is recorded, not requeued
+
+`STATUS_FOR_STAGE.merge` is `Review`, and `Review` is an in-flight status — so a
+crash between `gh pr merge` returning success and the loop writing its `MERGED:`
+marker used to send a ticket whose code is already on `main` back to Ready. For a
+crashed `merge` lane still sitting at Review, reconcile reads the PR (one lookup,
+only for such lanes): **MERGED** → move to Done, prune, unlock, never release and
+never park; **OPEN** → the ordinary recovery; **unreadable** → nothing at all, and
+the ticket is named on stderr for a human. An unreadable PR is not proof of an
+unmerged one, and leaving a lane wedged is recoverable where rebuilding merged work
+is not.
+
+### Run the recovery commands from anywhere in the repo
+
+`reconcile scan` / `apply` / `clean-retained` / `sweep-review` resolve
+`<repo root>/.worktrees` from the shared `.git`, not from `process.cwd()`. Run from
+inside a lane worktree they used to report zero orphans with exit 0 — an answer
+indistinguishable from a clean board — and clear nothing while reporting success.
+Outside a git repo the board-touching verbs refuse rather than answer.
+
 Mid-run, dragging a Building/QA ticket to Blocked or Questions on the board is
 respected: the loop stops that one lane cleanly at its next stage boundary and
-keeps the others running.
+keeps the others running, with its worktree recorded `retained` so it survives.
 
 ## Done when
 

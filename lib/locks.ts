@@ -7,6 +7,10 @@
 //     transition, removed at lane end. Atomic (tmp + rename) so a reader never
 //     sees a half-written lock. `claimedAt` doubles as the lane's last-touched
 //     time, so a stale lock is legible after a crash.
+//   * Worktree records `worktree-<N>.json` {ticket, disposition, session,
+//     writtenAt} -- what a lane-terminating action MEANT to leave behind (issue
+//     #271). Written beside the lane locks, same atomic write, and read by
+//     lib/reconcile.ts's orphan scan.
 //   * Loop lock   `loop.lock` {session, startedAt, pid?} -- one per project. A
 //     second /z-loop on the same project reads it and refuses to start, naming
 //     the live session. Liveness: a verifiable pid decides; with no pid, a lock
@@ -144,6 +148,112 @@ function parseLaneLock(path: string): LaneLock {
     throw new ZError(`Lane lock ${path} must be {ticket, stage, session, claimedAt}.`);
   }
   return l as LaneLock;
+}
+
+// -- worktree disposition records (issue #271) ---------------------------------
+//
+// Before this, `lib/reconcile.ts` classified a lane worktree by ONE fact: does a
+// lane lock exist for its ticket? Everything else was an orphan, force-pruned by
+// the next `--reconcile`. But three of the four lane-terminating actions
+// deliberately keep their worktree AND drop their lock -- `park N Questions`,
+// `skip N`, and `stop-lane N` all say "keep the worktree for inspection"
+// (z-loop/SKILL.md). So the moment a lane parked, the worktree it kept on purpose
+// became an orphan by definition: the next run refused to start ("Orphans
+// present") and the `--reconcile` it demanded deleted exactly what the park was
+// saving.
+//
+// Lock-absence cannot distinguish those from a crash, because it is the same
+// observation. So the intent is RECORDED instead of inferred:
+//
+//   * `retained`   -- a human-facing park/skip/stop-lane kept this worktree as
+//                     the artifact. Never an orphan, never auto-pruned.
+//   * `disposable` -- the salvage parks (#177's commit-retry, #209's dead-worker
+//                     respawn) dumped a patch first precisely BECAUSE their
+//                     worktree is meant to die. Behaves exactly like a crash.
+//
+// A worktree with NO record is a genuine crash and keeps today's behavior
+// byte-for-byte -- which is what makes this safe to add: absence of a record is
+// never read as permission to keep something.
+//
+// There is deliberately no `active` value. A lane that is still running has a
+// LANE LOCK, and that is already the stronger fact reconcile checks first; a
+// third value would be a second source of truth for the same question.
+export type WorktreeDisposition = "retained" | "disposable";
+
+export interface WorktreeRecord {
+  ticket: number;
+  disposition: WorktreeDisposition;
+  session: string;
+  writtenAt: number; // ms, injected clock
+}
+
+// Name safety, same discipline as heartbeatPath: `worktree-<N>.json` matches
+// neither listLaneLocks's /^ticket-\d+\.json$/ nor currentClaimGen's
+// `loop.lock.reconcile` prefix scan, so the three kinds of file in this directory
+// can never be read as one another.
+//
+// The ticket is validated HERE, in the one place a number becomes a filename, so
+// the writer and the remover cannot disagree with the reader. `Number.isInteger`
+// alone was not enough: it admits 0, negatives and exponential forms, and
+// `worktree--5.json` / `worktree-1e+21.json` do not match listWorktreeRecords's
+// /^worktree-\d+\.json$/. A record that is written but can never be read back is
+// the worst possible failure for this file -- "retained" degrades to "no record",
+// which means "a crash", which force-prunes the worktree a human parked.
+export function worktreeRecordPath(locksDir: string, ticket: number): string {
+  if (!Number.isInteger(ticket) || ticket <= 0 || !/^\d+$/.test(String(ticket))) {
+    throw new ZError(`Worktree record ticket must be a positive integer, got "${ticket}".`);
+  }
+  return join(locksDir, `worktree-${ticket}.json`);
+}
+
+export function writeWorktreeRecord(locksDir: string, rec: WorktreeRecord): void {
+  mkdirSync(locksDir, { recursive: true });
+  atomicWrite(worktreeRecordPath(locksDir, rec.ticket), JSON.stringify(rec, null, 2) + "\n");
+}
+
+export function removeWorktreeRecord(locksDir: string, ticket: number): void {
+  rmSync(worktreeRecordPath(locksDir, ticket), { force: true });
+}
+
+// Every worktree record on disk, sorted by ticket. Tolerates a missing dir like
+// listLaneLocks does, and for the same reason.
+//
+// Fails LOUD on a corrupt record, deliberately -- the alternative is to skip it,
+// which reads as "no record", which reads as "a crash", which force-prunes a
+// worktree a human parked. A record that cannot be parsed must stop the scan, not
+// resolve to the destructive answer.
+export function listWorktreeRecords(locksDir: string): { path: string; record: WorktreeRecord }[] {
+  let names: string[];
+  try {
+    names = readdirSync(locksDir);
+  } catch (e: any) {
+    if (e?.code === "ENOENT") return [];
+    throw new ZError(`Cannot read locks dir ${locksDir}: ${e?.message ?? e}`);
+  }
+  const out: { path: string; record: WorktreeRecord }[] = [];
+  for (const name of names) {
+    if (!/^worktree-\d+\.json$/.test(name)) continue;
+    const path = join(locksDir, name);
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(path, "utf8"));
+    } catch (e) {
+      throw new ZError(`Worktree record ${path} is not valid JSON: ${(e as Error).message}`);
+    }
+    const r = raw as any;
+    if (
+      typeof r?.ticket !== "number" ||
+      (r?.disposition !== "retained" && r?.disposition !== "disposable") ||
+      typeof r?.session !== "string" ||
+      typeof r?.writtenAt !== "number"
+    ) {
+      throw new ZError(
+        `Worktree record ${path} must be {ticket, disposition: "retained"|"disposable", session, writtenAt}.`
+      );
+    }
+    out.push({ path, record: r as WorktreeRecord });
+  }
+  return out.sort((a, b) => a.record.ticket - b.record.ticket);
 }
 
 // -- loop lock ----------------------------------------------------------------
@@ -539,6 +649,15 @@ const USAGE = `locks <command> [args]
   lane-write  --slug S <ticket> <stage> --session ID [--now MS]
                                        write/re-stamp a lane lock
   lane-remove --slug S <ticket>        remove a lane lock
+  worktree-record --slug S <ticket> <retained|disposable> --session ID [--now MS]
+                                       record what a lane-terminating action MEANT
+                                       to leave behind (#271). "retained" = a park /
+                                       skip / stop-lane kept this worktree as the
+                                       artifact, so reconcile must never prune it;
+                                       "disposable" = a salvage park whose worktree
+                                       is meant to die, which behaves like a crash.
+  worktree-forget --slug S <ticket>    drop the record (the worktree is gone, or a
+                                       re-claim took the lane back)
 
 Paths default to ~/.zstack/projects/<slug>/locks; --dir overrides for tests.`;
 
@@ -670,6 +789,33 @@ export function main(argv: string[]): number {
       if (!Number.isInteger(ticket)) throw new ZError("Usage: locks lane-remove --slug S <ticket>");
       removeLaneLock(locksDir, ticket);
       console.log(`removed lane lock ticket-${ticket}`);
+      return 0;
+    }
+
+    if (cmd === "worktree-record") {
+      const { locksDir } = resolveDir(flags);
+      const ticket = Number(positionals[0]);
+      const disposition = positionals[1] as WorktreeDisposition;
+      // The ticket's own shape is enforced by worktreeRecordPath below, which is
+      // what the READER's filename regex actually agrees with.
+      if (disposition !== "retained" && disposition !== "disposable") {
+        throw new ZError("Usage: locks worktree-record --slug S <ticket> <retained|disposable> --session ID");
+      }
+      writeWorktreeRecord(locksDir, {
+        ticket,
+        disposition,
+        session: requireFlag(flags, "session"),
+        writtenAt: nowMs,
+      });
+      console.log(`recorded worktree ticket-${ticket} as ${disposition}`);
+      return 0;
+    }
+
+    if (cmd === "worktree-forget") {
+      const { locksDir } = resolveDir(flags);
+      const ticket = Number(positionals[0]);
+      removeWorktreeRecord(locksDir, ticket); // ticket shape enforced by worktreeRecordPath
+      console.log(`forgot worktree record ticket-${ticket}`);
       return 0;
     }
 

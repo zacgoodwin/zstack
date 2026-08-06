@@ -1750,6 +1750,147 @@ describe("release", () => {
   });
 });
 
+// -- prState (#272): "is this branch's PR merged?" ---------------------------
+// Reconcile's crash recovery needs this one fact: a crash between `gh pr merge`
+// returning success and the loop recording its MERGED marker leaves a lane lock on
+// a ticket the board still shows at Review, and requeuing it rebuilds work that is
+// already on main. It goes through the same executor as everything else here, so
+// lib/board.ts stays the pack's only gh caller (gated below).
+describe("prState (#272)", () => {
+  function prBackend(nodes: unknown[], hasNextPage = false) {
+    const calls: string[] = [];
+    const exec: GraphQLExecutor = async (query) => {
+      calls.push(opName(query));
+      // #153 appends `rateLimit { remaining resetAt }` to every query document, so
+      // a double that omits it trips the quota guard rather than the code under test.
+      return {
+        rateLimit: HEALTHY_RATE_LIMIT,
+        repository: { pullRequests: { pageInfo: { hasNextPage }, nodes } },
+      } as GraphQLData;
+    };
+    return { exec, calls };
+  }
+
+  test("a MERGED PR wins over a newer one", async () => {
+    // Nodes arrive newest-first, but "newest" is not the question -- "did this
+    // branch's work LAND" is. A branch merged and then re-PRed (a follow-up, a
+    // reverted retarget) reported that later CLOSED one, which lib/reconcile.ts
+    // reads as "open" and requeues a ticket whose code is already on main: exactly
+    // the outcome #272 exists to prevent. A merge is positive evidence and nothing
+    // later un-merges it, so evidence beats recency.
+    const backend = prBackend([
+      { number: 14, url: "https://pr/14", state: "CLOSED" },
+      { number: 12, url: "https://pr/12", state: "MERGED" },
+    ]);
+    expect(await new Board(CFG, backend.exec).prState("z/ticket-77-thing")).toEqual({
+      state: "MERGED",
+      url: "https://pr/12",
+      number: 12,
+    });
+  });
+
+  // With no merge anywhere in the list, recency decides as before.
+  test("with no merge in the list the newest PR still answers", async () => {
+    const backend = prBackend([
+      { number: 14, url: "https://pr/14", state: "OPEN" },
+      { number: 12, url: "https://pr/12", state: "CLOSED" },
+    ]);
+    expect(await new Board(CFG, backend.exec).prState("z/b")).toMatchObject({ number: 14, state: "OPEN" });
+  });
+
+  // A repository the token cannot see comes back null. That must be undefined --
+  // which reconcile fails closed on -- not a crash and not a fabricated state.
+  test("an unreadable repository answers undefined, not a throw", async () => {
+    const exec: GraphQLExecutor = async () =>
+      ({ rateLimit: HEALTHY_RATE_LIMIT, repository: null }) as unknown as GraphQLData;
+    expect(await new Board(CFG, exec).prState("z/ticket-77-thing")).toBeUndefined();
+  });
+
+  test("returns the newest PR's state, url and number", async () => {
+    const backend = prBackend([{ number: 12, url: "https://pr/12", state: "MERGED" }]);
+    const board = new Board(CFG, backend.exec);
+    expect(await board.prState("z/ticket-77-thing")).toEqual({
+      state: "MERGED",
+      url: "https://pr/12",
+      number: 12,
+    });
+    // The first-probe RateLimit query, then exactly ONE PR read: reconcile pays
+    // one lookup per crashed merge lane, never a sweep (#272).
+    expect(backend.calls.filter((c) => c === "PrState")).toEqual(["PrState"]);
+  });
+
+  test("an OPEN PR is reported as OPEN, not coerced", async () => {
+    const backend = prBackend([{ number: 13, url: "https://pr/13", state: "OPEN" }]);
+    expect(await new Board(CFG, backend.exec).prState("z/b")).toMatchObject({ state: "OPEN" });
+  });
+
+  // undefined is "no PR found", and the caller must not read it as "not merged" --
+  // lib/reconcile.ts fails closed on it for exactly that reason (#138).
+  test("a branch with no PR returns undefined rather than a fabricated state", async () => {
+    expect(await new Board(CFG, prBackend([]).exec).prState("z/never-opened")).toBeUndefined();
+  });
+
+  // The same single-page discipline every other per-item read here takes: a
+  // truncated list would make the newest PR unknowable, and a silently-wrong
+  // "newest" is how a ticket gets marked Done on someone else's merge.
+  test("a truncated PR list fails loud instead of guessing which one is newest", async () => {
+    const backend = prBackend([{ number: 1, url: "https://pr/1", state: "CLOSED" }], true);
+    await expect(new Board(CFG, backend.exec).prState("z/many")).rejects.toThrow(/pullRequests for branch/);
+  });
+
+  // The `pr-state` CLI verb. It exists so the H9 watchdog row in z-loop/SKILL.md
+  // (a dead MERGE worker) and reconcile's #272 recovery (a crashed MERGE lane) ask
+  // "did this branch's work land" through ONE code path -- the SKILL row used to
+  // shell out to `gh pr view` itself, which is both a second implementation of the
+  // same decision and a gh call outside lib/board.ts.
+  describe("the pr-state CLI verb", () => {
+    async function run(argv: string[], nodes: unknown[]): Promise<{ code: number; out: string }> {
+      const lines: string[] = [];
+      const realLog = console.log;
+      console.log = (...a: unknown[]) => void lines.push(a.map(String).join(" "));
+      try {
+        const code = await main(argv, () => new Board(CFG, prBackend(nodes).exec));
+        return { code, out: lines.join("\n") };
+      } finally {
+        console.log = realLog;
+      }
+    }
+
+    test("prints the PR as JSON with found:true", async () => {
+      const { code, out } = await run(["pr-state", "z/ticket-77-thing"], [
+        { number: 12, url: "https://pr/12", state: "MERGED" },
+      ]);
+      expect(code).toBe(0);
+      expect(JSON.parse(out)).toEqual({
+        branch: "z/ticket-77-thing",
+        found: true,
+        state: "MERGED",
+        url: "https://pr/12",
+        number: 12,
+      });
+    });
+
+    // found:false is NOT proof of an unmerged PR (#138). It has to be
+    // distinguishable from a state, or both callers would read "no PR" as "not
+    // merged" and skip or requeue landed work.
+    test("a branch with no PR prints found:false and still exits 0", async () => {
+      const { code, out } = await run(["pr-state", "z/never-opened"], []);
+      expect(code).toBe(0);
+      expect(JSON.parse(out)).toEqual({ branch: "z/never-opened", found: false });
+    });
+
+    test("a missing branch argument is a usage error, not an empty lookup", async () => {
+      const realErr = console.error;
+      console.error = () => {};
+      try {
+        expect(await main(["pr-state"], () => new Board(CFG, prBackend([]).exec))).toBe(1);
+      } finally {
+        console.error = realErr;
+      }
+    });
+  });
+});
+
 // -- AC3: grep contract-enforcement gate for the whole pack ------------------
 describe("contract enforcement", () => {
   function trackedFiles(): string[] {

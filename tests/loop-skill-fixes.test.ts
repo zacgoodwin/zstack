@@ -51,12 +51,31 @@ describe("C3: drain loop re-reads the board before every next (via z-loop-tick)"
 // ============================================================================
 // H9 -- dead merge worker: verify PR state before skipping
 // ============================================================================
-describe("H9: a dead merge lane is verified via gh pr view, not blind-skipped", () => {
-  test("the SKILL documents the gh pr view check for merge lanes", () => {
+describe("H9: a dead merge lane is verified against the PR, not blind-skipped", () => {
+  // This assertion used to require the literal `gh pr view`. It now requires the
+  // OPPOSITE, deliberately: #272 gave reconcile its own answer to "did this
+  // branch's work land", and two implementations of the same decision about the
+  // same lane in the same failure shape can classify it differently. The verb is
+  // the shared one, and routing the SKILL through it also restores lib/board.ts as
+  // the pack's sole gh caller -- this row was the one hand-rolled exception.
+  test("the SKILL verifies merge lanes through the shared pr-state verb", () => {
     const md = zLoop();
-    expect(md).toMatch(/gh pr view/);
+    expect(md).toContain('lib/board.ts" pr-state');
+    // No INVOCATION of gh pr view survives. The row still names it once, to say
+    // not to use it, so the gate is on the executable form (the --json flags),
+    // not on the string.
+    expect(md).not.toMatch(/gh pr view\s+[^`]*--json/);
     expect(md).toMatch(/merge/i);
     expect(md).toMatch(/mergedThisRun/); // the reason: a landed merge must be counted
+  });
+
+  // found:false is not proof of an unmerged PR (#138). Both consumers of this verb
+  // have to fail closed on it, or a lookup that simply could not see the PR skips
+  // (H9) or requeues (#272) landed work.
+  test("the row says found:false is not proof of an unmerged PR", () => {
+    const md = zLoop();
+    expect(md).toContain("found:false");
+    expect(md).toMatch(/not\*{0,2}\s*proof/i);
   });
 });
 
@@ -687,5 +706,151 @@ describe("#205: the advance row moves the board to the new stage's status", () =
     const PREFIX = "board write for #";
     expect(readFileSync(join(REPO_ROOT, "lib", "loop.ts"), "utf8")).toContain(`\`${PREFIX}$\{owed.ticket}`);
     expect(advanceRow()).toContain(PREFIX);
+  });
+});
+
+// ============================================================================
+// #271 / #272 / #280 -- the crash-recovery contract the SKILL rows must honor
+// ============================================================================
+// The lib half is gate-tested in tests/reconcile-recovery.test.ts, but the
+// orchestrator can only execute what the SKILL tells it: if the park rows stop
+// writing a disposition record, lib/reconcile.ts's classification is correct and
+// still never fires. These canaries pin the writes and their ordering.
+describe("#271: the lane-terminating rows record what they meant to leave behind", () => {
+  const row = (md: string, label: string): string => {
+    const start = md.indexOf(`| \`${label}\``);
+    if (start < 0) return "";
+    const rest = md.slice(start);
+    const end = rest.indexOf("\n|");
+    return end < 0 ? rest : rest.slice(0, end);
+  };
+
+  test("park Questions records `retained` BEFORE dropping the lane lock", () => {
+    const r = row(zLoop(), "park N Questions");
+    expect(r).not.toBe("");
+    expect(r).toContain("worktree-record");
+    expect(r).toContain("retained");
+    // Order is the invariant: between the two writes the worktree has neither
+    // lock nor record, which is exactly the crash shape reconcile force-prunes.
+    expect(r.indexOf("worktree-record")).toBeLessThan(r.indexOf("lane-remove"));
+  });
+
+  test("the salvage parks record `disposable`, so lib/loop.ts's note stays true", () => {
+    for (const label of ["park N Blocked", "skip N", "stop-lane N"]) {
+      const r = row(zLoop(), label);
+      expect(r).not.toBe("");
+      expect(r).toContain("disposable");
+      expect(r).toContain("salvage");
+      expect(r).toContain("retained"); // the non-salvage half of the same rule
+    }
+  });
+
+  test("complete forgets the record along with the worktree", () => {
+    expect(row(zLoop(), "complete N")).toContain("worktree-forget");
+  });
+
+  test("a re-claim takes the worktree back, so it drops any record", () => {
+    expect(row(zLoop(), "claim N")).toContain("worktree-forget");
+  });
+
+  test("the reconcile contract documents the record and that reconcile never prunes a retained one", () => {
+    const md = zLoop();
+    expect(md).toContain("worktree-<N>.json");
+    expect(md).toContain("clean-retained");
+    expect(md).toMatch(/never[^.]*removes? a `?retained`? worktree|never.{0,40}retained/i);
+  });
+});
+
+describe("#272: the claim row reuses a surviving branch instead of failing on it", () => {
+  const claimRow = (): string => {
+    const md = zLoop();
+    const start = md.indexOf("| `claim N`");
+    const rest = md.slice(start);
+    const end = rest.indexOf("\n|");
+    return end < 0 ? rest : rest.slice(0, end);
+  };
+
+  // Reconcile never deletes a branch and a crashed run never reached Step 7's
+  // cleanup, so a recovered ticket's branch is still there. Bare `-b` hard-fails
+  // on it, mid-action, after the board move and the lock write.
+  test("it checks for an existing branch and attaches to it", () => {
+    const r = claimRow();
+    expect(r).toContain("rev-parse --verify");
+    expect(r).toMatch(/git worktree add[^`]*"\$BR"/);
+    expect(r).toContain("#272");
+  });
+
+  // The tempting one-character "fix" is `-B`, which force-resets the branch to
+  // $BASE and silently discards the commits the crashed lane already made. The
+  // named error is the point; a silent overwrite is worse than the failure.
+  test("it never reaches for -B, which would silently discard the crashed lane's commits", () => {
+    const r = claimRow();
+    expect(r).not.toMatch(/git worktree add[^|]*\s-B\s/);
+    expect(r).toContain("Never `-B`");
+  });
+
+  test("the reconcile contract names the merged / open / unreadable classes", () => {
+    const md = zLoop();
+    expect(md).toContain("record-merged");
+    expect(md).toContain("unresolvedMergeLanes");
+    expect(md).toMatch(/Absence is not proof/i);
+  });
+});
+
+describe("#280: Step 0 says the recovery commands resolve the repo root themselves", () => {
+  test("the orphan-scan block names the resolution and the old silent failure", () => {
+    const md = zLoop();
+    expect(md).toContain("#280");
+    expect(md).toMatch(/repo root/i);
+    // The specific lie: a clean-looking answer nobody looked for.
+    expect(md).toMatch(/hasOrphans: false/);
+  });
+
+  // The refusal reaches nobody if the caller throws its exit code away. Step 0(b)
+  // piped `scan` straight into `jq -r .hasOrphans`, so the command substitution
+  // took JQ's status, not the scan's: every new refusal (no repo root, a corrupt
+  // worktree record) produced empty stdout, HAS_ORPHANS="", a false `= "true"`
+  // test, and a drain on top of a board nobody managed to read. #280's own defect,
+  // re-created one layer up in the one caller that matters.
+  test("Step 0(b) checks the scan's exit status before parsing it", () => {
+    const step0 = zLoop().split("## Step 1")[0]!;
+    expect(step0).toMatch(/SCAN=\$\(bun "\$PACK\/lib\/reconcile\.ts" scan --slug "\$SLUG"\) \|\| \{/);
+    // Refuses on failure rather than falling through to the drain.
+    expect(step0).toMatch(/Refusing to start/i);
+    // And the orphan test is now "not false" rather than "is true", so an
+    // unparseable answer refuses instead of proceeding.
+    expect(step0).toContain('[ "$HAS_ORPHANS" != "false" ]');
+    expect(step0).not.toContain('scan --slug "$SLUG" | jq');
+  });
+
+  // --reconcile deliberately does NOT clear a crashed merge lane whose PR could
+  // not be read (#272). Printing "re-run with --reconcile" and nothing else sends
+  // the operator to a command that provably cannot help them.
+  test("Step 0(b) reads unresolvedMergeLanes and says --reconcile will not clear them", () => {
+    const step0 = zLoop().split("## Step 1")[0]!;
+    expect(step0).toContain("unresolvedMergeLanes");
+    expect(step0).toContain("UNRESOLVED");
+    expect(step0).toMatch(/NOT cleared by --reconcile/);
+  });
+});
+
+// The salvage-dump preamble stated the pre-#271 rule unconditionally -- that
+// park/skip/stop-lane all leave an orphan the next reconcile force-removes --
+// while the four rows directly above it had just been changed to record a
+// disposition. The orchestrator reads both, and they said opposite things about
+// the same worktree.
+describe("#271: the salvage preamble is scoped to the disposition, not to parking", () => {
+  test("it says the disposition decides, and names both halves", () => {
+    const md = zLoop();
+    // The section heading, not the table rows that link to it -- those say
+    // "**Salvage dump** block below" and come first in the file.
+    const at = md.indexOf("**Salvage dump (");
+    expect(at).toBeGreaterThan(-1);
+    const pre = md.slice(at, at + 900);
+    expect(pre).toContain("#271");
+    expect(pre).toContain("disposable");
+    expect(pre).toContain("retained");
+    // The load-bearing consequence: the dump is not optional for the disposable half.
+    expect(pre).toMatch(/not optional/i);
   });
 });

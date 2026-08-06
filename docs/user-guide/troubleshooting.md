@@ -104,8 +104,75 @@ state:
 Reconcile releases claims, parks the affected tickets back to Ready, prunes the
 stray worktrees (a crashed builder's uncommitted work is discarded — the ticket
 rebuilds fresh), and clears the stale lock, then starts normally. It never deletes
-a branch, never removes a board comment, and never touches a ticket that still has
-a live lane.
+a branch, never removes a board comment, never touches a ticket that still has a
+live lane, and never removes a worktree a park deliberately kept (below).
+
+**Run it from anywhere in the repo.** `reconcile scan` / `apply` / `clean-retained`
+/ `sweep-review` resolve `<repo root>/.worktrees` themselves from the shared `.git`
+(#280). Before that they trusted `process.cwd()`, and a lane worktree has no
+`.worktrees` of its own — so run from inside one they printed
+`{"hasOrphans": false, ...}` / `reconciled: nothing` with **exit 0**, which is
+byte-identical to a genuinely clean board. That mattered because the Bash tool's cwd
+persists between calls, so "the shell is sitting in a worktree" is the ordinary
+state; the recovery command cleared nothing, reported success, and the loop drained
+on top of live orphans. Outside a git repo the board-touching verbs now refuse
+instead of answering.
+
+## "Orphans present" after a run that only parked tickets
+
+Not a crash. `park N Questions`, `skip N` and `stop-lane N` all keep their worktree
+and drop their lane lock, and the orphan scan used to classify a worktree by
+lock-absence alone — so the worktree the park kept **on purpose** was reported as an
+orphan, the next run refused to start, and the `--reconcile` it told you to run
+force-removed exactly what the park was saving.
+
+Those worktrees now carry a record in `~/.zstack/projects/<slug>/locks/`:
+
+- `worktree-<N>.json` with `"disposition": "retained"` — a human is meant to read
+  this worktree. It is not an orphan, it does not trip the startup refusal, and
+  reconcile leaves it alone forever.
+- `"disposition": "disposable"` — a **salvage** park (the exhausted commit retry,
+  the exhausted dead-worker respawn). Its worktree is meant to die, which is why
+  that park dumps a patch first; it behaves exactly like a crash.
+- **no record at all** — a genuine crash, force-pruned exactly as before.
+
+So a batch that only parked tickets starts again plainly, with no `--reconcile`. When
+you have finished reading the retained worktrees:
+
+```bash
+bun ~/.claude/skills/zstack/lib/reconcile.ts clean-retained --slug <slug>
+```
+
+That removes the retained ones and nothing else. `reconcile scan` lists them under
+`orphans.retainedWorktrees`, so they are visible rather than merely excluded.
+
+## A ticket I already merged came back as Ready, and its rebuild failed on an existing branch
+
+`gh pr merge` returning success and the loop recording its `MERGED:` marker are two
+steps. A crash between them leaves a lane lock on a ticket whose code is already on
+`main` and whose board status is still Review — and Review is an in-flight status, so
+reconcile used to release it, prune it, and park it back to **Ready** to be rebuilt.
+The rebuild then hard-failed: reconcile never deletes a branch, the crashed run never
+reached its batch cleanup, so `z/ticket-<N>-<slug>` still existed and the claim row's
+`git worktree add … -b` aborts on an existing branch — mid-action, after the board
+move and the lock write, wedging the tick that was meant to unwedge things.
+
+Reconcile now reads that lane's PR before deciding (one lookup, only for crashed
+`merge` lanes still at Review):
+
+- PR **MERGED** → the ticket is moved to **Done**, its worktree pruned and its lock
+  removed. Never released, never parked.
+- PR **OPEN** → released, pruned, parked to Ready, unlocked, exactly as before.
+- PR state **unreadable** → **nothing at all**. Absence is not proof of an unmerged
+  PR, so the lane keeps its lock and worktree and is named on stderr:
+  `reconcile: left N crashed merge lane(s) untouched -- ticket(s) …`. Check each PR
+  by hand, then move the ticket to Done (merged) or Ready (not merged) and delete
+  its `ticket-<N>.json` from the locks directory.
+
+The claim row also attaches an existing `z/ticket-<N>-<slug>` branch instead of
+creating one, so a re-claim after any recovery cannot fail on a branch reconcile
+preserved. It never uses `-B`: that would force-reset the branch to the base and
+silently discard the commits the crashed lane had already made.
 
 ## A ticket was Skipped with a dead-worker note but its worktree has real uncommitted changes
 
