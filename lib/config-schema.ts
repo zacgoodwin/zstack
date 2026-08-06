@@ -223,7 +223,45 @@ export function validateConfig(cfg: unknown): BoardConfig {
   // lib/identity.ts; loadConfig reads through it like every other field.
   if (c.identity !== undefined) validateIdentity(c.identity);
 
+  // versionBumpLabels: the per-PR version claim's label -> bump-level map.
+  // Validated only when present (absent = DEFAULT_BUMP_LABELS). Single
+  // enforcement point, like every field above: a typo'd level would otherwise
+  // surface as a silent MICRO on the one ticket that earned a MAJOR.
+  if (c.versionBumpLabels !== undefined) validateVersionBumpLabels(c.versionBumpLabels);
+
   return c as BoardConfig;
+}
+
+// versionBumpLabels: {label: "major"|"minor"|"patch"|"micro"}. An EMPTY object
+// is legal and means "no label earns more than MICRO" -- a project that wants
+// every loop PR to move only the last segment says so this way.
+//
+// The four level names are duplicated here rather than imported from
+// lib/version.ts for the same reason STAGE_NAMES is: version.ts imports
+// config.ts, and importing back would close a cycle.
+//
+// Keyed off BoardConfig's own union rather than written as a bare string[], so
+// the duplication is still COMPILE-checked: a fifth level added to the config
+// type fails to typecheck here until it is listed. A bare array would have
+// accepted the new level in config.json and rejected it in this validator.
+type BumpLevel = NonNullable<BoardConfig["versionBumpLabels"]>[string];
+const BUMP_LEVEL_SET: Record<BumpLevel, true> = { major: true, minor: true, patch: true, micro: true };
+const BUMP_LEVELS = Object.keys(BUMP_LEVEL_SET);
+
+export function validateVersionBumpLabels(v: unknown): void {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) {
+    throw new ZError(`Config "versionBumpLabels" must be an object of {label: bump level}, not an array.`);
+  }
+  for (const [label, level] of Object.entries(v as Record<string, unknown>)) {
+    if (!label.trim()) {
+      throw new ZError(`Config "versionBumpLabels" has an empty label key; keys are GitHub issue label names.`);
+    }
+    if (typeof level !== "string" || !BUMP_LEVELS.includes(level)) {
+      throw new ZError(
+        `Config "versionBumpLabels.${label}" must be one of ${BUMP_LEVELS.join(", ")}, got ${JSON.stringify(level)}.`
+      );
+    }
+  }
 }
 
 // quota (issue #2)/notifications (#60)/adversarialMode (#59)/stageModels

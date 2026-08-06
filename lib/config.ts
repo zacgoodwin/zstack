@@ -222,6 +222,16 @@ export interface BoardConfig {
   // what lets z-update's re-check (SKILL.md) prompt an old project exactly
   // once and never re-prompt one that already answered either way.
   identity?: IdentityRecord;
+  // Per-PR version claiming: which bump level each of THIS project's issue
+  // labels earns (lib/version.ts). Absent -> DEFAULT_BUMP_LABELS, which is keyed
+  // on GitHub's own default label set. Present -> used INSTEAD of the defaults,
+  // not merged over them, so a project whose taxonomy reuses a default name for
+  // a different meaning (`enhancement` as a chore bucket) can demote it rather
+  // than being stuck with the shipped reading. Any label not in the map falls to
+  // MICRO, so the map only ever needs the labels that earn more than that.
+  // Deliberately NOT defaulted by loadConfig, for the same reason `identity` is
+  // not: absent and "explicitly {}" mean different things here.
+  versionBumpLabels?: Record<string, "major" | "minor" | "patch" | "micro">;
 }
 
 export const DEFAULT_QUOTA: QuotaConfig = { threshold: 100, mode: "sleep" };
