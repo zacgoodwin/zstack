@@ -584,3 +584,71 @@ describe("#256: per-stage watchdog budgets and the stage ceiling", () => {
     expect(step5).toContain('"salvage": true');
   });
 });
+
+// ============================================================================
+// #205 -- the advance row writes the board, so a crash resumes at the stage
+// that actually ran instead of rebuilding finished work
+// ============================================================================
+describe("#205: the advance row moves the board to the new stage's status", () => {
+  // The whole fix is a SKILL row: lib/board.ts is the pack's sole gh caller and
+  // the reducer is pure, so nothing in lib/ can issue this move -- only the
+  // orchestrator can, and it does what this row says. Deleting the move string
+  // is exactly the regression, so it is what this canary watches.
+  function advanceRow(): string {
+    const row = zLoop()
+      .split("\n")
+      .find((l) => l.startsWith("| `advance N to S`"));
+    return row ?? "";
+  }
+
+  test("the row issues `z-board move` to STATUS_FOR_STAGE[S], with --if-present and --slug", () => {
+    const row = advanceRow();
+    expect(row).not.toBe("");
+    expect(row).toContain("#205");
+    expect(row).toContain('"$Z_BOARD" move <N> <status> --if-present --slug "$SLUG"');
+    expect(row).toContain("STATUS_FOR_STAGE[S]");
+    // Every stage's target named, merge included -- merge has no column of its
+    // own, and "what does an advance to merge write" is the question a reader
+    // would otherwise have to answer by reading lib/loop.ts.
+    for (const pair of ["`builder`→`Building`", "`qa`→`QA`", "`reviewer`→`Review`", "`merge`→`Review`"]) {
+      expect(row).toContain(pair);
+    }
+  });
+
+  test("the row names the cost of skipping the move: a re-claim as builder that rebuilds committed work", () => {
+    const row = advanceRow();
+    expect(row).toMatch(/never skip this/i);
+    expect(row).toContain("claimStage");
+    expect(row).toMatch(/rebuilds work already committed/i);
+  });
+
+  // The ordering is load-bearing and was chosen, not inherited: apply first, so
+  // canTransition validates before the board is touched and a crash in the gap
+  // leaves the board one hop BEHIND a lane carrying its own write marker -- the
+  // one shape #125's guard resyncs. Moving first inverts the window to
+  // board-ahead-of-lane, which isOneHopLag does not model, so it stop-lanes and
+  // drops the lane's bounce counters and pending notes.
+  test("the row applies BEFORE it moves, and says why", () => {
+    const row = advanceRow();
+    expect(row).toMatch(/AFTER the apply/);
+    expect(row.indexOf("2. Apply.")).toBeGreaterThan(0);
+    expect(row.indexOf("2. Apply.")).toBeLessThan(row.indexOf('"$Z_BOARD" move'));
+    expect(row).toContain("canTransition");
+  });
+
+  // `--if-present` means the move can report moved:false, and after the apply
+  // the lane has already advanced -- so the recovery is a stop-lane applied
+  // next, carrying #273's dropTicket, and NO stage spawn.
+  test("the row's moved:false recovery drops the lane and spawns nothing", () => {
+    const row = advanceRow();
+    expect(row).toContain("moved:false");
+    expect(row).toContain('"dropTicket":true');
+    expect(row).toMatch(/do NOT spawn stage S/);
+  });
+
+  // The tick output carries the same derivation, so a skipped move is visible
+  // on the spot rather than a stage later as a rebuild.
+  test("the row points at the owed-write line `apply` prints", () => {
+    expect(advanceRow()).toContain("board write for #<N> = <status>");
+  });
+});

@@ -74,6 +74,28 @@ records the result. It never re-derives a scheduling decision in prose.
   instead of the drain wedging — including on the final move to Done, where the
   merge is still recorded even though the board can no longer show it, so a
   stacked child's PR retarget survives.
+- **Every stage transition writes the board, because that is where a resumed run
+  reads the stage from.** The board status is a write-through projection of
+  `state.json`, so each of the two actions that place an agent on a lane — the
+  `claim` and the `advance` — issues its own `z-board move` to
+  `STATUS_FOR_STAGE[stage]`: `builder`→Building, `qa`→QA, `reviewer`→Review, and
+  `merge`→Review too (merge has no column of its own; Done means the PR landed,
+  so an advance into merge re-writes Review and is a no-op on the board). This is
+  not cosmetic. A ticket that is on the board with no lane behind it — a lane the
+  loop stopped mid-run, or one a previous run left behind — is re-claimed at
+  `claimStage(status)`, the stage its **board status** names. Leave the board at
+  Building while the lane has moved on to QA and that re-claim spawns a
+  *builder*, which rebuilds work that is already committed and pushed (#205;
+  #164 burned $1.35 on exactly that). The move is part of the row, so the two
+  cannot drift: `loop apply` prints the write each action owes
+  (`board write for #N = QA — … z-board move N QA --if-present --slug …`),
+  derived in code from `STATUS_FOR_STAGE`, and running it again when the board
+  already agrees costs one no-op call. The `advance` row applies *before* it
+  moves, so the transition is validated (an illegal one throws and the board is
+  never touched) and a crash in the gap leaves the board exactly one hop behind a
+  lane that still names the write it owes — the lagged-write shape the desync
+  guard below already resyncs, with the lane's stage, bounce counters and pending
+  notes intact.
 - **A board status the loop does not know is evidence, not an error.** The nine
   canonical statuses are the whole state machine, but the board is yours: add a
   staging queue or a triage column and the loop ignores any ticket sitting in

@@ -332,6 +332,43 @@ prompting until it restarts. If a prompt appears right after you answered A, tha
 is a straggler session, not a bug — restart it. `bin/z-setup-permissions --check`
 confirms all three layers (hook / bypass mode / allowlist) are present.
 
+## The board says Building for a ticket the loop is actually QA-ing or reviewing — and a resumed ticket rebuilt work that was already committed
+
+Fixed in #205; if you are on an older pack, update (`/z-update`).
+
+The two symptoms are one defect. `/z-loop`'s `advance N to S` row re-stamped the
+lane lock and spawned the next stage but never moved the ticket, so from the
+first transition onward the board sat a stage behind the lane for the rest of the
+run: `/z-status` showed Building for a ticket in QA or Review, and the in-flight
+write marker the loop stamps on each move (`lastWroteStatus`) never cleared,
+because clearing it requires seeing the write land.
+
+The expensive half is the second symptom. `state.json` is authoritative for a
+lane the loop still holds, but a ticket sitting on the board with **no** lane
+behind it is re-claimed at the stage its **board status** names
+(`lib/lanes.ts` `claimStage`) — that is how a crashed or stopped run picks a
+ticket back up at `qa`/`reviewer` instead of rebuilding it. With the board frozen
+at Building, that re-claim spawns a *builder* into a ticket whose build already
+finished, so it redoes work that is committed and pushed on the lane branch. It
+is silent: nothing errors, you just pay for the stage twice (#164 burned $1.35
+this way).
+
+The advance row now issues `z-board move <N> <STATUS_FOR_STAGE[S]> --if-present`
+as part of the transition, and `bun lib/loop.ts apply` prints the write each
+action owes (`board write for #N = QA — …`) so a skipped move shows up in the
+tick output instead of a stage later as a rebuild.
+
+To repair a run that already drifted, move the ticket to the status its lane is
+actually at — `z-board move <N> QA --if-present --slug <slug>` — and the next
+tick's ingest clears the marker. Nothing else needs undoing; the move is
+idempotent, and running it when the board already agrees costs one no-op call.
+
+Not this: a crashed run whose lane **lock** is still on disk does not take the
+re-claim path at all. `/z-loop` refuses to start on orphans, and `--reconcile`
+releases and parks that ticket back to Ready by design (see
+`--reconcile (crash recovery)` in the z-loop guide) — a full rebuild, and a
+separate question from this one.
+
 ## Done tickets are still open on the board
 
 That is intended. The loop never calls `gh issue close`; it leaves Done tickets
