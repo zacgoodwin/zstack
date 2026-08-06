@@ -75,6 +75,10 @@ import {
   resolveWatchdogMinutes,
   ZError,
 } from "../lib/config.ts";
+// #307: the placeholder-coverage test derives the contract's template lines from the
+// REAL rendered prompts, so rewording a prompt cannot leave a template that parses
+// as a live verdict.
+import { builderPrompt, mergePrompt, qaPrompt, reviewerPrompt } from "../lib/stage-prompts.ts";
 import {
   MEASURED_MAX_STAGE_MS,
   MEASURED_MIDWORK_GAP_MS,
@@ -2676,6 +2680,42 @@ describe("parseStageResult", () => {
 // AC1/AC2/AC6 run against the REAL final messages, pulled verbatim out of the
 // retained run-16 stage transcripts and checked in, so these pin the observed
 // regression rather than a reconstruction of it.
+// Inputs for the placeholder-coverage test below. They render the REAL contract
+// text; none of the payload values reach the assertions, only the template lines do.
+const PLACEHOLDER_INPUT_PATH = "/loop/tmp/input-42.json";
+const PLACEHOLDER_BUILDER = {
+  ticketNumber: 42,
+  ticketTitle: "t",
+  ticketBody: "b",
+  worktreePath: ".worktrees/ticket-42",
+  branch: "z/ticket-42",
+  baseBranch: "main",
+};
+const PLACEHOLDER_QA = {
+  ticketNumber: 42,
+  ticketBody: "b",
+  worktreePath: ".worktrees/ticket-42",
+  branch: "z/ticket-42",
+  qaPass: 1,
+  webTarget: false,
+};
+const PLACEHOLDER_REVIEWER = { ticketBody: "b", acceptanceCriteria: "a", diff: "d", worktreePath: "/tmp/wt" };
+const PLACEHOLDER_MERGE = {
+  ticketNumber: 42,
+  prTitle: "p",
+  branch: "z/ticket-42",
+  baseBranch: "main",
+  worktreePath: ".worktrees/ticket-42",
+  stackedOn: [],
+};
+// The markers each stage owns, as the exit contracts print them.
+const STAGE_MARKERS: Record<Stage, string[]> = {
+  builder: ["BUILT", "NEEDS-INPUT", "BLOCKED", "CONFUSED"],
+  qa: ["QA-PASS", "QA-BUGS", "NEEDS-HUMAN", "BLOCKED", "CONFUSED"],
+  reviewer: ["REVIEW-APPROVE", "REVIEW-FINDINGS", "NEEDS-HUMAN", "BLOCKED", "CONFUSED"],
+  merge: ["MERGED", "NEEDS-HUMAN", "BLOCKED", "CONFUSED"],
+};
+
 describe("parseStageResult finds a marker that is not the first line (#307)", () => {
   const fixture = (name: string) => readFileSync(join(import.meta.dir, "fixtures", "stage-messages", name), "utf8");
   // parseStageResult returns the StageOutcome union, and TS cannot narrow it off
@@ -2920,6 +2960,35 @@ describe("parseStageResult finds a marker that is not the first line (#307)", ()
       kind: "merged",
       note: "https://github.com/o/r/pull/7",
     });
+  });
+
+  // The durable version of the guard's coverage: derive the placeholders from the
+  // REAL rendered prompts rather than trusting a hand-written list, so rewording the
+  // contract cannot silently leave a template that parses as a verdict. This is what
+  // caught `<reason>` -- the one single-word placeholder, which a bare "must contain
+  // a space" rule let through as a live BLOCKED.
+  test("every placeholder the rendered prompts lead a payload with is treated as quoted", () => {
+    const prompts: [Stage, string][] = [
+      ["builder", builderPrompt(PLACEHOLDER_BUILDER, PLACEHOLDER_INPUT_PATH)],
+      ["qa", qaPrompt(PLACEHOLDER_QA, PLACEHOLDER_INPUT_PATH)],
+      ["reviewer", reviewerPrompt(PLACEHOLDER_REVIEWER, PLACEHOLDER_INPUT_PATH, true)],
+      ["merge", mergePrompt(PLACEHOLDER_MERGE, PLACEHOLDER_INPUT_PATH)],
+    ];
+    let checked = 0;
+    for (const [stage, prompt] of prompts) {
+      for (const line of prompt.split("\n")) {
+        // Only the contract's own template lines: `MARKER: <placeholder> ...`, where
+        // MARKER is one this stage owns.
+        const m = line.match(/^([A-Z][A-Z-]*):\s*(<[^>]*>.*)$/);
+        if (!m || !STAGE_MARKERS[stage].includes(m[1]!)) continue;
+        checked++;
+        const out = parseStageResult(stage, ["I was told to end with:", line, "but I did not finish."].join("\n"));
+        expect(out.kind, `${stage} template not treated as quoted: ${line}`).toBe("confused");
+      }
+    }
+    // Guard the guard: if the extraction stops matching anything, the loop above
+    // would pass vacuously.
+    expect(checked).toBeGreaterThanOrEqual(6);
   });
 
   // The merge note is the PR URL, not the message. The orchestrator writes a merge

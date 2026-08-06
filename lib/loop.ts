@@ -742,16 +742,19 @@ const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 // quoting the contract, not reporting a verdict, and no real verdict is a bare
 // angle-bracket token: measured over every retained stage final message in this
 // repo (507 messages, 135 with a marker off line 1), zero real verdicts match.
-// The angle-bracket content must contain a SPACE. Every placeholder the contract
-// actually puts at the START of a payload is multi-word (`<one-line summary>`,
-// `<the PR URL>`, `<numbered findings>`, `<the judgment call>`), while the things a
-// real verdict legitimately opens with are single tokens: a markdown autolink
+// The angle-bracket content must contain a SPACE, or be one of the contract's
+// single-word placeholders. Almost every placeholder the contract puts at the START
+// of a payload is multi-word (`<one-line summary>`, `<the PR URL>`, `<numbered
+// findings>`, `<the judgment call>`, `<what makes no sense>`), and the things a real
+// verdict legitimately opens with are single tokens: a markdown autolink
 // (`MERGED: <https://github.com/o/r/pull/7>`) or an identifier
-// (`NEEDS-HUMAN: <API_KEY> is missing`). Without the space requirement this guard
-// discarded those -- refusing a landed PR, which drops the ticket out of
-// mergedThisRun and breaks stacked-chain handling. Fail-closed is the right default
-// for a guard, but not at the cost of eating correct verdicts.
-const PLACEHOLDER_PAYLOAD = /^<[^>]*\s[^>]*>(\s|$)/;
+// (`NEEDS-HUMAN: <API_KEY> is missing`). A bare space rule discarded those --
+// refusing a landed PR, which drops the ticket out of mergedThisRun and breaks
+// stacked-chain handling -- so the space is the general test and `reason`, the one
+// single-word template, is named. tests/loop.test.ts derives the full placeholder
+// list from the four RENDERED prompts and asserts every one is excluded, so this
+// stays correct if the contract's wording ever changes.
+const PLACEHOLDER_PAYLOAD = /^<(?:[^>]*\s[^>]*|reason)>(\s|$)/;
 
 // Every `<token>=` occurrence in a text, as suffixes. parseReviewerConfidence and
 // parseSkepticQuorum each read only the FIRST token in whatever they are given, so
