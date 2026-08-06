@@ -655,8 +655,14 @@ const MARKERS: Record<Stage, Record<string, (ev: MarkerEvidence) => StageOutcome
   reviewer: {
     "REVIEW-APPROVE": (ev) => ({
       kind: "review-approve",
-      confidence: lowestMarkerConfidence(ev.markerLines),
-      skeptics: pessimisticSkepticQuorum(ev.markerLines.join("\n")) ?? pessimisticSkepticQuorum(ev.unquoted),
+      confidence: lowestConfidence(ev.markerLines),
+      // The LOWER of the two sources, not the marker's if present: `??` would have
+      // let a marker-line `3/3` hide a `1/3` the reviewer disclosed in its prose,
+      // which is the value the quorum floor exists to see.
+      skeptics: lowerQuorum(
+        pessimisticSkepticQuorum(ev.markerLines.join("\n")),
+        pessimisticSkepticQuorum(ev.unquoted)
+      ),
     }),
     "REVIEW-FINDINGS": (ev) => ({ kind: "review-findings", note: ev.note }),
     "NEEDS-HUMAN": (ev) => ({ kind: "human-question", note: ev.note }),
@@ -664,7 +670,10 @@ const MARKERS: Record<Stage, Record<string, (ev: MarkerEvidence) => StageOutcome
     "CONFUSED": (ev) => ({ kind: "confused", note: ev.note }),
   },
   merge: {
-    "MERGED": (ev) => ({ kind: "merged", note: ev.rest }),
+    // `rest` is the URL, but fall back to the note when the payload is empty: an
+    // agent that writes `MERGED:` and puts the URL on the NEXT line would otherwise
+    // complete the ticket with an empty prUrl.
+    "MERGED": (ev) => ({ kind: "merged", note: ev.rest.trim() || ev.note }),
     "NEEDS-HUMAN": (ev) => ({ kind: "human-question", note: ev.note }),
     "BLOCKED": (ev) => ({ kind: "stage-blocked", note: ev.note }),
     "CONFUSED": (ev) => ({ kind: "confused", note: ev.note }),
@@ -733,34 +742,61 @@ const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 // quoting the contract, not reporting a verdict, and no real verdict is a bare
 // angle-bracket token: measured over every retained stage final message in this
 // repo (507 messages, 135 with a marker off line 1), zero real verdicts match.
-const PLACEHOLDER_PAYLOAD = /^<[^>]*>(\s|$)/;
+// The angle-bracket content must contain a SPACE. Every placeholder the contract
+// actually puts at the START of a payload is multi-word (`<one-line summary>`,
+// `<the PR URL>`, `<numbered findings>`, `<the judgment call>`), while the things a
+// real verdict legitimately opens with are single tokens: a markdown autolink
+// (`MERGED: <https://github.com/o/r/pull/7>`) or an identifier
+// (`NEEDS-HUMAN: <API_KEY> is missing`). Without the space requirement this guard
+// discarded those -- refusing a landed PR, which drops the ticket out of
+// mergedThisRun and breaks stacked-chain handling. Fail-closed is the right default
+// for a guard, but not at the cost of eating correct verdicts.
+const PLACEHOLDER_PAYLOAD = /^<[^>]*\s[^>]*>(\s|$)/;
 
-// The pessimistic reading of every `skeptics=k/of` token in a text: the LOWEST `k`.
-// #191's quorum floor blocks on a low denominator, so taking the minimum is the
-// fail-closed direction and it is immune to a quoted `3/3` outranking a real `1/3`
-// -- which the first-match parseSkepticQuorum was not, whichever order the note
-// happened to put them in.
+// Every `<token>=` occurrence in a text, as suffixes. parseReviewerConfidence and
+// parseSkepticQuorum each read only the FIRST token in whatever they are given, so
+// scanning for the lowest value means handing them each occurrence separately --
+// otherwise `confidence=95, corrected to confidence=40` reads 95, which is the
+// opposite of the pessimistic rule these helpers exist to implement.
+function tokenSuffixes(text: string, token: string): string[] {
+  return text.split(new RegExp(`(?=\\b${token}=)`, "i"));
+}
+
+// The pessimistic reading of every `skeptics=k/of` token: the LOWEST `k`. #191's
+// quorum floor blocks on a low denominator, so the minimum is the fail-closed
+// direction, and it is immune to a `3/3` outranking a real `1/3` whichever order
+// they appear in -- which the first-match read was not.
 function pessimisticSkepticQuorum(text: string): { received: number; of: number } | null {
   let worst: { received: number; of: number } | null = null;
-  for (const line of text.split("\n")) {
-    const q = parseSkepticQuorum(line);
+  for (const part of tokenSuffixes(text, "skeptics")) {
+    const q = parseSkepticQuorum(part);
     if (q && (worst === null || q.received < worst.received)) worst = q;
   }
   return worst;
 }
 
-// The lowest `confidence=` on any of the winning marker's own lines, or null if none
-// of them carried one. Lowest, so a stage that narrates a high score and then
-// reports a real lower one is held to the real one; per-marker-line, so a number
-// anywhere else in the message -- prose, or a diff hunk the reviewer pasted -- can
-// never score the gate.
-function lowestMarkerConfidence(rests: string[]): number | null {
+// The lowest `confidence=` anywhere in the given texts, or null if none carried one.
+// Callers pass the winning marker's OWN lines, so a number elsewhere in the message
+// -- prose, or a diff hunk the reviewer pasted -- can never score the gate.
+function lowestConfidence(texts: string[]): number | null {
   let low: number | null = null;
-  for (const rest of rests) {
-    const c = parseReviewerConfidence(rest);
-    if (c !== null && (low === null || c < low)) low = c;
+  for (const t of texts) {
+    for (const part of tokenSuffixes(t, "confidence")) {
+      const c = parseReviewerConfidence(part);
+      if (c !== null && (low === null || c < low)) low = c;
+    }
   }
   return low;
+}
+
+// The lower of two quorum readings, either of which may be absent.
+function lowerQuorum(
+  a: { received: number; of: number } | null,
+  b: { received: number; of: number } | null
+): { received: number; of: number } | null {
+  if (!a) return b;
+  if (!b) return a;
+  return a.received <= b.received ? a : b;
 }
 
 // The note a LINE-1 marker carries: the remainder of its own line plus every line

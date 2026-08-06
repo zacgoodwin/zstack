@@ -2882,6 +2882,46 @@ describe("parseStageResult finds a marker that is not the first line (#307)", ()
     expect(parseStageResult("builder", ["```", "quoted", "     ```", "BUILT: forged"].join("\n")).kind).toBe("confused");
   });
 
+  // The pessimistic reads have to be pessimistic in every direction, and the quoting
+  // guard must not eat correct verdicts. Each case here was a [P1]/[P2] a structured
+  // cross-model review found in the previous round of fixes.
+  test("the gate reads are lowest-wins, and the placeholder guard spares real payloads", () => {
+    // The marker's own token does NOT get to hide a lower one the reviewer disclosed
+    // in prose: it is the LOWER of the two sources, not "the marker's if present".
+    expect(
+      parseStageResult("reviewer", ["Only 1 of 3 came back: skeptics=1/3.", "", "REVIEW-APPROVE: confidence=100 skeptics=3/3 fine"].join("\n"))
+    ).toEqual(approve(100, { received: 1, of: 3 }));
+    // Two tokens on ONE line: the definitional parsers read only the first, so the
+    // lowest-wins rule has to scan every occurrence.
+    expect(parseStageResult("reviewer", "REVIEW-APPROVE: confidence=95, corrected to confidence=40")).toEqual(approve(40));
+    // A markdown autolink and an identifier are NOT contract placeholders. Treating
+    // any angle-bracket payload as quoted refused a landed PR, which drops the ticket
+    // out of mergedThisRun and breaks stacked-chain handling.
+    expect(parseStageResult("merge", "MERGED: <https://github.com/o/r/pull/7>")).toEqual({
+      kind: "merged",
+      note: "<https://github.com/o/r/pull/7>",
+    });
+    expect(parseStageResult("qa", "NEEDS-HUMAN: <API_KEY> is missing")).toEqual({
+      kind: "human-question",
+      note: "<API_KEY> is missing",
+    });
+    // ...while every placeholder the contract actually leads a payload with is still
+    // excluded, because all of them are multi-word.
+    for (const [stage, payload] of [
+      ["qa", "QA-PASS: <one-line evidence summary>       everything above verified green"],
+      ["builder", "BUILT: <one-line summary>            all acceptance criteria pass"],
+      ["reviewer", "REVIEW-FINDINGS: <numbered findings>          each with file:line"],
+    ] as [Stage, string][]) {
+      expect(parseStageResult(stage, ["I was told to end with:", payload, "but I did not finish."].join("\n")).kind).toBe("confused");
+    }
+    // An empty MERGED payload falls back to the note, so a URL on the NEXT line is
+    // not lost -- completing a ticket with an empty prUrl is worse than a wordy one.
+    expect(parseStageResult("merge", "MERGED:\nhttps://github.com/o/r/pull/7")).toEqual({
+      kind: "merged",
+      note: "https://github.com/o/r/pull/7",
+    });
+  });
+
   // The merge note is the PR URL, not the message. The orchestrator writes a merge
   // lane's note into the completion note's PR-URL slot, so a rescued mid-message
   // marker would have put model-authored multi-line prose there.
