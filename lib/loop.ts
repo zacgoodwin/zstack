@@ -4007,9 +4007,17 @@ export function main(argv: string[]): number {
     // nowMs. One `--now ""` would drag every foreign ticket's bound clock to 1970
     // and park its dependents on the next real tick. A millisecond epoch is an
     // integer, so require exactly that and let Number() do only the conversion.
+    // NON-NEGATIVE, and a safe integer. A millisecond epoch is never negative,
+    // and allowing `-?` was a hole in the guard rather than a feature of it:
+    // `--now -1` persists an anchor BEFORE the epoch that stampAnchor will never
+    // repair (it only pulls back stamps that LEAD the clock), so the next real
+    // tick sees the full bound elapsed and parks the dependent. Same shape as the
+    // `--now ""` hole one line of regex above it was written to close.
     const rawNow = str(flags, "now");
-    if (rawNow !== undefined && !/^-?\d+$/.test(rawNow.trim())) {
-      throw new ZError(`--now must be an integer number of MILLISECONDS since the epoch, got ${JSON.stringify(rawNow)}.`);
+    if (rawNow !== undefined && (!/^\d+$/.test(rawNow.trim()) || !Number.isSafeInteger(Number(rawNow.trim())))) {
+      throw new ZError(
+        `--now must be a non-negative integer number of MILLISECONDS since the epoch, got ${JSON.stringify(rawNow)}.`
+      );
     }
     const nowMs = Number(rawNow ?? Date.now());
     if (!Number.isFinite(nowMs)) {

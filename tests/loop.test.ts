@@ -7874,13 +7874,18 @@ describe("#223: re-confirming a carried-forward claimedByOther flag", () => {
       // repairs any anchor that leads the clock down to nowMs, so one `--now ""`
       // would drag every foreign ticket's bound clock to 1970 and park its
       // dependents on the next real tick. An ms epoch is an integer; require that.
-      for (const bad of ["soon", "", " ", "0x10", "1e3", "12.5", "NaN"]) {
+      // "-1" belongs on this list for the same reason "" does, and is the sharper
+      // case: stampAnchor only pulls back a stamp that LEADS the clock, so a
+      // pre-epoch anchor is never repaired and the next real tick sees the whole
+      // bound elapsed. 9007199254740993 is past the safe-integer range, where
+      // Number() silently rounds to a different value than the operator typed.
+      for (const bad of ["soon", "", " ", "0x10", "1e3", "12.5", "NaN", "-1", "-1000000", "9007199254740993"]) {
         const p = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", statePath, "--now", bad], {
           stdout: "pipe",
           stderr: "pipe",
         });
         expect(p.exitCode).toBe(1);
-        expect(p.stderr.toString()).toMatch(/--now must be an integer number of MILLISECONDS/);
+        expect(p.stderr.toString()).toMatch(/--now must be a non-negative integer number of MILLISECONDS/);
         expect(readFileSync(statePath, "utf8")).toBe(before); // nothing was written
       }
       // ...and a real millisecond epoch still works.
