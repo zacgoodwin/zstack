@@ -3088,12 +3088,17 @@ describe("#205: every stage transition writes the board", () => {
     expect(s.lanes[0].lastWroteStatus).toBeUndefined();
   });
 
-  // The crash window the row's ordering leaves: apply landed, the move did not,
-  // so the board is exactly one hop BEHIND a lane that names the write it owes.
+  // The crash window the row's ordering leaves, evaluated where the guard
+  // actually runs: apply landed, the move did not, and the lane has since
+  // reached its next stage boundary (the guard skips a lane with no recorded
+  // outcome, so a crash that also cost the step-4 spawn waits on the #209
+  // re-spawn to produce one before any of this is reachable). The board is then
+  // exactly one hop BEHIND a lane that names the write it owes.
   // That is the shape #125's origin marker was built for, so the existing guard
   // resyncs on the next tick and the advance proceeds with the lane's stage,
   // bounce counters intact -- no stop-lane, no re-claim, no
-  // rebuild. Pinned here because the ordering is a choice: move the board FIRST
+  // rebuild, FOR A ONE-HOP ADVANCE (the skip-qa two-hop case is its own test
+  // below). Pinned here because the ordering is a choice: move the board FIRST
   // and this window inverts to board-ahead-of-lane, which isOneHopLag does not
   // model and which therefore stop-lanes (losing qaBounces and qaNotes).
   test("crash between the apply and the move is recovered by the existing one-hop resync, on both the forward advance and a bounce", () => {
@@ -3106,6 +3111,36 @@ describe("#205: every stage transition writes the board", () => {
     // survives -- the QA note rides on the advance the loop is about to make.
     const bounce = state([ticket(1, "QA")], [lane(1, "builder", { qaBounces: 1, lastWroteStatus: "Building", outcome: { kind: "built" } })]);
     expect(nextAction(bounce, 0)).toEqual({ kind: "advance", ticket: 1, to: "qa", resyncStatus: "Building" });
+  });
+
+  // KNOWN GAP, pinned so it cannot be mistaken for the recovered case above.
+  // #130's skip-qa walk is the ONE advance that is not one hop: resolveOutcome
+  // sends a labeled builder straight to `reviewer`, i.e. Building -> Review,
+  // while PRECEDING_BOARD_STATUS maps a reviewer lane's lag to `QA` alone. So a
+  // missed step-3 move on THAT advance is not a lag the guard recognizes -- it
+  // stop-lanes, and the re-claim reads the board's stale Building and comes back
+  // as a *builder*, rebuilding an already-built, already-approved ticket.
+  //
+  // This is the pre-#205 outcome for EVERY skip-qa advance (the row wrote
+  // nothing, so the board never left Building), now narrowed to the crash window
+  // -- so the board write is a strict improvement here too. Closing the window
+  // means widening isOneHopLag, which this ticket's Out of scope list holds back
+  // ("the #125 resync guard's logic, which is correct given a truthful marker"),
+  // so the gap is pinned rather than silently patched.
+  test("KNOWN GAP: the skip-qa two-hop advance is NOT recovered -- a missed move there still re-claims as a builder", () => {
+    const skip = state(
+      [ticket(1, "Building", [], { skipQa: true })],
+      [lane(1, "reviewer", { outcome: approve(100), lastWroteStatus: "Review" })]
+    );
+    const stop = nextAction(skip, 0);
+    expect(stop).toMatchObject({ kind: "stop-lane", ticket: 1 });
+    // ...and that stop-lane is what hands the ticket back to a builder.
+    expect(nextAction(applyAction(skip, stop, 0), 0)).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+
+    // The same lane WITHOUT the two-hop jump resyncs, which is what isolates the
+    // cause to the hop distance rather than to the reviewer stage itself.
+    const oneHop = state([ticket(1, "QA")], [lane(1, "reviewer", { outcome: approve(100), lastWroteStatus: "Review" })]);
+    expect(nextAction(oneHop, 0)).not.toMatchObject({ kind: "stop-lane" });
   });
 });
 

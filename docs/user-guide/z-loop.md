@@ -99,10 +99,14 @@ records the result. It never re-derives a scheduling decision in prose.
   `lib/loop.ts` resyncs at that lane's next **stage boundary**, keeping its stage
   and bounce counters (the guard only judges a lane with a recorded outcome, so
   the board stays behind for the rest of the running stage).
-  One stage this does not rescue: merge shares Review, so a lane that died at the
-  merge stage is re-claimed as a *reviewer* and re-pays one review of an already
-  approved diff. That is inherent to merge having no column, and far cheaper than
-  the builder rebuild above, but it is the residual cost rather than a fixed one.
+  Two cases this does not rescue, both narrowed rather than removed. Merge shares
+  Review, so a lane that died at the merge stage is re-claimed as a *reviewer* and
+  re-pays one review of an already approved diff — inherent to merge having no
+  column, and far cheaper than the builder rebuild above. And a `skip-qa` ticket
+  walks Building→Review in one advance, which is two hops, so the guard does not
+  read a missed write there as a lag: that one stop-lanes and comes back as a
+  builder, exactly as it did before this fix. Both are the residual cost, not a
+  fixed one, and both are pinned by their own tests.
 - **A board status the loop does not know is evidence, not an error.** The nine
   canonical statuses are the whole state machine, but the board is yours: add a
   staging queue or a triage column and the loop ignores any ticket sitting in
