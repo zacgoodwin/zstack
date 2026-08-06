@@ -174,6 +174,35 @@ creating one, so a re-claim after any recovery cannot fail on a branch reconcile
 preserved. It never uses `-B`: that would force-reset the branch to the base and
 silently discard the commits the crashed lane had already made.
 
+## A ticket was Skipped but its branch carries a finished, committed, green diff
+
+The stage did the work and reported it in the wrong shape. The exit contract asks
+every stage to OPEN its final message with its marker; a stage that wrote a prose
+acceptance-criteria summary and closed with `BUILT:` or `QA-PASS:` as the LAST line
+used to parse as CONFUSED, which skips the ticket — after the stage had spent its
+whole budget. Loop 16 lost three tickets that way, all three with the work already
+done.
+
+What the loop does now: a final message whose first line is not a marker is scanned
+line by line, and the **last** line-leading marker belonging to that stage is the
+verdict. So the trailing-marker shape lands as `BUILT` / `QA-PASS` and the lane
+advances. Three cases deliberately still skip:
+
+- **No marker anywhere.** The stage did not finish (the classic shape is an agent
+  that backgrounded `bun test` and ended its turn to await a notification nobody
+  will send). Skip note: `ended without a recognized exit marker (…)`.
+- **Two different markers of that stage, neither on line 1.** The stage reported two
+  verdicts and nothing can say which it meant. Skip note:
+  `reported 2 different exit markers (…), none of them on the first line`. Fix it by
+  hand; do not guess.
+- **A marker only in prose** — indented inside a code fence, or mid-sentence. That is
+  text about a marker, not a marker.
+
+If you hit the first case, recover it exactly as the dead-worker section below
+describes. If you hit the second, read the stage's transcript
+(`~/.zstack/projects/<slug>/loop/transcripts/ticket-<N>/`), decide which verdict it
+meant, and move the ticket by hand.
+
 ## A ticket was Skipped with a dead-worker note but its worktree has real uncommitted changes
 
 The stage agent died without emitting an exit marker. That parses as CONFUSED,

@@ -599,8 +599,9 @@ export function builtGuardFailure(facts: BuilderCommitFacts): string | null {
 
 // The machine-parsed exit contract every stage prompt ends with
 // (lib/stage-prompts.ts). Marker -> outcome, per stage; a final message that
-// starts with none of its stage's markers is CONFUSED by definition -- the
-// no-token-burn rule turns unparseable output into a skip, never a retry loop.
+// carries none of its stage's markers on a line of its own is CONFUSED by
+// definition -- the no-token-burn rule turns unparseable output into a skip,
+// never a retry loop.
 const MARKERS: Record<Stage, Record<string, (note: string) => StageOutcome>> = {
   builder: {
     "BUILT": () => ({ kind: "built" }),
@@ -634,21 +635,68 @@ const MARKERS: Record<Stage, Record<string, (note: string) => StageOutcome>> = {
   },
 };
 
+// A marker line: an ALL-CAPS token (hyphens allowed) then a colon, at the very
+// start of the line. Applied to the RAW line by the #307 scan below, so leading
+// whitespace disqualifies -- an indented `BUILT:` inside a code fence is prose
+// ABOUT a marker, not a marker.
+const MARKER_LINE = /^([A-Z][A-Z-]*):\s*(.*)$/;
+
+// The note a marker carries: the remainder of its own line plus every line after
+// it. One definition, shared by both paths below, so a trailing marker's note is
+// extracted exactly the way a leading one's always was.
+function markerNote(lines: string[], markerIdx: number, rest: string): string {
+  return [rest, ...lines.slice(markerIdx + 1)].join("\n").trim();
+}
+
 export function parseStageResult(stage: Stage, finalMessage: string): StageOutcome {
   const lines = finalMessage.split(/\r?\n/);
-  const first = lines.find((l) => l.trim() !== "")?.trim() ?? "";
-  const m = first.match(/^([A-Z][A-Z-]*):\s*(.*)$/);
-  const make = m ? MARKERS[stage][m[1]] : undefined;
-  if (!m || !make) {
-    const snippet = finalMessage.trim().slice(0, 200);
+  // Fast path, byte-identical to the contract as it shipped: the marker is the
+  // first non-empty line, which is what a well-formed stage message looks like.
+  // It stays FIRST so today's messages parse exactly as before -- including the
+  // case where line 1 is a marker and a later line holds a different one, which
+  // has always resolved to line 1 and still does.
+  const firstIdx = lines.findIndex((l) => l.trim() !== "");
+  const first = firstIdx === -1 ? "" : lines[firstIdx]!.trim();
+  const m = first.match(MARKER_LINE);
+  const leading = m ? MARKERS[stage][m[1]!] : undefined;
+  if (m && leading) return leading(markerNote(lines, firstIdx, m[2]!));
+
+  // #307: a stage that did the work, spelled its marker correctly, and put it
+  // anywhere but line 1 used to be CONFUSED by definition -- and CONFUSED skips
+  // the ticket AFTER the stage has spent its whole budget, so the loop pays for
+  // the work and then discards it. Loop 16 lost 3 of 3 tickets that way; two of
+  // them (#207 builder, #192 QA, both haiku) closed a prose acceptance-criteria
+  // summary with `BUILT:` / `QA-PASS:` as the LAST line, work committed, suite
+  // green. A marker that is present, correctly spelled, and unambiguous is not
+  // unparseable output, so scan every line before falling back.
+  //
+  // LAST match wins. A stage narrating "I will finish with BUILT: ..." mid-message
+  // must not be able to pre-commit its own verdict, and a genuine sign-off is
+  // always the closing line.
+  const hits: { idx: number; marker: string; rest: string }[] = [];
+  for (const [idx, line] of lines.entries()) {
+    const hit = line.match(MARKER_LINE);
+    if (hit && MARKERS[stage][hit[1]!]) hits.push({ idx, marker: hit[1]!, rest: hit[2]! });
+  }
+  const distinct = [...new Set(hits.map((h) => h.marker))].sort();
+  const last = hits[hits.length - 1];
+  if (last && distinct.length === 1) return MARKERS[stage][last.marker]!(markerNote(lines, last.idx, last.rest));
+
+  const snippet = finalMessage.trim().slice(0, 200);
+  // Two DIFFERENT markers of the same stage, neither on line 1, is genuinely
+  // unparseable: the stage reported two verdicts and nothing here can say which
+  // it meant. Resolving that silently by position would be worse than the skip,
+  // so it stays CONFUSED and names both so the human note is actionable.
+  if (distinct.length > 1) {
     return {
       kind: "confused",
-      note: `Stage "${stage}" ended without a recognized exit marker (${Object.keys(MARKERS[stage]).join(", ")}). Message began: ${JSON.stringify(snippet)}`,
+      note: `Stage "${stage}" reported ${distinct.length} different exit markers (${distinct.join(", ")}), none of them on the first line, so no single verdict can be read. Message began: ${JSON.stringify(snippet)}`,
     };
   }
-  const restIdx = lines.indexOf(lines.find((l) => l.trim() !== "")!);
-  const note = [m[2], ...lines.slice(restIdx + 1)].join("\n").trim();
-  return make(note);
+  return {
+    kind: "confused",
+    note: `Stage "${stage}" ended without a recognized exit marker (${Object.keys(MARKERS[stage]).join(", ")}). Message began: ${JSON.stringify(snippet)}`,
+  };
 }
 
 // -- actions ------------------------------------------------------------------

@@ -1,0 +1,1 @@
+Waiting on the full `bun test` suite (background, PID befpselre) and the diagnostic Monitor to report back before finalizing — typecheck is already clean. I'll continue once I get the completion notification.

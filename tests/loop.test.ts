@@ -2662,6 +2662,131 @@ describe("parseStageResult", () => {
   });
 });
 
+// -- #307: a marker that is not the first line ---------------------------------
+
+// Loop 16 drained three tickets and delivered zero. All three were Skipped, and
+// in all three the stage had already done the work: #207's builder had committed
+// 7940725 with 1986 pass / 0 fail, #192's QA had verified all three acceptance
+// criteria green. Both closed a prose summary with a correctly spelled `BUILT:` /
+// `QA-PASS:` as the LAST line, and first-line-only parsing made the marker
+// invisible -- CONFUSED, which the no-token-burn rule turns into a skip AFTER the
+// stage spent its full budget. $2.33 paid, nothing merged, three tickets left for
+// a human.
+//
+// AC1/AC2/AC6 run against the REAL final messages, pulled verbatim out of the
+// retained run-16 stage transcripts and checked in, so these pin the observed
+// regression rather than a reconstruction of it.
+describe("parseStageResult finds a marker that is not the first line (#307)", () => {
+  const fixture = (name: string) => readFileSync(join(import.meta.dir, "fixtures", "stage-messages", name), "utf8");
+  // parseStageResult returns the StageOutcome union, and TS cannot narrow it off
+  // an expect() call, so this asserts CONFUSED and yields its note in one step.
+  const confusedNote = (out: StageOutcome): string => {
+    expect(out.kind).toBe("confused");
+    return out.kind === "confused" ? out.note : "";
+  };
+
+  test("AC1: the real #207 builder message -- prose summary, BUILT: last -- is built", () => {
+    const msg = fixture("builder-207-trailing-built.txt");
+    // The shape that lost the ticket: line 1 is prose, the marker is the closer.
+    expect(msg.split(/\r?\n/)[0]).not.toMatch(/^BUILT:/);
+    expect(msg.trimEnd().split(/\r?\n/).at(-1)).toMatch(/^BUILT:/);
+    expect(parseStageResult("builder", msg)).toEqual({ kind: "built" });
+  });
+
+  test("AC2: the real #192 QA message -- multi-paragraph summary, QA-PASS: last -- is qa-pass", () => {
+    const msg = fixture("qa-192-trailing-qa-pass.txt");
+    expect(msg.split(/\r?\n/)[0]).not.toMatch(/^QA-PASS:/);
+    expect(parseStageResult("qa", msg)).toEqual({ kind: "qa-pass" });
+  });
+
+  test("AC3: the widening is additive -- a well-formed first-line marker is unchanged", () => {
+    // Same expectations as the pre-#307 suite above, plus the note extraction:
+    // the note is the remainder of the marker line and every line after it, and
+    // the prose an agent writes BELOW its marker still rides along.
+    expect(parseStageResult("builder", "BUILT: done")).toEqual({ kind: "built" });
+    expect(parseStageResult("qa", "QA-BUGS: 1) x\n2) y")).toEqual({ kind: "qa-bugs", note: "1) x\n2) y" });
+    expect(parseStageResult("builder", "NEEDS-INPUT: pick a currency\n\nmore context")).toEqual({
+      kind: "needs-input",
+      note: "pick a currency\n\nmore context",
+    });
+    expect(parseStageResult("merge", "MERGED: https://pr/9")).toEqual({ kind: "merged", note: "https://pr/9" });
+    // A leading marker still wins over anything below it, so a stage that signs
+    // off on line 1 and then rambles is parsed exactly as it always was -- the
+    // ambiguity guard below never sees a well-formed message.
+    expect(parseStageResult("reviewer", "REVIEW-APPROVE: confidence=85 clean\n\nREVIEW-FINDINGS: ignore me")).toEqual({
+      kind: "review-approve",
+      confidence: 85,
+      skeptics: null,
+    });
+  });
+
+  test("AC4: two different markers of one stage, neither on line 1, stays CONFUSED and names both", () => {
+    const msg = [
+      "I read the whole diff and I am of two minds about it.",
+      "",
+      "REVIEW-APPROVE: confidence=85 every criterion verified",
+      "",
+      "REVIEW-FINDINGS: two issues",
+    ].join("\n");
+    // Both markers named, so the skip note tells a human what the stage actually
+    // said. Resolving a contradiction silently by position would be worse.
+    const note = confusedNote(parseStageResult("reviewer", msg));
+    expect(note).toContain("REVIEW-APPROVE");
+    expect(note).toContain("REVIEW-FINDINGS");
+    expect(note).toContain("2 different exit markers");
+  });
+
+  test("AC5: a marker mentioned in prose or indented in a code fence is not a marker", () => {
+    const indented = [
+      "Here is the contract I was given:",
+      "",
+      "```",
+      "    BUILT: <one-line summary>",
+      "```",
+      "",
+      "I have not finished yet.",
+    ].join("\n");
+    expect(parseStageResult("builder", indented).kind).toBe("confused");
+    const midSentence = "I will report BUILT: once the suite finishes, which it has not.";
+    expect(parseStageResult("builder", midSentence).kind).toBe("confused");
+  });
+
+  test("AC5b: the LAST line-leading marker wins, so a narrated one cannot pre-commit the verdict", () => {
+    const msg = [
+      "My plan is to close with BLOCKED: if the dependency is broken.",
+      "It was not broken.",
+      "",
+      "BUILT: dependency was fine after all",
+    ].join("\n");
+    expect(parseStageResult("builder", msg)).toEqual({ kind: "built" });
+    // Same marker twice is not a contradiction -- last still wins, and it carries
+    // its own note, not the earlier line's.
+    expect(parseStageResult("merge", "prose\nMERGED: https://pr/1\nmore\nMERGED: https://pr/2")).toEqual({
+      kind: "merged",
+      note: "https://pr/2",
+    });
+  });
+
+  test("AC6: the real #286 builder message -- no marker anywhere -- is still CONFUSED", () => {
+    // The other run-16 failure mode: the agent backgrounded `bun test` and ended
+    // its turn to await a completion notification no orchestrator will ever send.
+    // It genuinely did not finish, so the widening must NOT rescue it.
+    const msg = fixture("builder-286-no-marker.txt");
+    const note = confusedNote(parseStageResult("builder", msg));
+    expect(note).toContain("ended without a recognized exit marker");
+    expect(note).toContain("BUILT, NEEDS-INPUT, BLOCKED, CONFUSED");
+    // Byte-identical to the note main already produced for this message.
+    expect(note).toContain(JSON.stringify(msg.trim().slice(0, 200)));
+  });
+
+  test("a marker belonging to another stage is still not this stage's verdict", () => {
+    // The scan filters by THIS stage's marker table, exactly as the first-line
+    // path always did, so a builder closing with QA-PASS is not a pass.
+    expect(parseStageResult("builder", "summary\n\nQA-PASS: all good").kind).toBe("confused");
+    expect(parseStageResult("qa", "summary\n\nMERGED: https://pr/9").kind).toBe("confused");
+  });
+});
+
 // -- transition matrix + reducers ---------------------------------------------
 
 describe("transitions and reducers", () => {

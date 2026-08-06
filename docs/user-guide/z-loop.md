@@ -303,7 +303,27 @@ records the result. It never re-derives a scheduling decision in prose.
   no more durable there than after a skip.
   Every stage prompt that runs the gauntlet now also states the other half: run
   verification in the FOREGROUND, because ending a turn with a background job
-  still pending is parsed as CONFUSED.
+  still pending is parsed as CONFUSED. Each of those prompts prices the wait too —
+  this repo's full suite runs 128-234s measured, against that stage's own watchdog
+  budget in minutes — so foreground is visibly affordable rather than merely
+  mandatory.
+- **A marker that is not the first line is still a marker.** The exit contract asks
+  every stage to OPEN its final message with the marker, and the parser used to
+  read nothing else, so a stage that wrote a prose summary and closed with a
+  correctly spelled `BUILT:` was CONFUSED by definition — skipped after spending
+  its whole budget, work committed and green, ticket left for a human. That was the
+  dominant failure of loop 16: 3 of 3 tickets, two models, two stage kinds, $2.33
+  paid for nothing merged. So a message whose first line is not a marker is now
+  scanned line by line, and the **last** line-leading marker belonging to that
+  stage is the verdict. Last, not first, so a stage narrating "I will finish with
+  `BUILT: ...`" cannot pre-commit its own verdict; line-leading only, so a `BUILT:`
+  indented in a code fence or buried mid-sentence is prose about a marker, not a
+  marker. Two **different** markers of one stage below line 1 is a genuine
+  contradiction and stays CONFUSED, naming both in the note — resolving that
+  silently by position would be worse than the skip. A well-formed message still
+  parses off line 1 exactly as before, and a message with no marker anywhere is
+  CONFUSED exactly as before: the widening rescues a stage that finished and said
+  so awkwardly, never one that did not finish.
 - **Actual per ticket.** After each stage the ticket's transcripts are priced with
   `bin/z-cost` (dedup by requestId) and written to the Actual field. A stage that
   died without reporting is priced too, at the moment it is found dead and before

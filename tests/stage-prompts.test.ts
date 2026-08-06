@@ -29,7 +29,7 @@ import {
   type QaPromptInput,
   type ReviewerPromptInput,
 } from "../lib/stage-prompts.ts";
-import { ZError } from "../lib/config.ts";
+import { DEFAULT_STAGE_WATCHDOG_MINUTES, ZError } from "../lib/config.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 
@@ -790,6 +790,67 @@ describe("merge prompt", () => {
     expect(p).toContain(`--title ${shSingleQuote(evil)}`);
     // ...and NOT via JSON.stringify, whose double quotes let bash expand $()/backticks.
     expect(p).not.toContain(`--title ${JSON.stringify(evil)}`);
+  });
+});
+
+// -- exit-contract hardening (#307 AC7) ---------------------------------------
+
+// Loop 16 lost 3 of 3 tickets to a marker that was present and correctly spelled
+// but not on line 1. lib/loop.ts now reads a trailing marker, and this is the
+// other half: the contract restated as a RULE with the exact failing shape as a
+// worked negative example, because the positive template alone was demonstrably
+// not sticky enough for haiku. All four stages carry it -- one exit contract, no
+// stage where the rule is weaker -- which is why
+// tests/reviewer-single-pass.golden.txt was regenerated in this commit.
+describe("marker position rule (#307)", () => {
+  const CASES: { stage: string; marker: string; prompt: string }[] = [
+    { stage: "builder", marker: "BUILT", prompt: builderPrompt(BUILDER_INPUT, INPUT_PATH) },
+    { stage: "qa", marker: "QA-PASS", prompt: qaPrompt(QA_INPUT, INPUT_PATH) },
+    { stage: "reviewer", marker: "REVIEW-APPROVE", prompt: reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false) },
+    { stage: "reviewer (adversarial)", marker: "REVIEW-APPROVE", prompt: reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true) },
+    { stage: "merge", marker: "MERGED", prompt: mergePrompt(MERGE_INPUT, INPUT_PATH) },
+  ];
+
+  for (const c of CASES) {
+    test(`${c.stage}: the first-line rule is stated with its own marker as the negative example`, () => {
+      expect(c.prompt).toContain("POSITION IS PART OF THE CONTRACT");
+      expect(c.prompt).toContain("the marker is line 1, column 1");
+      // The negative example names THIS stage's success marker, so the shape the
+      // stage would actually have gotten wrong is the one it is shown.
+      expect(c.prompt).toContain(`A summary followed by \`${c.marker}: ...\` is a FAILURE`);
+      expect(c.prompt).toContain('no "Perfect!"'); // the literal opener #207 and #192 both used
+      // It closes the prompt: the last instruction read before the agent acts.
+      expect(c.prompt.indexOf("POSITION IS PART OF THE CONTRACT")).toBeGreaterThan(c.prompt.indexOf("## Exit contract"));
+      expect(c.prompt.trimEnd().endsWith("Everything you want to say goes on the lines AFTER it.")).toBe(true);
+    });
+  }
+
+  // The #286 half. #209's rule already said "do not background a gate"; it never
+  // said waiting in the foreground FITS, so the affordability argument is the
+  // measured suite runtime against this stage's own watchdog budget. Merge is
+  // excluded for the same reason #209 excluded it: it runs `gh pr merge`, not a
+  // gauntlet.
+  test("the foreground rule prices the wait against each stage's own watchdog budget", () => {
+    const budgets: [string, string, number][] = [
+      ["builder", builderPrompt(BUILDER_INPUT, INPUT_PATH), DEFAULT_STAGE_WATCHDOG_MINUTES.builder],
+      ["qa", qaPrompt(QA_INPUT, INPUT_PATH), DEFAULT_STAGE_WATCHDOG_MINUTES.qa],
+      ["reviewer", reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false), DEFAULT_STAGE_WATCHDOG_MINUTES.reviewer],
+    ];
+    for (const [, prompt, minutes] of budgets) {
+      expect(prompt).toContain("Waiting is affordable");
+      expect(prompt).toContain("full suite runs 128-234s measured");
+      // Read off DEFAULT_STAGE_WATCHDOG_MINUTES, the one definition of the budget,
+      // so a change to the table cannot leave a stale number in the prompt.
+      expect(prompt).toContain(`against the ${minutes} minutes of silence`);
+    }
+    // Each stage gets ITS number, not a shared one: a builder told 15 or a QA
+    // agent told 25 is being priced against a budget it does not have.
+    expect(DEFAULT_STAGE_WATCHDOG_MINUTES.builder).not.toBe(DEFAULT_STAGE_WATCHDOG_MINUTES.qa);
+    expect(builderPrompt(BUILDER_INPUT, INPUT_PATH)).not.toContain(
+      `against the ${DEFAULT_STAGE_WATCHDOG_MINUTES.qa} minutes of silence`
+    );
+    // Merge runs no gauntlet, so it carries neither the rule nor a budget.
+    expect(mergePrompt(MERGE_INPUT, INPUT_PATH)).not.toContain("Waiting is affordable");
   });
 });
 
