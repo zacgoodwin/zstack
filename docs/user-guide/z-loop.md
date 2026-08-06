@@ -405,6 +405,94 @@ The reviewer still runs: `skip-qa` skips QA, never the last correctness gate.
 Every ticket without the label runs the full builder → QA → reviewer → merge
 pipeline, and the QA bounce/investigate machinery is unchanged.
 
+## Version claiming
+
+Every PR carries its own version bump. There is no release-only PR and no
+`[Unreleased]` section in `CHANGELOG.md`: the merge stage's **Step 0** claims a
+version slot on the branch, commits it, and pushes it — all before
+`gh pr create`, so the PR exists with its version already in it.
+
+```
+bun lib/version.ts claim --ticket <N> --worktree <W> --base <B> \
+  --title <T> --entry-file <F> --title-out <P>
+```
+
+What it does, in order: fetch `origin/<B>`; read that branch's VERSION; read
+every **other** open PR's claimed VERSION (one paginated GraphQL read, through
+`lib/board.ts` — still the pack's only `gh` caller, also exposed as
+`z-board open-pr-versions`); derive the bump level from ticket `<N>`'s labels;
+write VERSION, `package.json` and `CHANGELOG.md`; commit and push; and print the
+decision as JSON.
+
+**The number is never an agent's to pick.** The merge prompt says so explicitly
+and forbids hand-editing VERSION, `package.json`, or a CHANGELOG heading. The
+one latent input is the CHANGELOG prose the agent writes to `--entry-file`,
+because summarizing what shipped is genuinely a judgment call; absent or empty,
+it falls back to `- <ticket title> (#N)`.
+
+**Why it exists.** gstack's `/review` reads a PR's claimed version off the
+branch (`git show HEAD:VERSION`) and compares it to the next free slot. With no
+bump on the branch, every PR read as claiming the base version — indistinguishable
+from claiming nothing — so that check could not say anything at all.
+
+### How the slot is picked
+
+The pick is **the greatest of (base, every outstanding claim), bumped by
+level** — not the base alone. Bump the base and a `patch` ticket picks `1.0.2.0`
+while an open PR already holds `1.0.1.1`: free today, and a version that goes
+*backwards* the moment that PR lands last. Taking the max makes the pick
+strictly above every claim, so no collision loop is needed. The cost is a gap in
+the sequence when a PR closes unmerged — cosmetic, where a decreasing version is
+not.
+
+A PR whose head has no readable VERSION claims nothing and is omitted. An
+unreadable queue is different and **throws**: "nobody claims anything" hands out
+the slot just above the base, which is exactly wrong when the real answer is "we
+could not see the queue".
+
+### Bump level, from labels
+
+| label | level | example |
+| --- | --- | --- |
+| `breaking`, `breaking-change` | MAJOR | `1.0.1.0` → `2.0.0.0` |
+| `enhancement`, `feature` | MINOR | `1.0.1.0` → `1.1.0.0` |
+| `bug`, `fix` | PATCH | `1.0.1.0` → `1.0.2.0` |
+| anything else, or no label | MICRO | `1.0.1.0` → `1.0.1.1` |
+
+The **highest** matching label wins, so GitHub's return order cannot change the
+answer: a ticket labeled both `bug` and `enhancement` is an enhancement that
+fixes something. Matching ignores case on both sides.
+
+Set `versionBumpLabels` in `~/.zstack/projects/<slug>/config.json` to **replace**
+that map for a project whose taxonomy reuses a default name differently:
+
+```json
+{ "versionBumpLabels": { "chore": "micro", "api-break": "major" } }
+```
+
+It replaces rather than merges, so a default label can be demoted; `{}` means
+nothing earns more than MICRO. Any label not in the map falls to MICRO, so the
+map only ever needs the labels that earn more.
+
+### Ordering, and re-runs
+
+Step 0 runs **ahead of** the green gate on purpose: it commits to the branch,
+and a gate run before it would stamp a verdict naming a commit that is not the
+one being merged (see […and about one commit](#and-about-one-commit)). The
+conflict path re-runs the claim *first* and then the gate, since resolving pulls
+the base VERSION in; a CHANGELOG conflict resolves by keeping both sections,
+newest version on top.
+
+Re-running the claim is always safe:
+
+- **queue unmoved** → keep the existing claim, no second commit, no inflation.
+- **queue moved above this branch's claim** (a lane blocked at merge, resumed a
+  run later) → the CHANGELOG heading is re-pointed in place, not duplicated.
+- **this branch's claim still highest** → left alone.
+
+Every failure fails closed and maps to `BLOCKED`: a nonzero exit means no
+version was claimed, and the PR is not opened.
+
 ## The merge green gate
 
 The last thing between a branch and `main` is mechanical, and the loop owns it —
