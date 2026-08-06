@@ -147,6 +147,11 @@ change them.
   "disable the watchdog" value, because a stage with no watchdog runs until the
   480-minute stage ceiling.
 - `lockStalenessMinutes` (default 60) — when a crashed loop's lock is judged stale.
+  Since #288 this is the **fallback**, not the primary judgment: the lock records
+  the Claude Code harness pid, so a dead or recycled process reads stale at any age
+  and a live confirmed one reads live at any age. This value only decides for locks
+  nothing can prove — no pid recorded, written on another host, or an unreadable
+  start-time — so in practice it is rarely load-bearing now.
 - `auditEveryNLoops` (default 5) — how often the end-of-loop stage runs the
   `/cso` + `/health` audits (`loopCount % auditEveryNLoops === 0`). Lower it
   (e.g. 3) for a high-churn repo, raise it (e.g. 10) for a docs-only one. Must

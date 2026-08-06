@@ -145,7 +145,11 @@ describe("control 1: loop lock (second-invocation refusal)", () => {
   });
 
   test("pid decides liveness: a dead pid reads stale, a live pid reads live", () => {
-    const withPid = (pid: number): LoopLock => ({ session: "s", startedAt: 0, pid });
+    // #288: the lock must record the host too. A pid integer means nothing off the
+    // machine that assigned it, so the pid arm is gated on sameHost -- a host-less
+    // (pre-#14) lock now falls to the age heuristic in BOTH directions instead of
+    // letting an unattributable pid decide. See the foreign-host case below.
+    const withPid = (pid: number): LoopLock => ({ session: "s", startedAt: 0, pid, host: hostname() });
     expect(loopLockLiveness(withPid(4242), 0, STALE, () => false)).toBe("stale");
     expect(loopLockLiveness(withPid(4242), 0, STALE, () => true)).toBe("live");
     // Real check against this very process (definitely alive) and pid 1 semantics.
@@ -167,7 +171,16 @@ describe("control 1: loop lock (second-invocation refusal)", () => {
     const foreign: LoopLock = { session: "s", startedAt: 0, pid: 4242, host: "some-other-host" };
     expect(loopLockLiveness(foreign, STALE + 1, STALE, () => true)).toBe("stale"); // past staleness -> clearable
     expect(loopLockLiveness(foreign, STALE - 1, STALE, () => true)).toBe("live"); // within window -> don't nuke
-    expect(loopLockLiveness(foreign, 0, STALE, () => false)).toBe("stale"); // dead pid -> stale, host regardless
+    // RETIRED by #288, deliberately. This line used to assert "dead pid -> stale,
+    // host regardless", which was safe only while production recorded no pid at
+    // all: the branch was unreachable. Now every lock carries the harness pid, so
+    // "pid 41644 is not alive here" would be read as proof that ANOTHER machine's
+    // loop is dead, and --reconcile would park its tickets and delete its
+    // worktrees -- #198's exact loss, reached across machines. A foreign lock now
+    // falls to the age heuristic, the same answer the two lines above already give
+    // for a foreign lock whose pid happens to be alive.
+    expect(loopLockLiveness(foreign, 0, STALE, () => false)).toBe("live"); // fresh -> age decides, pid ignored
+    expect(loopLockLiveness(foreign, STALE + 1, STALE, () => false)).toBe("stale"); // ...and age still clears it
 
     // (c) A same-host lock with NO stored start-time is a legacy lock -> unconfirmable
     // -> age decides, both directions (fresh -> live, old -> stale). This is what the

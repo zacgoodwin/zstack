@@ -19,6 +19,7 @@ import {
   inspectLoopLock,
   listLaneLocks,
   listWorktreeRecords,
+  livenessEvidence,
   removeWorktreeRecord,
   type LaneLock,
   type WorktreeDisposition,
@@ -721,17 +722,32 @@ export async function sweep(board: Board): Promise<BoardTicketStatus[]> {
 export function assertNotReconcilingLiveLoop(
   locksDir: string,
   nowMs: number,
-  cfg: { lockStalenessMinutes?: number },
+  cfg: { lockStalenessMinutes?: number; slug?: string },
   session: string | undefined
 ): void {
   const stalenessMs = (cfg.lockStalenessMinutes ?? DEFAULT_LOCK_STALENESS_MINUTES) * 60_000;
+  const slug = cfg.slug ?? "<slug>";
   const st = inspectLoopLock(locksDir, nowMs, stalenessMs);
   if (st.state !== "live") return;
   if (session !== undefined && st.lock!.session === session) return; // our own recovery pass
+  // #288: the refusal names WHY it believes the loop is live. When that belief is
+  // proof (the harness process is alive on this host and its start-time still
+  // matches), "stop that loop first" is the whole answer. When it is only the age
+  // heuristic -- no recorded pid, a foreign host, an unreadable start-time -- the
+  // operator needs the way out, or a crashed loop inside the staleness window
+  // leaves them with nothing to do but delete the file by hand.
+  const { proven, evidence } = livenessEvidence(st.lock!);
   throw new ZError(
     `Refusing to reconcile: a /z-loop is running on this project in session ` +
       `"${st.lock!.session}". Reconciling would park its tickets back to Ready and ` +
-      `delete its worktrees. Stop that loop first.`
+      `delete its worktrees. Evidence: ${evidence}.` +
+      (proven
+        ? ` That is proof, not a guess from age -- stop that loop first. If that session is NOT draining ` +
+          `(its turn ended or was interrupted while Claude Code stayed open), the process outlives the loop ` +
+          `and this never clears on its own -- release it deliberately with: `
+        : ` That is a guess from the lock's age, NOT proof it is running. If you know it is not, ` +
+          `clear the lock first with: `) +
+      `bun lib/locks.ts force-release --slug "${slug}" --session "${st.lock!.session}"`
   );
 }
 

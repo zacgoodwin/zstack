@@ -854,3 +854,37 @@ describe("#271: the salvage preamble is scoped to the disposition, not to parkin
     expect(pre).toMatch(/not optional/i);
   });
 });
+
+// ============================================================================
+// #288 -- the loop lock proves liveness instead of guessing it from age
+// ============================================================================
+// The lib half is gate-tested in tests/loop-lock-liveness.test.ts. These pin the
+// SKILL contract, because the acquire is a prose step and the one thing worse
+// than no pid in the lock is the wrong one: #164 rejected `$$` (the Bash tool's
+// shell, which exits the moment the acquire returns) and a future edit that
+// "helpfully" adds it back would silently re-break the whole mechanism.
+describe("#288: Step 0 records the harness pid, and never the shell's", () => {
+  test("Step 0 names CLAUDE_PID and the proof-over-age rule", () => {
+    const md = zLoop();
+    expect(md).toContain("#288");
+    expect(md).toContain("CLAUDE_PID");
+    expect(md).toMatch(/ANY age/i);
+  });
+
+  // The trap, spelled out where the acquire lives.
+  test("Step 0 forbids passing --pid by hand and says why", () => {
+    const md = zLoop();
+    expect(md).toContain("Do NOT pass --pid");
+    expect(md).toContain("#164");
+    // The acquire line itself must not carry a --pid: the default is the point.
+    const acquire = md.split("\n").find((l) => l.includes('locks.ts" acquire --slug'));
+    expect(acquire).toBeDefined();
+    expect(acquire).not.toContain("--pid");
+  });
+
+  test("the lock contract documents the escape hatch and the foreign-host rule", () => {
+    const md = zLoop();
+    expect(md).toContain("force-release");
+    expect(md).toMatch(/foreign-host lock is\s+always judged by age/);
+  });
+});

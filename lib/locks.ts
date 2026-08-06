@@ -13,9 +13,11 @@
 //     lib/reconcile.ts's orphan scan.
 //   * Loop lock   `loop.lock` {session, startedAt, pid?} -- one per project. A
 //     second /z-loop on the same project reads it and refuses to start, naming
-//     the live session. Liveness: a verifiable pid decides; with no pid, a lock
-//     older than the configured staleness threshold is judged stale (crashed)
-//     rather than live, so a dead loop never wedges the next run. The one-shot
+//     the live session. Liveness: a verifiable pid decides (see harnessPid --
+//     since #288 that pid is recorded in production, so this is the arm that
+//     actually runs); with no verifiable pid, a lock older than the configured
+//     staleness threshold is judged stale (crashed) rather than live, so a dead
+//     loop never wedges the next run. The one-shot
 //     `loop.lock.reconcile` claim that serializes --reconcile's clear-and-replace
 //     carries the same payload and gets the same judgment, so a claim orphaned by a
 //     crash inside the claimed section self-heals too: the next run supersedes it with
@@ -323,6 +325,43 @@ export function effectiveLastSeen(lock: LoopLock, beat: Heartbeat | null): numbe
     : lock.startedAt;
 }
 
+// The process whose death IS the loop's death (issue #288).
+//
+// /z-loop is an AGENT, not a daemon -- "no daemon" is the design -- so for a long
+// time the pack had no pid worth recording and `loopLockLiveness`'s pid arm never
+// ran in production. The comment further down said so outright. The consequence
+// was the wedge #288 exists for: with only the age heuristic left, a loop that
+// died five minutes ago read LIVE for the rest of `lockStalenessMinutes` (default
+// 60), `acquireLoopLock` refuses a live lock even with --reconcile (on purpose --
+// never nuke a running loop), `assertNotReconcilingLiveLoop` refuses too (on
+// purpose, #198), and the only way out was `rm loop.lock` by hand. That happened
+// on 2026-08-02.
+//
+// #164 rejected the obvious candidate and was right to: the SKILL step's `$$` is
+// the Bash tool's SHELL, which exits the moment the acquire command returns, so a
+// lock carrying it would read dead instantly. But the shell is not the only
+// ancestor. Claude Code exports `CLAUDE_PID` into every tool process, and it names
+// the harness process that owns the session -- verified by walking the ancestor
+// chain from a tool call on this machine: the immediate parent is `claude.exe`
+// and its pid is exactly `CLAUDE_PID`. That process's lifetime IS the drain's
+// lifetime: while it lives the session can still be executing the loop, and when
+// it dies -- crash, close, kill -- nothing is left that could still be draining.
+//
+// So this is the whole of #288's fix. No new liveness mechanism: the pid arm
+// below (dead pid -> stale at any age; alive + start-time confirmed -> live at any
+// age; recycled -> stale) was already written and gate-tested for issue #14 H12
+// and has simply never had a pid to run on.
+//
+// Absent or unparseable -> undefined -> the lock records no pid -> the age
+// heuristic decides, exactly as before. Every entrypoint that does not export the
+// variable degrades to today's behavior rather than to a wrong answer.
+export function harnessPid(env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const raw = env.CLAUDE_PID;
+  if (raw === undefined) return undefined;
+  const pid = Number(raw);
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
 // Is the process holding a loop lock alive on THIS host? signal 0 checks
 // existence: EPERM means it exists but is another user's (alive); ESRCH / any
 // other error means gone. Only meaningful when the lock was written on THIS host
@@ -422,9 +461,23 @@ export function loopLockLiveness(
   // effectiveLastSeen(lock, readHeartbeat(dir)); omitting it falls back to
   // startedAt, which is exactly the pre-#198 behavior -- so every existing
   // positional call site keeps its meaning.
-  lastSeenAt?: number
+  lastSeenAt?: number,
+  // #288: the host the pid arm is being evaluated ON. Injected for the gate tests;
+  // production takes this machine's hostname.
+  host: string = hostname()
 ): LockLiveness {
-  if (lock.pid !== undefined) {
+  // The whole pid arm is gated on the lock having been written by THIS host.
+  //
+  // Before #288 the dead-pid branch ran host-regardless, and that was harmless
+  // only because production recorded no pid at all -- the branch was unreachable.
+  // Now that every lock carries the harness pid, "pid 41644 is not alive here"
+  // would be read as proof that ANOTHER machine's loop is dead, and --reconcile
+  // would park its tickets and delete its worktrees: #198's exact loss, reached
+  // across machines. A pid integer means nothing off the host that assigned it,
+  // which is what processAlive's own comment has always said; only the branch
+  // failed to honour it. A foreign lock now falls to the age heuristic, the same
+  // answer it already gave for a foreign lock whose pid happened to be alive.
+  if (lock.pid !== undefined && sameHost(lock, host)) {
     if (!isAlive(lock.pid)) return "stale"; // dead pid: our loop is definitely gone
     switch (identify(lock)) {
       case "confirmed":
@@ -435,11 +488,59 @@ export function loopLockLiveness(
         break; // unconfirmable: fall through to the age heuristic
     }
   }
-  // A pid, when present and confirmable, still outranks the heartbeat above.
-  // Production passes no pid (the SKILL step's $$ is the shell, not the loop --
-  // #164), so in practice this age branch is the only one reached, which is why
-  // an un-refreshed anchor made every long drain read stale (#198).
+  // A pid, when present and confirmable, outranks the heartbeat above. Since #288
+  // production DOES record one (harnessPid), so this age branch is now the
+  // fallback for the unprovable cases -- a foreign host, a legacy lock with no
+  // start-time, an entrypoint that exports no CLAUDE_PID -- rather than the only
+  // branch ever reached. It is still the branch whose un-refreshed anchor made
+  // every long drain read stale (#198), which is why the heartbeat feeds it.
   return nowMs - (lastSeenAt ?? lock.startedAt) > stalenessMs ? "stale" : "live";
+}
+
+// Which arm decided, in words, for the refusal messages (#288). The operator's
+// next move depends entirely on this: a PROVEN reading is worth trusting, while
+// an unprovable one is a guess from age that they may need to override.
+export function livenessEvidence(
+  lock: LoopLock,
+  host: string = hostname(),
+  isAlive: (pid: number) => boolean = processAlive,
+  identify: (l: LoopLock) => IdentityCheck = (l) => confirmIdentity(l)
+): { proven: boolean; evidence: string } {
+  if (lock.pid === undefined) {
+    return { proven: false, evidence: `the lock records no process id, so only its age is legible` };
+  }
+  if (!sameHost(lock, host)) {
+    return {
+      proven: false,
+      evidence: `the lock was written on host "${lock.host ?? "(unrecorded)"}", not this one, so its pid ${lock.pid} proves nothing here`,
+    };
+  }
+  if (!isAlive(lock.pid)) return { proven: true, evidence: `process ${lock.pid} is gone` };
+  switch (identify(lock)) {
+    case "confirmed":
+      return { proven: true, evidence: `process ${lock.pid} is alive and its OS start-time still matches the one recorded at lock creation` };
+    case "recycled":
+      return { proven: true, evidence: `process ${lock.pid} is alive but the OS reused that number for an unrelated process` };
+    default:
+      return { proven: false, evidence: `process ${lock.pid}'s identity could not be confirmed (no recorded start-time, or it could not be read), so only the lock's age is legible` };
+  }
+}
+
+// The one command that clears a loop lock nobody can prove anything about
+// (#288). Deliberately NOT part of --reconcile: reconcile acts on evidence, and
+// this is the verb for when there is none. Requires the holder's EXACT session id
+// as a confirmation token, so a copy-pasted command cannot clear a lock the
+// operator never looked at, and touches ONLY the loop lock and its beat -- lane
+// locks, worktree records and worktrees stay reconcile's business.
+export function forceReleaseLoopLock(
+  locksDir: string,
+  session: string
+): { released: boolean; held?: LoopLock } {
+  const lock = readLoopLock(locksDir);
+  if (!lock) return { released: true }; // already gone: idempotent, not an error
+  if (lock.session !== session) return { released: false, held: lock };
+  releaseLoopLock(locksDir);
+  return { released: true, held: lock };
 }
 
 export interface LoopLockState {
@@ -641,6 +742,19 @@ const USAGE = `locks <command> [args]
                                        take the project loop lock, or refuse
                                        (exit 1) naming the live/stale session
   release  --slug S                    remove the project loop lock
+  force-release --slug S --session ID  clear a loop lock whose liveness cannot be
+                                       PROVEN (#288): no recorded pid, a lock from
+                                       another host, or an unreadable start-time,
+                                       where only the lock's age is legible and the
+                                       age says "live". ID must be the holder's
+                                       exact session -- a mismatch refuses and names
+                                       the real holder, so a pasted command cannot
+                                       clear a lock you never looked at. Removes the
+                                       loop lock and its heartbeat and NOTHING else;
+                                       lane locks, worktree records and worktrees
+                                       stay "reconcile"'s business. A lock whose
+                                       process is provably alive should never be
+                                       cleared this way -- stop that loop instead.
   beat     --slug S --session ID [--now MS]
                                        re-stamp the liveness heartbeat; a no-op
                                        unless the loop lock is held by ID
@@ -703,7 +817,12 @@ export function main(argv: string[]): number {
       // host is recorded so a lock's pid is only trusted on the machine that wrote
       // it (issue #14 H12): a foreign-host lock falls back to the age heuristic.
       const lock: LoopLock = { session: requireFlag(flags, "session"), startedAt: nowMs, host: hostname() };
-      const pid = str(flags, "pid");
+      // #288: the harness pid is the DEFAULT, not something the SKILL has to
+      // remember to pass. Prose that must not be forgotten is prose that will be,
+      // and the one thing worse than no pid is the wrong one (#164's `$$`), so
+      // resolving it here makes the right answer the only reachable one.
+      // `--pid` stays an explicit override for the gate tests.
+      const pid = str(flags, "pid") ?? harnessPid()?.toString();
       if (pid !== undefined) {
         lock.pid = Number(pid);
         // Record the pid's OS start-time now so a later same-host liveness check can
@@ -731,8 +850,32 @@ export function main(argv: string[]): number {
       const agoMin = (t: number) => Math.round((nowMs - t) / 60_000);
       if (res.reason === "live") {
         const seenTxt = seen !== undefined ? `, last seen ${agoMin(seen)}m ago` : "";
+        // #288: say WHICH arm decided, and when it was the age heuristic rather
+        // than proof, say what to run. A refusal that names no next action is how
+        // an operator ends up deleting the lock file by hand, which is what
+        // happened on 2026-08-02 -- there was nothing else to do.
+        const { proven, evidence } = livenessEvidence(h);
+        const slug = str(flags, "slug");
+        const escape =
+          slug === undefined
+            ? ` If you know that loop is NOT running, clear the lock with: bun lib/locks.ts force-release --dir "${locksDir}" --session "${h.session}"`
+            : ` If you know that loop is NOT running, clear the lock with: bun lib/locks.ts force-release --slug "${slug}" --session "${h.session}"`;
+        // The escape hatch is offered in BOTH branches, with the severity matched
+        // to the evidence. Proof that the HARNESS process is alive is not proof
+        // that the drain is still executing: if the orchestrator's turn died --
+        // an API error, an interrupt -- while Claude Code stayed open, the pid
+        // lives on and this reading is "live" forever, where the age heuristic
+        // used to give up after the staleness window. That is the cost of letting
+        // proof outrank age, and hiding the way out is how an operator ends up
+        // deleting the lock file by hand (2026-08-02) all over again.
         console.error(
-          `Refusing to start: a /z-loop is already running on this project in session "${h.session}" (started ${since}${seenTxt}${h.pid ? `, pid ${h.pid}` : ""}). Stop that loop first.`
+          `Refusing to start: a /z-loop is already running on this project in session "${h.session}" ` +
+            `(started ${since}${seenTxt}${h.pid ? `, pid ${h.pid}` : ""}). Evidence: ${evidence}.` +
+            (proven
+              ? ` That is proof, not a guess from age -- stop that loop first. If that session is NOT ` +
+                `draining (its turn ended or was interrupted while Claude Code stayed open), the process ` +
+                `outlives the loop and this will never clear on its own:${escape}`
+              : ` That is a guess from the lock's age (${agoMin(seen ?? h.startedAt)}m < the staleness window), NOT proof it is running.${escape}`)
         );
       } else {
         const evidence =
@@ -750,6 +893,35 @@ export function main(argv: string[]): number {
       const { locksDir } = resolveDir(flags);
       releaseLoopLock(locksDir);
       console.log("released loop lock");
+      return 0;
+    }
+
+    // #288: the in-band way out of an unprovable-but-live-reading lock. Prints
+    // what it is about to clear and what it deliberately is NOT clearing, so the
+    // operator can see that recovering the lanes is still reconcile's job.
+    if (cmd === "force-release") {
+      const { locksDir } = resolveDir(flags);
+      const session = requireFlag(flags, "session");
+      const res = forceReleaseLoopLock(locksDir, session);
+      if (!res.released) {
+        console.error(
+          `Refusing to force-release: the loop lock is held by session "${res.held!.session}", not "${session}". ` +
+            `Re-run with --session "${res.held!.session}" if that is really the lock you mean to clear.`
+        );
+        return 1;
+      }
+      if (res.held === undefined) {
+        console.log(`no loop lock to release`);
+        return 0;
+      }
+      // Naming the evidence on the way out matters: if it says PROVEN alive, the
+      // operator has just cleared a lock on a loop that is still running.
+      const { proven, evidence } = livenessEvidence(res.held);
+      console.log(
+        `force-released the loop lock from session "${res.held.session}" (${evidence}` +
+          `${proven ? " -- that reading was PROVEN, so make sure that loop really is stopped" : ""}). ` +
+          `Lane locks, worktree records and worktrees were NOT touched: run \`reconcile apply\` to recover those.`
+      );
       return 0;
     }
 

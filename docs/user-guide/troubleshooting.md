@@ -46,25 +46,74 @@ enough. Do not proceed until the probe passes.
 
 The loop lock (`~/.zstack/projects/<slug>/locks/loop.lock`) names a live session.
 This is the **second-invocation guard**: two loops on one project would fight over
-the same tickets and worktrees. Options:
+the same tickets and worktrees.
 
-- It really is running elsewhere → let it finish, or stop that session.
-- It crashed and the lock is stale → the message says so, and names the evidence
-  ("no sign of life for N minutes", or "no heartbeat was ever recorded"); start
-  with `/z-loop --reconcile`.
+**Read the `Evidence:` clause in the message first** — it says which of three arms
+decided, and your next move differs for each (#288):
 
-A **live** lock never clears via reconcile — you cannot reconcile over a running
-loop, by design. Since #198 that is enforced in code as well: `reconcile apply`
-itself refuses while the lock is live, rather than trusting the caller to have
-checked. The loop passes its own `--session` so its Step 0 recovery pass still
-works; a bare human invocation has no session and is refused.
+| Evidence | Meaning | What to do |
+| --- | --- | --- |
+| `process N is gone` | **Proven dead.** | Nothing — `--reconcile` already clears it, at any age. |
+| `process N is alive and its OS start-time still matches` | **Proven alive.** | Let it finish, or stop that session. |
+| `process N is alive but the OS reused that number` | **Proven dead** (pid recycled). | `--reconcile` clears it. |
+| `the lock records no process id` / `written on host "X", not this one` / `identity could not be confirmed` | **Unprovable** — only the lock's age is legible. | See the escape hatch below. |
+
+A **live** lock never clears via `--reconcile` — you cannot reconcile over a
+running loop, by design (#198 enforces it in `reconcile apply` too, rather than
+trusting the caller to have checked; the loop passes its own `--session` so its
+Step 0 recovery pass still works, and a bare human invocation is refused).
+
+### The wedge that used to have no in-band fix
+
+Before #288 the lock recorded no process id at all. `/z-loop` is an agent, not a
+daemon, and #164 had correctly rejected the obvious candidate — the SKILL step's
+`$$` is the Bash tool's *shell*, which exits the moment the acquire returns. So
+the pid arm never ran and **age was the only judgment**: a loop that died five
+minutes ago read LIVE for the rest of `lockStalenessMinutes` (default 60), the
+acquire refused, `--reconcile` refused, and the only remedy was `rm loop.lock` by
+hand. That happened on 2026-08-02.
+
+The fix is not a new liveness mechanism. Claude Code exports `CLAUDE_PID` into
+every tool process, naming the **harness process that owns the session** — whose
+lifetime is the drain's lifetime. Recording it makes the pid machinery that
+already existed (dead pid → stale at any age; alive with a matching OS start-time
+→ live at any age; recycled pid → stale) actually run. Kill Claude Code and the
+next run clears the lock immediately instead of an hour later.
+
+### The escape hatch: `force-release`
+
+Two cases still need a human, and both now name the exact command instead of
+leaving you to delete a file:
+
+1. **Unprovable** (no pid recorded, a lock from another host, an unreadable
+   start-time) where age says "live".
+2. **Proven alive, but not actually draining.** The harness process being alive is
+   not proof that the *loop* is executing: if the orchestrator's turn died — an
+   API error, an interrupt — while Claude Code stayed open, the pid outlives the
+   loop and the reading never clears on its own, where age used to give up after
+   the staleness window. This is the cost of letting proof outrank age.
+
+```bash
+bun ~/.claude/skills/zstack/lib/locks.ts force-release --slug <slug> --session "<the session named in the message>"
+```
+
+The session id must match the holder exactly — a mismatch refuses and names the
+real holder, so a pasted command cannot clear a lock you never looked at. It
+removes **only** the loop lock and its heartbeat; lane locks, worktree records and
+worktrees stay `reconcile`'s job, so follow it with `/z-loop --reconcile` to
+recover those. If the lock's reading was PROVEN, the command says so on the way
+out — check that the loop really is stopped before trusting it.
 
 ### The liveness heartbeat (`locks/loop.lock.beat`)
 
-Liveness is judged against a **heartbeat**, not against the lock's creation time.
-`bin/z-loop-tick` re-stamps `locks/loop.lock.beat` every iteration, so the
-question the lock answers is "was this loop seen recently" rather than "did it
-start recently".
+Since #288 the heartbeat is the **fallback**, not the primary judgment: a
+confirmable pid decides first, and the beat only matters for the unprovable arm
+above. It still matters there, and for the same reason it always did.
+
+Within that arm, liveness is judged against a **heartbeat**, not against the
+lock's creation time. `bin/z-loop-tick` re-stamps `locks/loop.lock.beat` every
+iteration, so the question the lock answers is "was this loop seen recently"
+rather than "did it start recently".
 
 That distinction matters because `loop.lock` is written once and never
 re-stamped. Before #198 a loop that simply ran longer than `lockStalenessMinutes`

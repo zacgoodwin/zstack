@@ -465,7 +465,7 @@ are managed by setup; don't hand-edit them. The tunables:
 | `epicStyle` | `"milestones"` | How epics are modeled. Only `milestones` is supported today. |
 | `maxLanes` | `3` | Max concurrent lanes in a loop run. |
 | `watchdogMinutes` | `{"builder":25,"qa":15,"reviewer":40,"merge":15}` | Minutes in which a lane's agent subtree appended nothing to its transcripts before the loop probes and, if dead, skips the lane. Per stage, each 2x that stage's measured worst silence, floored at 2x the longest measured gap of any single agent (423s). A plain number applies one budget to every stage; an object with only some stages set overrides those and defaults the rest. |
-| `lockStalenessMinutes` | `60` | Age past which a crashed loop's lock is judged stale (also stale immediately when its pid is dead on the same host). |
+| `lockStalenessMinutes` | `60` | Fallback only (#288): age past which a crashed loop's lock is judged stale when nothing can be proven. A recorded harness pid decides first — dead or recycled is stale at any age, live and start-time-confirmed is live at any age — and a pid is only trusted on the host that wrote the lock. |
 | `maxQaPasses` | `3` | QA passes on a ticket before it parks Blocked instead of bouncing to a fresh builder. |
 | `qaInvestigateAfter` | `2` | QA-bounce count at/after which the rebuild runs `/investigate` first. |
 | `auditEveryNLoops` | `5` | How often (modulo loop count) the end-of-loop stage runs `/cso` + `/health` audits. Must be a positive integer. |
