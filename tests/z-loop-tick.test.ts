@@ -222,17 +222,22 @@ describe("z-loop-tick", () => {
     // ~/.claude/projects, so context-budget resolves nothing and reads 0
     // (fail-open) -- the manual ingest passes the same `--context-tokens 0` so
     // both states carry contextTokens:0 and the default contextTokenLimit.
+    // #223: the wrapper also threads its --session through as the RUN identity
+    // (stored as runSession, and what makes a resume re-earn the bounded park), so
+    // the manual ingest passes the same one or the two states differ by that key.
     const items = join(dir, "items.json");
     const bodies = join(dir, "bodies.json");
     const expectedState = join(dir, "expected-state.json");
     writeFileSync(items, ITEMS);
     writeFileSync(bodies, BODIES);
     const ing = Bun.spawnSync(
-      ["bun", join(REPO_ROOT, "lib", "loop.ts"), "ingest", expectedState, items, bodies, "--context-tokens", "0"],
+      ["bun", join(REPO_ROOT, "lib", "loop.ts"), "ingest", expectedState, items, bodies, "--context-tokens", "0", "--session", "test-session"],
       { stdout: "pipe", stderr: "pipe" }
     );
     expect(ing.exitCode).toBe(0);
     expect(readFileSync(tickState, "utf8")).toBe(readFileSync(expectedState, "utf8"));
+    // ...and that the wrapper really passed it, rather than both sides omitting it.
+    expect(JSON.parse(readFileSync(tickState, "utf8")).runSession).toBe("test-session");
 
     // #131: this is the FAIL-OPEN branch -- under the temp $HOME there is no
     // ~/.claude/projects transcript, so context-budget resolves nothing and reads
@@ -312,7 +317,7 @@ describe("z-loop-tick", () => {
     writeFileSync(items, ITEMS);
     writeFileSync(bodies, BODIES);
     const ing = Bun.spawnSync(
-      ["bun", join(REPO_ROOT, "lib", "loop.ts"), "ingest", expectedState, items, bodies, "--context-tokens", "450000"],
+      ["bun", join(REPO_ROOT, "lib", "loop.ts"), "ingest", expectedState, items, bodies, "--context-tokens", "450000", "--session", "test-session"],
       { stdout: "pipe", stderr: "pipe" }
     );
     expect(ing.exitCode).toBe(0);

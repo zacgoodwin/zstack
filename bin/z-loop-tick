@@ -116,7 +116,13 @@ jq -s '.' "$TMP/lookups.jsonl" > "$TMP/lookups.json" 2>/dev/null \
 #    stderr is NOT: the confirm notes ("read missed #N; ...") are the record of
 #    what was actually proven about a missing ticket, and they belong in the
 #    operator's tick output.
-bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" --lookups "$TMP/lookups.json" --context-tokens "$CTX" >/dev/null
+#
+#    --session is not a config flag: it is the RUN identity (#223), the same
+#    value passed to `locks.ts beat` above. Every tick of one invocation carries
+#    the SAME id, so it changes only when a new /z-loop starts -- which is what
+#    tells the ingest to make the bounded park re-earn itself with a fresh confirm
+#    read instead of inheriting the previous run's clock across a resume.
+bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" --lookups "$TMP/lookups.json" --context-tokens "$CTX" --session "$SESSION" >/dev/null
 # 2a. Watchdog heartbeat (issue #256): observe each live lane's stage-spawn
 #     subtree and move its watchdog baseline forward to the newest transcript
 #     append. Without this the baseline is only ever stamped by stage EVENTS

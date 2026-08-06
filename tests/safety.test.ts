@@ -54,6 +54,7 @@ import {
 import { SUBTREE_STALE_MS } from "../lib/transcripts.ts";
 import {
   applyAction,
+  abandonedClaimBoundMs,
   claimConfirmed,
   ingestBoardItems,
   nextAction,
@@ -1561,7 +1562,11 @@ describe("item 18: corrupt locks fail with ZErrors on the recovery path", () => 
 // not session, here as there.)
 describe("control 7: a live foreign claim is never stolen (#223)", () => {
   const T0 = 1_000_000;
-  const WD_MS = 10 * 60_000; // state()'s watchdogMinutes
+  const WD_MS = 10 * 60_000; // state()'s watchdogMinutes -- the confirm THROTTLE's period
+  // The bounded park's own budget is a whole foreign TICKET, every stage summed
+  // (4 * 10 * 3 = 120 min here), not the throttle's single-stage period. Derived,
+  // so this control is asserted against the real budget and not a copied number.
+  const BOUND_MS = abandonedClaimBoundMs(10);
 
   // #1 flagged, #2 depends on it, both Ready, no lanes: the step-6 wait branch.
   // Exactly what markClaimLost leaves behind -- the throttle stamp and nothing
@@ -1602,7 +1607,7 @@ describe("control 7: a live foreign claim is never stolen (#223)", () => {
     // Ending the run must not mean handing #1 to this loop: it parks #2 and
     // leaves #1 flagged and untouched for its real owner.
     let s = claimConfirmed(flagged(), 1, ["someone-else"], "me", T0 + WD_MS);
-    const late = T0 + WD_MS + 3 * WD_MS; // three watchdogs after that first confirm
+    const late = T0 + WD_MS + BOUND_MS; // a full bound after that first confirm
     const park = nextAction(s, late);
     expect(park).toMatchObject({ kind: "park", ticket: 2, status: "Blocked" });
     s = applyAction(s, park, late);
@@ -1619,6 +1624,17 @@ describe("control 7: a live foreign claim is never stolen (#223)", () => {
     const s = flagged(); // markClaimLost's output: throttle stamped, no attempt
     for (const elapsed of [3, 10, 100, 10_000]) {
       expect(nextAction(s, T0 + elapsed * WD_MS)).toEqual({ kind: "confirm-claim", ticket: 1 });
+    }
+    // ...and "no attempt" is not only an ABSENT anchor. A stamp that is not a
+    // time reaches disk without any hand-editing (`--now` -> NaN -> JSON null),
+    // and a bare existence gate let it through to be read as epoch 0: measured,
+    // that parked #2 on the FIRST idle tick with the note claiming 30000000
+    // minutes of confirming and no read ever spent. Non-finite is "never asked".
+    for (const anchor of [null, undefined, NaN, "soon"]) {
+      const bad = flagged({ claimConfirmingSince: anchor as never });
+      for (const elapsed of [1, 100, 10_000]) {
+        expect(nextAction(bad, T0 + elapsed * BOUND_MS)).toEqual({ kind: "confirm-claim", ticket: 1 });
+      }
     }
   });
 
@@ -1658,14 +1674,15 @@ describe("control 7: a live foreign claim is never stolen (#223)", () => {
     let s = flagged();
     let now = T0;
     const kinds: string[] = [];
-    for (let i = 0; i < 60 && kinds[kinds.length - 1] !== "drain-complete"; i++) {
+    for (let i = 0; i < 200 && kinds[kinds.length - 1] !== "drain-complete"; i++) {
       now += 60_000;
       const a = nextAction(s, now);
       kinds.push(a.kind);
       if (a.kind === "confirm-claim") s = recordConfirmAttempt(s, a.ticket, now); // the driver's write, and nothing else
       else if (a.kind !== "wait" && a.kind !== "drain-complete") s = applyAction(s, a, now);
     }
-    expect(kinds.filter((k) => k === "confirm-claim").length).toBe(3); // one per watchdog period, bounded
+    // One ask per throttle period for the whole bound, and then it stops.
+    expect(kinds.filter((k) => k === "confirm-claim").length).toBe(BOUND_MS / WD_MS);
     expect(kinds).toContain("park");
     expect(kinds[kinds.length - 1]).toBe("drain-complete");
     expect(kinds).not.toContain("claim"); // and it never took the ticket
