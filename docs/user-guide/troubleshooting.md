@@ -505,14 +505,22 @@ of `wait`, the orchestrator makes exactly that read (`"$Z_BOARD" assignees <N>
 --slug "$SLUG"`, the sanctioned path), and `loop claim-confirmed` either clears
 the flag (the ticket is claimable again on the next tick) or re-stamps it. A read
 that fails is recorded too (`loop claim-confirm-failed`), so a broken read paces
-its retry instead of asking every tick. Once `watchdogMinutes * 3` have passed
-**since the first of those attempts** with the claim still standing, the
+its retry instead of asking every tick. Once **three whole-ticket budgets** have
+passed **since the first of those attempts** with the claim still standing, the
 dependents park Blocked — naming the holding login when a read ever returned one
-— and the run ends. The bound counts from the first attempt, not from when the
-claim was lost, so a claim lost hours before the drain went idle still gets read
-once: no dependent is ever Blocked over a claim the loop never checked. That
-holds across runs too — a **new run** resets the anchor, so moving a parked
-dependent back to Ready really does get the claim re-read rather than re-parked. The
+— and the run ends. A whole-ticket budget is every stage's `watchdogMinutes`
+summed (285 minutes on the defaults), not one stage's: a foreign claim covers
+builder through merge, so bounding it by a single stage Blocked the dependents of
+a healthy sibling loop about an hour in. The bound counts from the first attempt,
+not from when the claim was lost, so a claim lost hours before the drain went idle
+still gets read once: no dependent is ever Blocked over a claim the loop never
+checked. That holds across runs too — a **new run** (a changed `--session`, which
+covers a context-clear or crash resume as well as a fresh batch) resets the read
+*throttle*, and the park requires a read on the record, so moving a parked
+dependent back to Ready really does get the claim re-read rather than re-parked.
+The bound's own clock is not reset: it accrues across resumes, so a loop that
+keeps hitting its context ceiling mid-wait still reaches the park instead of
+restarting the countdown forever. The
 "attempt" is the **ask**, not the answer: `loop next` stamps it as it hands the
 `confirm-claim` over, so both the one-read-per-period pacing and the bound hold
 even if the orchestrator never writes an outcome back. See [z-loop.md → Waiting
@@ -530,6 +538,17 @@ is to clear it by hand: stop the loop, delete the `"claimedByOther": true` line
 from that ticket in `state.json`, and re-invoke `/z-loop`. **Only do that after
 the `gh issue view` read above comes back empty** — clearing a claim that is
 still live starts a second lane on a ticket another session is building.
+
+If you edit `state.json` by hand on a build that *does* have the machinery,
+delete whole keys rather than blanking their values. `claimedByOtherAt` and
+`claimConfirmingSince` are millisecond timestamps; an absent key means "never
+recorded" and is safe, but a `null`, a `0`, or a seconds-epoch value is a
+different instruction. The loop refuses to treat a non-number as a time (it asks
+the board instead of parking), but a *plausible* wrong number — seconds where
+milliseconds belong — reads as decades of waiting and will park the dependents on
+the next idle tick. The same applies to `loop next --now`, which persists the
+clock it is given when it hands a `confirm-claim` over: it is milliseconds, and a
+non-numeric value is rejected outright.
 
 ## setup: "already exists as a separate install; skipping" — and its uninstall mirror
 
