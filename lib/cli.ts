@@ -3,8 +3,8 @@
 // extraction, JSON file reads, the ZError->exit-1 epilogue -- plus the
 // tmp+rename atomic write. One copy of each lives here; behavior is identical
 // to the originals, so consolidating is a pure de-duplication.
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { ZError } from "./config.ts";
 
 export interface ParsedArgs {
@@ -119,7 +119,28 @@ export function atomicWrite(
   // Test-only seam for simulating transient rename failures; callers never pass it.
   rename: (from: string, to: string) => void = renameSync,
 ): void {
-  mkdirSync(dirname(path), { recursive: true });
+  // Root cause, not the ".": Bun's mkdirSync throws on some already-existing
+  // directories even under `recursive`, where Node's is always a no-op.
+  // Measured (bun 1.3.14, Windows): the RELATIVE forms dirname() hands it every
+  // day throw EEXIST -- "." for a bare `state.json`, ".." for `../up.json` --
+  // and a drive root throws EPERM whether or not it is resolved. An existing
+  // absolute non-root directory is a no-op, which is why this only ever bit
+  // CLIs invoked with a bare or relative state/lock path, and bit them with a
+  // raw stack before anything was written. Two defences, both load-bearing:
+  // resolve() normalises "."/".." into the absolute form bun accepts, and the
+  // existsSync guard covers the drive root, which resolve() cannot help.
+  const dir = resolve(dirname(path));
+  if (!existsSync(dir)) {
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch (e: any) {
+      // Lost the race to a concurrent writer between the existsSync and here.
+      // Cheap insurance rather than an observed throw (bun no-ops on an
+      // existing absolute dir), and the one shape that must never be fatal:
+      // only a dir that is still genuinely absent is a real failure.
+      if (e?.code !== "EEXIST" || !existsSync(dir)) throw e;
+    }
+  }
   let tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
   try {
     writeFileSync(tmp, content, { encoding: "utf8", mode: 0o600, flag: "wx" });

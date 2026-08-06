@@ -6,7 +6,7 @@
 import { test, expect, describe, afterAll } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import {
   adversarialActive,
   builderPrompt,
@@ -590,11 +590,87 @@ describe("merge prompt", () => {
   test("plain merge: PR steps, conflict gauntlet, no branch deletion mid-batch, input pointer", () => {
     const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
     expect(p).toContain("gh pr create --base main");
-    expect(p).toContain("full gauntlet");
+    expect(p).toContain("re-run Step 0's gate command exactly as written"); // the conflict path re-gates
+
     expect(p).toContain("Never pass --delete-branch");
     expect(p).toContain("MERGED:");
     expect(p).toContain(INPUT_PATH); // AC1: every stage references its input file
     expect(p).not.toContain("Stacked chain");
+  });
+
+  // #178: the merge agent must never judge green vs red -- the loop's own gate
+  // does, and its exit code is the merge permission.
+  test("the green gate is the loop's: the prompt hands the agent a command and an exit code, not a judgment", () => {
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    expect(p).toMatch(/never decide green vs red/i);
+    expect(p).toContain("merge-gate"); // the loop-owned CLI, by absolute pack path
+    expect(p).toContain(resolve(MERGE_INPUT.worktreePath)); // ...against an ABSOLUTE worktree (QA finding 5)
+    expect(p).toContain("Exit 0 = green");
+    expect(p).toMatch(/ANY nonzero exit = stop and exit BLOCKED/);
+    expect(p).toContain("only when the gate exited 0"); // step 3 no longer says "when everything is green"
+  });
+
+  // QA finding 2 on the first #178 pass: the prompt ASSERTED "the loop already
+  // ran the gate and it returned GREEN", and the only instruction to run it was
+  // conditional on a conflict resolution -- so on the clean-merge path the agent
+  // ran nothing and merged on an unverifiable claim. The gate command is now an
+  // unconditional Step 0 and the prompt states no verdict as fact.
+  test("the gate is an UNCONDITIONAL step 0, ahead of the numbered steps, with no claim that it already passed", () => {
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const gateIdx = p.indexOf("merge-gate");
+    expect(gateIdx).toBeGreaterThan(-1);
+    expect(gateIdx).toBeLessThan(p.indexOf("## Steps")); // before every numbered step, including the merge
+    expect(p).toMatch(/Step 0/);
+    expect(p).toMatch(/Run this yourself, in THIS session, before any gh pr merge -- unconditionally/);
+    // No unverifiable assurance about a run the agent cannot see.
+    expect(p).not.toMatch(/returned GREEN/i);
+    expect(p).not.toMatch(/already ran the mechanical pre-merge gate/i);
+    // The command inherits the same timeout lesson as the orchestrator's row:
+    // a full suite + typecheck plus a 15s contention retry blows a 120s default.
+    expect(p).toMatch(/timeout/i);
+    expect(p).toContain("600000");
+    // ...and a change to the branch invalidates the earlier run.
+    expect(p).toMatch(/Run it AGAIN -- the same command, byte for byte -- after any change you make to the branch/);
+  });
+
+  // QA finding 5: the rendered command paired an ABSOLUTE cli path with the
+  // input's RELATIVE worktree (`merge-gate '.worktrees/ticket-42'`), while the
+  // Workspace line and step 2 ("resolve ON the branch") both invite a cd into
+  // that worktree. From in there the gate's existsSync fails, it exits nonzero,
+  // and Step 0's own "ANY nonzero exit = BLOCKED" rule false-blocks every merge.
+  // toContain(worktreePath) could never catch it -- the relative path is a
+  // substring of the absolute one.
+  test("the gate command's worktree argument is ABSOLUTE, so it runs from any cwd", () => {
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const arg = p.match(/merge-gate '([^']+)'/)![1];
+    expect(isAbsolute(arg)).toBe(true);
+    expect(arg).toBe(resolve(MERGE_INPUT.worktreePath));
+    // The Workspace line names the same absolute path, so nothing in the prompt
+    // hands the agent a cwd-dependent worktree.
+    expect(p).toContain(`- Worktree: ${resolve(MERGE_INPUT.worktreePath)},`);
+    expect(p).toMatch(/absolute, so it runs correctly from any directory/);
+  });
+
+  // QA finding 6: the post-conflict re-gate was back to prose compliance --
+  // Step 0's command omitted --state/--ticket, so a re-run after a conflict
+  // resolution stamped nothing and the reducer could not see whether it
+  // happened, while the lane kept carrying the pre-merge verdict for a commit
+  // the agent had since changed.
+  test("with a statePath the gate command STAMPS, so a post-conflict re-run is on the record", () => {
+    const statePath = join("loop", "state.json");
+    const p = mergePrompt({ ...MERGE_INPUT, statePath }, INPUT_PATH);
+    expect(p).toContain(`--state '${resolve(statePath)}' --ticket 42`);
+    // Step 2 sends the agent back to the very same command, stamp included.
+    expect(p).toMatch(/re-run Step 0's gate command exactly as written/);
+    expect(p).toMatch(/the verdict records the commit sha it tested/);
+  });
+
+  test("without a statePath the gate is still run, just unstamped -- the exit code still gates", () => {
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    expect(p).toContain("merge-gate");
+    expect(p).not.toContain("--state");
+    expect(p).not.toContain("--ticket");
+    expect(p).toMatch(/ANY nonzero exit = stop and exit BLOCKED/);
   });
 
   test("stacked chain: parent first, no deletion, retarget, delete last", () => {

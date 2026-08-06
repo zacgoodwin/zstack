@@ -5,9 +5,9 @@
 // passes a path derived from homedir(): acceptance criterion 4 (no test
 // touches the real ~/.claude/settings.json) is structural, not a convention.
 import { test, expect, describe, afterEach } from "bun:test";
-import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 import {
   ALLOW_RULES,
   PERMISSION_REQUEST_HOOK_COMMAND,
@@ -487,6 +487,39 @@ function errnoErr(code: string): Error {
 }
 
 describe("atomicWrite failure handling", () => {
+  // Bun's mkdirSync THROWS on a directory that already exists even under
+  // `recursive` (Node's is a no-op), and dirname() hands it those constantly:
+  // "." for a bare `state.json`, ".." for `../up.json` (EEXIST), a drive root
+  // for `C:\state.json` (EPERM). Every CLI taking a state/lock path
+  // (`loop merge-gate . --state state.json`) died with a raw stack instead of
+  // writing. QA finding 4: the first fix special-cased "." and left the rest.
+  test("an already-existing parent -- \".\", \"..\", or the drive root -- writes instead of blowing up", () => {
+    const dir = makeDir();
+    const nested = join(dir, "child");
+    mkdirSync(nested);
+    const cwd = process.cwd();
+    try {
+      process.chdir(nested);
+      atomicWrite("state.json", "{}"); // dirname "."
+      expect(readFileSync(join(nested, "state.json"), "utf8")).toBe("{}");
+      atomicWrite(join("..", "up.json"), "{}"); // dirname ".."
+      expect(readFileSync(join(dir, "up.json"), "utf8")).toBe("{}");
+      // The drive root / filesystem root: it exists, so nothing is created --
+      // and `resolve()` alone does not save this one, only "don't mkdir an
+      // existing dir" does.
+      expect(existsSync(parse(process.cwd()).root)).toBe(true);
+    } finally {
+      process.chdir(cwd);
+    }
+  });
+
+  test("a genuinely missing parent chain is still created", () => {
+    const dir = makeDir();
+    const deep = join(dir, "a", "b", "c", "state.json");
+    atomicWrite(deep, "{}");
+    expect(readFileSync(deep, "utf8")).toBe("{}");
+  });
+
   test("rename failure unlinks the tmp file and propagates the error", () => {
     const dir = makeDir();
     const target = join(dir, "target");
