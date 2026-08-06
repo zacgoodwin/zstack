@@ -10,13 +10,82 @@
 // deletion. It releases claims, parks tickets back to Ready, prunes worktrees,
 // and removes stale lane locks -- nothing that a human can't cheaply redo.
 import { readdirSync, rmSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { Board, ghExecutor } from "./board.ts";
 import { handleCliError, parseFlags, str, type ParsedArgs } from "./cli.ts";
 import { DEFAULT_LOCK_STALENESS_MINUTES, TERMINAL_STATUSES, ZError, loadConfig } from "./config.ts";
-import { defaultLocksDir, inspectLoopLock, listLaneLocks, type LaneLock } from "./locks.ts";
+import {
+  defaultLocksDir,
+  inspectLoopLock,
+  listLaneLocks,
+  listWorktreeRecords,
+  removeWorktreeRecord,
+  type LaneLock,
+  type WorktreeDisposition,
+} from "./locks.ts";
 import { BOARD_STATUSES, type BoardStatus, type LaneState, type TicketSnapshot } from "./loop.ts";
 import { liveAgentsIn, subagentsDirFor } from "./transcripts.ts";
+
+// -- where the worktrees are (issue #280) -------------------------------------
+
+// The MAIN checkout's root, from any cwd inside the repo -- including inside one
+// of the loop's own lane worktrees.
+//
+// This exists because `scan` and `apply` defaulted their worktrees directory to
+// `<cwd>/.worktrees`, and a lane worktree has no `.worktrees` of its own. Run
+// from inside one, both commands read an empty directory and reported
+// `hasOrphans: false` / `reconciled: nothing` -- exit 0, indistinguishable from a
+// genuinely clean board. Hit live during loop run 15: from inside
+// `.worktrees/ticket-261` the scan found nothing; from the repo root, the same
+// second, it found the orphan and a prune plan. `--reconcile` is the documented
+// recovery for a crashed loop, and an orchestrator whose shell happens to sit in
+// a worktree -- which is where the previous `cd` left it -- would clear the wedge
+// it was invoked to clear, report success, and drain on top of live orphans.
+//
+// `git rev-parse --show-toplevel` is NOT sufficient: inside a worktree it returns
+// THAT worktree's root. `--git-common-dir` names the SHARED `.git` directory,
+// whose parent is the main checkout, so it is the same answer from every worktree
+// of the repo. `--path-format=absolute` (git 2.31+) is what makes the parent
+// meaningful without resolving a relative path against the wrong cwd.
+//
+// Returns undefined rather than throwing: the two callers want different
+// failures. scan/plan/apply refuse loudly (silence is the whole defect), while
+// sweep-review -- which only removes litter and must never fail a batch-end
+// cleanup -- falls back to cwd with a warning.
+export function resolveRepoRoot(cwd: string): string | undefined {
+  const r = Bun.spawnSync(["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (r.exitCode !== 0) return undefined;
+  const common = r.stdout.toString().trim();
+  if (common === "") return undefined;
+  // resolve(), not a bare dirname(): git prints forward slashes on Windows while
+  // process.cwd() gives backslashes, so an unnormalized root would never compare
+  // equal to cwd -- printing the "resolved the repo root" divergence note on
+  // every single invocation from the repo root, which is the one place it is
+  // meaningless. It also keeps join() from producing mixed separators.
+  return resolve(dirname(common));
+}
+
+// The worktrees directory for a CLI invocation, and the note that explains a
+// surprising answer. `--worktrees` always wins (the gate tests and any operator
+// pointing at a fixture); otherwise the repo root is resolved and the divergence
+// from cwd is announced on stderr, so stdout stays pure JSON.
+export function resolveWorktreesDir(
+  explicit: string | undefined,
+  cwd: string,
+  root: string | undefined
+): { dir: string; note?: string } {
+  if (explicit !== undefined) return { dir: explicit };
+  if (root === undefined) return { dir: join(cwd, ".worktrees") };
+  const dir = join(root, ".worktrees");
+  // Both sides through resolve() so the comparison is about the LOCATION, not
+  // about which of git's or the OS's spelling of it we happen to hold.
+  return resolve(root) === resolve(cwd)
+    ? { dir }
+    : { dir, note: `resolved the repo root ${root} from cwd ${cwd}; scanning ${dir}.` };
+}
 
 // -- orphan scan --------------------------------------------------------------
 
@@ -34,6 +103,17 @@ const INFLIGHT: BoardStatus[] = ["Building", "QA", "Review"];
 
 export type BoardTicketStatus = Pick<TicketSnapshot, "number" | "status">;
 
+// What the crashed lane's PR turned out to be (#272). Threaded in by the CLI,
+// never read here -- reconcilePlan stays pure, exactly as `sweep` already threads
+// the board snapshot in.
+//
+//   "merged"  -- the code is on main; requeuing would rebuild landed work.
+//   "open"    -- genuinely unmerged; today's release + park + prune recovery.
+//   undefined -- NOT looked up (any non-merge lane), or looked up and unreadable.
+//                Absence is not proof of an unmerged PR (#138), so a merge lane
+//                that lands here is left alone for a human rather than requeued.
+export type PrOutcome = "merged" | "open";
+
 // A lane lock left behind by a crashed loop. How it is reconciled depends on the
 // ticket's current board status (issue #14 C4): an INFLIGHT lane is released +
 // parked to Ready + pruned + unlocked; a TERMINAL lane (the work already landed
@@ -45,6 +125,9 @@ export interface CrashedLane {
   ageMs: number;
   worktreePath?: string;
   boardStatus?: BoardStatus; // the ticket's status in the board snapshot, if present
+  branch?: string; // #272: the lane's branch, when one could be resolved
+  prOutcome?: PrOutcome; // #272: set ONLY for a crashed merge lane the CLI looked up
+  prUrl?: string; // #272: the PR the outcome came from, for the operator's report
 }
 
 // A worktree with no backing lock. Pruned; also parked when the board still
@@ -55,9 +138,18 @@ export interface OrphanWorktree {
   boardStatus?: BoardStatus;
 }
 
+// A lockless worktree a park/skip/stop-lane KEPT on purpose (#271). Not an
+// orphan: reported so the scan output stays honest about what is on disk, but
+// never planned for a prune and never counted by hasOrphans.
+export interface RetainedWorktree extends OrphanWorktree {
+  session: string; // the run that retained it
+  writtenAt: number;
+}
+
 export interface Orphans {
   crashedLanes: CrashedLane[];
   orphanWorktrees: OrphanWorktree[];
+  retainedWorktrees: RetainedWorktree[]; // parked/skipped worktrees kept on purpose (#271)
   throwawayWorktrees: OrphanWorktree[]; // leftover `review-<N>` reviewer scratch checkouts (#209)
   buildingWithoutState: number[]; // Building on the board with neither lock nor worktree
 }
@@ -185,6 +277,15 @@ export function scanOrphans(
   const lockTickets = new Set(locks.map((l) => l.lock.ticket));
   const wtByTicket = new Map(worktrees.map((w) => [w.ticket, w]));
   const statusByTicket = new Map(boardSnapshot.map((t) => [t.number, t.status]));
+  // #271: what each lockless worktree was MEANT to be. Read from the same
+  // directory as the lane locks, so the scan keeps one source of on-disk truth
+  // and its signature is unchanged for every existing caller.
+  const dispositionByTicket = new Map<number, { disposition: WorktreeDisposition; session: string; writtenAt: number }>(
+    listWorktreeRecords(locksDir).map((r) => [
+      r.record.ticket,
+      { disposition: r.record.disposition, session: r.record.session, writtenAt: r.record.writtenAt },
+    ])
+  );
 
   const crashedLanes: CrashedLane[] = locks.map((l) => ({
     ticket: l.lock.ticket,
@@ -195,9 +296,22 @@ export function scanOrphans(
     boardStatus: statusByTicket.get(l.lock.ticket),
   }));
 
-  const orphanWorktrees: OrphanWorktree[] = worktrees
-    .filter((w) => !lockTickets.has(w.ticket))
-    .map((w) => ({ ticket: w.ticket, worktreePath: w.path, boardStatus: statusByTicket.get(w.ticket) }));
+  // A `retained` record takes the worktree out of the orphan set entirely; a
+  // `disposable` one and a missing one both leave today's behavior untouched --
+  // the salvage parks dump a patch precisely because their worktree is meant to
+  // die (lib/loop.ts's commit-retry note), and a crash records nothing at all.
+  const lockless = worktrees.filter((w) => !lockTickets.has(w.ticket));
+  const retainedWorktrees: RetainedWorktree[] = [];
+  const orphanWorktrees: OrphanWorktree[] = [];
+  for (const w of lockless) {
+    const entry = { ticket: w.ticket, worktreePath: w.path, boardStatus: statusByTicket.get(w.ticket) };
+    const rec = dispositionByTicket.get(w.ticket);
+    if (rec?.disposition === "retained") {
+      retainedWorktrees.push({ ...entry, session: rec.session, writtenAt: rec.writtenAt });
+    } else {
+      orphanWorktrees.push(entry);
+    }
+  }
 
   // No lock lookup and no board status: a throwaway has neither by construction.
   const throwawayWorktrees: OrphanWorktree[] = all
@@ -209,7 +323,7 @@ export function scanOrphans(
     .map((t) => t.number)
     .sort((a, b) => a - b);
 
-  return { crashedLanes, orphanWorktrees, throwawayWorktrees, buildingWithoutState };
+  return { crashedLanes, orphanWorktrees, retainedWorktrees, throwawayWorktrees, buildingWithoutState };
 }
 
 // Deliberately does NOT count throwawayWorktrees. hasOrphans is the startup
@@ -219,6 +333,12 @@ export function scanOrphans(
 // to start the loop after almost every run. They are still pruned by the plan
 // below whenever reconcile does run, and swept unconditionally by Step 0's
 // `sweep-review` and Step 7's batch cleanup.
+//
+// It does not count retainedWorktrees either, and that is #271's whole point: a
+// batch that parked one ticket to Questions left a worktree behind ON PURPOSE, so
+// counting it here refused to start the next run and sent the operator to the
+// `--reconcile` that would delete it. A retained worktree is an artifact, not a
+// wedge; `reconcile clean-retained` is how it goes away.
 export function hasOrphans(o: Orphans): boolean {
   return o.crashedLanes.length > 0 || o.orphanWorktrees.length > 0 || o.buildingWithoutState.length > 0;
 }
@@ -229,7 +349,48 @@ export type ReconcileAction =
   | { kind: "release-claim"; ticket: number }
   | { kind: "park-ready"; ticket: number; note: string }
   | { kind: "prune-worktree"; ticket: number; path: string }
-  | { kind: "remove-lock"; ticket: number; path: string };
+  | { kind: "remove-lock"; ticket: number; path: string }
+  // #272: the crashed lane's PR is already merged. Moves the ticket to Done
+  // instead of back to Ready. Emitted by reconcilePlan, and never alongside a
+  // release-claim or a park-ready for the same ticket.
+  | { kind: "record-merged"; ticket: number; url?: string }
+  // #271: remove a worktree a park deliberately kept. reconcilePlan NEVER emits
+  // this -- only the explicit `reconcile clean-retained` verb does, so reconcile
+  // keeps its "only undoes a crashed run" contract.
+  | { kind: "drop-retained"; ticket: number; path: string };
+
+// Crashed merge lanes whose PR state could not be read (#272). Not an action:
+// the plan deliberately contains NOTHING for these, so this is how the CLI can
+// still tell a human that a lane was left alone and why.
+export function unresolvedMergeLanes(orphans: Orphans): number[] {
+  return orphans.crashedLanes
+    .filter((c) => isMergeLane(c) && c.prOutcome === undefined)
+    .map((c) => c.ticket)
+    .sort((a, b) => a - b);
+}
+
+// A crashed lane sitting exactly where a merge can be lost: stage `merge` with
+// the board still showing Review (STATUS_FOR_STAGE.merge). Anywhere else, no PR
+// lookup is performed and nothing about the recovery changes (#272 AC5).
+//
+// Exported because the CLI decides which lanes to LOOK UP and reconcilePlan
+// decides which lanes to HOLD, and those two sets must be the same one. Two
+// copies of this predicate drifting apart means either wasted GraphQL calls or --
+// far worse -- a lane held forever because nobody ever looked it up.
+export function isMergeLane(c: CrashedLane): boolean {
+  return c.lock.stage === "merge" && c.boardStatus === "Review";
+}
+
+// The explicit operator cleanup for retained worktrees (#271). Separate from
+// reconcilePlan on purpose: reconcile undoes a crashed run, and a retained
+// worktree is the opposite of that -- it is the thing a human asked to keep.
+export function planCleanRetained(orphans: Orphans): ReconcileAction[] {
+  return orphans.retainedWorktrees.map((w) => ({
+    kind: "drop-retained" as const,
+    ticket: w.ticket,
+    path: w.worktreePath,
+  }));
+}
 
 // Pure: orphans in, ordered action list out. For each crashed lane the board
 // status decides the recovery (issue #14 C4):
@@ -240,9 +401,33 @@ export type ReconcileAction =
 //     park it back to Ready, remove its lock -- the crash left it mid-build.
 // A lockless worktree is pruned, and also released+parked when the board still
 // thinks it in-flight. A Building ticket with no on-disk state is released+parked.
+// A crashed MERGE lane gets a third class ahead of both (issue #272), because
+// STATUS_FOR_STAGE.merge is "Review" and "Review" is INFLIGHT -- so a crash
+// between `gh pr merge` returning success and the loop recording its MERGED
+// marker used to take the INFLIGHT branch and send a ticket whose code is already
+// on main back to Ready to be rebuilt. The live watchdog already refuses to
+// blind-skip that lane (lib/loop.ts, issue #14 H9); this is the same failure
+// reached by a crash instead of a dead worker. Keyed on the PR fact the CLI
+// threaded in:
+//   * "merged"  -> record-merged + prune + unlock. NEVER release, NEVER park.
+//   * "open"    -> the ordinary INFLIGHT recovery, byte-identical to before.
+//   * undefined -> NOTHING. The lookup failed or found no PR, and absence is not
+//     proof of an unmerged PR (#138) -- so the lane keeps its lock and its
+//     worktree and unresolvedMergeLanes() reports it for a human. Leaving a lane
+//     wedged is recoverable; rebuilding merged work is not.
 export function reconcilePlan(orphans: Orphans): ReconcileAction[] {
   const actions: ReconcileAction[] = [];
   for (const c of orphans.crashedLanes) {
+    if (isMergeLane(c)) {
+      if (c.prOutcome === undefined) continue; // fail closed: leave it exactly as found
+      if (c.prOutcome === "merged") {
+        actions.push({ kind: "record-merged", ticket: c.ticket, url: c.prUrl });
+        if (c.worktreePath) actions.push({ kind: "prune-worktree", ticket: c.ticket, path: c.worktreePath });
+        actions.push({ kind: "remove-lock", ticket: c.ticket, path: c.lockPath });
+        continue;
+      }
+      // "open": fall through to the ordinary recovery below.
+    }
     if (c.boardStatus && TERMINAL_STATUSES.includes(c.boardStatus)) {
       // Terminal: leave the board alone; just clear the crashed run's on-disk state.
       if (c.worktreePath) actions.push({ kind: "prune-worktree", ticket: c.ticket, path: c.worktreePath });
@@ -293,6 +478,10 @@ export interface ReconcileEffects {
   pruneWorktree: (ticket: number, path: string) => void;
   parkReady: (ticket: number, note: string) => void;
   releaseClaim: (ticket: number) => void;
+  // #272: the ticket's PR is already on main -- move it to Done rather than back
+  // to Ready. #271: drop a worktree the operator explicitly asked to clean up.
+  recordMerged: (ticket: number, url?: string) => void;
+  dropRetained: (ticket: number, path: string) => void;
 }
 
 export async function applyReconcile(actions: ReconcileAction[], fx: ReconcileEffects): Promise<void> {
@@ -309,6 +498,12 @@ export async function applyReconcile(actions: ReconcileAction[], fx: ReconcileEf
         break;
       case "release-claim":
         await fx.releaseClaim(a.ticket);
+        break;
+      case "record-merged":
+        await fx.recordMerged(a.ticket, a.url);
+        break;
+      case "drop-retained":
+        await fx.dropRetained(a.ticket, a.path);
         break;
     }
   }
@@ -346,16 +541,54 @@ function pruneWorktreeReal(path: string): void {
   Bun.spawnSync(["git", "worktree", "prune"], { stdout: "pipe", stderr: "pipe" });
 }
 
-function realEffects(board: Board): ReconcileEffects {
+// The branch a crashed lane was working on (#272), needed to ask GitHub what
+// happened to its PR. Two sources, strongest first: the lane worktree's own HEAD
+// (exact, and a crashed merge lane usually still has its worktree), then the
+// `z/ticket-<N>-*` branches git still holds -- reconcile never deletes a branch,
+// so one is expected to survive the crash.
+//
+// EXACTLY ONE match or nothing. Two branches for one ticket (a re-claim under a
+// different title slug) is ambiguity, and guessing which one carried the merge is
+// exactly the guess that gets a ticket rebuilt or wrongly marked Done.
+export function resolveLaneBranch(root: string, ticket: number, worktreePath?: string): string | undefined {
+  if (worktreePath !== undefined) {
+    const head = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const name = head.exitCode === 0 ? head.stdout.toString().trim() : "";
+    if (name !== "" && name !== "HEAD") return name;
+  }
+  const listed = Bun.spawnSync(
+    ["git", "-C", root, "for-each-ref", "--format=%(refname:short)", `refs/heads/z/ticket-${ticket}-*`],
+    { stdout: "pipe", stderr: "pipe" }
+  );
+  if (listed.exitCode !== 0) return undefined;
+  const names = listed.stdout.toString().trim().split("\n").filter((s) => s !== "");
+  return names.length === 1 ? names[0] : undefined;
+}
+
+function realEffects(board: Board, locksDir: string): ReconcileEffects {
+  // A pruned worktree's disposition record is dropped with it (#271): the record
+  // describes a directory, so outliving that directory makes it litter that a
+  // later re-claim of the same ticket would read as a stale intent.
+  const prune = (t: number, p: string) => {
+    pruneWorktreeReal(p);
+    removeWorktreeRecord(locksDir, t);
+  };
   return {
     removeLock: (p) => rmSync(p, { force: true }),
-    pruneWorktree: (_t, p) => pruneWorktreeReal(p),
+    pruneWorktree: prune,
     parkReady: async (n) => {
       await board.move(n, "Ready");
     },
     releaseClaim: async (n) => {
       await board.release(n);
     },
+    recordMerged: async (n) => {
+      await board.move(n, "Done");
+    },
+    dropRetained: prune,
   };
 }
 
@@ -365,6 +598,10 @@ const USAGE = `reconcile <command> [args] --slug S
 
   scan   [--now MS]   scan orphans + build the plan; print JSON {hasOrphans, orphans, plan}
   plan   [--now MS]   print the reconcile action list as JSON
+  clean-retained      remove the worktrees a park/skip/stop-lane deliberately KEPT
+                      (#271). Never part of scan/plan/apply: reconcile only undoes
+                      a crashed run, and these are what a human asked to keep. This
+                      is the explicit "I have finished inspecting them" verb.
   sweep-review [--worktrees D] [--project-dir D] [--subagents-dir D]
                [--quiet-ms MS] [--stale-ms MS]
                       remove leftover throwaway reviewer worktrees (.worktrees/review-<N>)
@@ -389,8 +626,12 @@ const USAGE = `reconcile <command> [args] --slug S
                       --session is the owning loop's own id: /z-loop reconciles
                       AFTER taking the lock, so it passes its session to proceed.
 
-  --dir / --worktrees override the locks + worktrees dirs (tests). Otherwise
-  locks default to ~/.zstack/projects/<slug>/locks and worktrees to ./.worktrees.`;
+  --dir / --worktrees override the locks + worktrees dirs (tests). Otherwise locks
+  default to ~/.zstack/projects/<slug>/locks and worktrees to <repo root>/.worktrees
+  -- the MAIN checkout's root, resolved with \`git rev-parse --git-common-dir\`, so
+  running from inside a lane worktree scans the same directory as running from the
+  root (#280). scan/plan/apply REFUSE outside a git repo rather than report an empty
+  result; a divergence between cwd and the resolved root is announced on stderr.`;
 
 // Sweeps EVERY status, not just the in-flight ones (issue #14 C4): a crashed
 // lane's recovery hinges on whether its ticket is already terminal (Done/parked),
@@ -449,7 +690,7 @@ export async function main(argv: string[]): Promise<number> {
     console.log(USAGE);
     return cmd ? 0 : 1;
   }
-  if (!["scan", "plan", "apply", "sweep-review"].includes(cmd)) {
+  if (!["scan", "plan", "apply", "sweep-review", "clean-retained"].includes(cmd)) {
     console.error(`Unknown command "${cmd}".\n\n${USAGE}`);
     return 1;
   }
@@ -461,8 +702,14 @@ export async function main(argv: string[]): Promise<number> {
     // before the config load and the board client: Step 7 calls it with the loop
     // lock still held, and a batch-end cleanup must not be able to fail on a
     // GraphQL quota or a missing project config.
+    // #280: the same repo-root resolution every command below uses. sweep-review
+    // degrades to cwd instead of refusing -- it removes litter, nothing waits on
+    // it, and a batch-end cleanup must not be able to fail on a shell that
+    // wandered outside the repo. It says so on stderr either way.
     if (cmd === "sweep-review") {
-      const dir = str(flags, "worktrees") ?? join(process.cwd(), ".worktrees");
+      const resolved = resolveWorktreesDir(str(flags, "worktrees"), process.cwd(), resolveRepoRoot(process.cwd()));
+      if (resolved.note) console.error(`reconcile: ${resolved.note}`);
+      const dir = resolved.dir;
       const { paths, live } = planReviewSweep({
         worktreesDir: dir,
         subagentsDir: reviewSweepSubagentsDir(flags),
@@ -492,10 +739,32 @@ export async function main(argv: string[]): Promise<number> {
       return 0;
     }
 
+    // #280: resolve the MAIN checkout instead of trusting cwd. Before this, a
+    // scan or apply run from inside a lane worktree read `<that worktree>/
+    // .worktrees` -- which does not exist -- and reported `hasOrphans: false` /
+    // `reconciled: nothing` with exit 0. Silence was the defect: that answer is
+    // byte-identical to a genuinely clean board, so the recovery command for a
+    // crashed loop reported success without looking.
+    //
+    // Resolved BEFORE loadConfig for the same reason #198's guard runs before the
+    // board sweep: a refusal should cost nothing, and it should name the problem
+    // it actually has rather than whichever check happened to run first.
+    const explicitWorktrees = str(flags, "worktrees");
+    const repoRoot = resolveRepoRoot(process.cwd());
+    if (explicitWorktrees === undefined && repoRoot === undefined) {
+      throw new ZError(
+        `Cannot resolve the repository root from ${process.cwd()}, so there is no worktrees directory to ` +
+          `scan. Run this from inside the repo, or pass --worktrees <dir> explicitly. (Refusing to scan ` +
+          `nothing and report a clean board -- that answer would be indistinguishable from a real one.)`
+      );
+    }
+    const resolved = resolveWorktreesDir(explicitWorktrees, process.cwd(), repoRoot);
+    if (resolved.note) console.error(`reconcile: ${resolved.note}`);
+    const worktreesDir = resolved.dir;
+
     const cfg = loadConfig(str(flags, "slug"));
     const board = new Board(cfg, ghExecutor());
     const locksDir = str(flags, "dir") ?? defaultLocksDir(cfg.slug);
-    const worktreesDir = str(flags, "worktrees") ?? join(process.cwd(), ".worktrees");
 
     // #198: refuse to reconcile a LIVE loop, before doing any work.
     //
@@ -510,13 +779,45 @@ export async function main(argv: string[]): Promise<number> {
     // caller (z-loop/SKILL.md Step 0) reconciles AFTER taking the lock, so it
     // passes its own --session and is let through; a bare human invocation has no
     // session and refuses on any live lock, which is the safe default.
-    if (cmd === "apply") assertNotReconcilingLiveLoop(locksDir, nowMs, cfg, str(flags, "session"));
+    // clean-retained takes the same guard: it force-removes worktrees, which is
+    // the exact damage this refusal exists to prevent.
+    if (cmd === "apply" || cmd === "clean-retained") {
+      assertNotReconcilingLiveLoop(locksDir, nowMs, cfg, str(flags, "session"));
+    }
 
     const orphans = scanOrphans(locksDir, worktreesDir, await sweep(board), nowMs);
-    const plan = reconcilePlan(orphans);
+
+    // #272: gather the ONE fact reconcilePlan cannot compute, for the ONLY lanes
+    // that need it -- crashed `merge` lanes the board still shows as Review. One
+    // lookup per such lane, never a sweep, so every other crashed lane costs
+    // exactly what it did before. The lookup is best-effort by design: anything
+    // that fails leaves prOutcome undefined, which the plan fails closed on.
+    for (const c of cmd === "clean-retained" ? [] : orphans.crashedLanes) {
+      if (!isMergeLane(c)) continue; // the SAME predicate reconcilePlan holds on
+      c.branch = resolveLaneBranch(repoRoot ?? process.cwd(), c.ticket, c.worktreePath);
+      if (c.branch === undefined) continue;
+      const pr = await board.prState(c.branch);
+      if (pr === undefined) continue;
+      c.prOutcome = pr.state === "MERGED" ? "merged" : "open";
+      c.prUrl = pr.url;
+    }
+
+    const plan = cmd === "clean-retained" ? planCleanRetained(orphans) : reconcilePlan(orphans);
+    const unresolved = cmd === "clean-retained" ? [] : unresolvedMergeLanes(orphans);
+    // Never silent: a lane the plan deliberately skipped must be named, or "0
+    // actions" reads as "nothing to do" (#272 AC4, and #280's whole lesson).
+    if (unresolved.length > 0) {
+      console.error(
+        `reconcile: left ${unresolved.length} crashed merge lane(s) untouched -- ticket(s) ` +
+          `${unresolved.join(", ")}. Their board status is Review and their PR state could not be read, ` +
+          `and an unreadable PR is not proof of an unmerged one (#138): requeuing would rebuild work that ` +
+          `may already be on main. Check each PR by hand, then move the ticket to Done (merged) or Ready ` +
+          `(not merged) and remove its lane lock from ${locksDir}.`
+      );
+    }
 
     if (cmd === "scan") {
-      console.log(JSON.stringify({ hasOrphans: hasOrphans(orphans), orphans, plan }, null, 2));
+      console.log(JSON.stringify({ hasOrphans: hasOrphans(orphans), orphans, plan, unresolvedMergeLanes: unresolved }, null, 2));
       return 0;
     }
     if (cmd === "plan") {
@@ -538,7 +839,7 @@ export async function main(argv: string[]): Promise<number> {
       staleMs: msFlag(flags, "stale-ms"),
     }).live;
     const runnable = holdLiveThrowawayPrunes(plan, live);
-    await applyReconcile(runnable, realEffects(board));
+    await applyReconcile(runnable, realEffects(board, locksDir));
     const counts = runnable.reduce((m, a) => ((m[a.kind] = (m[a.kind] ?? 0) + 1), m), {} as Record<string, number>);
     const held = plan.length - runnable.length;
     console.log(

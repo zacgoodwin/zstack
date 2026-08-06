@@ -689,3 +689,101 @@ describe("#205: the advance row moves the board to the new stage's status", () =
     expect(advanceRow()).toContain(PREFIX);
   });
 });
+
+// ============================================================================
+// #271 / #272 / #280 -- the crash-recovery contract the SKILL rows must honor
+// ============================================================================
+// The lib half is gate-tested in tests/reconcile-recovery.test.ts, but the
+// orchestrator can only execute what the SKILL tells it: if the park rows stop
+// writing a disposition record, lib/reconcile.ts's classification is correct and
+// still never fires. These canaries pin the writes and their ordering.
+describe("#271: the lane-terminating rows record what they meant to leave behind", () => {
+  const row = (md: string, label: string): string => {
+    const start = md.indexOf(`| \`${label}\``);
+    if (start < 0) return "";
+    const rest = md.slice(start);
+    const end = rest.indexOf("\n|");
+    return end < 0 ? rest : rest.slice(0, end);
+  };
+
+  test("park Questions records `retained` BEFORE dropping the lane lock", () => {
+    const r = row(zLoop(), "park N Questions");
+    expect(r).not.toBe("");
+    expect(r).toContain("worktree-record");
+    expect(r).toContain("retained");
+    // Order is the invariant: between the two writes the worktree has neither
+    // lock nor record, which is exactly the crash shape reconcile force-prunes.
+    expect(r.indexOf("worktree-record")).toBeLessThan(r.indexOf("lane-remove"));
+  });
+
+  test("the salvage parks record `disposable`, so lib/loop.ts's note stays true", () => {
+    for (const label of ["park N Blocked", "skip N", "stop-lane N"]) {
+      const r = row(zLoop(), label);
+      expect(r).not.toBe("");
+      expect(r).toContain("disposable");
+      expect(r).toContain("salvage");
+      expect(r).toContain("retained"); // the non-salvage half of the same rule
+    }
+  });
+
+  test("complete forgets the record along with the worktree", () => {
+    expect(row(zLoop(), "complete N")).toContain("worktree-forget");
+  });
+
+  test("a re-claim takes the worktree back, so it drops any record", () => {
+    expect(row(zLoop(), "claim N")).toContain("worktree-forget");
+  });
+
+  test("the reconcile contract documents the record and that reconcile never prunes a retained one", () => {
+    const md = zLoop();
+    expect(md).toContain("worktree-<N>.json");
+    expect(md).toContain("clean-retained");
+    expect(md).toMatch(/never[^.]*removes? a `?retained`? worktree|never.{0,40}retained/i);
+  });
+});
+
+describe("#272: the claim row reuses a surviving branch instead of failing on it", () => {
+  const claimRow = (): string => {
+    const md = zLoop();
+    const start = md.indexOf("| `claim N`");
+    const rest = md.slice(start);
+    const end = rest.indexOf("\n|");
+    return end < 0 ? rest : rest.slice(0, end);
+  };
+
+  // Reconcile never deletes a branch and a crashed run never reached Step 7's
+  // cleanup, so a recovered ticket's branch is still there. Bare `-b` hard-fails
+  // on it, mid-action, after the board move and the lock write.
+  test("it checks for an existing branch and attaches to it", () => {
+    const r = claimRow();
+    expect(r).toContain("rev-parse --verify");
+    expect(r).toMatch(/git worktree add[^`]*"\$BR"/);
+    expect(r).toContain("#272");
+  });
+
+  // The tempting one-character "fix" is `-B`, which force-resets the branch to
+  // $BASE and silently discards the commits the crashed lane already made. The
+  // named error is the point; a silent overwrite is worse than the failure.
+  test("it never reaches for -B, which would silently discard the crashed lane's commits", () => {
+    const r = claimRow();
+    expect(r).not.toMatch(/git worktree add[^|]*\s-B\s/);
+    expect(r).toContain("Never `-B`");
+  });
+
+  test("the reconcile contract names the merged / open / unreadable classes", () => {
+    const md = zLoop();
+    expect(md).toContain("record-merged");
+    expect(md).toContain("unresolvedMergeLanes");
+    expect(md).toMatch(/Absence is not proof/i);
+  });
+});
+
+describe("#280: Step 0 says the recovery commands resolve the repo root themselves", () => {
+  test("the orphan-scan block names the resolution and the old silent failure", () => {
+    const md = zLoop();
+    expect(md).toContain("#280");
+    expect(md).toMatch(/repo root/i);
+    // The specific lie: a clean-looking answer nobody looked for.
+    expect(md).toMatch(/hasOrphans: false/);
+  });
+});

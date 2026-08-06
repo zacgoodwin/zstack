@@ -149,6 +149,25 @@ const Q_ISSUE_LOOKUP = `query IssueLookup($owner: String!, $repo: String!, $numb
   }
 }`;
 
+// Was the PR on this branch merged? (#272) Reconcile's crash recovery needs it:
+// a crash between `gh pr merge` returning and the loop recording its MERGED
+// marker leaves a lane lock on a ticket the board still shows as Review, and
+// requeuing that ticket rebuilds work that is already on main.
+//
+// `states:` is deliberately absent and `first: 20` deliberately generous: the
+// question is "what happened to the PR for this branch", so a filtered query that
+// returned nothing would be indistinguishable from "no PR at all" -- and #138's
+// rule is that absence is never evidence. Ordered newest-first so a re-opened /
+// re-created branch reports its current PR, not its first.
+const Q_PR_STATE = `query PrState($owner: String!, $repo: String!, $branch: String!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequests(headRefName: $branch, first: 20, orderBy: { field: CREATED_AT, direction: DESC }) {
+      pageInfo { hasNextPage }
+      nodes { number url state }
+    }
+  }
+}`;
+
 // Single-ticket board lookup (#138). Deliberately NOT a filtered form of
 // Q_PROJECT_ITEMS: that query pages the whole board, and a short page is
 // indistinguishable from a removed ticket, so absence from it proves nothing.
@@ -845,6 +864,27 @@ export class Board {
       );
     }
     return item;
+  }
+
+  // The newest PR whose head is `branch`, or undefined when the branch has none
+  // (#272). Goes through the same executor as every other call here, so
+  // lib/board.ts stays the pack's only `gh` caller.
+  //
+  // undefined means "no PR found", and the caller must NOT read that as "not
+  // merged" -- a network failure throws, but a branch whose PR was never opened
+  // and a branch whose PR list we simply could not see look the same from here.
+  // lib/reconcile.ts fails closed on undefined for exactly that reason (#138).
+  async prState(branch: string): Promise<{ state: string; url: string; number: number } | undefined> {
+    const data = await this.gql(Q_PR_STATE, {
+      owner: this.cfg.owner,
+      repo: this.cfg.repo,
+      branch,
+    });
+    const prs = data.repository?.pullRequests;
+    if (!prs) return undefined;
+    assertSinglePage(prs, `pullRequests for branch "${branch}" (ceiling: 20 PRs per branch)`);
+    const pr = prs.nodes?.[0];
+    return pr ? { state: String(pr.state), url: String(pr.url), number: Number(pr.number) } : undefined;
   }
 
   private async userId(login: string): Promise<string> {

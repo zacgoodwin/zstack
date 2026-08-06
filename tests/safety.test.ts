@@ -900,11 +900,15 @@ describe("control 2: orphan scan (crash recovery)", () => {
     const parked: number[] = [];
     const released: number[] = [];
     const pruned: string[] = [];
+    const merged: number[] = [];
+    const dropped: string[] = [];
     const fx: ReconcileEffects = {
       removeLock: (p) => rmSync(p, { force: true }), // real fs, prove the file goes away
       pruneWorktree: (_t, p) => void pruned.push(p), // faked: no git in a temp dir
       parkReady: (n) => void parked.push(n),
       releaseClaim: (n) => void released.push(n),
+      recordMerged: (n) => void merged.push(n),
+      dropRetained: (_t, p) => void dropped.push(p),
     };
     await applyReconcile(plan, fx);
 
