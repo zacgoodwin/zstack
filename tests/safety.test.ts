@@ -550,11 +550,20 @@ describe("orphaned reconcile claim self-heals (#144)", () => {
   });
 
   // The claim of a process that is provably alive (this very process: same host,
-  // matching OS start-time) stays untouched even PAST the staleness window.
-  test("a claim held by a live process still defers, and is left untouched", () => {
+  // matching OS start-time) stays untouched while the claim is FRESH.
+  //
+  // #288 review retired the old "even PAST the staleness window" half of this
+  // assertion. It was safe only while claims carried no pid: once the claim body
+  // began carrying the harness pid, a run that died inside the claimed section
+  // while Claude Code stayed open left a claim that read live FOREVER, and every
+  // later --reconcile deferred to it while reporting "stale" -- sending the
+  // operator back to the --reconcile that had just no-opped. A claim is held
+  // across a handful of filesystem ops, so a real racer's claim is always fresh;
+  // age is the right ceiling for one that is not. See claimLiveness.
+  test("a claim held by a live process still defers while it is fresh", () => {
     const dir = tmp();
     seedStale(dir);
-    const claim = { session: "racer-A", startedAt: 0, pid: process.pid, host: hostname(), startTime: processStartTime(process.pid)! };
+    const claim = { session: "racer-A", startedAt: NOW, pid: process.pid, host: hostname(), startTime: processStartTime(process.pid)! };
     const claimPath = seedClaim(dir, claim);
 
     const res = reconcile(dir, "racer-B");
@@ -562,6 +571,20 @@ describe("orphaned reconcile claim self-heals (#144)", () => {
     expect(res.reason).toBe("stale"); // still stale under A's claim
     expect(readLoopLock(dir)!.session).toBe("crashed"); // B did not overwrite the lock
     expect(JSON.parse(readFileSync(claimPath, "utf8"))).toEqual(claim); // claim untouched
+  });
+
+  // The other side of that rule, and the wedge it removes: the SAME live pid on an
+  // OLD claim is an orphan, not a racer, and must be superseded.
+  test("a live-pid claim that has aged out is superseded, not deferred to forever", () => {
+    const dir = tmp();
+    seedStale(dir);
+    // Identical to the claim above except for its age: written long ago by a run
+    // that died inside the claimed section, in a Claude Code that stayed open.
+    seedClaim(dir, { session: "died-in-section", startedAt: 0, pid: process.pid, host: hostname(), startTime: processStartTime(process.pid)! });
+
+    const res = reconcile(dir, "next-run");
+    expect(res.acquired).toBe(true); // the orphan no longer wedges every future --reconcile
+    expect(readLoopLock(dir)!.session).toBe("next-run");
   });
 
   // Real processes, all seeing the same dead claim: every one of them clears it and
@@ -639,7 +662,9 @@ describe("orphaned reconcile claim self-heals (#144)", () => {
     const dir = tmp();
     seedStale(dir);
     const gen0 = seedClaim(dir, { session: "killed", startedAt: 0 }); // the orphan A superseded
-    const live = { session: "racer-A", startedAt: 0, pid: process.pid, host: hostname(), startTime: processStartTime(process.pid)! };
+    // Fresh, like any real racer's claim: it is held across a few filesystem ops,
+    // and since #288's review an aged one is superseded whatever pid it names.
+    const live = { session: "racer-A", startedAt: NOW, pid: process.pid, host: hostname(), startTime: processStartTime(process.pid)! };
     writeFileSync(`${gen0}.1`, JSON.stringify(live) + "\n"); // A, provably running
 
     const res = reconcile(dir, "racer-B");

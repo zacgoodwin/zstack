@@ -1267,6 +1267,14 @@ stayed open, so the pid outlives the drain). The session id must match the holde
 exactly, and the command clears only the loop lock and its heartbeat; run
 `/z-loop --reconcile` afterwards to recover the lanes.
 
+The second case additionally requires `--even-if-running`. The session id cannot be
+the whole gate there, because the refusal that sends you to this command prints
+that id and Step 0 hands the same output to the orchestrator — so a copy-paste,
+human or agent, would clear a provably-running loop's lock and let `reconcile
+apply` park its tickets and delete its worktrees. Without the flag the command
+refuses and explains; with it, you are stating you have confirmed the drain
+stopped.
+
 ### Run the recovery commands from anywhere in the repo
 
 `reconcile scan` / `apply` / `clean-retained` / `sweep-review` resolve

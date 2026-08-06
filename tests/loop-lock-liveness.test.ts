@@ -185,7 +185,15 @@ describe("#288 arm 2: a lock whose process is provably alive is never cleared", 
     expect(
       acquireLoopLock(d, { session: "x", startedAt: nowMs, host: HOST }, { nowMs, stalenessMs: STALE, reconcile: true }).acquired
     ).toBe(false);
-    expect(forceReleaseLoopLock(d, "wedged").released).toBe(true);
+    // The session id alone is NOT enough while the process is provably alive: the
+    // refusal that sends people here prints that id, and the orchestrator reads
+    // that output too, so a blind paste must land on an explanation.
+    const blind = forceReleaseLoopLock(d, "wedged");
+    expect(blind.released).toBe(false);
+    expect(blind.refusedBecause).toBe("provably-alive");
+    expect(existsSync(loopLockPath(d))).toBe(true);
+    // A human who knows the turn died says so deliberately.
+    expect(forceReleaseLoopLock(d, "wedged", { allowLive: true }).released).toBe(true);
     expect(existsSync(loopLockPath(d))).toBe(false);
   });
 });
@@ -303,9 +311,65 @@ describe("#288: force-release is scoped, confirmed, and idempotent", () => {
 
   // Force-releasing a PROVEN-live lock is possible -- the operator may know
   // something the machine does not -- but it must not be quiet about it.
-  test("force-releasing a provably-live lock says so on the way out", () => {
+  test("the CLI refuses a provably-live lock until --even-if-running is passed", () => {
     const d = tmp();
     lockFile(d, { session: "A", pid: process.pid, startTime: processStartTime(process.pid)! });
+
+    // A blind paste of the command the acquire refusal prints.
+    const errs: string[] = [];
+    const realError = console.error;
+    console.error = (...a: unknown[]) => void errs.push(a.map(String).join(" "));
+    let code: number;
+    try {
+      code = locksMain(["force-release", "--dir", d, "--session", "A"]);
+    } finally {
+      console.error = realError;
+    }
+    expect(code).toBe(1);
+    expect(existsSync(loopLockPath(d))).toBe(true); // the running loop keeps its lock
+    expect(errs.join("\n")).toMatch(/PROOF the process holding/);
+    expect(errs.join("\n")).toMatch(/--even-if-running/);
+    expect(errs.join("\n")).toMatch(/#198/); // names what it would cost
+
+    // The deliberate form goes through, and says what it just did.
+    const said: string[] = [];
+    const realLog = console.log;
+    console.log = (...a: unknown[]) => void said.push(a.map(String).join(" "));
+    try {
+      expect(locksMain(["force-release", "--dir", d, "--session", "A", "--even-if-running"])).toBe(0);
+    } finally {
+      console.log = realLog;
+    }
+    expect(said.join("\n")).toMatch(/PROVABLY ALIVE/);
+    expect(said.join("\n")).toMatch(/reconcile apply/); // the lanes are still someone's job
+  });
+
+  // The acquire refusal must print the UN-flagged command, so pasting it hits the
+  // refusal above rather than clearing a running loop's lock.
+  test("the acquire refusal never prints a paste-and-go command for a live loop", () => {
+    const d = tmp();
+    lockFile(d, { session: "long-drain", pid: process.pid, startTime: processStartTime(process.pid)! });
+    const errs: string[] = [];
+    const realError = console.error;
+    console.error = (...a: unknown[]) => void errs.push(a.map(String).join(" "));
+    try {
+      locksMain(["acquire", "--dir", d, "--session", "fresh", "--now", String(STALE * 10), "--reconcile"]);
+    } finally {
+      console.error = realError;
+    }
+    const said = errs.join("\n");
+    expect(said).toMatch(/force-release/); // still discoverable
+    expect(said).not.toMatch(/--even-if-running/); // ...but not ready to run
+  });
+
+  // The other half of the same rule, and the bug it was hiding: "proven" covered
+  // proven-DEAD too, so clearing a lock whose process was gone warned the operator
+  // to go make sure that loop was stopped -- about a process the same sentence had
+  // just called gone. The warning is gated on the arm, not on provenness.
+  test("clearing a lock whose process is GONE carries no still-running warning", () => {
+    const d = tmp();
+    lockFile(d, { session: "A", pid: 999999, startTime: "recorded-at-creation" });
+    expect(livenessEvidence(readLoopLock(d)!).arm).toBe("gone");
     const said: string[] = [];
     const realLog = console.log;
     console.log = (...a: unknown[]) => void said.push(a.map(String).join(" "));
@@ -314,8 +378,8 @@ describe("#288: force-release is scoped, confirmed, and idempotent", () => {
     } finally {
       console.log = realLog;
     }
-    expect(said.join("\n")).toMatch(/PROVEN/);
-    expect(said.join("\n")).toMatch(/reconcile apply/); // the lanes are still someone's job
+    expect(said.join("\n")).toMatch(/process 999999 is gone/);
+    expect(said.join("\n")).not.toMatch(/make sure that loop really is stopped/);
   });
 });
 
@@ -339,5 +403,67 @@ describe("#288: acquire records the harness pid without being told to", () => {
     const d = tmp();
     expect(locksMain(["acquire", "--dir", d, "--session", "s", "--pid", "4242", "--now", "0"])).toBe(0);
     expect(JSON.parse(readFileSync(loopLockPath(d), "utf8")).pid).toBe(4242);
+  });
+});
+
+// ============================================================================
+// #288 review findings — regressions this diff introduced, pinned
+// ============================================================================
+describe("#288 review: a malformed pid must never read as a dead one", () => {
+  // JSON.stringify turns NaN into null, so a garbage `--pid` wrote `"pid": null`
+  // to disk. null is not undefined, so it reached the pid arm, where
+  // processAlive(null) is false -- and a BRAND-NEW, actively-draining loop's lock
+  // read `stale` at age zero. That is the catastrophic direction: --reconcile then
+  // parks its tickets and force-deletes its worktrees. Same class as M19's NaN.
+  test("acquire rejects a non-positive-integer --pid instead of writing null", () => {
+    const d = tmp();
+    for (const bad of ["abc", "0", "-1", "12.5", ""]) {
+      expect(locksMain(["acquire", "--dir", d, "--session", "s", "--pid", bad, "--now", "0"])).toBe(1);
+      expect(existsSync(loopLockPath(d))).toBe(false); // nothing written
+    }
+  });
+
+  test("a lock on disk carrying a malformed pid fails loud, never 'stale'", () => {
+    const d = tmp();
+    for (const bad of [null, "4242", -1, 0, 12.5]) {
+      writeFileSync(loopLockPath(d), JSON.stringify({ session: "live-drain", startedAt: 0, host: HOST, pid: bad }));
+      expect(() => readLoopLock(d)).toThrow(/malformed pid/);
+      // ...and the acquire path refuses rather than clobbering a live loop's lock.
+      expect(() =>
+        acquireLoopLock(d, { session: "x", startedAt: 0, host: HOST }, { nowMs: 0, stalenessMs: STALE, reconcile: true })
+      ).toThrow(/malformed pid/);
+    }
+  });
+});
+
+describe("#288 review: the host gate and the identity check agree by construction", () => {
+  // The gate used the injected host while the default identify re-derived the real
+  // hostname(), so injecting a host made the "confirmed" arm structurally
+  // unreachable -- a test of the arm this ticket turns on could not fail.
+  test("an injected host reaches the confirmed arm instead of falling through to age", () => {
+    const startTime = processStartTime(process.pid)!;
+    const lock: LoopLock = { session: "s", startedAt: 0, pid: process.pid, host: "fixture-host", startTime };
+    // Past the staleness window: only the pid arm can return "live" here.
+    expect(loopLockLiveness(lock, STALE * 10, STALE, undefined, undefined, undefined, "fixture-host")).toBe("live");
+    expect(livenessEvidence(lock, "fixture-host").arm).toBe("alive");
+    // ...and a host that does NOT match still refuses to read the pid.
+    expect(loopLockLiveness(lock, STALE * 10, STALE, () => false, undefined, undefined, "other-host")).toBe("stale");
+    expect(livenessEvidence(lock, "other-host").arm).toBe("unprovable");
+  });
+});
+
+describe("#288 review: force-release does not clobber a lock that changed under it", () => {
+  test("a holder that is replaced between the read and the unlink is refused, not deleted", () => {
+    const d = tmp();
+    lockFile(d, { session: "A" });
+    // Simulate the racer: the same call re-reads before unlinking, so a lock that
+    // is no longer A's is left alone rather than removed by path.
+    const originalRead = readLoopLock(d);
+    expect(originalRead!.session).toBe("A");
+    writeFileSync(loopLockPath(d), JSON.stringify({ session: "B-fresh", startedAt: 1, host: HOST }));
+    const res = forceReleaseLoopLock(d, "A");
+    expect(res.released).toBe(false);
+    expect(res.held!.session).toBe("B-fresh");
+    expect(existsSync(loopLockPath(d))).toBe(true); // B's live lock survived
   });
 });

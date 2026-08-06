@@ -98,11 +98,23 @@ bun ~/.claude/skills/zstack/lib/locks.ts force-release --slug <slug> --session "
 ```
 
 The session id must match the holder exactly — a mismatch refuses and names the
-real holder, so a pasted command cannot clear a lock you never looked at. It
-removes **only** the loop lock and its heartbeat; lane locks, worktree records and
-worktrees stay `reconcile`'s job, so follow it with `/z-loop --reconcile` to
-recover those. If the lock's reading was PROVEN, the command says so on the way
-out — check that the loop really is stopped before trusting it.
+real holder. It removes **only** the loop lock and its heartbeat; lane locks,
+worktree records and worktrees stay `reconcile`'s job, so follow it with
+`/z-loop --reconcile` to recover those.
+
+**Case 2 refuses by default, on purpose.** When the process is *provably* alive,
+the session id is not enough of a gate — the refusal that sent you here prints
+that id, and `/z-loop` Step 0 feeds the same output to the orchestrator, so a
+copy-paste (by a human or by an agent) would clear a running loop's lock and let
+`reconcile apply` park its tickets and force-delete its worktrees. Add the flag
+only once you have confirmed that session is not draining:
+
+```bash
+bun ~/.claude/skills/zstack/lib/locks.ts force-release --slug <slug> --session "<holder>" --even-if-running
+```
+
+The other arms (process gone, pid recycled, unprovable) need no flag — nothing is
+proven to be running, so the id alone is the gate.
 
 ### The liveness heartbeat (`locks/loop.lock.beat`)
 
