@@ -1751,6 +1751,90 @@ describe("release", () => {
   });
 });
 
+// -- openPrVersions: the per-PR version queue --------------------------------
+// lib/version.ts picks the next free slot ABOVE everything in this list, so what
+// this read reports -- and what it refuses to report -- decides whether two PRs
+// can claim one version. Same executor as everything else here, so lib/board.ts
+// stays the pack's only gh caller.
+describe("openPrVersions", () => {
+  function prNode(number: number, branch: string, version: string | null) {
+    return {
+      number,
+      url: `https://pr/${number}`,
+      headRefName: branch,
+      headRef: version === null ? { target: {} } : { target: { file: { object: { text: `${version}\n` } } } },
+    };
+  }
+
+  function queue(pages: unknown[][]) {
+    const calls: Record<string, unknown>[] = [];
+    const exec: GraphQLExecutor = async (q, vars) => {
+      // The first gql() of a process spends a standalone Q_RATE_LIMIT probe
+      // (#153); only the OpenPrVersions documents are pages of this queue.
+      if (!q.includes("query OpenPrVersions")) return { rateLimit: HEALTHY_RATE_LIMIT } as GraphQLData;
+      calls.push(vars as Record<string, unknown>);
+      const i = calls.length - 1;
+      return {
+        rateLimit: HEALTHY_RATE_LIMIT,
+        repository: {
+          pullRequests: {
+            pageInfo: { hasNextPage: i < pages.length - 1, endCursor: `cur${i}` },
+            nodes: pages[i],
+          },
+        },
+      } as GraphQLData;
+    };
+    return { exec, calls };
+  }
+
+  test("reports each open PR's claimed version, trimmed", async () => {
+    const q = queue([[prNode(7, "z/ticket-7-a", "1.1.0.0"), prNode(8, "z/ticket-8-b", "1.0.2.0")]]);
+    expect(await new Board(CFG, q.exec).openPrVersions()).toEqual([
+      { number: 7, url: "https://pr/7", branch: "z/ticket-7-a", version: "1.1.0.0" },
+      { number: 8, url: "https://pr/8", branch: "z/ticket-8-b", version: "1.0.2.0" },
+    ]);
+    expect(q.calls[0].path).toBe("VERSION"); // the default blob path
+  });
+
+  // A branch cut before per-PR claiming has no VERSION at its head. Reporting it
+  // as some version would be an invented claim; omitting it is the only honest
+  // reading, and it is safe because the caller takes a MAXIMUM over the list.
+  test("a PR whose head has no readable VERSION is omitted, not reported as a claim", async () => {
+    const q = queue([[prNode(7, "a", "1.1.0.0"), prNode(9, "old", null)]]);
+    const out = await new Board(CFG, q.exec).openPrVersions();
+    expect(out.map((c) => c.number)).toEqual([7]);
+  });
+
+  test("--path selects the blob for a monorepo's nested VERSION", async () => {
+    const q = queue([[prNode(7, "a", "1.1.0.0")]]);
+    await new Board(CFG, q.exec).openPrVersions("packages/core/VERSION");
+    expect(q.calls[0].path).toBe("packages/core/VERSION");
+  });
+
+  test("paginates: a stalled drain can pile open PRs past one page", async () => {
+    const q = queue([[prNode(1, "a", "1.0.0.1")], [prNode(2, "b", "1.0.0.2")]]);
+    const out = await new Board(CFG, q.exec).openPrVersions();
+    expect(out.map((c) => c.number)).toEqual([1, 2]);
+    expect(q.calls[1].cursor).toBe("cur0");
+  });
+
+  // THE fail-closed case. An empty queue and an unreadable one are the same
+  // shape from here and mean opposite things: "nobody claims anything" hands out
+  // the slot just above the base, which is precisely wrong when the real answer
+  // is "we could not see the queue". Same rule prState's undefined carries
+  // (#138), enforced here so no reader can forget it.
+  test("a null repository THROWS -- an unreadable queue must never read as an empty one", async () => {
+    const exec: GraphQLExecutor = async () =>
+      ({ rateLimit: HEALTHY_RATE_LIMIT, repository: null }) as unknown as GraphQLData;
+    await expect(new Board(CFG, exec).openPrVersions()).rejects.toThrow(/came back null/);
+  });
+
+  test("no open PRs is a genuinely empty queue, not an error", async () => {
+    const q = queue([[]]);
+    expect(await new Board(CFG, q.exec).openPrVersions()).toEqual([]);
+  });
+});
+
 // -- prState (#272): "is this branch's PR merged?" ---------------------------
 // Reconcile's crash recovery needs this one fact: a crash between `gh pr merge`
 // returning success and the loop recording its MERGED marker leaves a lane lock on

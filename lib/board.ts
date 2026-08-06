@@ -168,6 +168,39 @@ const Q_PR_STATE = `query PrState($owner: String!, $repo: String!, $branch: Stri
   }
 }`;
 
+// Every open PR's claimed VERSION, for the per-PR version queue (lib/version.ts).
+//
+// `headRef.target.file(path)` resolves the blob at that PR's head commit, so the
+// whole queue is one paginated read -- no checkout, no fetch, no per-PR round
+// trip through the local repo. Paginated rather than single-page-guarded: the
+// count here is open PRs, which a stalled drain can genuinely pile up past any
+// ceiling worth asserting.
+//
+// A node whose VERSION cannot be read (a branch cut before per-PR claiming, a
+// path that does not exist on that head) yields no `text`, and the caller drops
+// it. This is fail-OPEN and it is NOT free: nextFreeSlot takes the MAXIMUM of
+// the claims, so dropping the one PR holding 1.2.3.4 lowers the ceiling and the
+// next claim can be handed 1.2.3.4 itself. (An earlier version of this comment
+// claimed the drop was safe because it "can never invent a claim" -- true, and
+// beside the point; lowering a maximum is exactly how a collision happens.)
+//
+// It is still the right direction, because the alternative is worse: a branch
+// that genuinely predates per-PR claiming carries no VERSION at its head, and
+// failing closed on that would wedge every claim in the repo behind one legacy
+// PR. The collision it admits is bounded -- it needs an unreadable blob on a PR
+// that later merges -- and gstack's /review queue check reports the drift.
+const Q_OPEN_PR_VERSIONS = `query OpenPrVersions($owner: String!, $repo: String!, $path: String!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequests(states: OPEN, first: 50, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number url headRefName
+        headRef { target { ... on Commit { file(path: $path) { object { ... on Blob { text } } } } } }
+      }
+    }
+  }
+}`;
+
 // Single-ticket board lookup (#138). Deliberately NOT a filtered form of
 // Q_PROJECT_ITEMS: that query pages the whole board, and a short page is
 // indistinguishable from a removed ticket, so absence from it proves nothing.
@@ -309,6 +342,14 @@ export interface CreatedIssue {
 export interface QuotaStatus {
   remaining: number;
   resetAt: string;
+}
+
+// One open PR's claimed version slot (lib/version.ts's queue).
+export interface ClaimedVersion {
+  number: number;
+  url: string;
+  branch: string;
+  version: string;
 }
 
 export class Board {
@@ -906,6 +947,43 @@ export class Board {
     return pr ? { state: String(pr.state), url: String(pr.url), number: Number(pr.number) } : undefined;
   }
 
+  // The open-PR version queue: which slot every outstanding PR has claimed.
+  //
+  // A null `repository` THROWS rather than paginating to an empty list. An empty
+  // queue and an unreadable one are the same shape from here, and they mean
+  // opposite things to the caller: "no PR claims anything" hands out the slot
+  // right above the base, which is the one thing that must not happen when the
+  // real answer is "we could not see the queue". Same fail-closed rule prState's
+  // undefined carries (#138), enforced here instead of at every reader.
+  async openPrVersions(path: string = "VERSION"): Promise<ClaimedVersion[]> {
+    const nodes = await paginate<any>(`open pull requests for ${this.cfg.owner}/${this.cfg.repo}`, async (after) => {
+      const data = await this.gql(Q_OPEN_PR_VERSIONS, {
+        owner: this.cfg.owner,
+        repo: this.cfg.repo,
+        path,
+        ...(after === undefined ? {} : { cursor: after }),
+      });
+      if (!data.repository) {
+        throw new ZError(
+          `Cannot read pull requests for ${this.cfg.owner}/${this.cfg.repo} -- the repository came back null (missing scope, or the repo is gone).`
+        );
+      }
+      return data.repository.pullRequests;
+    });
+    const out: ClaimedVersion[] = [];
+    for (const n of nodes) {
+      const text = n?.headRef?.target?.file?.object?.text;
+      if (typeof text !== "string") continue; // see Q_OPEN_PR_VERSIONS: unreadable is not a claim
+      out.push({
+        number: Number(n.number),
+        url: String(n.url),
+        branch: String(n.headRefName),
+        version: text.trim(),
+      });
+    }
+    return out;
+  }
+
   private async userId(login: string): Promise<string> {
     const data = await this.gql(Q_USER_ID, { login });
     const id = data.user?.id;
@@ -1165,6 +1243,11 @@ const USAGE = `z-board <command> [args]
                                    H9 watchdog and reconcile's #272 recovery must
                                    fail closed on it rather than skip or requeue.
   quota                            remaining GraphQL points
+  open-pr-versions [--path P]      every OPEN PR's claimed VERSION as JSON:
+                                   [{number,url,branch,version}] -- the queue
+                                   lib/version.ts picks the next free slot above.
+                                   A PR whose head has no readable VERSION is
+                                   omitted (it claims nothing)
 
   --slug <name>                     which ~/.zstack/projects/<slug> to use`;
 
@@ -1183,6 +1266,7 @@ const COMMANDS = new Set([
   "release",
   "pr-state",
   "quota",
+  "open-pr-versions",
 ]);
 
 function requireInt(v: string | undefined, label: string): number {
@@ -1362,6 +1446,13 @@ export async function main(
       case "quota": {
         const q = await board.quota();
         console.log(`remaining=${q.remaining} resetAt=${q.resetAt}`);
+        return 0;
+      }
+      // The version queue as data. lib/version.ts calls the method directly;
+      // this verb exists so a human (or gstack's /review) can read the same
+      // queue the claim was computed from without a second gh caller.
+      case "open-pr-versions": {
+        console.log(JSON.stringify(await board.openPrVersions(str(flags, "path") ?? "VERSION"), null, 2));
         return 0;
       }
     }
