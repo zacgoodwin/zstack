@@ -129,9 +129,24 @@ BLOCKED: could not read stage prompt at ${promptPath}`;
 // and ended its turn to await the completion notification -- the rule above told
 // it not to, but never told it that waiting in the foreground FITS. The suite is
 // 128-234s measured against a 25-minute builder budget, so the numbers are the
-// argument. They come from DEFAULT_STAGE_WATCHDOG_MINUTES, the one definition of
-// the budget, and are hedged as the default because a project may override
-// `watchdogMinutes` and the prompt constructors never see config.
+// argument.
+//
+// The minutes come from DEFAULT_STAGE_WATCHDOG_MINUTES, the one definition of the
+// budget, and are stated as the DEFAULT because a project can override
+// `watchdogMinutes` and these constructors are not handed config today. That is a
+// choice, not a constraint -- the `prompt` CLI verb below already takes
+// config-derived flags (--adversarial-mode, --labels) and a resolved budget could
+// ride in the same way. It costs nothing today because a live agent is probed
+// alive rather than killed at the bound, so an over-generous number in the prompt
+// never loses work; the day the watchdog kills on age, thread the resolved value.
+//
+// ponytail: "128-234s" is a literal here, matching the ~11 existing copies of the
+// measurement across z-loop/SKILL.md, docs/user-guide/z-loop.md, lib/lanes.ts and
+// the CHANGELOG. No constant owns it. The ceiling: one measured-runtime constant
+// every consumer (including MERGE_GATE_BUDGET_MS, already derived from it) reads,
+// so re-measuring moves one number. Out of #307's scope -- it would touch every
+// copy -- and the gate test below pins only the string, so a stale figure here
+// fails no test.
 function foregroundRule(stage: Stage): string {
   return `## Verification runs in the FOREGROUND
 Every command you verify with -- the test suite, typecheck, build, anything you would cite as evidence -- must run to completion IN THE FOREGROUND before your final message. Never background a gate and end your turn waiting on it: no one will wake you (this loop sends a stage agent exactly one message, by design), so the run's result reaches nobody. The same goes for anything else you are waiting on, a sub-agent included: report what you actually hold. Ending your turn with a background job still pending is parsed as CONFUSED, the same as any final message with no marker, and CONFUSED skips this ticket -- the worst outcome available to you. Waiting is affordable: this repo's full suite runs 128-234s measured, against the ${DEFAULT_STAGE_WATCHDOG_MINUTES[stage]} minutes of silence your stage's watchdog allows by default. If a check is too slow to finish, report what you actually ran and what you did not.`;
@@ -140,11 +155,14 @@ Every command you verify with -- the test suite, typecheck, build, anything you 
 // #307, the other half. Every exit contract already said the marker must be the
 // FIRST line; two haiku stages in run 16 wrote a prose summary and closed with a
 // correctly spelled `BUILT:` / `QA-PASS:` anyway, and both tickets were skipped
-// with the work committed and green. lib/loop.ts now reads a trailing marker
-// rather than losing the ticket, but the CONTRACT does not loosen: the parser's
-// leniency is a net, not the spec, and a message whose marker is buried can still
-// be ambiguous (two different markers below line 1 stay CONFUSED). So the rule is
-// restated as a rule with the exact failing shape as a worked negative example --
+// with the work committed and green. lib/loop.ts now reads a marker on a line of
+// its own wherever it sits rather than losing the ticket, but the CONTRACT does not
+// loosen and the prompt deliberately does not advertise that. The parser's leniency
+// is a NET, not the spec: a quoted marker (fenced, or still carrying this
+// placeholder) is not read at all, two different markers below line 1 are still
+// CONFUSED, and only a line-1 marker is guaranteed unambiguous. An agent told "any
+// line will do" aims at the loose target and lands in the cases the net misses. So
+// the rule is restated with the exact failing shape as a worked negative example --
 // positive templates alone were demonstrably not sticky enough.
 //
 // `example` is the stage's own success marker, so the negative example names the

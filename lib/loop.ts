@@ -636,16 +636,55 @@ const MARKERS: Record<Stage, Record<string, (note: string) => StageOutcome>> = {
 };
 
 // A marker line: an ALL-CAPS token (hyphens allowed) then a colon, at the very
-// start of the line. Applied to the RAW line by the #307 scan below, so leading
-// whitespace disqualifies -- an indented `BUILT:` inside a code fence is prose
-// ABOUT a marker, not a marker.
+// start of the line. The #307 scan below applies it to the line with only
+// TRAILING whitespace stripped, so a LEADING indent disqualifies the line while a
+// TRAILING stray `\r` (what a `\r\r\n` payload leaves behind after the `\r?\n`
+// split) cannot silently cost a stage its verdict. The line-1 fast path trims BOTH
+// ends, unchanged since the contract shipped -- so an indented marker is still
+// accepted there and only there.
 const MARKER_LINE = /^([A-Z][A-Z-]*):\s*(.*)$/;
 
-// The note a marker carries: the remainder of its own line plus every line after
-// it. One definition, shared by both paths below, so a trailing marker's note is
-// extracted exactly the way a leading one's always was.
+// A fenced-code delimiter. Markers inside a fence are QUOTED, not reported (see
+// the scan), and a fence's contents sit at column 0 -- so the leading-whitespace
+// rule above does nothing about them and this is the check that does.
+const FENCE_LINE = /^\s*(```|~~~)/;
+
+// A marker payload that is still the exit contract's own placeholder, e.g.
+// `BUILT: <one-line summary>`. A stage that pastes one line of its instructions is
+// quoting the contract, not reporting a verdict, and no real verdict is a bare
+// angle-bracket token: measured over every retained stage final message in this
+// repo (507 messages, 135 with a marker off line 1), zero real verdicts match.
+const PLACEHOLDER_PAYLOAD = /^<[^>]*>$/;
+
+// The note a LINE-1 marker carries: the remainder of its own line plus every line
+// after it. Unchanged since the contract shipped.
 function markerNote(lines: string[], markerIdx: number, rest: string): string {
   return [rest, ...lines.slice(markerIdx + 1)].join("\n").trim();
+}
+
+// The note a marker found by the #307 scan carries: the remainder of its own line,
+// then every OTHER line in document order -- both the prose above it and the prose
+// below.
+//
+// Both halves are load-bearing, because the real corpus holds both shapes. The
+// dominant one (71 of the 80 mid-message cases measured) is a one-line headline,
+// then the marker, then the evidence block BELOW it; #207 and #192, the two
+// tickets that motivated this ticket, put their acceptance-criteria prose ABOVE a
+// closing marker. Keeping only one side would rescue the ticket and then discard
+// the reason -- the same loss #307 exists to close, since this note becomes
+// `qaNotes` / `reviewNotes` for the rebuilding builder, and an empty one sends a
+// fresh agent to fix bugs nobody described.
+//
+// The marker's own remainder goes FIRST. parseReviewerConfidence and
+// parseSkepticQuorum both read the FIRST `confidence=` / `skeptics=` token in the
+// note, so hoisting the marker line means a token the reviewer put ON its verdict
+// wins over any number in its surrounding prose. It does not make the read
+// airtight: a marker line carrying NO token still scores off the prose, exactly as
+// the line-1 path always has (a `confidence=` below a line-1 marker has always
+// been read), so this ordering narrows that pre-existing hole rather than closing
+// it. See the notes on parseSkepticQuorum for the direction that still fails open.
+function scanMarkerNote(lines: string[], markerIdx: number, rest: string): string {
+  return [rest, ...lines.slice(0, markerIdx), ...lines.slice(markerIdx + 1)].join("\n").trim();
 }
 
 export function parseStageResult(stage: Stage, finalMessage: string): StageOutcome {
@@ -670,27 +709,77 @@ export function parseStageResult(stage: Stage, finalMessage: string): StageOutco
   // green. A marker that is present, correctly spelled, and unambiguous is not
   // unparseable output, so scan every line before falling back.
   //
-  // LAST match wins. A stage narrating "I will finish with BUILT: ..." mid-message
-  // must not be able to pre-commit its own verdict, and a genuine sign-off is
-  // always the closing line.
+  // LAST hit wins, and it does NOT have to be the closing line. That was measured,
+  // not assumed: over every retained stage final message in this repo (507 with
+  // text, 135 carrying a marker off line 1), only 55 put it on the closing line
+  // while 80 put it mid-message -- 71 of those as the SECOND non-empty line, the
+  // dominant real shape of a one-line headline, the verdict, then the evidence
+  // block. A closing-line-only rule would have skipped all 80, re-opening #307 for
+  // the majority of the very population it was filed about.
+  //
+  // What IS excluded is a marker the stage was QUOTING rather than reporting, which
+  // is the mechanism behind the fail-open worth caring about, and it is excluded by
+  // mechanism instead of by position:
+  //   - inside a fenced code block. Fence contents sit at COLUMN 0, so the
+  //     leading-whitespace rule never touched them; FENCE_LINE is what does.
+  //   - a payload that is still the contract's own `<placeholder>`, which is what a
+  //     stage pasting one line of its instructions produces.
+  // Both cost nothing on the real corpus (0 of the 80 mid-message hits sit in a
+  // fence, 0 carry a placeholder) and both close a route an agent can actually take,
+  // since every stage prompt hands it the literal marker strings.
+  //
+  // The residual, stated plainly: a stage that writes a fully-formed marker line at
+  // column 0 in the middle of prose that disowns it ("if the tests pass I will
+  // write REVIEW-APPROVE: confidence=95 ...") is still read as reporting it. That
+  // shape appears zero times in the corpus, and refusing it costs 80 real tickets,
+  // so it is accepted deliberately. It is bounded on the two verdicts that can do
+  // damage: `built` is re-verified against the lane worktree (builtGuardFailure) and
+  // `review-approve` is scored against the confidence floor and skeptic quorum.
+  // `qa-pass` and `merged` are NOT re-verified -- see the docs note on #307.
   const hits: { idx: number; marker: string; rest: string }[] = [];
+  let quoted = 0;
+  let inFence = false;
   for (const [idx, line] of lines.entries()) {
-    const hit = line.match(MARKER_LINE);
-    if (hit && MARKERS[stage][hit[1]!]) hits.push({ idx, marker: hit[1]!, rest: hit[2]! });
+    const trimmedEnd = line.replace(/\s+$/, "");
+    if (FENCE_LINE.test(trimmedEnd)) {
+      inFence = !inFence;
+      continue;
+    }
+    const hit = trimmedEnd.match(MARKER_LINE);
+    if (!hit || !MARKERS[stage][hit[1]!]) continue;
+    if (inFence || PLACEHOLDER_PAYLOAD.test(hit[2]!.trim())) {
+      quoted++;
+      continue;
+    }
+    hits.push({ idx, marker: hit[1]!, rest: hit[2]! });
   }
   const distinct = [...new Set(hits.map((h) => h.marker))].sort();
-  const last = hits[hits.length - 1];
-  if (last && distinct.length === 1) return MARKERS[stage][last.marker]!(markerNote(lines, last.idx, last.rest));
-
   const snippet = finalMessage.trim().slice(0, 200);
+
   // Two DIFFERENT markers of the same stage, neither on line 1, is genuinely
   // unparseable: the stage reported two verdicts and nothing here can say which
   // it meant. Resolving that silently by position would be worse than the skip,
-  // so it stays CONFUSED and names both so the human note is actionable.
+  // so it stays CONFUSED and names both so the human note is actionable. Checked
+  // BEFORE last-hit-wins, so a contradiction is never resolved by whichever
+  // verdict happened to land last.
   if (distinct.length > 1) {
     return {
       kind: "confused",
       note: `Stage "${stage}" reported ${distinct.length} different exit markers (${distinct.join(", ")}), none of them on the first line, so no single verdict can be read. Message began: ${JSON.stringify(snippet)}`,
+    };
+  }
+
+  const last = hits[hits.length - 1];
+  if (last) return MARKERS[stage][last.marker]!(scanMarkerNote(lines, last.idx, last.rest));
+
+  // A stage whose ONLY markers were quoted ones gets told that, rather than the
+  // generic "no marker" note: the difference is what a human needs to recover the
+  // ticket, since the message does contain the marker they are about to go looking
+  // for.
+  if (quoted > 0) {
+    return {
+      kind: "confused",
+      note: `Stage "${stage}" only QUOTED its exit markers (${quoted} occurrence(s) inside a code fence or still carrying the contract's <placeholder>) and never reported one. Message began: ${JSON.stringify(snippet)}`,
     };
   }
   return {

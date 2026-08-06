@@ -92,7 +92,7 @@ for i in $(seq 1 "$RUNS"); do
     Return ONLY this JSON object, with every defect id present in both maps:
     {\"single\":{\"D1\":true|false,...},\"adversarial\":{\"D1\":true|false,...},
      \"singleUnmatched\":<int>,\"adversarialUnmatched\":<int>,
-     \"singleMarker\":\"<the marker its final message starts with>\",
+     \"singleMarker\":\"<the exit marker the loop reads from its final message: the first line if that is a marker, else the LAST marker on a line of its own anywhere in the message (#307); a marker only QUOTED -- inside a fenced code block, or still carrying the contract's <placeholder> -- is not read, so report NONE>\",
      \"adversarialMarker\":\"<same>\"}" \
     --add-dir "$OUT" --add-dir "$HERE" > "$OUT/grade-$i.json"
 done

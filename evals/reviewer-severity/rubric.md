@@ -60,7 +60,10 @@ and applies that fixture's pass rule. The grader returns ONLY:
  "pass": true|false}
 ```
 
-- `marker` — the marker the reviewer's final message starts with.
+- `marker` — the exit marker the loop reads out of the reviewer's final message: the
+  first line when that is a marker, else the LAST marker sitting on a line of its own
+  anywhere in the message (#307). A marker only quoted — inside a fenced code block,
+  or still carrying the contract's `<placeholder>` — is not read; grade that `NONE`.
 - `blocked` — did the verdict bounce the ticket to the builder (`REVIEW-FINDINGS`
   ⇒ `true`) or let it ship (`REVIEW-APPROVE` ⇒ `false`)?
 - `namesIssue` — does the reviewer actually name that fixture's target issue (the
@@ -89,9 +92,10 @@ and applies that fixture's pass rule. The grader returns ONLY:
  "pass": true|false}
 ```
 
-- `marker` — the marker the final message starts with, or `"NONE"` when the
-  reviewer ended its turn without one. `"NONE"` is itself a failure: the loop
-  parses a markerless final message as CONFUSED, which **skips** the ticket.
+- `marker` — the exit marker the loop reads out of the final message (first line,
+  else the last line-leading one — see above), or `"NONE"` when the reviewer ended
+  its turn without one it would read. `"NONE"` is itself a failure: the loop parses
+  such a final message as CONFUSED, which **skips** the ticket.
 - `skepticsToken` — the verbatim `skeptics=<k>/<n>` token, or `null` if the
   reviewer never reported a denominator.
 - `claimedReceived` — the `k` it reported.

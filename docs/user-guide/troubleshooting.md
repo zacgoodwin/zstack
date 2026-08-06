@@ -183,25 +183,47 @@ used to parse as CONFUSED, which skips the ticket — after the stage had spent 
 whole budget. Loop 16 lost three tickets that way, all three with the work already
 done.
 
-What the loop does now: a final message whose first line is not a marker is scanned
-line by line, and the **last** line-leading marker belonging to that stage is the
-verdict. So the trailing-marker shape lands as `BUILT` / `QA-PASS` and the lane
-advances. Three cases deliberately still skip:
+What the loop does now: the first line is read first, as always; when it is not a
+marker, the whole message is scanned for markers of that stage on a line of their own
+and the **last** one is the verdict, wherever it sits. So the trailing-marker shape
+lands as `BUILT` / `QA-PASS` and the lane advances. The note carries the prose on
+**both** sides of the marker, so QA's repro steps and a reviewer's `file:line`
+findings reach the rebuilding builder whichever side they were written on.
+
+Measured over this repo's own retained transcripts, that rescues 135 of 507 real
+stage messages and changes no other verdict.
+
+Three cases deliberately still skip:
 
 - **No marker anywhere.** The stage did not finish (the classic shape is an agent
   that backgrounded `bun test` and ended its turn to await a notification nobody
   will send). Skip note: `ended without a recognized exit marker (…)`.
+- **Only QUOTED markers.** Skip note: `only QUOTED its exit markers (…)`. A marker
+  inside a fenced code block, or one whose payload is still the contract's own
+  `<placeholder>` (`BUILT: <one-line summary>`), is the stage echoing its
+  instructions, not reporting. Read the transcript and move the ticket by hand.
 - **Two different markers of that stage, neither on line 1.** The stage reported two
   verdicts and nothing can say which it meant. Skip note:
   `reported 2 different exit markers (…), none of them on the first line`. Fix it by
   hand; do not guess.
-- **A marker only in prose** — indented inside a code fence, or mid-sentence. That is
-  text about a marker, not a marker.
 
-If you hit the first case, recover it exactly as the dead-worker section below
-describes. If you hit the second, read the stage's transcript
-(`~/.zstack/projects/<slug>/loop/transcripts/ticket-<N>/`), decide which verdict it
-meant, and move the ticket by hand.
+Two things that are **not** markers, so they never rescue a ticket: a marker inside a
+sentence (`I will report BUILT: once the suite finishes` — it has to start its own
+line), and, below line 1, an **indented** marker. A line-1 marker is still accepted
+indented; the scan below it is not.
+
+The one shape that will read as a verdict when you might not want it to: a
+fully-formed marker line at column 0 sitting in prose that disowns it. Zero
+occurrences in this repo's corpus, against the 80 real tickets that refusing it would
+cost, so it is accepted on purpose. `BUILT` is re-verified against the lane worktree
+and `REVIEW-APPROVE` is scored, but `QA-PASS` and `MERGED` are not — so if a lane
+advanced or a ticket went Done and you cannot find the work, read that stage's
+transcript first.
+
+For the first case, recover it exactly as the dead-worker section below describes. For
+the others, read the stage's transcript
+(`~/.zstack/projects/<slug>/loop/transcripts/ticket-<N>/`), decide what the stage
+actually concluded, and move the ticket by hand.
 
 ## A ticket was Skipped with a dead-worker note but its worktree has real uncommitted changes
 

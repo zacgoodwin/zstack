@@ -2730,10 +2730,17 @@ describe("parseStageResult finds a marker that is not the first line (#307)", ()
     ].join("\n");
     // Both markers named, so the skip note tells a human what the stage actually
     // said. Resolving a contradiction silently by position would be worse.
+    //
+    // Asserted as the marker LIST, not as two bare toContain() calls: main's
+    // fallback note interpolates Object.keys(MARKERS[stage]), so it already
+    // contains every marker name for this stage and `toContain("REVIEW-APPROVE")`
+    // passes against the old code too. Only the list phrase discriminates.
     const note = confusedNote(parseStageResult("reviewer", msg));
-    expect(note).toContain("REVIEW-APPROVE");
-    expect(note).toContain("REVIEW-FINDINGS");
-    expect(note).toContain("2 different exit markers");
+    expect(note).toContain("2 different exit markers (REVIEW-APPROVE, REVIEW-FINDINGS)");
+    expect(note).not.toContain("ended without a recognized exit marker");
+    // The contradiction is judged BEFORE last-hit-wins, so the fact that
+    // REVIEW-FINDINGS happens to be the last hit does not resolve it.
+    expect(msg.trimEnd().split(/\r?\n/).at(-1)).toMatch(/^REVIEW-FINDINGS:/);
   });
 
   test("AC5: a marker mentioned in prose or indented in a code fence is not a marker", () => {
@@ -2759,12 +2766,130 @@ describe("parseStageResult finds a marker that is not the first line (#307)", ()
       "BUILT: dependency was fine after all",
     ].join("\n");
     expect(parseStageResult("builder", msg)).toEqual({ kind: "built" });
-    // Same marker twice is not a contradiction -- last still wins, and it carries
-    // its own note, not the earlier line's.
-    expect(parseStageResult("merge", "prose\nMERGED: https://pr/1\nmore\nMERGED: https://pr/2")).toEqual({
-      kind: "merged",
-      note: "https://pr/2",
+    // Same marker twice is not a contradiction -- the last is the verdict, and it
+    // leads the note.
+    const twice = parseStageResult("merge", "prose\nMERGED: https://pr/1\nmore\nMERGED: https://pr/2");
+    expect(twice.kind).toBe("merged");
+    expect(twice.kind === "merged" && twice.note.split("\n")[0]).toBe("https://pr/2");
+  });
+
+  // A marker mid-message is ACCEPTED, and that is measured rather than assumed.
+  // Over every retained stage final message in this repo (507 with text, 135 with a
+  // marker off line 1), 80 put the marker mid-message against 55 on the closing
+  // line -- 71 of the 80 as the second non-empty line, the dominant real shape of a
+  // headline, the verdict, then the evidence below. A closing-line-only rule would
+  // skip all 80 and re-open #307 for the majority of its own population.
+  test("a marker mid-message is a verdict: the corpus's dominant shape", () => {
+    const shape = (marker: string) => ["Ran the full gauntlet.", "", marker, "", "Evidence:", "- suite green", "- typecheck clean"].join("\n");
+    expect(parseStageResult("builder", shape("BUILT: narrowed the assertion"))).toEqual({ kind: "built" });
+    expect(parseStageResult("qa", shape("QA-PASS: all three criteria green"))).toEqual({ kind: "qa-pass" });
+    expect(parseStageResult("reviewer", shape("REVIEW-APPROVE: confidence=100 skeptics=3/3 verified"))).toEqual({
+      kind: "review-approve",
+      confidence: 100,
+      skeptics: { received: 3, of: 3 },
     });
+  });
+
+  // The fail-open worth closing is a QUOTED marker, and it is closed by mechanism
+  // rather than by position, because position is what the corpus says we cannot use.
+  // Every stage prompt hands the agent the literal marker strings, so pasting one
+  // back is a route it can actually take; narrating a fully-formed marker at column
+  // 0 is not a shape the corpus contains (0 occurrences).
+  test("a QUOTED marker is not a verdict: fenced, or still carrying the contract placeholder", () => {
+    // Column-0 fence. This is the case the leading-whitespace rule never covered:
+    // fenced content is not indented.
+    const fenced = ["The contract says:", "", "```", "BUILT: done and committed", "```", "", "Still building."].join("\n");
+    expect(confusedNote(parseStageResult("builder", fenced))).toContain("only QUOTED its exit markers");
+    // ~~~ fences too, and an indented fence body stays excluded by both rules.
+    const tilde = ["Contract:", "~~~", "QA-PASS: everything green", "~~~", "Not done."].join("\n");
+    expect(parseStageResult("qa", tilde).kind).toBe("confused");
+    // The contract's own placeholder, unfenced -- what pasting one instruction line
+    // produces.
+    const placeholder = ["I was told to end with:", "BUILT: <one-line summary>", "I could not finish."].join("\n");
+    expect(confusedNote(parseStageResult("builder", placeholder))).toContain("only QUOTED its exit markers");
+    // A real verdict AFTER a quoted one is still read: quoting does not poison the
+    // message, it just does not count as reporting.
+    const both = ["Contract:", "```", "BUILT: <one-line summary>", "```", "", "BUILT: the real thing"].join("\n");
+    expect(parseStageResult("builder", both)).toEqual({ kind: "built" });
+    // An unbalanced fence cannot swallow the verdict below it either... it can, and
+    // that is the honest boundary: a stage that opens a fence and never closes it
+    // has produced a message whose marker IS inside a fence.
+    expect(parseStageResult("builder", ["```", "BUILT: inside an unclosed fence"].join("\n")).kind).toBe("confused");
+  });
+
+  // The scan's note carries the prose on BOTH sides of the marker, because the
+  // corpus holds both shapes: the mid-message majority puts its evidence BELOW the
+  // marker, while #207 and #192 put theirs ABOVE. Dropping either side would rescue
+  // the ticket and discard the reason -- this note becomes `qaNotes` / `reviewNotes`
+  // for the rebuilding builder (nextAction's qa-bugs advance), so an empty one sends
+  // a fresh agent to fix bugs nobody described.
+  test("a scanned marker's note carries the prose above AND below it, remainder first", () => {
+    const above = parseStageResult(
+      "qa",
+      ["1) click X, expect Y, got Z", "2) null deref at a.ts:10", "", "QA-BUGS: 2 issues, detailed above"].join("\n")
+    );
+    expect(above.kind === "qa-bugs" && above.note.split("\n")[0]).toBe("2 issues, detailed above");
+    expect(above.kind === "qa-bugs" && above.note).toContain("1) click X, expect Y, got Z");
+    expect(above.kind === "qa-bugs" && above.note).toContain("2) null deref at a.ts:10");
+    const below = parseStageResult(
+      "qa",
+      ["Found two bugs.", "", "QA-BUGS: 2 issues, detailed below", "", "1) click X, expect Y, got Z", "2) null deref at a.ts:10"].join("\n")
+    );
+    expect(below.kind === "qa-bugs" && below.note.split("\n")[0]).toBe("2 issues, detailed below");
+    expect(below.kind === "qa-bugs" && below.note).toContain("Found two bugs.");
+    expect(below.kind === "qa-bugs" && below.note).toContain("1) click X, expect Y, got Z");
+  });
+
+  // #191's quorum denominator is written by the reviewer, and parseSkepticQuorum
+  // reads the FIRST `skeptics=` token in the note. A scanned REVIEW-APPROVE whose
+  // denominator sits in the prose around it must still be SEEN -- dropping it yields
+  // null, which the quorum gate reads as "no fan-out" and never blocks, so a 1-of-3
+  // starved review would merge. Marker remainder first also means the confidence
+  // scored is the one the reviewer signed off with, not any number in its prose.
+  test("a scanned REVIEW-APPROVE keeps its confidence and cannot hide a starved quorum", () => {
+    expect(
+      parseStageResult(
+        "reviewer",
+        ["Only 1 of 3 skeptics reported: skeptics=1/3.", "", "REVIEW-APPROVE: confidence=100 nobody could refute"].join("\n")
+      )
+    ).toEqual({ kind: "review-approve", confidence: 100, skeptics: { received: 1, of: 3 } });
+    // Confidence comes off the marker line even when the prose above names another.
+    expect(
+      parseStageResult("reviewer", ["I started at confidence=20.", "", "REVIEW-APPROVE: confidence=90 verified"].join("\n"))
+    ).toEqual({ kind: "review-approve", confidence: 90, skeptics: null });
+  });
+
+  test("line endings and degenerate messages", () => {
+    // The loop runs on Windows, so the split is load-bearing: a CRLF payload and a
+    // `\r\r\n` payload -- which leaves a stray TRAILING \r the scan must tolerate,
+    // since `.` in MARKER_LINE does not match \r -- must both still find the marker.
+    // A LONE-CR message is out of scope and stays CONFUSED: split(/\r?\n/) never
+    // breaks it into lines at all, and no real transcript produces one.
+    expect(parseStageResult("builder", "prose\r\nBUILT: done\r\n")).toEqual({ kind: "built" });
+    expect(parseStageResult("builder", "prose\r\r\nBUILT: done\r\r\n")).toEqual({ kind: "built" });
+    expect(parseStageResult("merge", "prose\r\nMERGED: https://pr/9\r\n").kind).toBe("merged");
+    expect(parseStageResult("builder", "prose\rBUILT: done").kind).toBe("confused");
+    // A trailing whitespace-only line does not hide the marker either.
+    expect(parseStageResult("builder", "prose\nBUILT: done\n   \n")).toEqual({ kind: "built" });
+    // Nothing to parse is CONFUSED, never a crash.
+    expect(parseStageResult("builder", "   \n\t\n ").kind).toBe("confused");
+    expect(parseStageResult("builder", "\n\n").kind).toBe("confused");
+    // A marker with an empty note is still that marker.
+    expect(parseStageResult("builder", "prose\nBUILT:")).toEqual({ kind: "built" });
+    // Three repeats of one marker: the closing one wins, same as two.
+    const thrice = parseStageResult("merge", "p\nMERGED: a\nq\nMERGED: b\nr\nMERGED: c");
+    expect(thrice.kind === "merged" && thrice.note.split("\n")[0]).toBe("c");
+  });
+
+  test("an unusable first line falls through to the scan", () => {
+    // A line-1 marker belonging to ANOTHER stage is not this stage's verdict, so
+    // the fast path cannot use it -- and the scan then reads the real closing
+    // marker rather than skipping the ticket over a mislabeled opener.
+    expect(parseStageResult("builder", "QA-PASS: wrong stage\nBUILT: the right one")).toEqual({ kind: "built" });
+    // An indented marker IS accepted as line 1 (the fast path trims both ends,
+    // unchanged since the contract shipped) but never below it.
+    expect(parseStageResult("builder", "    BUILT: indented opener")).toEqual({ kind: "built" });
+    expect(parseStageResult("builder", "context\n    BUILT: indented below line 1").kind).toBe("confused");
   });
 
   test("AC6: the real #286 builder message -- no marker anywhere -- is still CONFUSED", () => {

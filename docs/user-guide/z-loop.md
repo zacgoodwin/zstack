@@ -307,23 +307,52 @@ records the result. It never re-derives a scheduling decision in prose.
   this repo's full suite runs 128-234s measured, against that stage's own watchdog
   budget in minutes — so foreground is visibly affordable rather than merely
   mandatory.
-- **A marker that is not the first line is still a marker.** The exit contract asks
-  every stage to OPEN its final message with the marker, and the parser used to
-  read nothing else, so a stage that wrote a prose summary and closed with a
-  correctly spelled `BUILT:` was CONFUSED by definition — skipped after spending
-  its whole budget, work committed and green, ticket left for a human. That was the
-  dominant failure of loop 16: 3 of 3 tickets, two models, two stage kinds, $2.33
-  paid for nothing merged. So a message whose first line is not a marker is now
-  scanned line by line, and the **last** line-leading marker belonging to that
-  stage is the verdict. Last, not first, so a stage narrating "I will finish with
-  `BUILT: ...`" cannot pre-commit its own verdict; line-leading only, so a `BUILT:`
-  indented in a code fence or buried mid-sentence is prose about a marker, not a
-  marker. Two **different** markers of one stage below line 1 is a genuine
-  contradiction and stays CONFUSED, naming both in the note — resolving that
-  silently by position would be worse than the skip. A well-formed message still
-  parses off line 1 exactly as before, and a message with no marker anywhere is
-  CONFUSED exactly as before: the widening rescues a stage that finished and said
-  so awkwardly, never one that did not finish.
+- **A marker on a line of its own is read wherever it sits; a QUOTED one is not.**
+  The exit contract asks every stage to open its final message with the marker, and
+  the parser used to read nothing else, so a stage that wrote a prose summary and
+  put a correctly spelled `BUILT:` anywhere else was CONFUSED by definition —
+  skipped after spending its whole budget, work committed and green, ticket left for
+  a human. That was the dominant failure of loop 16: 3 of 3 tickets, two models, two
+  stage kinds, $2.33 paid for nothing merged. So the first line is still read first,
+  and when it is not a marker the whole message is scanned for line-leading markers
+  of that stage and the **last** one is the verdict. Last, not first, so a stage
+  narrating "I will close with `BLOCKED:` if the dependency is broken" cannot
+  pre-commit a verdict it goes on to contradict.
+  - **Position is not the filter, because the corpus says it cannot be.** Measured
+    over every retained stage final message in this repo — 507 with text, 135
+    carrying a marker off line 1 — only 55 put it on the closing line while **80**
+    put it mid-message, 71 of those as the second non-empty line (a one-line
+    headline, the verdict, then the evidence block). A "must be the closing line"
+    rule would skip all 80 and re-open #307 for the majority of its own population.
+    The whole change rescues **135 of 507** real messages with **zero** verdicts
+    changed in any other direction.
+  - **What is excluded is a marker the stage was quoting**, filtered by mechanism
+    rather than position: a marker inside a fenced code block (fenced content sits
+    at column 0, so the line-leading rule alone never excluded it), and a marker
+    whose payload is still the contract's own `<placeholder>` — what pasting one
+    instruction line produces. Both cost nothing on the real corpus (0 of the 80
+    hits are fenced, 0 carry a placeholder) and both close a route an agent can
+    actually take, since every stage prompt hands it the literal marker strings.
+    Such a message gets its own note: `only QUOTED its exit markers`.
+  - **The residual, stated plainly.** A stage that writes a fully-formed marker line
+    at column 0 inside prose that disowns it ("if the tests pass I will write
+    `REVIEW-APPROVE: confidence=95 …`") is still read as reporting it. Zero
+    occurrences in the corpus, against 80 real tickets that refusing it would cost,
+    so it is accepted deliberately. It is bounded on the two verdicts that can do
+    damage — `BUILT` is re-verified against the lane worktree and `REVIEW-APPROVE`
+    is scored against the confidence floor and skeptic quorum — and unbounded on
+    `QA-PASS` (advances the lane) and `MERGED` (marks the ticket Done), which have
+    no equivalent re-check.
+  - Two **different** markers of one stage is a genuine contradiction and stays
+    CONFUSED naming both, judged before last-hit-wins so whichever landed last
+    cannot resolve it. A scanned marker's note carries the prose on **both** sides
+    of it with the marker's own remainder first, so QA's numbered repros and a
+    reviewer's `file:line` findings reach the rebuilding builder whichever side of
+    the marker they were written on, and a `skeptics=k/3` denominator in the
+    surrounding prose still counts against the quorum floor. A well-formed message
+    parses off line 1 exactly as before, and a message with no marker anywhere is
+    CONFUSED exactly as before: the widening rescues a stage that finished and said
+    so awkwardly, never one that did not finish.
 - **Actual per ticket.** After each stage the ticket's transcripts are priced with
   `bin/z-cost` (dedup by requestId) and written to the Actual field. A stage that
   died without reporting is priced too, at the moment it is found dead and before
