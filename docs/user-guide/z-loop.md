@@ -333,16 +333,33 @@ records the result. It never re-derives a scheduling decision in prose.
     instruction line produces. Both cost nothing on the real corpus (0 of the 80
     hits are fenced, 0 carry a placeholder) and both close a route an agent can
     actually take, since every stage prompt hands it the literal marker strings.
-    Such a message gets its own note: `only QUOTED its exit markers`.
-  - **The residual, stated plainly.** A stage that writes a fully-formed marker line
-    at column 0 inside prose that disowns it ("if the tests pass I will write
-    `REVIEW-APPROVE: confidence=95 …`") is still read as reporting it. Zero
-    occurrences in the corpus, against 80 real tickets that refusing it would cost,
-    so it is accepted deliberately. It is bounded on the two verdicts that can do
-    damage — `BUILT` is re-verified against the lane worktree and `REVIEW-APPROVE`
-    is scored against the confidence floor and skeptic quorum — and unbounded on
-    `QA-PASS` (advances the lane) and `MERGED` (marks the ticket Done), which have
-    no equivalent re-check.
+    Such a message gets its own note: `only QUOTED its exit markers`. Fences follow
+    CommonMark's closing rule — same character, at least as long as the opener — so
+    a ``` block nested inside a ```` block cannot re-open the outer one and expose
+    the marker it contains.
+  - **The residual, and what bounds each verdict.** A stage that writes a
+    fully-formed marker line at column 0 inside prose that disowns it ("if the tests
+    pass I will write `REVIEW-APPROVE: confidence=95 …`") is still read as reporting
+    it. Zero occurrences in the corpus against 80 real tickets that refusing it
+    outright would cost, so it is accepted — but only where a mechanism bounds it:
+    - `BUILT` — re-verified against the lane worktree (a dirty tree or a HEAD still
+      at the base bounces the lane back to the builder).
+    - `REVIEW-APPROVE` — its `confidence=` is read from the **marker line only**, so
+      a number narrated in prose, or quoted inside a pasted diff hunk, cannot score
+      the gate. A bare approve scores null, which the truth-check gate refuses to
+      merge on. `skeptics=` is read from the marker line first and then from
+      anywhere, because a denominator can only ever *block*.
+    - `MERGED` — accepted on the **first or the closing line only**. It is terminal
+      and nothing re-reads it, so it does not get the loose rule. Cost: 3 real
+      messages, against a false Done that would delete an unmerged branch at batch
+      cleanup.
+    - `QA-PASS` — the one verdict where the residual is live, by choice: 17 real
+      mid-message occurrences make the strict rule expensive, and a false pass still
+      has to clear the blinded reviewer and then the merge gate's own suite run. The
+      open hazard is a QA agent echoing a marker line out of the ticket's own
+      Acceptance Criteria — this repo files tickets that contain them. Closing that
+      needs the stage's input payload at parse time; it is a follow-up, not shipped
+      here.
   - Two **different** markers of one stage is a genuine contradiction and stays
     CONFUSED naming both, judged before last-hit-wins so whichever landed last
     cannot resolve it. A scanned marker's note carries the prose on **both** sides

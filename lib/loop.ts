@@ -602,7 +602,32 @@ export function builtGuardFailure(facts: BuilderCommitFacts): string | null {
 // carries none of its stage's markers on a line of its own is CONFUSED by
 // definition -- the no-token-burn rule turns unparseable output into a skip,
 // never a retry loop.
-const MARKERS: Record<Stage, Record<string, (note: string) => StageOutcome>> = {
+// Each entry takes the full `note` (human-facing text, both sides of the marker)
+// and `rest` -- the marker's OWN payload, the remainder of the marker line.
+//
+// They are separate arguments because #62's confidence floor and #191's skeptic
+// quorum are gates, and each of their two tokens has a SAFE direction to read
+// from. Scoring both off the whole note let a bare `REVIEW-APPROVE:` be vouched
+// for by a `confidence=100` written anywhere else in the message -- including
+// inside a fenced diff hunk the reviewer merely quoted, i.e. text the BUILDER
+// wrote. So:
+//
+//   confidence -- `rest` ONLY. A number found anywhere else can only INFLATE the
+//     score, so a number the reviewer did not attach to its verdict is refused.
+//     Absent means null, which resolveOutcome already treats as a truth-check
+//     failure, so refusing fails CLOSED.
+//   skeptics   -- `rest` first, else anywhere in the note. A denominator can only
+//     ever BLOCK (a null never blocks; #191's floor blocks on a low `k`), so
+//     reading a wider net is the pessimistic direction. An honest "only 1 of 3
+//     reported" in the prose still stops the merge, and a quoted `3/3` cannot
+//     override a real `1/3` on the marker line, because the marker line is read
+//     first.
+//
+// Measured over every retained reviewer message in this repo: 82 approves put
+// `confidence=` on the marker line and 0 put it only elsewhere; 8 put `skeptics=`
+// on the marker line and 0 put it only elsewhere. So this costs nothing real in
+// either direction -- it only removes the two ways a gate could be fooled.
+const MARKERS: Record<Stage, Record<string, (note: string, rest: string) => StageOutcome>> = {
   builder: {
     "BUILT": () => ({ kind: "built" }),
     "NEEDS-INPUT": (note) => ({ kind: "needs-input", note }),
@@ -617,10 +642,10 @@ const MARKERS: Record<Stage, Record<string, (note: string) => StageOutcome>> = {
     "CONFUSED": (note) => ({ kind: "confused", note }),
   },
   reviewer: {
-    "REVIEW-APPROVE": (note) => ({
+    "REVIEW-APPROVE": (note, rest) => ({
       kind: "review-approve",
-      confidence: parseReviewerConfidence(note),
-      skeptics: parseSkepticQuorum(note),
+      confidence: parseReviewerConfidence(rest),
+      skeptics: parseSkepticQuorum(rest) ?? parseSkepticQuorum(note),
     }),
     "REVIEW-FINDINGS": (note) => ({ kind: "review-findings", note }),
     "NEEDS-HUMAN": (note) => ({ kind: "human-question", note }),
@@ -635,6 +660,28 @@ const MARKERS: Record<Stage, Record<string, (note: string) => StageOutcome>> = {
   },
 };
 
+// Markers the SCAN will only accept on the closing line -- the message's last
+// non-empty line -- rather than anywhere. The line-1 fast path is untouched.
+//
+// The test is damage, not position: a verdict with no downstream re-check that is
+// also TERMINAL earns the stricter rule. `MERGED` is the only one. It sets the
+// ticket Done and pushes it into mergedThisRun (which the end-of-loop ship reads,
+// and after which batch cleanup deletes the branch), and nothing re-reads the PR
+// state -- so a merge agent that narrates a red gate and mentions the PR it WOULD
+// have opened could mark a ticket Done over an unmerged branch. Cost, measured
+// over the retained corpus: 3 real messages put MERGED mid-message against 5 that
+// close with it. Losing 3 rescues means a human sees a merged PR next to a Skipped
+// ticket, which is loud and recoverable; the false Done is silent.
+//
+// `qa-pass` deliberately stays unrestricted (17 real mid-message occurrences, and
+// a false pass still has to clear the blinded reviewer and then the merge gate's
+// own suite run). `review-approve` needs no position rule now that its score is
+// read off the marker line: a bare approve scores null, which the truth-check
+// gate already refuses to merge on.
+const CLOSING_LINE_ONLY: Partial<Record<Stage, ReadonlySet<string>>> = {
+  merge: new Set(["MERGED"]),
+};
+
 // A marker line: an ALL-CAPS token (hyphens allowed) then a colon, at the very
 // start of the line. The #307 scan below applies it to the line with only
 // TRAILING whitespace stripped, so a LEADING indent disqualifies the line while a
@@ -644,10 +691,19 @@ const MARKERS: Record<Stage, Record<string, (note: string) => StageOutcome>> = {
 // accepted there and only there.
 const MARKER_LINE = /^([A-Z][A-Z-]*):\s*(.*)$/;
 
-// A fenced-code delimiter. Markers inside a fence are QUOTED, not reported (see
-// the scan), and a fence's contents sit at column 0 -- so the leading-whitespace
-// rule above does nothing about them and this is the check that does.
-const FENCE_LINE = /^\s*(```|~~~)/;
+// A fenced-code delimiter, captured as its full RUN of backticks or tildes.
+// Markers inside a fence are QUOTED, not reported (see the scan), and a fence's
+// contents sit at column 0 -- so the leading-whitespace rule above does nothing
+// about them and this is the check that does.
+//
+// The run length is captured, not just the first three characters, because a plain
+// boolean toggle is wrong on nested fences and that is not hypothetical: an agent
+// documenting the exit contract writes ````markdown ... ``` ... ``` ... ```` , and
+// a toggle flips OFF at the inner delimiter, so the marker inside the real code
+// block reads as a live verdict. CommonMark's own rule is the fix -- a fence closes
+// only on a run of the SAME character at least as long as the opener -- so the
+// inner ``` cannot close a ```` block.
+const FENCE_LINE = /^\s*(`{3,}|~{3,})/;
 
 // A marker payload that is still the exit contract's own placeholder, e.g.
 // `BUILT: <one-line summary>`. A stage that pastes one line of its instructions is
@@ -707,7 +763,7 @@ export function parseStageResult(stage: Stage, finalMessage: string): StageOutco
   const first = firstIdx === -1 ? "" : lines[firstIdx]!.trim();
   const m = first.match(MARKER_LINE);
   const leading = m ? MARKERS[stage][m[1]!] : undefined;
-  if (m && leading) return leading(markerNote(lines, firstIdx, m[2]!));
+  if (m && leading) return leading(markerNote(lines, firstIdx, m[2]!), m[2]!);
 
   // #307: a stage that did the work, spelled its marker correctly, and put it
   // anywhere but line 1 used to be CONFUSED by definition -- and CONFUSED skips
@@ -740,23 +796,43 @@ export function parseStageResult(stage: Stage, finalMessage: string): StageOutco
   // The residual, stated plainly: a stage that writes a fully-formed marker line at
   // column 0 in the middle of prose that disowns it ("if the tests pass I will
   // write REVIEW-APPROVE: confidence=95 ...") is still read as reporting it. That
-  // shape appears zero times in the corpus, and refusing it costs 80 real tickets,
-  // so it is accepted deliberately. It is bounded on the two verdicts that can do
-  // damage: `built` is re-verified against the lane worktree (builtGuardFailure) and
-  // `review-approve` is scored against the confidence floor and skeptic quorum.
-  // `qa-pass` and `merged` are NOT re-verified -- see the docs note on #307.
+  // shape appears zero times in the corpus, and refusing it outright costs 80 real
+  // tickets, so it is accepted -- but only where it is bounded, and each bound is a
+  // mechanism rather than a hope:
+  //   built           re-verified against the lane worktree (builtGuardFailure).
+  //   review-approve  scored off the MARKER LINE only, so a narrated or quoted
+  //                   number cannot vouch for it; a bare approve scores null, which
+  //                   the truth-check gate refuses to merge on.
+  //   merged          CLOSING_LINE_ONLY -- terminal and never re-read, so it does
+  //                   not get the loose rule at all.
+  //   qa-pass         unbounded here BY CHOICE, and the one verdict where the
+  //                   residual is live: 17 real mid-message occurrences make the
+  //                   strict rule expensive, and a false pass still has to clear
+  //                   the blinded reviewer and then the merge gate's own suite run.
+  //                   The open hazard is a QA agent ECHOING a marker line out of the
+  //                   ticket's own Acceptance Criteria (this repo files tickets that
+  //                   contain them -- #307 does). Closing that needs the stage's
+  //                   input payload here, which this function does not have; see the
+  //                   #307 follow-up note in docs/user-guide/troubleshooting.md.
   const hits: { idx: number; marker: string; rest: string }[] = [];
   let quoted = 0;
-  let inFence = false;
+  // The OPEN fence's delimiter run, or null outside a fence. CommonMark's closing
+  // rule (same character, at least as long) so a nested shorter fence cannot open
+  // the block back up -- see FENCE_LINE.
+  let fence: string | null = null;
+  let lastNonEmpty = -1;
   for (const [idx, line] of lines.entries()) {
     const trimmedEnd = line.replace(/\s+$/, "");
-    if (FENCE_LINE.test(trimmedEnd)) {
-      inFence = !inFence;
+    if (trimmedEnd !== "") lastNonEmpty = idx;
+    const delim = trimmedEnd.match(FENCE_LINE)?.[1];
+    if (delim) {
+      if (fence === null) fence = delim;
+      else if (delim[0] === fence[0] && delim.length >= fence.length) fence = null;
       continue;
     }
     const hit = trimmedEnd.match(MARKER_LINE);
     if (!hit || !MARKERS[stage][hit[1]!]) continue;
-    if (inFence || PLACEHOLDER_PAYLOAD.test(hit[2]!.trim())) {
+    if (fence !== null || PLACEHOLDER_PAYLOAD.test(hit[2]!.trim())) {
       quoted++;
       continue;
     }
@@ -779,7 +855,13 @@ export function parseStageResult(stage: Stage, finalMessage: string): StageOutco
   }
 
   const last = hits[hits.length - 1];
-  if (last) return MARKERS[stage][last.marker]!(scanMarkerNote(lines, last.idx, last.rest));
+  if (last && CLOSING_LINE_ONLY[stage]?.has(last.marker) && last.idx !== lastNonEmpty) {
+    return {
+      kind: "confused",
+      note: `Stage "${stage}" mentioned ${last.marker} on a line of its own but did not CLOSE with it. ${last.marker} is terminal and nothing re-reads it, so the loop only accepts it as the first or the last line -- put it on line 1. Message began: ${JSON.stringify(snippet)}`,
+    };
+  }
+  if (last) return MARKERS[stage][last.marker]!(scanMarkerNote(lines, last.idx, last.rest), last.rest);
 
   // A stage whose ONLY markers were quoted ones gets told that, rather than the
   // generic "no marker" note: the difference is what a human needs to recover the

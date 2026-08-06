@@ -193,7 +193,7 @@ findings reach the rebuilding builder whichever side they were written on.
 Measured over this repo's own retained transcripts, that rescues 135 of 507 real
 stage messages and changes no other verdict.
 
-Three cases deliberately still skip:
+Four cases deliberately still skip:
 
 - **No marker anywhere.** The stage did not finish (the classic shape is an agent
   that backgrounded `bun test` and ended its turn to await a notification nobody
@@ -206,6 +206,12 @@ Three cases deliberately still skip:
   verdicts and nothing can say which it meant. Skip note:
   `reported 2 different exit markers (…), none of them on the first line`. Fix it by
   hand; do not guess.
+- **A `MERGED` that is neither the first nor the closing line.** Skip note:
+  `mentioned MERGED on a line of its own but did not CLOSE with it`. `MERGED` is the
+  only marker held to that stricter rule, because it is terminal — it sets the ticket
+  Done, and batch cleanup then deletes the branch — and nothing re-reads the PR
+  state. Check the PR yourself: if it really did land, move the ticket to Done by
+  hand; if it did not, return the ticket to Ready.
 
 Two things that are **not** markers, so they never rescue a ticket: a marker inside a
 sentence (`I will report BUILT: once the suite finishes` — it has to start its own
@@ -214,11 +220,19 @@ indented; the scan below it is not.
 
 The one shape that will read as a verdict when you might not want it to: a
 fully-formed marker line at column 0 sitting in prose that disowns it. Zero
-occurrences in this repo's corpus, against the 80 real tickets that refusing it would
-cost, so it is accepted on purpose. `BUILT` is re-verified against the lane worktree
-and `REVIEW-APPROVE` is scored, but `QA-PASS` and `MERGED` are not — so if a lane
-advanced or a ticket went Done and you cannot find the work, read that stage's
-transcript first.
+occurrences in this repo's corpus, against the 80 real tickets that refusing it
+outright would cost, so it is accepted on purpose — but each verdict that could do
+damage has a mechanism behind it. `BUILT` is re-verified against the lane worktree,
+`REVIEW-APPROVE` is scored off its own marker line only (so a number in prose or in a
+quoted diff cannot vouch for it, and a bare approve scores null and will not merge),
+and `MERGED` is restricted to the first or closing line.
+
+`QA-PASS` is the exception, deliberately: it keeps the loose rule, and a false pass is
+bounded only by the blinded reviewer and the merge gate's own suite run downstream.
+The known hazard is a QA agent **echoing** a marker line out of the ticket's own
+Acceptance Criteria — and this repo files tickets that contain them. If a lane
+advanced past QA and you cannot find evidence the criteria were exercised, read that
+stage's transcript first.
 
 For the first case, recover it exactly as the dead-worker section below describes. For
 the others, read the stage's transcript
