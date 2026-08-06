@@ -7,7 +7,7 @@ import { test, expect, describe } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveSlug } from "../lib/config.ts";
-import { applyAction, type LoopState } from "../lib/loop.ts";
+import { applyAction, STATUS_FOR_STAGE, type LoopState } from "../lib/loop.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const zLoop = () => readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
@@ -609,9 +609,13 @@ describe("#205: the advance row moves the board to the new stage's status", () =
     expect(row).toContain("STATUS_FOR_STAGE[S]");
     // Every stage's target named, merge included -- merge has no column of its
     // own, and "what does an advance to merge write" is the question a reader
-    // would otherwise have to answer by reading lib/loop.ts.
-    for (const pair of ["`builder`→`Building`", "`qa`→`QA`", "`reviewer`→`Review`", "`merge`→`Review`"]) {
-      expect(row).toContain(pair);
+    // would otherwise have to answer by reading lib/loop.ts. DERIVED from the
+    // map the row promises to mirror, not a frozen copy of it: a literal list
+    // would keep passing against a row naming the wrong status after
+    // STATUS_FOR_STAGE changed, which is the exact drift this canary exists to
+    // catch -- and a newly added Stage now fails here until the row documents it.
+    for (const [stage, status] of Object.entries(STATUS_FOR_STAGE)) {
+      expect(row).toContain(`\`${stage}\`→\`${status}\``);
     }
   });
 
@@ -638,17 +642,31 @@ describe("#205: the advance row moves the board to the new stage's status", () =
 
   // `--if-present` means the move can report moved:false, and after the apply
   // the lane has already advanced -- so the recovery is a stop-lane applied
-  // next, carrying #273's dropTicket, and NO stage spawn.
-  test("the row's moved:false recovery drops the lane and spawns nothing", () => {
+  // next, carrying #273's dropTicket, and NO stage spawn. The row DELEGATES to
+  // the shared `--if-present` block rather than copying its JSON: one payload,
+  // one place to change. So the canary checks both halves of that delegation --
+  // the row points at the block and adds the spawn bar, and the block still owns
+  // the dropTicket payload and now enumerates the advance row as a caller.
+  test("the row's moved:false recovery delegates to the shared --if-present block, and spawns nothing", () => {
     const row = advanceRow();
     expect(row).toContain("moved:false");
-    expect(row).toContain('"dropTicket":true');
-    expect(row).toMatch(/do NOT spawn stage S/);
+    expect(row).toMatch(/shared `--if-present` recovery above/);
+    expect(row).toMatch(/do \*\*not\*\* spawn stage S/);
+    expect(row).not.toContain('"dropTicket":true'); // the block owns it, not this row
+
+    const shared = section(zLoop(), "**Lane moves are `--if-present` (#138).**");
+    expect(shared).toContain('"dropTicket":true');
+    expect(shared).toContain("the `advance` row's step-3 move"); // enumeration kept current
   });
 
   // The tick output carries the same derivation, so a skipped move is visible
-  // on the spot rather than a stage later as a rebuild.
-  test("the row points at the owed-write line `apply` prints", () => {
-    expect(advanceRow()).toContain("board write for #<N> = <status>");
+  // on the spot rather than a stage later as a rebuild. Pinned against the
+  // PRODUCING format string, not a second copy of it: reword the print and this
+  // goes red, instead of leaving the orchestrator hunting for a line lib/loop.ts
+  // no longer emits.
+  test("the row points at the owed-write line `apply` prints, using that line's own prefix", () => {
+    const PREFIX = "board write for #";
+    expect(readFileSync(join(REPO_ROOT, "lib", "loop.ts"), "utf8")).toContain(`\`${PREFIX}$\{owed.ticket}`);
+    expect(advanceRow()).toContain(PREFIX);
   });
 });

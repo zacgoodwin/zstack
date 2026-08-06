@@ -359,15 +359,16 @@ action owes (`board write for #N = QA — …`) so a skipped move shows up in th
 tick output instead of a stage later as a rebuild.
 
 To repair a run that already drifted, move the ticket to the status its lane is
-actually at — `z-board move <N> QA --if-present --slug <slug>` — and the next
+actually at — `bin/z-board move <N> QA --if-present --slug <slug>` — and the next
 tick's ingest clears the marker. Nothing else needs undoing; the move is
 idempotent, and running it when the board already agrees costs one no-op call.
 
 Not this: a crashed run whose lane **lock** is still on disk does not take the
 re-claim path at all. `/z-loop` refuses to start on orphans, and `--reconcile`
-releases and parks that ticket back to Ready by design (see
+parks an in-flight ticket back to Ready by design (see
 `--reconcile (crash recovery)` in the z-loop guide) — a full rebuild, and a
-separate question from this one.
+separate question from this one. A crashed lane whose ticket already reached a
+terminal status is only pruned and unlocked; reconcile never reopens it.
 
 ## Done tickets are still open on the board
 

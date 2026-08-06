@@ -79,6 +79,7 @@ import {
 } from "../lib/transcripts.ts";
 import { SPAWN_TAG_MARKER } from "../lib/stage-prompts.ts";
 import { isWorkableStatus } from "../lib/lanes.ts";
+import { defaultLoopDir } from "../lib/throttle.ts";
 import { validateConfig } from "../lib/config-schema.ts";
 import {
   claimableTickets,
@@ -2890,16 +2891,37 @@ describe("#205: every stage transition writes the board", () => {
     expect(slugFromStatePath("/tmp/scratch/state.json", { ZSTACK_SLUG: "" })).toBeUndefined();
     // the path wins over a stale env var pointing at another project
     expect(slugFromStatePath("/home/z/.zstack/projects/zstack/loop/state.json", { ZSTACK_SLUG: "other" })).toBe("zstack");
+    // The result is interpolated into a command line a human or the orchestrator
+    // RUNS, so a segment outside the slug charset must not become a --slug
+    // argument. Refusing to match is the safe direction: the line then carries no
+    // --slug and resolveSlug fails loudly at the point of use, instead of a
+    // whitespace split or a metacharacter riding into the shell.
+    expect(slugFromStatePath("/home/z/.zstack/projects/my app/loop/state.json", {})).toBeUndefined();
+    expect(slugFromStatePath("/home/z/.zstack/projects/a;rm -rf ~/loop/state.json", {})).toBeUndefined();
+    // ...and it falls back rather than inventing one, same as any other non-match
+    expect(slugFromStatePath("/home/z/.zstack/projects/my app/loop/state.json", { ZSTACK_SLUG: "real" })).toBe("real");
+    // The regex hardcodes the on-disk layout that lib/throttle.ts defaultLoopDir
+    // CONSTRUCTS, and nothing else couples them -- so a layout change would make
+    // this return undefined silently and drop --slug from a repair line the
+    // comment above calls load-bearing. Drive the real constructor instead of a
+    // hand-written path, so the move breaks a test rather than degrading quietly.
+    expect(slugFromStatePath(join(defaultLoopDir("acme-app", "/home/z"), "state.json"), {})).toBe("acme-app");
   });
 
+  // The contract stated as literals, NOT re-derived from the map the function
+  // reads -- an assertion built out of STATUS_FOR_STAGE survives any mutation
+  // that keeps a STATUS_FOR_STAGE lookup (swapping action.to for action.stage,
+  // say), which is most of them.
   test("boardWriteFor derives STATUS_FOR_STAGE for claim and advance, at every stage", () => {
+    const EXPECTED: Record<Stage, BoardStatus> = { builder: "Building", qa: "QA", reviewer: "Review", merge: "Review" };
+    // merge is in that table on purpose: it has no column of its own, it runs
+    // under Review (Done means the PR landed), so advancing to merge re-writes
+    // Review and is a no-op on the board.
+    expect(EXPECTED).toEqual(STATUS_FOR_STAGE);
     for (const stage of STAGES) {
-      expect(boardWriteFor({ kind: "claim", ticket: 7, stage })).toEqual({ ticket: 7, status: STATUS_FOR_STAGE[stage] });
-      expect(boardWriteFor({ kind: "advance", ticket: 7, to: stage })).toEqual({ ticket: 7, status: STATUS_FOR_STAGE[stage] });
+      expect(boardWriteFor({ kind: "claim", ticket: 7, stage })).toEqual({ ticket: 7, status: EXPECTED[stage] });
+      expect(boardWriteFor({ kind: "advance", ticket: 7, to: stage })).toEqual({ ticket: 7, status: EXPECTED[stage] });
     }
-    // Named explicitly because merge has no column of its own -- it runs under
-    // Review (Done means the PR landed), so advancing to merge re-writes Review.
-    expect(boardWriteFor({ kind: "advance", ticket: 7, to: "merge" })).toEqual({ ticket: 7, status: "Review" });
   });
 
   // The coupling that makes a marker clearable at all, as a biconditional driven
@@ -3004,7 +3026,9 @@ describe("#205: every stage transition writes the board", () => {
   // gone (a stop-lane'd lane, or one a previous --reconcile pruned), so nothing
   // marks it as crashed and the fresh invocation just ingests the board and
   // claims. A ticket that still holds its lock takes the --reconcile path
-  // instead, which parks it back to Ready by design (lib/reconcile.ts).
+  // instead, which parks an in-flight one back to Ready by design (a lock whose
+  // ticket already reached a TERMINAL status is only pruned and unlocked --
+  // lib/reconcile.ts reconcilePlan).
   test("AC2: a lane advanced to qa, then killed, resumes at `qa` and never re-claims as a builder -- because the advance wrote the board", () => {
     const board = new Map<number, BoardStatus>([[1, "Building"]]);
     let live = state([ticket(1, "Building")], [lane(1, "builder", { outcome: { kind: "built" } })]);
@@ -3032,6 +3056,22 @@ describe("#205: every stage transition writes the board", () => {
     expect(nextAction(ingestBoardItems(null, asItems(rBoard), { "2": "" }), 0)).toEqual({ kind: "claim", ticket: 2, stage: "reviewer" });
   });
 
+  // The one stage the board write does NOT restore, pinned so it cannot change
+  // unnoticed. merge owns no column -- it runs under Review -- so the advance
+  // into it writes `Review`, and CLAIMABLE_STAGE maps Review back to `reviewer`.
+  // A lane that reached merge and then died therefore re-claims as a REVIEWER
+  // and re-pays one adversarial review of a diff that was already approved. That
+  // is strictly cheaper than the builder rebuild this ticket removes, and it is
+  // inherent to merge having no status of its own (out of scope here: the nine
+  // canonical statuses), but it is the residual cost, not a fixed one.
+  test("known limit: a lane advanced to merge, then killed, resumes as a REVIEWER -- merge owns no board column", () => {
+    const board = new Map<number, BoardStatus>([[3, "Review"]]);
+    performRow(board, { kind: "advance", ticket: 3, to: "merge" });
+    expect(board.get(3)).toBe("Review");
+    expect(claimStage("Review")).toBe("reviewer");
+    expect(nextAction(ingestBoardItems(null, asItems(board), { "3": "" }), 0)).toEqual({ kind: "claim", ticket: 3, stage: "reviewer" });
+  });
+
   // AC3: the legality check is unchanged, and the row's ordering keeps it in
   // FRONT of the board. `apply` validates the transition through canTransition
   // and throws exactly as it does today; the orchestrator only moves the board
@@ -3052,7 +3092,7 @@ describe("#205: every stage transition writes the board", () => {
   // so the board is exactly one hop BEHIND a lane that names the write it owes.
   // That is the shape #125's origin marker was built for, so the existing guard
   // resyncs on the next tick and the advance proceeds with the lane's stage,
-  // bounce counters and pending notes intact -- no stop-lane, no re-claim, no
+  // bounce counters intact -- no stop-lane, no re-claim, no
   // rebuild. Pinned here because the ordering is a choice: move the board FIRST
   // and this window inverts to board-ahead-of-lane, which isOneHopLag does not
   // model and which therefore stop-lanes (losing qaBounces and qaNotes).
@@ -4241,7 +4281,7 @@ describe("loop CLI", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("applied advance #1");
     expect(stdout).toContain("board write for #1 = QA");
-    expect(stdout).toContain("z-board move 1 QA --if-present");
+    expect(stdout).toContain(`"$Z_BOARD" move 1 QA --if-present`);
   });
 
   // The printed line has to be runnable as printed: lib/config.ts resolveSlug
@@ -4252,7 +4292,27 @@ describe("loop CLI", () => {
   test("apply's printed board move carries --slug, derived from the state path (#205)", () => {
     const s = state([ticket(1, "Building")], [lane(1, "builder", { outcome: { kind: "built" } })]);
     const { stdout } = runApply("advance", s, { kind: "advance", ticket: 1, to: "qa" }, join("projects", "acme-app", "loop"));
-    expect(stdout).toContain("z-board move 1 QA --if-present --slug acme-app");
+    expect(stdout).toContain(`"$Z_BOARD" move 1 QA --if-present --slug "acme-app"`);
+  });
+
+  // The env fallback is what covers a state path that is not under
+  // ~/.zstack/projects/<slug>/loop/, and it rides `slugFromStatePath`'s DEFAULT
+  // `env = process.env` binding -- which every other test replaces, so nothing
+  // exercised it end to end. Without this, changing that default to `{}` is
+  // green across the whole suite while the real loop silently loses its slug.
+  test("apply falls back to ZSTACK_SLUG when the state path names no project (#205)", () => {
+    const s = state([ticket(1, "Building")], [lane(1, "builder", { outcome: { kind: "built" } })]);
+    const statePath = join(dir, "envfallback-state.json");
+    const actionPath = join(dir, "envfallback-action.json");
+    writeFileSync(statePath, JSON.stringify(s));
+    writeFileSync(actionPath, JSON.stringify({ kind: "advance", ticket: 1, to: "qa" }));
+    const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "apply", statePath, actionPath, "--now", "0"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, ZSTACK_SLUG: "env-slug" },
+    });
+    expect(proc.exitCode).toBe(0);
+    expect(proc.stdout.toString()).toContain(`"$Z_BOARD" move 1 QA --if-present --slug "env-slug"`);
   });
 
   test("apply prints the owed write for a claim, and nothing for an action that owns no stage status (#205)", () => {

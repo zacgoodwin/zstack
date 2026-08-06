@@ -1719,10 +1719,13 @@ function dropLane(state: LoopState, n: number): void {
 // The reducer is pure and lib/board.ts is the pack's sole gh caller, so applying
 // a `claim`/`advance` only RECORDS the transition: it stamps the new status on
 // the state file and stamps lane.lastWroteStatus (#125's origin marker). Every
-// other kind is undefined -- park/skip/complete carry their own literal target
-// status on the action and their rows write that directly; these two are the
-// only ones whose target is DERIVED from STATUS_FOR_STAGE, which is exactly why
-// the derivation belongs here and not in a SKILL row's prose.
+// other kind is undefined -- park/skip/complete each write a status their own
+// row already names literally (the action's `status` for park, "Skipped" and
+// "Done" hardcoded in the reducer for the other two), and `respawn` writes
+// nothing at all because it re-enters the stage the lane is already on. `claim`
+// and `advance` are the only kinds whose target is DERIVED from
+// STATUS_FOR_STAGE, which is exactly why the derivation belongs here and not in
+// a SKILL row's prose.
 //
 // #205: the `advance` row named no move at all, so after every stage transition
 // the board sat a stage behind its lane -- permanently, since the marker only
@@ -1759,8 +1762,14 @@ export function boardWriteFor(action: Action): { ticket: number; status: BoardSt
 // "Multiple zstack projects configured" whenever ~/.zstack/projects holds more
 // than one project, so a printed `z-board move` without `--slug` is not runnable
 // on the machines the loop actually runs on.
+// The segment is matched against the slug charset rather than `[^/]+` on
+// purpose: the result is interpolated into a command line a human or the
+// orchestrator RUNS, so a path segment holding a space or a shell metacharacter
+// must not become a `--slug` argument. Refusing to match is the safe direction --
+// the printed line then carries no --slug, and `resolveSlug` fails loudly at the
+// point of use instead of quietly naming some other configured project.
 export function slugFromStatePath(statePath: string, env: Record<string, string | undefined> = process.env): string | undefined {
-  const m = statePath.replace(/\\/g, "/").match(/\/projects\/([^/]+)\/loop\//);
+  const m = statePath.replace(/\\/g, "/").match(/\/projects\/([A-Za-z0-9._-]+)\/loop\//);
   return m ? m[1] : env.ZSTACK_SLUG || undefined;
 }
 
@@ -3383,12 +3392,18 @@ export function main(argv: string[]): number {
       // later as a rebuild. The line carries --slug because resolveSlug throws
       // on a multi-project machine, and it is `--if-present` and idempotent, so
       // running it when the board already agrees costs one no-op call.
+      //
+      // It names `"$Z_BOARD"`, not a bare `z-board`: the reader is the
+      // orchestrator, `setup` never puts the pack's bin/ on PATH, and every
+      // executable invocation in z-loop/SKILL.md goes through that variable
+      // (Step 0 sets it to "$PACK/bin/z-board"). The SKILL row tells the agent to
+      // run exactly what this line names, so it has to be runnable as printed.
       const owed = boardWriteFor(action);
       if (owed) {
         const slug = slugFromStatePath(statePath);
         console.log(
           `board write for #${owed.ticket} = ${owed.status} -- run it now unless this action's row already did: ` +
-            `z-board move ${owed.ticket} ${owed.status} --if-present${slug ? ` --slug ${slug}` : ""}`
+            `"$Z_BOARD" move ${owed.ticket} ${owed.status} --if-present${slug ? ` --slug "${slug}"` : ""}`
         );
       }
       return 0;

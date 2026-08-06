@@ -76,26 +76,33 @@ records the result. It never re-derives a scheduling decision in prose.
   stacked child's PR retarget survives.
 - **Every stage transition writes the board, because that is where a resumed run
   reads the stage from.** The board status is a write-through projection of
-  `state.json`, so each of the two actions that place an agent on a lane — the
-  `claim` and the `advance` — issues its own `z-board move` to
+  `state.json`, so the two actions that move a lane ONTO a stage — the `claim`
+  and the `advance` — each issue their own `z-board move` to
   `STATUS_FOR_STAGE[stage]`: `builder`→Building, `qa`→QA, `reviewer`→Review, and
   `merge`→Review too (merge has no column of its own; Done means the PR landed,
-  so an advance into merge re-writes Review and is a no-op on the board). This is
-  not cosmetic. A ticket that is on the board with no lane behind it — a lane the
-  loop stopped mid-run, or one a previous run left behind — is re-claimed at
-  `claimStage(status)`, the stage its **board status** names. Leave the board at
-  Building while the lane has moved on to QA and that re-claim spawns a
-  *builder*, which rebuilds work that is already committed and pushed (#205;
-  #164 burned $1.35 on exactly that). The move is part of the row, so the two
-  cannot drift: `loop apply` prints the write each action owes
-  (`board write for #N = QA — … z-board move N QA --if-present --slug …`),
-  derived in code from `STATUS_FOR_STAGE`, and running it again when the board
-  already agrees costs one no-op call. The `advance` row applies *before* it
-  moves, so the transition is validated (an illegal one throws and the board is
-  never touched) and a crash in the gap leaves the board exactly one hop behind a
-  lane that still names the write it owes — the lagged-write shape the desync
-  guard below already resyncs, with the lane's stage, bounce counters and pending
-  notes intact.
+  so an advance into merge re-writes Review and is a no-op on the board). A #209
+  re-spawn writes nothing: it is a fresh agent at the stage the lane is already
+  on, so the board is already right. This is not cosmetic. A ticket that is on
+  the board with no lane behind it — a lane the loop stopped mid-run, or one a
+  previous run left behind — is re-claimed at `claimStage(status)`, the stage its
+  **board status** names. Leave the board at Building while the lane has moved on
+  to QA and that re-claim spawns a *builder*, which rebuilds work that is already
+  committed and pushed (#205; #164 burned $1.35 on exactly that). The move is
+  part of the row, so the two cannot drift: `loop apply` prints the write each
+  action owes (`board write for #N = QA — … "$Z_BOARD" move N QA --if-present
+  --slug …`), derived in code from `STATUS_FOR_STAGE`, and running it again when
+  the board already agrees costs one no-op call.
+  The `advance` row applies *before* it moves, so the transition is validated (an
+  illegal one throws and the board is never touched) and a crash in the gap
+  leaves the board exactly one hop behind a lane that still names the write it
+  owes — the lagged-write shape the `#110/#116/#125` stage/status desync guard in
+  `lib/loop.ts` resyncs at that lane's next **stage boundary**, keeping its stage
+  and bounce counters (the guard only judges a lane with a recorded outcome, so
+  the board stays behind for the rest of the running stage).
+  One stage this does not rescue: merge shares Review, so a lane that died at the
+  merge stage is re-claimed as a *reviewer* and re-pays one review of an already
+  approved diff. That is inherent to merge having no column, and far cheaper than
+  the builder rebuild above, but it is the residual cost rather than a fixed one.
 - **A board status the loop does not know is evidence, not an error.** The nine
   canonical statuses are the whole state machine, but the board is yours: add a
   staging queue or a triage column and the loop ignores any ticket sitting in
