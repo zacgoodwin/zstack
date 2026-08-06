@@ -18,6 +18,7 @@ import {
   type GhProc,
 } from "../lib/board.ts";
 import { ZError } from "../lib/config.ts";
+import { parseAssignees } from "../lib/loop.ts";
 import { loadConfig, resolveSlug, type BoardConfig } from "../lib/config.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
@@ -1888,6 +1889,88 @@ describe("prState (#272)", () => {
         console.error = realErr;
       }
     });
+  });
+});
+
+// -- assignees (#223): the read-only claim check ------------------------------
+// The one command the loop's `confirm-claim` row calls. Two properties carry the
+// safety weight: it MUTATES NOTHING (the ticket it asks about may belong to
+// another session), and a failed read THROWS rather than returning an empty set
+// -- an empty set is precisely what clears a foreign-claim flag, so a failure
+// that looked like "unassigned" would hand a live claim to the asking loop.
+describe("assignees", () => {
+  test("returns the live login list without mutating the issue", async () => {
+    const backend = claimBackend(["alice", "bob"]);
+    const board = new Board(CFG, backend.exec);
+    expect(await board.assignees(9)).toEqual(["alice", "bob"]);
+    expect(backend.assignees).toEqual(["alice", "bob"]);
+    expect(backend.calls.filter((c) => c.op === "AddAssignees" || c.op === "RemoveAssignees")).toEqual([]);
+  });
+
+  test("an unassigned issue reads as an empty list", async () => {
+    const board = new Board(CFG, claimBackend().exec);
+    expect(await board.assignees(9)).toEqual([]);
+  });
+
+  test("a deleted or transferred issue throws instead of reading as unassigned", async () => {
+    const board = new Board(CFG, makeExecutor({ overrides: { IssueLookup: { repository: { issue: null } } } }));
+    await expect(board.assignees(9)).rejects.toThrow(/not found/);
+  });
+
+  test("an assignee set too large to page throws rather than reading short", async () => {
+    // #148's ceiling, inherited through lookup(): a truncated set could omit the
+    // very login that holds the claim.
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        overrides: {
+          IssueLookup: {
+            repository: {
+              issue: {
+                id: "I_9",
+                number: 9,
+                title: "t",
+                body: "",
+                assignees: { pageInfo: { hasNextPage: true }, nodes: [{ login: "alice" }] },
+                projectItems: { pageInfo: { hasNextPage: false }, nodes: [{ id: "PVTI_9", project: { number: 1 } }] },
+              },
+            },
+          },
+        },
+      })
+    );
+    await expect(board.assignees(9)).rejects.toThrow(/assignees for issue #9/);
+  });
+
+  test("the CLI prints one JSON line in the shape `loop claim-confirmed` parses", async () => {
+    const printed: string[] = [];
+    const log = console.log;
+    console.log = (...a: unknown[]) => void printed.push(a.join(" "));
+    try {
+      expect(await main(["assignees", "9"], () => new Board(CFG, claimBackend(["alice"]).exec))).toBe(0);
+    } finally {
+      console.log = log;
+    }
+    expect(printed.length).toBe(1);
+    expect(printed[0]).not.toContain("\n");
+    expect(JSON.parse(printed[0])).toEqual({ number: 9, assignees: ["alice"] });
+    // The `number` is not decoration: parseAssignees checks it against the ticket
+    // the read is being applied to, because the orchestrator row types that
+    // number twice and an empty set folded into the wrong ticket clears a live
+    // foreign claim. Pin the producer/consumer contract from both ends here --
+    // this is the file that decides what gets printed.
+    expect(parseAssignees(JSON.parse(printed[0]), 9)).toEqual(["alice"]);
+    expect(() => parseAssignees(JSON.parse(printed[0]), 10)).toThrow(/for #9 but it is being applied to #10/);
+  });
+
+  test("the CLI requires an issue number", async () => {
+    const err = console.error;
+    console.error = () => {};
+    try {
+      expect(await main(["assignees"], () => new Board(CFG, claimBackend().exec))).toBe(1);
+    } finally {
+      console.error = err;
+    }
   });
 });
 

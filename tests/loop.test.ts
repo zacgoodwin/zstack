@@ -10,15 +10,18 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  ABANDONED_CLAIM_WATCHDOGS,
   applyAction,
   applyConfirmations,
   boardWriteFor,
   builtGuardFailure,
   canTransition,
+  claimConfirmed,
   confirmTargets,
   drainComplete,
   humanNeededStatus,
   humanNeededTripped,
+  clearsClaim,
   ingestBoardItems,
   markClaimLost,
   markHumanNeededNotified,
@@ -34,6 +37,7 @@ import {
   MERGE_GATE_MAX_RUNS,
   MERGE_GATE_RETRY_WAIT_MS,
   nextAction,
+  parseAssignees,
   parseSuiteFailCount,
   stripAnsi,
   parseReviewerConfidence,
@@ -45,6 +49,7 @@ import {
   MAX_QUORUM_RETRIES,
   STAGE_CEILING_MINUTES,
   recordActivity,
+  recordConfirmAttempt,
   recordMergeGate,
   recordOutcome,
   recordProbe,
@@ -1677,7 +1682,7 @@ describe("drain-complete", () => {
 
   test("a ticket claimed by another session is outside this batch", () => {
     let s = state([ticket(1, "Done"), ticket(2, "Building")]);
-    s = markClaimLost(s, 2);
+    s = markClaimLost(s, 2, 0);
     expect(claimableTickets(s.tickets, s.lanes)).toEqual([]);
     expect(nextAction(s, 0)).toEqual({ kind: "drain-complete" });
   });
@@ -1764,7 +1769,11 @@ describe("deadlock breaker excludes still-completable deps", () => {
     // #2 is being built by another session (claimedByOther, not Done). #1 depends
     // on it. There is no in-batch cycle -- #2 will finish elsewhere -- so #1 must
     // WAIT, not be wrongly parked Blocked as a phantom cycle.
-    const s = state([ticket(1, "Building", [2]), ticket(2, "Building", [], { claimedByOther: true })]);
+    //
+    // claimedByOtherAt: 0 keeps the flag inside its confirm throttle at nowMs 0.
+    // This case is about the wait-vs-park discriminator, not #223's read
+    // schedule; an UNSTAMPED flag is due for a confirm at any clock (AC2b).
+    const s = state([ticket(1, "Building", [2]), ticket(2, "Building", [], { claimedByOther: true, claimedByOtherAt: 0 })]);
     expect(nextAction(s, 0)).toEqual({ kind: "wait" });
   });
 
@@ -1791,7 +1800,7 @@ describe("deadlock breaker excludes still-completable deps", () => {
       ticket(1, "Building", [2]),
       ticket(2, "Building", [1]),
       ticket(3, "Building", [9]),
-      ticket(9, "Building", [], { claimedByOther: true }),
+      ticket(9, "Building", [], { claimedByOther: true, claimedByOtherAt: 0 }), // stamped: see above
     ]);
     expect(nextAction(s, 0)).toEqual({ kind: "wait" });
   });
@@ -2986,6 +2995,10 @@ describe("#205: every stage transition writes the board", () => {
       // it neither moves the ticket nor places an agent on a new stage.
       "merge-gate": [{ before: withLane("Review", "reviewer", { outcome: approve(100) }), action: { kind: "merge-gate", ticket: 1 } }],
       wait: [{ before: withLane("Building", "builder"), action: { kind: "wait" } }],
+      // #223's confirm-claim asks for ONE live assignee read on a ticket THIS
+      // loop does not own. It moves nothing and writes nothing to the board --
+      // the answer comes back through claimConfirmed, not the reducer.
+      "confirm-claim": [{ before: withLane("Building", "builder"), action: { kind: "confirm-claim", ticket: 1 } }],
       "context-clear": [{ before: withLane("Building", "builder"), action: { kind: "context-clear" } }],
       "drain-complete": [{ before: state([ticket(1, "Done")]), action: { kind: "drain-complete" } }],
     };
@@ -4666,6 +4679,182 @@ describe("loop CLI", () => {
     expect(JSON.parse(proc2.stdout.toString())).toMatchObject({ tripped: true, alreadyNotified: true });
   });
 
+  // -- #223: `claim-confirmed` CLI verb ---------------------------------------
+  describe("claim-confirmed", () => {
+    function runConfirm(statePath: string, assigneesJson: string, extra: string[] = ["--me", "me"]) {
+      const aPath = join(dir, "assignees.json");
+      writeFileSync(aPath, assigneesJson);
+      const proc = Bun.spawnSync(
+        ["bun", join(REPO_ROOT, "lib", "loop.ts"), "claim-confirmed", statePath, "1", "--assignees", aPath, "--now", "5000", ...extra],
+        { stdout: "pipe", stderr: "pipe" }
+      );
+      return { exitCode: proc.exitCode, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
+    }
+
+    function flaggedState(name: string): string {
+      const statePath = join(dir, name);
+      const s = state([ticket(1, "Ready", [], { claimedByOther: true, claimedByOtherAt: 0, claimConfirmingSince: 0 })]);
+      writeFileSync(statePath, JSON.stringify(s));
+      return statePath;
+    }
+
+    test("an unassigned read clears the flag and the next `next` claims the ticket", () => {
+      const statePath = flaggedState("confirm-empty.json");
+      const { exitCode, stdout } = runConfirm(statePath, JSON.stringify({ number: 1, assignees: [] }));
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain("claimable again");
+      expect(JSON.parse(readFileSync(statePath, "utf8")).tickets[0].claimedByOther).toBeUndefined();
+      const next = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", statePath, "--now", "5000"], { stdout: "pipe", stderr: "pipe" });
+      expect(JSON.parse(next.stdout.toString())).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+    });
+
+    test("a foreign read keeps the flag, records the login, and re-stamps the clock", () => {
+      const statePath = flaggedState("confirm-foreign.json");
+      const { exitCode, stdout } = runConfirm(statePath, JSON.stringify({ number: 1, assignees: ["someone-else"] }));
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain("someone-else");
+      expect(JSON.parse(readFileSync(statePath, "utf8")).tickets[0]).toMatchObject({
+        claimedByOther: true,
+        claimedByOtherAt: 5000,
+        claimConfirmingSince: 0,
+        claimedByOtherLogin: "someone-else",
+      });
+    });
+
+    test("an unreadable assignee file exits 1 and leaves the flag alone (never reads as unassigned)", () => {
+      const statePath = flaggedState("confirm-garbage.json");
+      const before = readFileSync(statePath, "utf8");
+      const { exitCode, stderr } = runConfirm(statePath, JSON.stringify({ oops: true }));
+      expect(exitCode).toBe(1);
+      expect(stderr).toMatch(/Refusing to read it as "unassigned"/);
+      expect(readFileSync(statePath, "utf8")).toBe(before);
+    });
+
+    // The trust boundary's readable-but-WRONG half. The orchestrator row writes
+    // `z-board assignees <N>` to a file and then re-types <N> in this command, so
+    // a transposed pair applies one ticket's live assignee set to another -- and
+    // an EMPTY set for the wrong ticket clears a live foreign claim exactly as a
+    // misparse would, handing another session's in-flight ticket to this run on
+    // the very next tick.
+    test("an assignee file for a DIFFERENT ticket exits 1 and never clears the flag", () => {
+      const statePath = flaggedState("confirm-wrong-ticket.json");
+      writeFileSync(statePath, JSON.stringify(state([ticket(1, "Ready", [], { claimedByOther: true, claimedByOtherAt: 0, claimConfirmingSince: 0, claimedByOtherLogin: "someone-else" })])));
+      const before = readFileSync(statePath, "utf8");
+      const { exitCode, stderr } = runConfirm(statePath, JSON.stringify({ number: 999, assignees: [] }));
+      expect(exitCode).toBe(1);
+      expect(stderr).toMatch(/for #999 but it is being applied to #1/);
+      expect(readFileSync(statePath, "utf8")).toBe(before);
+      const next = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", statePath, "--now", "5000"], { stdout: "pipe", stderr: "pipe" });
+      expect(JSON.parse(next.stdout.toString()).kind).not.toBe("claim");
+    });
+
+    // The mirror: applying a read to a ticket nobody flagged must not INVENT the
+    // flag. The attempt recorder has always guarded this; claimConfirmed now does
+    // too. Otherwise one transposed number both steals a claim and freezes a
+    // different workable ticket out of the batch.
+    test("a read applied to an UNFLAGGED ticket changes nothing and says so", () => {
+      const statePath = join(dir, "confirm-unflagged.json");
+      writeFileSync(statePath, JSON.stringify(state([ticket(1, "Ready")])));
+      const { exitCode, stdout } = runConfirm(statePath, JSON.stringify({ number: 1, assignees: ["someone-else"] }));
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain("nothing to confirm");
+      const after = JSON.parse(readFileSync(statePath, "utf8")).tickets[0];
+      for (const k of ["claimedByOther", "claimedByOtherAt", "claimConfirmingSince", "claimedByOtherLogin"]) {
+        expect(Object.keys(after)).not.toContain(k);
+      }
+      const next = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", statePath, "--now", "5000"], { stdout: "pipe", stderr: "pipe" });
+      expect(JSON.parse(next.stdout.toString())).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+    });
+
+    test("--me is required: without this loop's login there is no way to judge the set", () => {
+      const statePath = flaggedState("confirm-nome.json");
+      const before = readFileSync(statePath, "utf8");
+      const { exitCode, stderr } = runConfirm(statePath, JSON.stringify({ assignees: [] }), []);
+      expect(exitCode).toBe(1);
+      expect(stderr).toMatch(/--me/);
+      expect(readFileSync(statePath, "utf8")).toBe(before);
+    });
+
+    test("--assignees is required: without a read there is nothing to fold back", () => {
+      const statePath = flaggedState("confirm-noassignees.json");
+      const before = readFileSync(statePath, "utf8");
+      const proc = Bun.spawnSync(
+        ["bun", join(REPO_ROOT, "lib", "loop.ts"), "claim-confirmed", statePath, "1", "--me", "me", "--now", "5000"],
+        { stdout: "pipe", stderr: "pipe" }
+      );
+      expect(proc.exitCode).toBe(1);
+      expect(proc.stderr.toString()).toMatch(/--assignees/);
+      expect(readFileSync(statePath, "utf8")).toBe(before);
+    });
+
+    test("claim-confirm-failed on an UNFLAGGED ticket says so instead of reporting a write", () => {
+      // It takes its ticket from prose with no file to cross-check against, so a
+      // mistyped number is a real input. "attempt recorded" on the wrong number
+      // is what would let an operator believe a bound is running.
+      const statePath = join(dir, "confirm-failed-wrong.json");
+      writeFileSync(
+        statePath,
+        JSON.stringify(state([ticket(1, "Ready", [], { claimedByOther: true, claimedByOtherAt: 0, claimConfirmingSince: 0 }), ticket(2, "Ready")]))
+      );
+      const proc = Bun.spawnSync(
+        ["bun", join(REPO_ROOT, "lib", "loop.ts"), "claim-confirm-failed", statePath, "2", "--now", "5000"],
+        { stdout: "pipe", stderr: "pipe" }
+      );
+      expect(proc.exitCode).toBe(0);
+      expect(proc.stdout.toString()).toMatch(/not flagged claimedByOther.*check the ticket number/s);
+    });
+
+    // The failed-read half of the orchestrator row: no assignee file exists to
+    // fold back, so it takes no --assignees and no --me. It must never be able
+    // to CLEAR anything -- it only stamps the attempt.
+    test("claim-confirm-failed records the attempt and leaves the flag standing", () => {
+      const statePath = flaggedState("confirm-failed.json");
+      const proc = Bun.spawnSync(
+        ["bun", join(REPO_ROOT, "lib", "loop.ts"), "claim-confirm-failed", statePath, "1", "--now", "5000"],
+        { stdout: "pipe", stderr: "pipe" }
+      );
+      expect(proc.exitCode).toBe(0);
+      expect(proc.stdout.toString()).toContain("attempt recorded");
+      expect(JSON.parse(readFileSync(statePath, "utf8")).tickets[0]).toMatchObject({
+        claimedByOther: true,
+        claimedByOtherAt: 5000, // the throttle moved
+        claimConfirmingSince: 0, // the bound's anchor did not
+      });
+    });
+
+    // #223 QA pass 2, the exact CLI repro. A claim lost long before the drain
+    // first goes idle must still be ASKED about. Pass 1 anchored the bounded park
+    // on a stamp markClaimLost wrote, so this sequence parked #102 Blocked having
+    // spent zero reads -- the run-12 shape the ticket exists to remove, merely
+    // relabelled from a state.json hand-edit to a board move.
+    test("a claim lost long before the drain goes idle is confirmed, not parked unread", () => {
+      const statePath = join(dir, "late-idle.json");
+      writeFileSync(statePath, JSON.stringify(state([ticket(101, "Ready"), ticket(102, "Ready", [101]), ticket(103, "Done")])));
+      const lost = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "claim-lost", statePath, "101", "--now", "1000000"], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(lost.exitCode).toBe(0);
+      // 35 minutes later (watchdogMinutes 10, so already past the wd*3 bound), lanes idle.
+      const next = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", statePath, "--now", "3100000"], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(JSON.parse(next.stdout.toString())).toEqual({ kind: "confirm-claim", ticket: 101 });
+    });
+
+    test("claim-confirm-failed without a ticket number exits 1 and writes nothing", () => {
+      const statePath = flaggedState("confirm-failed-bad.json");
+      const before = readFileSync(statePath, "utf8");
+      const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "claim-confirm-failed", statePath], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(proc.exitCode).toBe(1);
+      expect(readFileSync(statePath, "utf8")).toBe(before);
+    });
+  });
+
   // -- #177: a BUILDER outcome may not be recorded without its git facts ------
   // The pure recordOutcome treats them as optional (a pre-#177 state file must
   // still load); this CLI edge is what makes the guard impossible to omit, the
@@ -4957,7 +5146,7 @@ describe("selectBatch (#131 ticket cap)", () => {
     const stuck = () => [
       ticket(1, "Ready", [2]),
       ticket(2, "Ready", [3]),
-      ticket(3, "Building", [], { claimedByOther: true }),
+      ticket(3, "Building", [], { claimedByOther: true, claimedByOtherAt: 0 }), // stamped: this is a cap case, not a confirm-schedule case
     ];
     // #3 is another session's, so it is never workable/admitted -- but #2, the
     // ticket that HOLDS the dep on it, now is, at every cap.
@@ -5086,7 +5275,7 @@ describe("batch-scoped claiming + drain (#131)", () => {
   test("#157: a capped stuck set blocked on another session's in-flight dep waits, never parks", () => {
     const s = state([
       ticket(1, "Ready", [2]),
-      ticket(2, "Building", [], { claimedByOther: true }),
+      ticket(2, "Building", [], { claimedByOther: true, claimedByOtherAt: 0 }), // stamped: see the deadlock-breaker cases
     ]);
     s.batchTickets = selectBatch(s.tickets, 2);
     expect(s.batchTickets).toEqual([1]); // #2 is another session's, so only #1 is admitted
@@ -6905,6 +7094,697 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
       expect(row).toContain("park N Blocked");
       expect(row).toMatch(/do NOT spawn a merge agent/i);
       expect(row).toMatch(/nonzero exit is EXPECTED/i); // exit 1 on red is the contract, not a tick failure
+    });
+  });
+});
+
+// -- #223: a released foreign claim is re-confirmed, never waited on forever ---
+//
+// `claimedByOther` is a point-in-time observation of ANOTHER login's assignee
+// set. ingest carries it forward on every re-ingest and nothing ever un-set it,
+// so once the foreign claim is released the step-6 wait branch's reasoning ("the
+// other session will finish and re-ingest will unblock it") is false: the ONE
+// input that could clear the flag is the one ingest overwrites with its own
+// carried-forward `true`. With zero lanes running, every subsequent tick returns
+// `wait` forever -- the one shape drainComplete cannot end. Run 12 hit exactly
+// this on #138/#149 and needed a hand-edited state.json to resume.
+describe("#223: re-confirming a carried-forward claimedByOther flag", () => {
+  const WD = 10; // watchdogMinutes on every fixture here
+  const MIN = 60_000;
+  const T0 = 1_000_000; // non-zero, so "absent timestamp" is distinguishable from "now"
+  const CLI_DIR = mkdtempSync(join(tmpdir(), "zstack-223-cli-"));
+  afterAll(() => rmSync(CLI_DIR, { recursive: true, force: true }));
+
+  // The livelock shape: #1 flagged claimedByOther, #2 depends on it, both Ready,
+  // no lanes -- nothing claimable, nothing in flight, work remaining.
+  const livelock = (over: Partial<TicketSnapshot> = {}) =>
+    state([ticket(1, "Ready", [], { claimedByOther: true, ...over }), ticket(2, "Ready", [1])], [], 3, WD);
+
+  // A flag already confirmed foreign once (the state claimConfirmed leaves
+  // behind). A RECORDED CONFIRM ATTEMPT -- claimConfirmingSince -- is the only
+  // thing the bounded park will ever act on.
+  const confirmedForeign = (login = "someone-else") =>
+    livelock({ claimedByOtherAt: T0, claimConfirmingSince: T0, claimedByOtherLogin: login });
+
+  const boardItem = (n: number, status: BoardStatus) => ({ number: n, title: `Ticket ${n}`, fields: { Status: status } });
+  const BODIES = { "1": "no deps", "2": "Depends on #1" };
+
+  test("AC1: the livelock -- the flag waits, and a re-ingest showing #1 plain Ready still waits", () => {
+    const s = livelock({ claimedByOtherAt: T0, claimConfirmingSince: T0 });
+    expect(nextAction(s, T0 + MIN)).toEqual({ kind: "wait" });
+    // The bulk board read carries no assignees at all, so a snapshot in which #1
+    // is simply Ready is NOT evidence the claim was released -- ingest must keep
+    // carrying the flag (dropping it would re-claim another session's ticket).
+    // That carry is precisely what pinned the wait forever.
+    const re = ingestBoardItems(s, [boardItem(1, "Ready"), boardItem(2, "Ready")], BODIES);
+    expect(re.tickets[0].claimedByOther).toBe(true);
+    expect(re.tickets[1].dependsOn).toEqual([1]);
+    expect(nextAction(re, T0 + 2 * MIN)).toEqual({ kind: "wait" });
+    // ...and this is the half that fails against main: the wait is no longer
+    // permanent. One watchdog period on, the loop asks the board instead of
+    // believing its own stale observation for the rest of the run.
+    expect(nextAction(re, T0 + WD * MIN)).toEqual({ kind: "confirm-claim", ticket: 1 });
+  });
+
+  test("AC1b: ingest carries the #223 stamps forward, not just the boolean", () => {
+    // Dropping them would reset the confirm throttle and the bounded wait on
+    // every single tick -- a read storm, and a bound that never arrives.
+    const re = ingestBoardItems(confirmedForeign(), [boardItem(1, "Ready"), boardItem(2, "Ready")], BODIES);
+    expect(re.tickets[0]).toMatchObject({
+      claimedByOther: true,
+      claimedByOtherAt: T0,
+      claimConfirmingSince: T0,
+      claimedByOtherLogin: "someone-else",
+    });
+  });
+
+  test("AC2: the confirm fires at the watchdog boundary and not before (one read per period)", () => {
+    const s = livelock({ claimedByOtherAt: T0, claimConfirmingSince: T0 });
+    expect(nextAction(s, T0 + (WD - 1) * MIN)).toEqual({ kind: "wait" });
+    expect(nextAction(s, T0 + WD * MIN)).toEqual({ kind: "confirm-claim", ticket: 1 });
+  });
+
+  test("AC2b: a state file predating #223 (no stamps at all) confirms rather than waiting or parking", () => {
+    // The upgrade path for a run already wedged: absent timestamps read as
+    // epoch-old, and with no confirmed login the bounded park cannot fire, so
+    // the first tick after the upgrade asks the board.
+    expect(nextAction(livelock(), T0)).toEqual({ kind: "confirm-claim", ticket: 1 });
+  });
+
+  test("AC3: an empty assignee set clears the flag and #1 becomes claimable", () => {
+    const now = T0 + WD * MIN;
+    const s = claimConfirmed(livelock({ claimedByOtherAt: T0, claimConfirmingSince: T0 }), 1, [], "me", now);
+    for (const k of ["claimedByOther", "claimedByOtherAt", "claimConfirmingSince", "claimedByOtherLogin"]) {
+      expect(Object.keys(s.tickets[0])).not.toContain(k);
+    }
+    expect(nextAction(s, now)).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+  });
+
+  test("AC3b: a set holding only this loop's own login clears it too (Board.claim would succeed)", () => {
+    const s = claimConfirmed(livelock({ claimedByOtherAt: T0 }), 1, ["me"], "me", T0 + WD * MIN);
+    expect(Object.keys(s.tickets[0])).not.toContain("claimedByOther");
+  });
+
+  // AC3, end to end and at the layer the defect actually lives in: two
+  // successive ingests, the claim released between them, asserting on
+  // claimableTickets (lib/lanes.ts) rather than only on nextAction's verdict.
+  // That filter is what excludes a flagged ticket from work; the whole point of
+  // the confirm is that its input can now change back.
+  test("AC3 end-to-end: ingest, confirm released, re-ingest -- #1 is in claimableTickets and the drain stops waiting", () => {
+    const board = [boardItem(1, "Ready"), boardItem(2, "Ready")];
+    // Ingest one: the flag stands, #1 is not claimable, #2 depends on it, wait.
+    let s = ingestBoardItems(livelock({ claimedByOtherAt: T0, claimConfirmingSince: T0 }), board, BODIES);
+    expect(claimableTickets(s.tickets, s.lanes).map((t) => t.number)).toEqual([]);
+    expect(nextAction(s, T0 + MIN)).toEqual({ kind: "wait" });
+    // A watchdog period on, the loop asks instead of believing itself, and the
+    // answer is that nobody holds it any more.
+    expect(nextAction(s, T0 + WD * MIN)).toEqual({ kind: "confirm-claim", ticket: 1 });
+    s = claimConfirmed(s, 1, [], "me", T0 + WD * MIN);
+    // Ingest two carries the cleared flag forward -- there is nothing left to
+    // carry -- so #1 is claimable and the drain moves.
+    s = ingestBoardItems(s, board, BODIES);
+    expect(s.tickets[0].claimedByOther).toBeUndefined();
+    expect(claimableTickets(s.tickets, s.lanes).map((t) => t.number)).toEqual([1]);
+    const next = nextAction(s, T0 + (WD + 1) * MIN);
+    expect(next).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+  });
+
+  // #256 turned watchdogMinutes into a scalar OR a per-stage object. The confirm
+  // clock has no stage of OUR own -- nobody here is running anything -- but the
+  // holder's stage is readable from the dep's board status, and that is the
+  // budget the holding lane is actually working to.
+  describe("the confirm clock under a per-stage watchdog config (#256)", () => {
+    const PER_STAGE = { builder: 30, qa: 5, reviewer: 40, merge: 15 };
+    const flaggedAt = (status: string) =>
+      ({
+        ...state(
+          [ticket(1, status as never, [], { claimedByOther: true, claimedByOtherAt: T0, claimConfirmingSince: T0 }), ticket(2, "Ready", [1])],
+          [],
+          3,
+          WD
+        ),
+        watchdogMinutes: PER_STAGE,
+      }) as LoopState;
+
+    test("resolves the HOLDER's stage from the dep's own status, not a hardcoded builder", () => {
+      // Review-time review finding: a claim is taken at whatever stage the ticket
+      // resumes at (lanes.ts CLAIMABLE_STAGE), so the holder can be a qa or
+      // reviewer lane. Keying every foreign claim to `builder` judged a live
+      // reviewer against 30 minutes instead of 40 and asked -- then parked --
+      // while it was still inside its own watchdog.
+      expect(nextAction(flaggedAt("Ready"), T0 + 29 * MIN)).toEqual({ kind: "wait" });
+      expect(nextAction(flaggedAt("Ready"), T0 + 30 * MIN)).toEqual({ kind: "confirm-claim", ticket: 1 });
+      expect(nextAction(flaggedAt("QA"), T0 + 4 * MIN)).toEqual({ kind: "wait" }); // qa: 5
+      expect(nextAction(flaggedAt("QA"), T0 + 5 * MIN)).toEqual({ kind: "confirm-claim", ticket: 1 });
+      expect(nextAction(flaggedAt("Review"), T0 + 39 * MIN)).toEqual({ kind: "wait" }); // reviewer: 40
+      expect(nextAction(flaggedAt("Review"), T0 + 40 * MIN)).toEqual({ kind: "confirm-claim", ticket: 1 });
+    });
+
+    test("the bound is 3 of the HOLDER's own periods", () => {
+      const foreign = claimConfirmed(flaggedAt("Review"), 1, ["someone-else"], "me", T0 + 40 * MIN);
+      expect(nextAction(foreign, T0 + 119 * MIN)).toEqual({ kind: "confirm-claim", ticket: 1 }); // 40*3 = 120
+      expect(nextAction(foreign, T0 + 120 * MIN)).toMatchObject({ kind: "park", ticket: 2, status: "Blocked" });
+    });
+  });
+
+  // -- review findings on this diff -----------------------------------------
+  //
+  // Six defects an independent review of this branch reproduced against the real
+  // reducer. Each case below FAILS without its fix.
+
+  test("a NEW claim loss inherits neither the old anchor nor the old login", () => {
+    // Reproduced: a ticket carrying a 10-hour-old claimConfirmingSince and
+    // `claimedByOtherLogin: "ghost"` (an earlier claim, confirmed foreign, then
+    // cleared) took ONE fresh markClaimLost and parked its dependents Blocked on
+    // the very next idle tick -- zero reads spent on the new claim, and the note
+    // naming a login that no longer held anything. One step from the hand-edit
+    // troubleshooting.md documents. Both fields describe re-confirmation of the
+    // PREVIOUS observation; a new observation inherits neither.
+    const stale = ticket(1, "Ready", [], { claimConfirmingSince: T0, claimedByOtherLogin: "ghost" });
+    const now = T0 + 10 * 60 * MIN;
+    const s = markClaimLost(state([stale, ticket(2, "Ready", [1])], [], 3, WD), 1, now);
+    expect(Object.keys(s.tickets[0])).not.toContain("claimConfirmingSince");
+    expect(Object.keys(s.tickets[0])).not.toContain("claimedByOtherLogin");
+    expect(s.tickets[0]).toMatchObject({ claimedByOther: true, claimedByOtherAt: now });
+    expect(nextAction(s, now)).toEqual({ kind: "wait" }); // asks before it ever Blocks
+  });
+
+  test("a NEW RUN re-earns the bound with a fresh read -- the park is not a one-way door", () => {
+    // Reproduced: claimConfirmingSince is set once and cleared only by a
+    // successful confirm, so the park survived every future run. The operator
+    // did exactly what the park note says ("move it back to Ready once that
+    // claim is released") and ten days later the first idle tick re-parked with
+    // the same note -- confirm-claim not emitted once across 500 ticks. The
+    // remediation the loop itself prints could not work.
+    let s = state([ticket(1, "Ready", [], { claimedByOther: true, claimedByOtherAt: T0, claimConfirmingSince: T0, claimedByOtherLogin: "alice" }), ticket(2, "Ready", [1])], [], 3, WD);
+    const bound = T0 + WD * MIN * ABANDONED_CLAIM_WATCHDOGS;
+    const park = nextAction(s, bound);
+    expect(park).toMatchObject({ kind: "park", ticket: 2, status: "Blocked" });
+    s = applyAction(s, park, bound); // the run really ends this way
+    // A new run: #2 is back to Ready, the prior batch drained.
+    s = ingestBoardItems(s, [boardItem(1, "Ready"), boardItem(2, "Ready")], BODIES);
+    expect(Object.keys(s.tickets[0])).not.toContain("claimConfirmingSince"); // the anchor resets
+    expect(s.tickets[0]).toMatchObject({ claimedByOther: true, claimedByOtherAt: T0 }); // the flag does NOT
+    const tenDaysOn = T0 + 10 * 24 * 60 * MIN;
+    expect(nextAction(s, tenDaysOn)).toEqual({ kind: "confirm-claim", ticket: 1 });
+  });
+
+  test("a clock that jumps delays the exits, never removes them", () => {
+    // Reproduced: a stamp one hour in the FUTURE (NTP step back, VM restore, a
+    // state.json from a faster-clocked machine, a stray --now) made both
+    // `nowMs - stamp` differences negative, disabling the confirm AND the park
+    // together -- `wait` forever with zero lanes, the pre-#223 spin verbatim.
+    // The two exits absorb it in opposite directions, each failing safe.
+    const ahead = T0 + 60 * MIN;
+    const s = state([ticket(1, "Ready", [], { claimedByOther: true, claimedByOtherAt: ahead, claimConfirmingSince: ahead }), ticket(2, "Ready", [1])], [], 3, WD);
+    // Throttle: an untrustworthy stamp is not evidence we read recently -> ask.
+    for (const m of [0, 30, 59]) expect(nextAction(s, T0 + m * MIN)).toEqual({ kind: "confirm-claim", ticket: 1 });
+    // Bound: not evidence we have been asking a long time either -> clamp, so a
+    // clock jump can never Block a dependent early.
+    expect(nextAction(s, T0 + 60 * MIN)).toEqual({ kind: "wait" });
+    // ...and once wall-clock passes the stamp, normal pacing resumes.
+    expect(nextAction(s, ahead + WD * MIN)).toEqual({ kind: "confirm-claim", ticket: 1 });
+  });
+
+  test("clearing a flag re-admits the freed ticket to a CAPPED batch", () => {
+    // Reproduced end to end: selectBatch filters `!claimedByOther`, so a ticket
+    // flagged at cut time was never admitted to batchTickets, and that list only
+    // shrinks. Clearing the flag left it workable but OUT OF BATCH, and the very
+    // next tick -- immediately after the targeted read this feature exists to
+    // spend -- parked the dependent with "Likely a dependency cycle in the
+    // batch". There is no cycle.
+    const prev = { ...state([ticket(1, "Ready", [], { claimedByOther: true, claimedByOtherAt: T0, claimConfirmingSince: T0 })], [], 3, WD), batchTickets: [] as number[] };
+    let s = ingestBoardItems(prev, [boardItem(1, "Ready"), boardItem(2, "Ready")], BODIES, { ticketLimit: 5 });
+    expect(s.batchTickets).toEqual([2]); // #1 excluded by the flag
+    expect(nextAction(s, T0 + WD * MIN)).toEqual({ kind: "confirm-claim", ticket: 1 });
+    s = claimConfirmed(s, 1, [], "me", T0 + WD * MIN);
+    expect(s.batchTickets).toEqual([1, 2]);
+    expect(claimableTickets(s.tickets, s.lanes, s.batchTickets).map((t) => t.number)).toEqual([1]);
+    expect(nextAction(s, T0 + (WD + 1) * MIN)).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+  });
+
+  test("an out-of-batch dep nobody depends on is NOT re-admitted (the cap still means something)", () => {
+    const prev = { ...state([ticket(1, "Ready", [], { claimedByOther: true, claimedByOtherAt: T0, claimConfirmingSince: T0 })], [], 3, WD), batchTickets: [] as number[] };
+    // #2 does NOT depend on #1 here, so freeing #1 must not widen the cap.
+    let s = ingestBoardItems(prev, [boardItem(1, "Ready"), boardItem(2, "Ready")], { "1": "no deps", "2": "no deps" }, { ticketLimit: 5 });
+    s = claimConfirmed(s, 1, [], "me", T0 + WD * MIN);
+    expect(s.batchTickets).not.toContain(1);
+  });
+
+  test("the park note reports the REAL elapsed time, not the bound it crossed", () => {
+    // A state carried in from an earlier run can be days past `wd * 3`; printing
+    // the constant told an operator the loop had tried more recently than it had.
+    const s = state([ticket(1, "Ready", [], { claimedByOther: true, claimedByOtherAt: T0, claimConfirmingSince: T0, claimedByOtherLogin: "alice" }), ticket(2, "Ready", [1])], [], 3, WD);
+    const note = (nextAction(s, T0 + 600 * MIN) as { note: string }).note;
+    expect(note).toContain("600 minutes after the first confirm attempt");
+    expect(note).not.toContain(`${WD * ABANDONED_CLAIM_WATCHDOGS} minutes`);
+  });
+
+  describe("an unverifiable read may CONFIRM a claim, never CLEAR one", () => {
+    // The wrong-ticket check only ran when the read carried a number, so the two
+    // number-less shapes were accepted for ANY ticket -- and an empty set is
+    // exactly what frees one. Requiring the number outright would reject
+    // GitHub's own raw node list, so only the CLEARING direction is refused:
+    // `me` is passed by the one state-changing caller and by nobody else.
+    test("a number-less read that would clear is refused", () => {
+      expect(() => parseAssignees([], 7, "me")).toThrow(/carries no issue number/);
+      expect(() => parseAssignees({ assignees: [] }, 7, "me")).toThrow(ZError);
+      expect(() => parseAssignees(["me"], 7, "me")).toThrow(/would CLEAR the claim/); // solely-me clears too
+    });
+
+    test("a number-less read that would NOT clear still works (the debug shapes survive)", () => {
+      expect(parseAssignees(["someone-else"], 7, "me")).toEqual(["someone-else"]);
+      expect(parseAssignees({ assignees: [{ login: "someone-else" }] }, 7, "me")).toEqual(["someone-else"]);
+    });
+
+    test("a VERIFIED read clears exactly as before", () => {
+      expect(parseAssignees({ number: 7, assignees: [] }, 7, "me")).toEqual([]);
+      expect(() => parseAssignees({ number: 9, assignees: [] }, 7, "me")).toThrow(/for #9/);
+    });
+
+    test("read-only inspection (no `me`) is unchanged -- it cannot clear anything", () => {
+      expect(parseAssignees([], 7)).toEqual([]);
+      expect(parseAssignees({ assignees: [] }, 7)).toEqual([]);
+    });
+
+    test("clearsClaim is the ONE rule, shared by the parser guard and the reducer", () => {
+      // Two copies of "would this clear?" could disagree, and the direction they
+      // would disagree in is the destructive one.
+      for (const [set, me, expected] of [
+        [[], "me", true],
+        [["me"], "me", true],
+        [["someone-else"], "me", false],
+        [["me", "someone-else"], "me", false],
+      ] as [string[], string, boolean][]) {
+        expect(clearsClaim(set, me)).toBe(expected);
+        const s = claimConfirmed(livelock({ claimedByOtherAt: T0 }), 1, set, me, T0 + WD * MIN);
+        expect(s.tickets[0].claimedByOther === undefined).toBe(expected);
+      }
+    });
+  });
+
+  test("`next` prints the action BEFORE it stamps, so a failed write cannot kill the tick", () => {
+    // `next` was a pure reader before this ticket, so nothing was built for it
+    // failing a write. atomicWrite rethrows after three retries, and
+    // bin/z-loop-tick runs under `set -euo pipefail` -- a stamp that threw
+    // before the log took the whole drain down, every tick, for as long as the
+    // loop sat in the confirm state.
+    const src = readFileSync(join(REPO_ROOT, "lib", "loop.ts"), "utf8");
+    const arm = src.slice(src.indexOf('if (cmd === "next")'));
+    const body = arm.slice(0, arm.indexOf('if (cmd === "apply")'));
+    expect(body.indexOf("console.log(JSON.stringify(action))")).toBeLessThan(
+      body.indexOf("recordConfirmAttempt(state, action.ticket, nowMs)")
+    );
+  });
+
+  test("AC4: a live foreign claim is never stolen -- flag stays, stamp refreshes, drain waits", () => {
+    const now = T0 + WD * MIN;
+    const s = claimConfirmed(livelock({ claimedByOtherAt: T0, claimConfirmingSince: T0 }), 1, ["someone-else"], "me", now);
+    expect(s.tickets[0]).toMatchObject({
+      claimedByOther: true,
+      claimedByOtherAt: now, // re-stamped
+      claimConfirmingSince: T0, // NOT re-stamped: the bounded wait's anchor
+      claimedByOtherLogin: "someone-else",
+    });
+    expect(nextAction(s, now)).toEqual({ kind: "wait" });
+    // ...and no second read inside the same window.
+    expect(nextAction(s, now + (WD - 1) * MIN)).toEqual({ kind: "wait" });
+  });
+
+  test("two people on one issue are both recorded, and both reach the park note", () => {
+    const s = claimConfirmed(livelock({ claimedByOtherAt: T0, claimConfirmingSince: T0 }), 1, ["alice", "bob"], "me", T0 + WD * MIN);
+    expect(s.tickets[0].claimedByOtherLogin).toBe("alice, bob");
+    const note = (nextAction(s, T0 + WD * MIN * ABANDONED_CLAIM_WATCHDOGS) as { note: string }).note;
+    expect(note).toContain("alice, bob");
+  });
+
+  test("two foreign deps both due for a confirm: the lowest ticket is asked first, one at a time", () => {
+    // The park branch is covered below; this is the earlier CONFIRM branch, where
+    // both deps are past the throttle but neither is past the bound.
+    const s = state(
+      [
+        ticket(3, "Ready", [], { claimedByOther: true, claimedByOtherAt: T0, claimConfirmingSince: T0 }),
+        ticket(1, "Ready", [], { claimedByOther: true, claimedByOtherAt: T0, claimConfirmingSince: T0 }),
+        ticket(2, "Ready", [1]),
+        ticket(4, "Ready", [3]),
+      ],
+      [],
+      3,
+      WD
+    );
+    expect(nextAction(s, T0 + WD * MIN)).toEqual({ kind: "confirm-claim", ticket: 1 });
+  });
+
+  test("AC4b: a mixed set that includes us but is not solely us is still foreign", () => {
+    const s = claimConfirmed(livelock({ claimedByOtherAt: T0 }), 1, ["me", "someone-else"], "me", T0 + WD * MIN);
+    expect(s.tickets[0]).toMatchObject({ claimedByOther: true, claimedByOtherLogin: "someone-else" });
+  });
+
+  test("AC5: the wait is bounded -- 3 watchdogs after the FIRST confirm the dependent parks and the run drains", () => {
+    const firstConfirm = T0 + WD * MIN;
+    let s = claimConfirmed(livelock({ claimedByOtherAt: T0 }), 1, ["someone-else"], "me", firstConfirm);
+    // The clock runs from that first confirm, not from when the flag was set:
+    // three watchdogs after T0 is still inside the window, so it asks again.
+    expect(nextAction(s, T0 + WD * MIN * ABANDONED_CLAIM_WATCHDOGS)).toEqual({ kind: "confirm-claim", ticket: 1 });
+    const late = firstConfirm + WD * MIN * ABANDONED_CLAIM_WATCHDOGS;
+    // With one confirm on record, AC5's literal trigger is satisfied here too:
+    // claimedByOtherAt is itself older than the bound.
+    expect(late - s.tickets[0].claimedByOtherAt!).toBeGreaterThanOrEqual(WD * MIN * ABANDONED_CLAIM_WATCHDOGS);
+    const park = nextAction(s, late);
+    // The park is preferred over one more confirm (that read is due here too).
+    expect(park).toMatchObject({ kind: "park", ticket: 2, status: "Blocked" });
+    expect((park as { note: string }).note).toContain("someone-else");
+    expect((park as { note: string }).note).toContain("#1");
+    // Strictly older than the bound, not just at it.
+    expect(nextAction(s, late + MIN)).toMatchObject({ kind: "park", ticket: 2, status: "Blocked" });
+    s = applyAction(s, park, late);
+    expect(nextAction(s, late)).toEqual({ kind: "drain-complete" });
+  });
+
+  test("AC5's literal anchor is unsatisfiable under AC5's own premise -- claimConfirmingSince is the only workable one", () => {
+    // Why the shipped anchor is claimConfirmingSince and not the claimedByOtherAt
+    // AC5's summary sentence names. The two clauses of AC5 cannot both hold of
+    // claimedByOtherAt:
+    //
+    //   "the assignee set still foreign"  =>  confirms keep happening, and Plan
+    //                                          step 3 REQUIRES each foreign answer
+    //                                          to re-stamp claimedByOtherAt;
+    //   "claimedByOtherAt older than wd*3" =>  no confirm for three periods.
+    //
+    // Drive the AC's own scenario -- Plan step 4's "if the confirm KEEPS COMING
+    // BACK FOREIGN" -- and watch the stamp stay young forever while the park
+    // still arrives on time. A literal claimedByOtherAt gate would never fire
+    // here; the wait would be unbounded, which is the exact opposite of the AC.
+    let s = livelock({ claimedByOtherAt: T0 });
+    let now = T0;
+    let parked: Action | undefined;
+    let ageAtPark = -1;
+    for (let i = 0; i < 200 && !parked; i++) {
+      now += MIN;
+      const a = nextAction(s, now);
+      if (a.kind === "confirm-claim") s = claimConfirmed(s, a.ticket, ["someone-else"], "me", now); // still foreign
+      else if (a.kind === "park") {
+        parked = a;
+        ageAtPark = now - s.tickets[0].claimedByOtherAt!;
+      }
+    }
+    // AC5's observable outcome, which is what the ticket is actually asking for.
+    expect(parked).toMatchObject({ kind: "park", ticket: 2, status: "Blocked" });
+    expect((parked as { note: string }).note).toContain("someone-else");
+    expect(now).toBe(T0 + 4 * WD * MIN); // one period to the first ask, three more to the bound
+    // ...and the proof that its literal trigger could not have produced it.
+    expect(ageAtPark).toBeLessThan(WD * MIN * ABANDONED_CLAIM_WATCHDOGS);
+    expect(ageAtPark).toBe(WD * MIN); // re-stamped by the most recent foreign answer
+  });
+
+  test("AC5b: the bound needs a recorded ATTEMPT -- a flag nobody ever asked about confirms, never parks", () => {
+    // Otherwise a dependent is Blocked over a claim the loop never once checked.
+    // Two shapes reach here, and both must ask first:
+    //   a) a pre-#223 state file, no stamps at all (absent = epoch-old);
+    expect(nextAction(livelock(), T0 * 1000)).toEqual({ kind: "confirm-claim", ticket: 1 });
+    //   b) the #223 QA pass-2 regression, and the run-12 shape verbatim: a claim
+    //      lost through the real markClaimLost path long before the drain first
+    //      went idle. Pass 1 anchored the bound on a stamp markClaimLost wrote,
+    //      so this parked #2 Blocked having spent zero reads -- turning the
+    //      state.json hand-edit this ticket removes into a board move instead.
+    const lost = markClaimLost(state([ticket(1, "Building"), ticket(2, "Ready", [1])], [], 3, WD), 1, T0);
+    const wayLater = T0 + WD * MIN * ABANDONED_CLAIM_WATCHDOGS * 10;
+    expect(nextAction({ ...lost, tickets: [{ ...lost.tickets[0], status: "Ready" }, lost.tickets[1]] }, wayLater)).toEqual({
+      kind: "confirm-claim",
+      ticket: 1,
+    });
+  });
+
+  // -- the confirm read itself failing --------------------------------------
+  // A confirm that cannot complete (deleted/transferred issue, >10 assignees, a
+  // gh auth or rate-limit outage -- lib/board.ts throws on all three) decides
+  // nothing about the claim. But it must not leave the state untouched either:
+  // claimedByOtherAt is the throttle and claimConfirmingSince is the bound, so a
+  // no-op re-emits confirm-claim on EVERY tick with nothing able to end it --
+  // a gh call plus an agent turn per tick, strictly worse than the pre-#223
+  // wait this ticket removed. Recording the ATTEMPT is also the only thing that
+  // keeps the park reachable when the read never succeeds and so never yields a
+  // login to name.
+  describe("a confirm read that fails", () => {
+    test("records the attempt without deciding anything: flag, login and anchor survive", () => {
+      const s = recordConfirmAttempt(confirmedForeign(), 1, T0 + WD * MIN);
+      expect(s.tickets[0]).toMatchObject({
+        claimedByOther: true,
+        claimedByOtherLogin: "someone-else", // a failed read is never evidence of release
+        claimConfirmingSince: T0, // the bound's anchor is never re-anchored
+        claimedByOtherAt: T0 + WD * MIN, // ...but the attempt IS stamped
+      });
+    });
+
+    test("paces the retry: no second read inside the same watchdog period", () => {
+      const at = T0 + WD * MIN;
+      const s = recordConfirmAttempt(livelock({ claimedByOtherAt: T0, claimConfirmingSince: T0 }), 1, at);
+      expect(nextAction(s, at)).toEqual({ kind: "wait" });
+      expect(nextAction(s, at + (WD - 1) * MIN)).toEqual({ kind: "wait" });
+      expect(nextAction(s, at + WD * MIN)).toEqual({ kind: "confirm-claim", ticket: 1 });
+    });
+
+    test("stamps a never-asked flag's anchors, so the very first failure starts the bound", () => {
+      const s = recordConfirmAttempt(livelock(), 1, T0);
+      expect(s.tickets[0]).toMatchObject({ claimedByOtherAt: T0, claimConfirmingSince: T0 });
+      expect(s.tickets[0].claimedByOtherLogin).toBeUndefined();
+    });
+
+    test("is a no-op once the flag is gone (a late failure cannot resurrect a cleared claim)", () => {
+      const cleared = claimConfirmed(confirmedForeign(), 1, [], "me", T0 + MIN);
+      expect(recordConfirmAttempt(cleared, 1, T0 + 2 * MIN)).toEqual(cleared);
+    });
+
+    test("a permanently broken read still ends the run, parking on a bound with no login", () => {
+      // Tick hourly for 240 simulated hours, every confirm read failing, starting
+      // from a flag that has never been asked about. It must ask at least once
+      // (the pass-2 rule) and then stop: pre-#223 this returned `wait` forever,
+      // and a login-gated bound would return confirm-claim on all 240 ticks.
+      let s: LoopState = livelock({ claimedByOtherAt: T0 });
+      const log: Action[] = [];
+      let now = T0;
+      for (let h = 0; h < 240; h++) {
+        now += 60 * MIN;
+        const a = nextAction(s, now);
+        log.push(a);
+        if (a.kind === "drain-complete") break;
+        if (a.kind === "confirm-claim") s = recordConfirmAttempt(s, a.ticket, now); // the read threw
+        else s = applyAction(s, a, now);
+      }
+      const confirms = log.filter((a) => a.kind === "confirm-claim").length;
+      expect(confirms).toBeGreaterThanOrEqual(1); // the board is always asked before a dependent is Blocked
+      expect(confirms).toBeLessThan(5);
+      const park = log.find((a) => a.kind === "park") as { note: string } | undefined;
+      expect(park).toBeDefined();
+      expect(park!.note).toContain("#1");
+      expect(park!.note).toContain("no confirm read ever returned"); // no login was ever read
+      expect(park!.note).not.toContain("undefined");
+      expect(log[log.length - 1]).toEqual({ kind: "drain-complete" });
+    });
+
+    test("the pure reducer alone cannot end it -- an unrecorded ask is indistinguishable from no ask", () => {
+      // Why the driver has to record the emission. nextAction is pure, so
+      // "confirm-claim was emitted and ignored" and "the flag was never asked
+      // about" are the SAME state to it, and it must not park on that state
+      // (Blocking a dependent over a claim nobody checked is the run-12 wedge in
+      // a new costume). Left there, the invariant "at most one confirm per
+      // watchdog period" would rest entirely on SKILL.md prose. The next test is
+      // the fix; this one pins the reason it is needed.
+      const s: LoopState = livelock({ claimedByOtherAt: T0 });
+      let now = T0;
+      for (let h = 0; h < 240; h++) {
+        now += 60 * MIN;
+        expect(nextAction(s, now)).toEqual({ kind: "confirm-claim", ticket: 1 });
+      }
+      // One recorded attempt of ANY kind ends it: that is the whole contract.
+      expect(nextAction(recordConfirmAttempt(s, 1, now), now + WD * MIN * ABANDONED_CLAIM_WATCHDOGS)).toMatchObject({
+        kind: "park",
+        ticket: 2,
+        status: "Blocked",
+      });
+    });
+  });
+
+  // -- the driver records its own ask ----------------------------------------
+  // AC2 ("at most one confirm per ticket per watchdog period") and AC5 ("the
+  // wait is bounded") are unqualified, so neither may depend on the orchestrator
+  // obeying z-loop/SKILL.md Step 4. `loop next` stamps the attempt as it hands
+  // the action over, which is what makes both hold in code.
+  describe("an orchestrator that writes back NOTHING is still throttled and still bounded", () => {
+    // Exactly what the `next` CLI verb does, minute by minute: ask, and record
+    // the ask. Nothing else is ever written -- no claim-confirmed, no
+    // claim-confirm-failed, no read performed at all.
+    const drive = (s0: LoopState, ticks: number, stepMs: number) => {
+      let s = s0;
+      const log: Action[] = [];
+      let now = T0;
+      for (let i = 0; i < ticks; i++) {
+        now += stepMs;
+        const a = nextAction(s, now);
+        log.push(a);
+        if (a.kind === "drain-complete") break;
+        s = a.kind === "confirm-claim" ? recordConfirmAttempt(s, a.ticket, now) : applyAction(s, a, now);
+      }
+      return log;
+    };
+
+    test("AC2: one confirm per watchdog period, no read storm, with no answer ever recorded", () => {
+      const log = drive(livelock({ claimedByOtherAt: T0 }), 60, MIN); // a tick a minute for an hour
+      // wd = 10 min, so the first 9 minutes are inside the window and wait; the
+      // asks land on the watchdog boundaries and nowhere else.
+      expect(log.slice(0, 9).every((a) => a.kind === "wait")).toBe(true);
+      const confirmAt = log.map((a, i) => (a.kind === "confirm-claim" ? i + 1 : -1)).filter((i) => i > 0);
+      expect(confirmAt).toEqual([10, 20, 30]); // minute 10, 20, 30 -- exactly one per period
+    });
+
+    test("AC5: bounded -- ABANDONED_CLAIM_WATCHDOGS periods after the first ask it parks and drains", () => {
+      const log = drive(livelock({ claimedByOtherAt: T0 }), 60, MIN);
+      const park = log.find((a) => a.kind === "park") as { ticket: number; note: string } | undefined;
+      expect(park).toBeDefined();
+      expect(park!.ticket).toBe(2); // the DEPENDENT, never the flagged ticket itself
+      expect(park!.note).toContain("#1");
+      expect(park!.note).toContain("no confirm read ever returned"); // no login was ever read
+      expect(park!.note).not.toContain("undefined");
+      expect(log[log.length - 1]).toEqual({ kind: "drain-complete" });
+      expect(log.filter((a) => a.kind === "confirm-claim").length).toBe(ABANDONED_CLAIM_WATCHDOGS);
+    });
+
+    test("the CLI actually performs that write: a second `next` inside the window waits", () => {
+      const statePath = join(CLI_DIR, "confirm-emission.json");
+      writeFileSync(statePath, JSON.stringify(livelock({ claimedByOtherAt: T0 })));
+      const run = (now: number) => {
+        const p = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", statePath, "--now", String(now)], {
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        expect(p.exitCode).toBe(0);
+        return JSON.parse(p.stdout.toString()) as Action;
+      };
+      const first = T0 + WD * MIN;
+      expect(run(first)).toEqual({ kind: "confirm-claim", ticket: 1 });
+      const written = JSON.parse(readFileSync(statePath, "utf8")).tickets[0];
+      expect(written).toMatchObject({ claimedByOther: true, claimedByOtherAt: first, claimConfirmingSince: first });
+      expect(written.claimedByOtherLogin).toBeUndefined(); // an ask is not an answer
+      // Same watchdog period: throttled, no second gh call demanded.
+      expect(run(first + (WD - 1) * MIN)).toEqual({ kind: "wait" });
+      // ...and the bound arrives without a single outcome ever being written back.
+      expect(run(first + WD * MIN * ABANDONED_CLAIM_WATCHDOGS)).toMatchObject({ kind: "park", ticket: 2, status: "Blocked" });
+    });
+
+    test("`next` writes NOTHING for any other action (it is a reader everywhere else)", () => {
+      const statePath = join(CLI_DIR, "next-readonly.json");
+      writeFileSync(statePath, JSON.stringify(livelock({ claimedByOtherAt: T0, claimConfirmingSince: T0 })));
+      const before = readFileSync(statePath, "utf8");
+      const p = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", statePath, "--now", String(T0 + MIN)], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(JSON.parse(p.stdout.toString())).toEqual({ kind: "wait" });
+      expect(readFileSync(statePath, "utf8")).toBe(before);
+    });
+  });
+
+  // -- coverage the reviewer's mutation pass found missing ---------------------
+  test("two foreign deps park BOTH dependents, lowest ticket first, then drain", () => {
+    // Pins `.sort()` on foreignDeps and the per-dep `unclaimed.find(...)`: with a
+    // single flagged dep in every other fixture, `unclaimed[0]` and an unsorted
+    // scan both survive. Two independent claims, two dependents.
+    let s = state(
+      [
+        ticket(1, "Ready", [], { claimedByOther: true, claimedByOtherAt: T0, claimConfirmingSince: T0, claimedByOtherLogin: "alice" }),
+        ticket(3, "Ready", [], { claimedByOther: true, claimedByOtherAt: T0, claimConfirmingSince: T0, claimedByOtherLogin: "bob" }),
+        ticket(4, "Ready", [3]),
+        ticket(2, "Ready", [1]),
+      ],
+      [],
+      3,
+      WD
+    );
+    const late = T0 + WD * MIN * ABANDONED_CLAIM_WATCHDOGS;
+    const first = nextAction(s, late);
+    expect(first).toMatchObject({ kind: "park", ticket: 2, status: "Blocked" });
+    expect((first as { note: string }).note).toContain("alice");
+    s = applyAction(s, first, late);
+    const second = nextAction(s, late);
+    expect(second).toMatchObject({ kind: "park", ticket: 4, status: "Blocked" });
+    expect((second as { note: string }).note).toContain("bob");
+    s = applyAction(s, second, late);
+    expect(nextAction(s, late)).toEqual({ kind: "drain-complete" });
+  });
+
+  test("the park targets the DEPENDENT of the foreign dep, not merely the first unclaimed ticket", () => {
+    // #5 is unclaimed and lower-numbered than the real dependent #9, but depends
+    // on nothing flagged -- it is in a plain cycle with #6. `unclaimed[0]` would
+    // park #5 and leave #9 wedged behind the foreign claim forever.
+    const s = state(
+      [
+        ticket(5, "Ready", [6]),
+        ticket(6, "Ready", [5]),
+        ticket(8, "Ready", [], { claimedByOther: true, claimedByOtherAt: T0, claimConfirmingSince: T0, claimedByOtherLogin: "alice" }),
+        ticket(9, "Ready", [8]),
+      ],
+      [],
+      3,
+      WD
+    );
+    const park = nextAction(s, T0 + WD * MIN * ABANDONED_CLAIM_WATCHDOGS);
+    expect(park).toMatchObject({ kind: "park", ticket: 9, status: "Blocked" });
+    expect((park as { note: string }).note).toContain("#8");
+  });
+
+  test("markClaimLost stamps the throttle ONLY -- a claim loss is not a confirm attempt", () => {
+    // The pass-1 bug in one assertion. Stamping the bound's anchor here made the
+    // park fire on elapsed time since the claim was LOST rather than time spent
+    // re-confirming, so a claim lost before the drain went idle parked its
+    // dependents with zero reads spent (AC5b case b).
+    let s = markClaimLost(state([ticket(1, "Building"), ticket(2, "Ready", [1])], [], 3, WD), 1, T0);
+    expect(s.tickets[0]).toMatchObject({ claimedByOther: true, claimedByOtherAt: T0 });
+    expect(s.tickets[0].claimConfirmingSince).toBeUndefined();
+    s = markClaimLost(s, 1, T0 + 5 * MIN);
+    expect(s.tickets[0].claimedByOtherAt).toBe(T0 + 5 * MIN); // the throttle re-paces
+    expect(s.tickets[0].claimConfirmingSince).toBeUndefined();
+  });
+
+  test("confirm-claim is a pure no-op on state (the orchestrator performs the read)", () => {
+    const s = livelock({ claimedByOtherAt: T0 });
+    expect(applyAction(s, { kind: "confirm-claim", ticket: 1 }, T0 + WD * MIN)).toEqual(s);
+  });
+
+  test("an unflagged deadlock still parks -- #223 changes nothing about a real cycle", () => {
+    const s = state([ticket(1, "Ready", [2]), ticket(2, "Ready", [1])], [], 3, WD);
+    expect(nextAction(s, T0)).toMatchObject({ kind: "park", ticket: 1, status: "Blocked", note: expect.stringContaining("deadlock") });
+  });
+
+  describe("parseAssignees: the fail-closed edge (an empty set CLEARS a claim)", () => {
+    test("accepts the z-board shape, GitHub's node shape, and a bare login list", () => {
+      expect(parseAssignees({ number: 1, assignees: ["a", "b"] }, 1)).toEqual(["a", "b"]);
+      expect(parseAssignees({ assignees: [{ login: "a" }] }, 1)).toEqual(["a"]);
+      expect(parseAssignees(["a"], 1)).toEqual(["a"]);
+      expect(parseAssignees({ assignees: [] }, 1)).toEqual([]);
+    });
+
+    test("anything unreadable throws instead of degrading to unassigned", () => {
+      for (const bad of [null, undefined, {}, "", 7, { assignees: {} }]) {
+        expect(() => parseAssignees(bad, 1)).toThrow(ZError);
+      }
+      expect(() => parseAssignees({ assignees: [{ name: "a" }] }, 1)).toThrow(/no login/);
+      expect(() => parseAssignees([""], 1)).toThrow(/no login/);
+    });
+
+    // READABLE-BUT-WRONG is the other half of the same boundary, and the more
+    // dangerous one: an EMPTY set read for the wrong issue clears a live foreign
+    // claim exactly as a misparse would. z-board assignees prints the number it
+    // read for precisely this check; discarding it left the sanctioned path --
+    // the only one the orchestrator row actually produces -- wide open.
+    test("a read for a DIFFERENT ticket is refused, empty set or not", () => {
+      expect(() => parseAssignees({ number: 999, assignees: [] }, 1)).toThrow(/for #999 but it is being applied to #1/);
+      expect(() => parseAssignees({ number: 999, assignees: ["x"] }, 1)).toThrow(ZError);
+      expect(() => parseAssignees({ number: "1", assignees: [] }, 1)).toThrow(ZError); // a string 1 is not #1
+    });
+
+    test("a read that carries no number is still accepted (the debug shapes cannot be checked)", () => {
+      expect(parseAssignees({ assignees: [] }, 7)).toEqual([]);
+      expect(parseAssignees([], 7)).toEqual([]);
     });
   });
 });

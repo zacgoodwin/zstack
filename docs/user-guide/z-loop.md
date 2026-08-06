@@ -718,6 +718,134 @@ Two details of that command matter, because both once broke it:
   it on the lane with the sha it tested, which is what makes "was the code I
   merged the code that was gated?" a readable fact rather than a claim.
 
+## Waiting on another session's claim
+
+Tickets are claimed on the board by GitHub assignee, so a second loop (or a
+human) can be holding one of yours. When a `z-board claim` loses that race, the
+loop flags the ticket `claimedByOther`, drops it from the batch, and — because
+its dependents now have an unsatisfiable dependency — **waits** rather than
+parking them: the other session will finish, and the ticket will come back.
+
+That flag is a point-in-time observation, and the drain re-reads the board in
+bulk, which carries no assignees at all. So no re-ingest can ever clear it: a
+snapshot showing the ticket sitting plainly in Ready is not evidence the claim
+was released. Dropping the flag on that non-evidence would re-claim a ticket
+another session is actively building; keeping it forever livelocked the drain at
+`wait` the moment the claim *was* released, with nothing running and no exit —
+the one shape `drain-complete` cannot end. Both halves are now covered by asking
+the one question a bulk read cannot answer:
+
+- **Re-confirm, at most once per `watchdogMinutes`.** When a flag has gone that
+  long unconfirmed, `next` returns a `confirm-claim N` action instead of a bare
+  `wait`. The orchestrator spends one targeted read — `z-board assignees N` —
+  and folds the answer back with `loop claim-confirmed`. It touches nothing else
+  on that ticket; it may still belong to someone. Under a per-stage
+  `watchdogMinutes` object (#256) the period is **the holder's own**, read off
+  the flagged ticket's board status: a claim is taken at whatever stage the
+  ticket resumes at (Ready/Building → `builder`, QA → `qa`, Review →
+  `reviewer`), so that status names the budget the holding lane is working to.
+  Keying every foreign claim to `builder` measured a live reviewer against
+  25 × 3 minutes instead of 40 × 3 and parked its dependents while it was still
+  inside its own watchdog. One resolver serves both the throttle above and the
+  bound below, so they can never end up on different clocks.
+- **A clock that jumps delays these exits, never removes them.** A timestamp in
+  the future (an NTP step backwards, a VM snapshot restore, a `state.json`
+  written on a faster-clocked machine) used to make both comparisons negative
+  and switch off the confirm *and* the park together — `wait` forever, the exact
+  spin this section exists to remove. The two now absorb it in opposite
+  directions, each failing safe: an untrustworthy stamp is not evidence the
+  board was read recently, so the **throttle treats it as due** (worst case, one
+  extra read); it is not evidence of a long wait either, so the **bound clamps
+  it to now** and starts over (worst case, a later park — never a dependent
+  Blocked early over a clock jump).
+- **The clearing rule is `Board.claim()`'s rule.** The flag drops only for an
+  assignee set that a real claim would accept: empty, or solely this loop's own
+  login. The ticket becomes claimable on the very next tick — including under a
+  ticket cap, where clearing the flag also re-admits the freed ticket to
+  `batchTickets`. It was excluded from the batch only because it was flagged
+  when the batch was cut, and something in that batch depends on it; without the
+  re-admission the next tick parked the dependent as a phantom "dependency
+  cycle" on the tick right after the read. Any other set is somebody else's: the
+  flag stays, the holding login is recorded, and the wait resumes without
+  another read for a full watchdog period.
+- **The answer must be for the ticket it is applied to.** `z-board assignees N`
+  prints the number it read alongside the logins, and `loop claim-confirmed`
+  refuses a file whose number is not the ticket on its own command line. The
+  orchestrator types that number twice — once to produce the file, once to apply
+  it — and an *empty* set folded into the wrong ticket clears a live foreign
+  claim just as effectively as a misparse would. A read that carries **no**
+  number (GitHub's raw `{"assignees":[…]}`, a hand-written login list) cannot be
+  checked, so it may **confirm** a claim but never **clear** one: the shapes with
+  no identity are exactly the ones that could free the wrong ticket, and freeing
+  is the only irreversible direction. Fold back a `z-board assignees` file and
+  every shape works. A read for a ticket that is not
+  flagged at all is a no-op for the mirror reason: folding a read back can
+  confirm or clear an existing observation, never invent one, which would drop a
+  perfectly workable ticket out of the batch.
+- **A failed read decides nothing but still counts.** An unreadable answer is
+  never read as "unassigned" — that is exactly the misread that would steal a
+  live claim — so the flag and the last known login survive untouched. The
+  *attempt* is recorded all the same (`loop claim-confirm-failed`): a read that
+  is permanently broken (a deleted or transferred issue, an assignee set too
+  large to page, a `gh` auth or rate-limit outage) would otherwise re-trigger
+  `confirm-claim` on every single tick, which costs a call and an agent turn per
+  tick — worse than the `wait` this replaced.
+- **The wait is bounded — from the first confirm, not from the claim.** Once
+  `watchdogMinutes * 3` have passed **since the first recorded confirm attempt**
+  with the claim still standing — the answer coming back foreign, the read
+  failing, or any mix of the two — the loop stops asking and parks the
+  dependents Blocked, naming the login that holds the ticket when a read ever
+  returned one. An abandoned claim and a broken read both end the run instead of
+  spinning. The flagged ticket itself is left exactly as it is — parking
+  releases *your* work, never someone else's. The note reports how long it has
+  actually been since that first attempt, not the bound it crossed, because a
+  state carried in from an earlier run can be days past it.
+- **The park is not a one-way door.** A **new run** drops the anchor and re-earns
+  the bound with a fresh read: the flag and its throttle still carry (the claim
+  may well still be held, and a bulk read cannot say otherwise), but
+  `claimConfirmingSince` resets on the same fresh-batch boundary
+  `mergedThisRun` uses. Without that reset the anchor outlived every future run,
+  so a ticket parked once could never be re-confirmed again — an operator doing
+  exactly what the park note says ("move it back to Ready once that claim is
+  released") got the same park back, days later, having spent no reads at all.
+  Nothing resets *within* a run, so the bound still ends a drain as described
+  above. A **fresh claim loss** clears the anchor for the same reason: it starts
+  a new observation, and it inherits neither the previous one's clock nor its
+  recorded login.
+- **The attempt is the *ask*, not the answer.** `loop next` records the confirm
+  as it hands the action over. So the pacing and the bound above hold in code
+  even when the orchestrator never reports back: without that write, `next`
+  would re-emit `confirm-claim` on every tick with nothing able to end it —
+  a `gh` call plus an agent turn per tick, worse than the `wait` it replaced —
+  and both invariants would rest on a SKILL instruction rather than on the state
+  machine. Recording the outcome is still required; it only ever *sharpens* the
+  record, replacing a bare attempt with the login that was read or the failure
+  that was hit. This is the one write `next` performs; for every other action it
+  is a pure reader.
+
+The clock starting at the first *confirm* rather than at the claim loss is the
+load-bearing part: time spent flagged is not time spent asking. A claim lost
+early in a long run — the run-12 shape, where the drain does not go idle until
+hours later — would otherwise be past the bound before the loop ever looked, so
+the dependents would be Blocked without a single read having been spent. **No
+dependent is ever parked over a claim the loop has not asked the board about at
+least once.**
+
+It is also the only anchor that can work. The `claimedByOtherAt` throttle is
+re-stamped by *every* foreign answer, so on a claim that keeps coming back
+foreign it never ages past the bound at all: an "assignee set still foreign for
+`watchdogMinutes * 3`" gate reading that field would never fire, and the wait
+would be unbounded. Counting from the first attempt is what makes "still foreign
+three periods later" a condition that can actually arrive.
+
+The same rule covers a `state.json` written before this existed: it carries the
+flag with no timestamps, which reads as infinitely stale, so such a run confirms
+on its first tick after the upgrade — which is what un-wedges it — and cannot
+park until an outcome of either kind has been recorded. The cross-machine
+limitation is unchanged — claims are keyed on the GitHub login, not the session,
+so two loops running as the *same* login on different machines are still
+unsupported.
+
 ## Ticket and context limits
 
 Two knobs cap a single `/z-loop` run so a large Ready queue or a long drain
@@ -776,7 +904,9 @@ What happens next is the ordinary drain loop, in this order: a dependency that
 can never complete in the batch (one already parked Blocked or Skipped) parks
 the dependent with a `Blocked by dependencies that cannot complete in this
 batch` note; otherwise, if any admitted ticket waits on another session's
-in-flight ticket, the whole set **waits**; otherwise the deadlock break parks
+in-flight ticket, the whole set **waits** (bounded and periodically re-confirmed
+— see [Waiting on another session's
+claim](#waiting-on-another-sessions-claim)); otherwise the deadlock break parks
 the lowest-numbered admitted ticket with a `Dependency deadlock … likely a
 dependency cycle` note. Only that *first* park carries the deadlock note — once
 one cycle member is Blocked, the rest fall to the dead-dependency park above and
@@ -804,8 +934,8 @@ before you set a cap:
   ticket. If one admitted ticket waits on another session's in-flight work, a
   genuine cycle admitted alongside it waits too — every tick, for as long as
   that session holds its ticket — and is only parked once that ticket lands and
-  the wait clears. An uncapped run behaves the same way; the capped shape used
-  to exit clean instead.
+  the wait clears, or once the bounded wait above expires. An uncapped run
+  behaves the same way; the capped shape used to exit clean instead.
 
 ### `contextTokenLimit` — a context ceiling with clear-and-resume
 

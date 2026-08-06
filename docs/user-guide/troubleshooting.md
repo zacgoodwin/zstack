@@ -483,6 +483,54 @@ locks directory (or run `/z-loop --reconcile` and move the ticket back to your
 column afterwards), and check `git worktree list` for a leftover
 `.worktrees/ticket-<N>` — see "orphans present" above.
 
+## The drain returns `wait` forever with no lanes running
+
+The tick prints `{"kind":"wait"}` every iteration, no worktrees are active, and
+the board still shows Ready tickets. The cause is a stale `claimedByOther` flag:
+a ticket lost a `z-board claim` earlier in the run, and every ticket that
+depends on it is unstartable while the flag is up.
+
+Confirm it from the state file
+(`~/.zstack/projects/<slug>/loop/state.json`) — the flagged ticket carries
+`"claimedByOther": true` — then check whether the claim is actually still live:
+
+```bash
+gh issue view <N> --json assignees
+```
+
+An empty `assignees` list means the claim was released and the loop is waiting
+on nothing. Current builds handle this themselves: once the flag has gone a
+`watchdogMinutes` period unconfirmed, `next` returns `confirm-claim <N>` instead
+of `wait`, the orchestrator makes exactly that read (`"$Z_BOARD" assignees <N>
+--slug "$SLUG"`, the sanctioned path), and `loop claim-confirmed` either clears
+the flag (the ticket is claimable again on the next tick) or re-stamps it. A read
+that fails is recorded too (`loop claim-confirm-failed`), so a broken read paces
+its retry instead of asking every tick. Once `watchdogMinutes * 3` have passed
+**since the first of those attempts** with the claim still standing, the
+dependents park Blocked — naming the holding login when a read ever returned one
+— and the run ends. The bound counts from the first attempt, not from when the
+claim was lost, so a claim lost hours before the drain went idle still gets read
+once: no dependent is ever Blocked over a claim the loop never checked. That
+holds across runs too — a **new run** resets the anchor, so moving a parked
+dependent back to Ready really does get the claim re-read rather than re-parked. The
+"attempt" is the **ask**, not the answer: `loop next` stamps it as it hands the
+`confirm-claim` over, so both the one-read-per-period pacing and the bound hold
+even if the orchestrator never writes an outcome back. See [z-loop.md → Waiting
+on another session's claim](z-loop.md#waiting-on-another-sessions-claim).
+
+To tell whether this build has that machinery, check for the CLI verb that
+writes the answer back:
+
+```bash
+bun lib/loop.ts --help | grep claim-confirmed
+```
+
+No match means the flag is never re-confirmed on this build, and the workaround
+is to clear it by hand: stop the loop, delete the `"claimedByOther": true` line
+from that ticket in `state.json`, and re-invoke `/z-loop`. **Only do that after
+the `gh issue view` read above comes back empty** — clearing a claim that is
+still live starts a second lane on a ticket another session is building.
+
 ## setup: "already exists as a separate install; skipping" — and its uninstall mirror
 
 Both ends of install honor one rule: **never touch a directory we did not
