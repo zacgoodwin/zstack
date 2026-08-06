@@ -2990,6 +2990,10 @@ describe("#205: every stage transition writes the board", () => {
       // it neither moves the ticket nor places an agent on a new stage.
       "merge-gate": [{ before: withLane("Review", "reviewer", { outcome: approve(100) }), action: { kind: "merge-gate", ticket: 1 } }],
       wait: [{ before: withLane("Building", "builder"), action: { kind: "wait" } }],
+      // #223's confirm-claim asks for ONE live assignee read on a ticket THIS
+      // loop does not own. It moves nothing and writes nothing to the board --
+      // the answer comes back through claimConfirmed, not the reducer.
+      "confirm-claim": [{ before: withLane("Building", "builder"), action: { kind: "confirm-claim", ticket: 1 } }],
       "context-clear": [{ before: withLane("Building", "builder"), action: { kind: "context-clear" } }],
       "drain-complete": [{ before: state([ticket(1, "Done")]), action: { kind: "drain-complete" } }],
     };
@@ -7145,6 +7149,48 @@ describe("#223: re-confirming a carried-forward claimedByOther flag", () => {
   test("AC3b: a set holding only this loop's own login clears it too (Board.claim would succeed)", () => {
     const s = claimConfirmed(livelock({ claimedByOtherAt: T0 }), 1, ["me"], "me", T0 + WD * MIN);
     expect(Object.keys(s.tickets[0])).not.toContain("claimedByOther");
+  });
+
+  // AC3, end to end and at the layer the defect actually lives in: two
+  // successive ingests, the claim released between them, asserting on
+  // claimableTickets (lib/lanes.ts) rather than only on nextAction's verdict.
+  // That filter is what excludes a flagged ticket from work; the whole point of
+  // the confirm is that its input can now change back.
+  test("AC3 end-to-end: ingest, confirm released, re-ingest -- #1 is in claimableTickets and the drain stops waiting", () => {
+    const board = [boardItem(1, "Ready"), boardItem(2, "Ready")];
+    // Ingest one: the flag stands, #1 is not claimable, #2 depends on it, wait.
+    let s = ingestBoardItems(livelock({ claimedByOtherAt: T0, claimConfirmingSince: T0 }), board, BODIES);
+    expect(claimableTickets(s.tickets, s.lanes).map((t) => t.number)).toEqual([]);
+    expect(nextAction(s, T0 + MIN)).toEqual({ kind: "wait" });
+    // A watchdog period on, the loop asks instead of believing itself, and the
+    // answer is that nobody holds it any more.
+    expect(nextAction(s, T0 + WD * MIN)).toEqual({ kind: "confirm-claim", ticket: 1 });
+    s = claimConfirmed(s, 1, [], "me", T0 + WD * MIN);
+    // Ingest two carries the cleared flag forward -- there is nothing left to
+    // carry -- so #1 is claimable and the drain moves.
+    s = ingestBoardItems(s, board, BODIES);
+    expect(s.tickets[0].claimedByOther).toBeUndefined();
+    expect(claimableTickets(s.tickets, s.lanes).map((t) => t.number)).toEqual([1]);
+    const next = nextAction(s, T0 + (WD + 1) * MIN);
+    expect(next).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+  });
+
+  // #256 turned watchdogMinutes into a scalar OR a per-stage object, and the
+  // confirm clock has no stage of its own -- it is waiting on ANOTHER session's
+  // builder. Pinning it to `builder` keeps the throttle and the bound reading
+  // one number; a per-stage config must not silently fall back to the shipped
+  // default and fire on a different schedule than the operator configured.
+  test("the confirm clock reads the BUILDER budget under a per-stage watchdog config (#256)", () => {
+    const perStage = {
+      ...livelock({ claimedByOtherAt: T0, claimConfirmingSince: T0 }),
+      watchdogMinutes: { builder: 30, qa: 5, reviewer: 40, merge: 15 },
+    };
+    expect(nextAction(perStage, T0 + 29 * MIN)).toEqual({ kind: "wait" }); // not qa's 5
+    expect(nextAction(perStage, T0 + 30 * MIN)).toEqual({ kind: "confirm-claim", ticket: 1 });
+    // and the bound is 3 of those same periods, not 3 of anything else
+    const foreign = claimConfirmed(perStage, 1, ["someone-else"], "me", T0 + 30 * MIN);
+    expect(nextAction(foreign, T0 + 89 * MIN)).toEqual({ kind: "confirm-claim", ticket: 1 });
+    expect(nextAction(foreign, T0 + 90 * MIN)).toMatchObject({ kind: "park", ticket: 2, status: "Blocked" });
   });
 
   test("AC4: a live foreign claim is never stolen -- flag stays, stamp refreshes, drain waits", () => {

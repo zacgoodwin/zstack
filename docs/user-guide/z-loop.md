@@ -739,7 +739,12 @@ the one question a bulk read cannot answer:
   long unconfirmed, `next` returns a `confirm-claim N` action instead of a bare
   `wait`. The orchestrator spends one targeted read — `z-board assignees N` —
   and folds the answer back with `loop claim-confirmed`. It touches nothing else
-  on that ticket; it may still belong to someone.
+  on that ticket; it may still belong to someone. Under a per-stage
+  `watchdogMinutes` object (#256) the period read here is the **`builder`** one:
+  a foreign claim is not a stage of ours, and the thing being waited on is the
+  other session's builder — `Board.claim()` is taken at builder-claim time. Both
+  the throttle above and the bound below read that one number, so they can never
+  end up on different clocks.
 - **The clearing rule is `Board.claim()`'s rule.** The flag drops only for an
   assignee set that a real claim would accept: empty, or solely this loop's own
   login. The ticket becomes claimable on the very next tick. Any other set is

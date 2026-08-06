@@ -1657,6 +1657,14 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
       .filter((dep): dep is TicketSnapshot => dep !== undefined && dep.claimedByOther === true && dep.status !== "Done")
       .sort((a, b) => a.number - b.number);
     if (foreignDeps.length > 0) {
+      // #256 made the watchdog per-stage, and a foreign claim is not a stage of
+      // ours: nobody here is running anything, we are re-reading someone else's
+      // assignee set. `builder` is the budget that matches what is actually being
+      // waited on -- Board.claim() is taken at builder-claim time, so the holder
+      // is a builder lane in the other session -- and it keys both the throttle
+      // (one read per period) and the bound below off one resolved number, so a
+      // per-stage config can never leave those two reading different clocks.
+      const wd = budgetFor("builder");
       const wdMs = wd * 60_000;
       // Bounded wait, checked FIRST so a claim already proved abandoned is not
       // re-confirmed one more time before parking.
@@ -1789,8 +1797,8 @@ export interface HumanNeededStatus {
 // The one place that turns a LoopState into the human-needed breakdown: counts
 // + which tickets (the notify() payload), plus tripped/alreadyNotified so the
 // orchestrator's fire-once check is a single field read, never prose
-// bookkeeping. Read-only -- the CLI wraps this with no writes, same contract
-// as `next`.
+// bookkeeping. Read-only -- the CLI wraps this with no writes at all (unlike
+// `next`, which stamps a confirm-claim ask as it hands one over).
 export function humanNeededStatus(state: LoopState): HumanNeededStatus {
   // #150: scope the numerator to this batch's own tickets (state.initialBatchTickets)
   // and never count a foreign claimedByOther park -- a pre-existing park from
@@ -3342,7 +3350,7 @@ const USAGE = `loop <command> [args]
                                                      when green (#178) -- nothing merges on a nonzero exit.
                                                      With --state/--ticket, stamps the verdict on that lane:
                                                      "next" will not advance a lane to merge without a green one
-  next <state.json> [--now <ms>]                     print the next Action as JSON (no writes)
+  next <state.json> [--now <ms>]                     print the next Action as JSON (writes only to record a confirm-claim ask)
   apply <state.json> <action.json> [--now <ms>]      apply an Action, rewrite the state file
   outcome <state.json> <ticket> <msg.txt> [--now <ms>]  parse a stage's final message onto its lane
           a BUILDER lane also REQUIRES its worktree's git facts (#177), which a
