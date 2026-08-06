@@ -7,7 +7,7 @@ import { test, expect, describe } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveSlug } from "../lib/config.ts";
-import { applyAction, type LoopState } from "../lib/loop.ts";
+import { applyAction, STATUS_FOR_STAGE, type LoopState } from "../lib/loop.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const zLoop = () => readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8");
@@ -582,5 +582,110 @@ describe("#256: per-stage watchdog budgets and the stage ceiling", () => {
     expect(step5).toContain("480 minutes");
     expect(step5).toMatch(/ALIVE/);
     expect(step5).toContain('"salvage": true');
+  });
+});
+
+// ============================================================================
+// #205 -- the advance row writes the board, so a crash resumes at the stage
+// that actually ran instead of rebuilding finished work
+// ============================================================================
+describe("#205: the advance row moves the board to the new stage's status", () => {
+  // The whole fix is a SKILL row: lib/board.ts is the pack's sole gh caller and
+  // the reducer is pure, so nothing in lib/ can issue this move -- only the
+  // orchestrator can, and it does what this row says. Deleting the move string
+  // is exactly the regression, so it is what this canary watches.
+  function advanceRow(): string {
+    const row = zLoop()
+      .split("\n")
+      .find((l) => l.startsWith("| `advance N to S`"));
+    return row ?? "";
+  }
+
+  test("the row issues `z-board move` to STATUS_FOR_STAGE[S], with --if-present and --slug", () => {
+    const row = advanceRow();
+    expect(row).not.toBe("");
+    expect(row).toContain("#205");
+    expect(row).toContain('"$Z_BOARD" move <N> <status> --if-present --slug "$SLUG"');
+    expect(row).toContain("STATUS_FOR_STAGE[S]");
+    // Every stage's target named, merge included -- merge has no column of its
+    // own, and "what does an advance to merge write" is the question a reader
+    // would otherwise have to answer by reading lib/loop.ts. DERIVED from the
+    // map the row promises to mirror, not a frozen copy of it: a literal list
+    // would keep passing against a row naming the wrong status after
+    // STATUS_FOR_STAGE changed, which is the exact drift this canary exists to
+    // catch -- and a newly added Stage now fails here until the row documents it.
+    for (const [stage, status] of Object.entries(STATUS_FOR_STAGE)) {
+      expect(row).toContain(`\`${stage}\`→\`${status}\``);
+    }
+  });
+
+  test("the row names the cost of skipping the move: a re-claim as builder that rebuilds committed work", () => {
+    const row = advanceRow();
+    expect(row).toMatch(/never skip this/i);
+    expect(row).toContain("claimStage");
+    expect(row).toMatch(/rebuilds work already committed/i);
+  });
+
+  // The ordering is load-bearing and was chosen, not inherited: apply first, so
+  // canTransition validates before the board is touched and a crash in the gap
+  // leaves the board one hop BEHIND a lane carrying its own write marker -- the
+  // one shape #125's guard resyncs. Moving first inverts the window to
+  // board-ahead-of-lane, which isOneHopLag does not model, so it stop-lanes and
+  // drops the lane's bounce counters and pending notes.
+  test("the row applies BEFORE it moves, and says why", () => {
+    const row = advanceRow();
+    expect(row).toMatch(/AFTER the apply/);
+    expect(row.indexOf("2. Apply.")).toBeGreaterThan(0);
+    expect(row.indexOf("2. Apply.")).toBeLessThan(row.indexOf('"$Z_BOARD" move'));
+    expect(row).toContain("canTransition");
+  });
+
+  // `--if-present` means the move can report moved:false, and after the apply
+  // the lane has already advanced -- so the recovery is a stop-lane applied
+  // next, carrying #273's dropTicket, and NO stage spawn. The row DELEGATES to
+  // the shared `--if-present` block rather than copying its JSON: one payload,
+  // one place to change. So the canary checks both halves of that delegation --
+  // the row points at the block and adds the spawn bar, and the block still owns
+  // the dropTicket payload and now enumerates the advance row as a caller.
+  test("the row's moved:false recovery delegates to the shared --if-present block, and spawns nothing", () => {
+    const row = advanceRow();
+    expect(row).toContain("moved:false");
+    expect(row).toMatch(/shared `--if-present` recovery above/);
+    expect(row).toMatch(/do \*\*not\*\* spawn stage S/);
+    expect(row).not.toContain('"dropTicket":true'); // the block owns it, not this row
+
+    const shared = section(zLoop(), "**Lane moves are `--if-present` (#138).**");
+    expect(shared).toContain('"dropTicket":true');
+    expect(shared).toContain("the `advance` row's step-3 move"); // enumeration kept current
+  });
+
+  // The three carve-outs the adversarial pass forced into the row. Each is a
+  // claim a reader acts on, and each was deletable with the suite green before
+  // this: the skip-qa window is the one advance the resync does NOT cover, the
+  // move is a blind write rather than a compare-and-set, and the recovery has to
+  // dump the worktree because "fires at a boundary" is not "the tree is clean".
+  test("the row names the skip-qa two-hop gap, the blind-write race, and the unconditional salvage dump", () => {
+    const row = advanceRow();
+    expect(row).toMatch(/is NOT recovered/);
+    expect(row).toContain("skip-qa");
+    expect(row).toMatch(/re-claimed as a \*builder\*/);
+    expect(row).toMatch(/blind write, not a compare-and-set/);
+    expect(row).toMatch(/TERMINAL status/);
+    // The salvage clause lives on the `stop-lane N` row, which is where the
+    // recovery is actually performed -- the advance row delegates to it.
+    const stopRow = zLoop().split("\n").find((l) => l.startsWith("| `stop-lane N`")) ?? "";
+    expect(stopRow).toMatch(/Salvage dump\*\* block before `lane-remove`, always/);
+    expect(stopRow).toMatch(/is not "the worktree is clean"/);
+  });
+
+  // The tick output carries the same derivation, so a skipped move is visible
+  // on the spot rather than a stage later as a rebuild. Pinned against the
+  // PRODUCING format string, not a second copy of it: reword the print and this
+  // goes red, instead of leaving the orchestrator hunting for a line lib/loop.ts
+  // no longer emits.
+  test("the row points at the owed-write line `apply` prints, using that line's own prefix", () => {
+    const PREFIX = "board write for #";
+    expect(readFileSync(join(REPO_ROOT, "lib", "loop.ts"), "utf8")).toContain(`\`${PREFIX}$\{owed.ticket}`);
+    expect(advanceRow()).toContain(PREFIX);
   });
 });

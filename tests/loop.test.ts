@@ -12,6 +12,7 @@ import { join } from "node:path";
 import {
   applyAction,
   applyConfirmations,
+  boardWriteFor,
   builtGuardFailure,
   canTransition,
   confirmTargets,
@@ -48,7 +49,9 @@ import {
   recordOutcome,
   recordProbe,
   resolveStageModel,
+  slugFromStatePath,
   stageAttempt,
+  STATUS_FOR_STAGE,
   worktreeHoldsWork,
   type Action,
   type GateScripts,
@@ -76,6 +79,7 @@ import {
 } from "../lib/transcripts.ts";
 import { SPAWN_TAG_MARKER } from "../lib/stage-prompts.ts";
 import { isWorkableStatus } from "../lib/lanes.ts";
+import { defaultLoopDir } from "../lib/throttle.ts";
 import { validateConfig } from "../lib/config-schema.ts";
 import {
   claimableTickets,
@@ -2852,6 +2856,314 @@ describe("one-hop resync: lagged write vs genuine move-back by origin (#125)", (
   });
 });
 
+// -- #205: every stage transition writes the board ----------------------------
+// applyAction can only RECORD a transition -- the reducer is pure and
+// lib/board.ts is the pack's sole gh caller -- so the board move belongs to the
+// ORCHESTRATOR, and `boardWriteFor` is the one place that derives which one. The
+// `advance` row named no move at all, so the board sat a stage behind its lane
+// forever: the #125 marker never cleared (the "transient" lag became permanent),
+// /z-status lied, and -- the expensive one -- every later claim of that ticket
+// reads the BOARD for its stage, so a lane that had reached qa came back as a
+// BUILDER and rebuilt finished, committed work.
+describe("#205: every stage transition writes the board", () => {
+  const STAGES: Stage[] = ["builder", "qa", "reviewer", "merge"];
+
+  // The board a simulated orchestrator keeps: it moves ONLY when boardWriteFor
+  // names a write, which is what makes a dropped derivation visible downstream
+  // instead of silently agreeing with the state file.
+  function performRow(board: Map<number, BoardStatus>, action: Action): void {
+    const write = boardWriteFor(action);
+    if (write) board.set(write.ticket, write.status);
+  }
+  const asItems = (board: Map<number, BoardStatus>) =>
+    [...board].map(([number, Status]) => ({ number, title: `Ticket ${number}`, fields: { Status } }));
+
+  // The printed repair line is only useful if it runs as printed, and
+  // resolveSlug throws on a multi-project machine, so the slug is read off the
+  // state path the caller already passed (~/.zstack/projects/<slug>/loop/...).
+  test("slugFromStatePath reads the slug out of the state path, on both separators, with a ZSTACK_SLUG fallback", () => {
+    expect(slugFromStatePath("/home/z/.zstack/projects/zstack/loop/state.json", {})).toBe("zstack");
+    expect(slugFromStatePath("C:\\Users\\z\\.zstack\\projects\\my-app\\loop\\state.json", {})).toBe("my-app");
+    // a path that is not a project state file falls back to the env the loop exports
+    expect(slugFromStatePath("/tmp/scratch/state.json", { ZSTACK_SLUG: "from-env" })).toBe("from-env");
+    // and with neither, no slug is invented
+    expect(slugFromStatePath("/tmp/scratch/state.json", {})).toBeUndefined();
+    expect(slugFromStatePath("/tmp/scratch/state.json", { ZSTACK_SLUG: "" })).toBeUndefined();
+    // the path wins over a stale env var pointing at another project
+    expect(slugFromStatePath("/home/z/.zstack/projects/zstack/loop/state.json", { ZSTACK_SLUG: "other" })).toBe("zstack");
+    // The result is interpolated into a command line a human or the orchestrator
+    // RUNS, so a segment outside the slug charset must not become a --slug
+    // argument. Refusing to match is the safe direction: the line then carries no
+    // --slug and resolveSlug fails loudly at the point of use, instead of a
+    // whitespace split or a metacharacter riding into the shell.
+    expect(slugFromStatePath("/home/z/.zstack/projects/my app/loop/state.json", {})).toBeUndefined();
+    expect(slugFromStatePath("/home/z/.zstack/projects/a;rm -rf ~/loop/state.json", {})).toBeUndefined();
+    // ...and it falls back rather than inventing one, same as any other non-match
+    expect(slugFromStatePath("/home/z/.zstack/projects/my app/loop/state.json", { ZSTACK_SLUG: "real" })).toBe("real");
+    // The ENV branch goes through the same guard. Guarding only the path branch
+    // left ZSTACK_SLUG a hole straight into the printed command line: driven
+    // through the real CLI, `ZSTACK_SLUG='evil"; cat ~/.ssh/id_rsa; echo "'`
+    // printed `--slug "evil"; cat ~/.ssh/id_rsa; echo ""` under an instruction
+    // to run the line verbatim.
+    expect(slugFromStatePath("/tmp/x/state.json", { ZSTACK_SLUG: 'evil"; cat ~/.ssh/id_rsa; echo "' })).toBeUndefined();
+    expect(slugFromStatePath("/tmp/x/state.json", { ZSTACK_SLUG: "has space" })).toBeUndefined();
+    // `..` would traverse out of ~/.zstack/projects; a leading `-` is read as a
+    // flag by the command the value is pasted into. Both refused on both branches.
+    expect(slugFromStatePath("/home/z/.zstack/projects/../loop/state.json", {})).toBeUndefined();
+    expect(slugFromStatePath("/home/z/.zstack/projects/--if-present/loop/state.json", {})).toBeUndefined();
+    expect(slugFromStatePath("/tmp/x/state.json", { ZSTACK_SLUG: ".." })).toBeUndefined();
+    expect(slugFromStatePath("/tmp/x/state.json", { ZSTACK_SLUG: "-rf" })).toBeUndefined();
+    // Anchored on the real layout and taking the LAST match, so an ancestor
+    // directory shaped `projects/<x>/loop/` cannot shadow the true slug and aim
+    // the printed board write at a different configured project. Unanchored,
+    // this returned "scratch".
+    expect(
+      slugFromStatePath("/home/zac/projects/scratch/loop/.zstack/projects/my-real-repo/loop/state.json", {})
+    ).toBe("my-real-repo");
+    // The regex hardcodes the on-disk layout that lib/throttle.ts defaultLoopDir
+    // CONSTRUCTS, and nothing else couples them -- so a layout change would make
+    // this return undefined silently and drop --slug from a repair line the
+    // comment above calls load-bearing. Drive the real constructor instead of a
+    // hand-written path, so the move breaks a test rather than degrading quietly.
+    expect(slugFromStatePath(join(defaultLoopDir("acme-app", "/home/z"), "state.json"), {})).toBe("acme-app");
+  });
+
+  // The contract stated as literals, NOT re-derived from the map the function
+  // reads -- an assertion built out of STATUS_FOR_STAGE survives any mutation
+  // that keeps a STATUS_FOR_STAGE lookup (swapping action.to for action.stage,
+  // say), which is most of them.
+  test("boardWriteFor derives STATUS_FOR_STAGE for claim and advance, at every stage", () => {
+    const EXPECTED: Record<Stage, BoardStatus> = { builder: "Building", qa: "QA", reviewer: "Review", merge: "Review" };
+    // merge is in that table on purpose: it has no column of its own, it runs
+    // under Review (Done means the PR landed), so advancing to merge re-writes
+    // Review and is a no-op on the board.
+    expect(EXPECTED).toEqual(STATUS_FOR_STAGE);
+    for (const stage of STAGES) {
+      expect(boardWriteFor({ kind: "claim", ticket: 7, stage })).toEqual({ ticket: 7, status: EXPECTED[stage] });
+      expect(boardWriteFor({ kind: "advance", ticket: 7, to: stage })).toEqual({ ticket: 7, status: EXPECTED[stage] });
+    }
+  });
+
+  // The coupling that makes a marker clearable at all, as a biconditional driven
+  // through the REAL reducer for every kind in the Action union: applying an
+  // action leaves a lane carrying `lastWroteStatus` IF AND ONLY IF boardWriteFor
+  // names a write of that same status for that same ticket. A branch that stamps
+  // a marker nothing is told to write leaves a lane no board read can ever clear
+  // -- #205 in code rather than in prose -- and a branch that names a write it
+  // never stamps re-arms the resync guard behind a write nobody made.
+  //
+  // `Record<Action["kind"], ...>` is what keeps this total: add a kind to the
+  // union and this file stops typechecking until the new branch is covered here.
+  test("INVARIANT: applying an action leaves a marker iff boardWriteFor names that exact write (every Action kind)", () => {
+    const withLane = (s: TicketSnapshot["status"], stage: Stage, over: Partial<LaneState> = {}) =>
+      state([ticket(1, s)], [lane(1, stage, over)]);
+    const CASES: Record<Action["kind"], { before: LoopState; action: Action }[]> = {
+      claim: [
+        { before: state([ticket(1, "Ready")]), action: { kind: "claim", ticket: 1, stage: "builder" } },
+        { before: state([ticket(1, "QA")]), action: { kind: "claim", ticket: 1, stage: "qa" } },
+        { before: state([ticket(1, "Review")]), action: { kind: "claim", ticket: 1, stage: "reviewer" } },
+      ],
+      advance: [
+        { before: withLane("Building", "builder", { outcome: { kind: "built" } }), action: { kind: "advance", ticket: 1, to: "qa" } },
+        { before: withLane("QA", "qa", { outcome: { kind: "qa-pass" } }), action: { kind: "advance", ticket: 1, to: "reviewer" } },
+        { before: withLane("Review", "reviewer", { outcome: approve(100) }), action: { kind: "advance", ticket: 1, to: "merge" } },
+        { before: withLane("QA", "qa", { outcome: { kind: "qa-bugs", note: "x" } }), action: { kind: "advance", ticket: 1, to: "builder" } },
+        { before: withLane("Review", "reviewer", { outcome: { kind: "review-findings", note: "x" } }), action: { kind: "advance", ticket: 1, to: "builder" } },
+      ],
+      park: [
+        { before: withLane("Building", "builder"), action: { kind: "park", ticket: 1, status: "Questions", note: "q" } },
+        { before: withLane("QA", "qa"), action: { kind: "park", ticket: 1, status: "Blocked", note: "b" } },
+      ],
+      skip: [{ before: withLane("Building", "builder"), action: { kind: "skip", ticket: 1, note: "s" } }],
+      "stop-lane": [{ before: withLane("QA", "qa"), action: { kind: "stop-lane", ticket: 1, note: "gone" } }],
+      complete: [{ before: withLane("Review", "merge", { outcome: { kind: "merged", note: "pr" } }), action: { kind: "complete", ticket: 1, note: "pr" } }],
+      respawn: [{ before: withLane("Building", "builder", { workerDead: true }), action: { kind: "respawn", ticket: 1, stage: "builder", note: "died", attempt: 2 } }],
+      // The no-ops KEEP their lane, so a stamping branch added to any of them is
+      // visible here (park/skip/stop-lane/complete drop the lane, which is
+      // itself why they own no derived write -- nothing survives to clear).
+      "check-worker": [{ before: withLane("Building", "builder"), action: { kind: "check-worker", ticket: 1 } }],
+      // #178's gate run is a probe of the lane's own branch, not a transition:
+      // it neither moves the ticket nor places an agent on a new stage.
+      "merge-gate": [{ before: withLane("Review", "reviewer", { outcome: approve(100) }), action: { kind: "merge-gate", ticket: 1 } }],
+      wait: [{ before: withLane("Building", "builder"), action: { kind: "wait" } }],
+      "context-clear": [{ before: withLane("Building", "builder"), action: { kind: "context-clear" } }],
+      "drain-complete": [{ before: state([ticket(1, "Done")]), action: { kind: "drain-complete" } }],
+    };
+
+    for (const cases of Object.values(CASES)) {
+      expect(cases.length).toBeGreaterThan(0);
+      for (const { before, action } of cases) {
+        // the fixture itself must start clean, or the assertion below is bogus
+        expect(before.lanes.every((l) => l.lastWroteStatus === undefined)).toBe(true);
+        const after = applyAction(before, action, 0);
+        const write = boardWriteFor(action);
+        const marked = after.lanes.filter((l) => l.lastWroteStatus !== undefined).map((l) => [l.ticket, l.lastWroteStatus]);
+        if (write) {
+          expect(marked).toEqual([[write.ticket, write.status]]);
+          // and the state file records the same status the orchestrator writes
+          expect(after.tickets.find((t) => t.number === write.ticket)!.status).toBe(write.status);
+        } else {
+          expect(marked).toEqual([]);
+        }
+      }
+    }
+  });
+
+  // AC1: the row's move is derived, the advance stamps QA, and the NEXT tick's
+  // ingest clears the marker. Skip the write and it is not transient, it is
+  // permanent -- which is what makes the resume below read the wrong stage.
+  test("AC1: advance to qa writes `QA`; once written, the next ingest clears the marker -- skipped, it survives every tick", () => {
+    const board = new Map<number, BoardStatus>([[1, "Building"]]);
+    let s = state([ticket(1, "Building")], [lane(1, "builder", { outcome: { kind: "built" } })]);
+    const action: Action = { kind: "advance", ticket: 1, to: "qa" };
+    s = applyAction(s, action, 0);
+    performRow(board, action); // the row moves the board as part of the advance
+    expect(s.lanes[0].lastWroteStatus).toBe("QA");
+    expect(board.get(1)).toBe("QA"); // AC1
+
+    // The next tick reads the board back and the marker is gone.
+    const written = ingestBoardItems(s, asItems(board), { "1": "" });
+    expect(written.lanes[0].lastWroteStatus).toBeUndefined();
+
+    // On the pre-#205 row the move never happened: the board stays Building and
+    // the marker is not transient, it is forever.
+    let skipped = ingestBoardItems(s, [{ number: 1, title: "t", fields: { Status: "Building" } }], { "1": "" });
+    expect(skipped.tickets[0].status).toBe("Building");
+    expect(skipped.lanes[0].lastWroteStatus).toBe("QA");
+    for (let tick = 0; tick < 5; tick++) {
+      skipped = ingestBoardItems(skipped, [{ number: 1, title: "t", fields: { Status: "Building" } }], { "1": "" });
+    }
+    expect(skipped.lanes[0].lastWroteStatus).toBe("QA");
+  });
+
+  // AC2, driven end to end so it FAILS if the write is dropped: the whole point
+  // of this ticket is that the resume stage comes from the board, so the test
+  // has to run the transition through the same simulated orchestrator and read
+  // the resume off the board it produced. Delete the `advance` case from
+  // boardWriteFor and this board never reaches QA, so the resume claims builder.
+  //
+  // Scope of "the process dies": this is the ticket whose lane lock is already
+  // gone (a stop-lane'd lane, or one a previous --reconcile pruned), so nothing
+  // marks it as crashed and the fresh invocation just ingests the board and
+  // claims. A ticket that still holds its lock takes the --reconcile path
+  // instead, which parks an in-flight one back to Ready by design (a lock whose
+  // ticket already reached a TERMINAL status is only pruned and unlocked --
+  // lib/reconcile.ts reconcilePlan).
+  test("AC2: a lane advanced to qa, then killed, resumes at `qa` and never re-claims as a builder -- because the advance wrote the board", () => {
+    const board = new Map<number, BoardStatus>([[1, "Building"]]);
+    let live = state([ticket(1, "Building")], [lane(1, "builder", { outcome: { kind: "built" } })]);
+    const action: Action = { kind: "advance", ticket: 1, to: "qa" };
+    live = applyAction(live, action, 0);
+    performRow(board, action);
+    expect(live.lanes[0].stage).toBe("qa");
+
+    // ...the process dies here. A new invocation holds no lanes; Step 3's ingest
+    // rebuilds loop state from the board alone, and Step 4 asks for an action.
+    const resumed = ingestBoardItems(null, asItems(board), { "1": "" });
+    expect(resumed.lanes).toEqual([]);
+    expect(nextAction(resumed, 0)).toEqual({ kind: "claim", ticket: 1, stage: "qa" });
+    expect(claimStage("QA")).toBe("qa");
+
+    // The same crash on pre-#205 main, where the row wrote nothing: the board
+    // still reads Building, so the resume re-claims a finished build and pays
+    // for it twice (#164 burned $1.35 duplicating already-pushed commits).
+    const stale = ingestBoardItems(null, [{ number: 1, title: "Ticket 1", fields: { Status: "Building" } }], { "1": "" });
+    expect(nextAction(stale, 0)).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+
+    // A reviewer lane resumes at the reviewer for the same reason.
+    const rBoard = new Map<number, BoardStatus>([[2, "QA"]]);
+    performRow(rBoard, { kind: "advance", ticket: 2, to: "reviewer" });
+    expect(nextAction(ingestBoardItems(null, asItems(rBoard), { "2": "" }), 0)).toEqual({ kind: "claim", ticket: 2, stage: "reviewer" });
+  });
+
+  // The one stage the board write does NOT restore, pinned so it cannot change
+  // unnoticed. merge owns no column -- it runs under Review -- so the advance
+  // into it writes `Review`, and CLAIMABLE_STAGE maps Review back to `reviewer`.
+  // A lane that reached merge and then died therefore re-claims as a REVIEWER
+  // and re-pays one adversarial review of a diff that was already approved. That
+  // is strictly cheaper than the builder rebuild this ticket removes, and it is
+  // inherent to merge having no status of its own (out of scope here: the nine
+  // canonical statuses), but it is the residual cost, not a fixed one.
+  test("known limit: a lane advanced to merge, then killed, resumes as a REVIEWER -- merge owns no board column", () => {
+    const board = new Map<number, BoardStatus>([[3, "Review"]]);
+    performRow(board, { kind: "advance", ticket: 3, to: "merge" });
+    expect(board.get(3)).toBe("Review");
+    expect(claimStage("Review")).toBe("reviewer");
+    expect(nextAction(ingestBoardItems(null, asItems(board), { "3": "" }), 0)).toEqual({ kind: "claim", ticket: 3, stage: "reviewer" });
+  });
+
+  // AC3: the legality check is unchanged, and the row's ordering keeps it in
+  // FRONT of the board. `apply` validates the transition through canTransition
+  // and throws exactly as it does today; the orchestrator only moves the board
+  // afterwards, so an illegal advance never reaches it at all.
+  test("AC3: an advance writing an illegal transition still throws, and the state file is untouched", () => {
+    const s = state([ticket(1, "Ready")], [lane(1, "reviewer", { outcome: { kind: "review-findings", note: "x" } })]);
+    // Ready -> Building is legal; Ready -> Review (the reviewer lane's own
+    // status) is not, and that is what an advance to `reviewer` would write.
+    expect(canTransition("Ready", "Review")).toBe(false);
+    expect(() => applyAction(s, { kind: "advance", ticket: 1, to: "reviewer" }, 0)).toThrow(/Illegal status transition for #1: Ready -> Review/);
+    // pure: the caller's state never moved, so nothing tells the row to write
+    expect(s.tickets[0].status).toBe("Ready");
+    expect(s.lanes[0].stage).toBe("reviewer");
+    expect(s.lanes[0].lastWroteStatus).toBeUndefined();
+  });
+
+  // The crash window the row's ordering leaves, evaluated where the guard
+  // actually runs: apply landed, the move did not, and the lane has since
+  // reached its next stage boundary (the guard skips a lane with no recorded
+  // outcome, so a crash that also cost the step-4 spawn waits on the #209
+  // re-spawn to produce one before any of this is reachable). The board is then
+  // exactly one hop BEHIND a lane that names the write it owes.
+  // That is the shape #125's origin marker was built for, so the existing guard
+  // resyncs on the next tick and the advance proceeds with the lane's stage,
+  // bounce counters intact -- no stop-lane, no re-claim, no
+  // rebuild, FOR A ONE-HOP ADVANCE (the skip-qa two-hop case is its own test
+  // below). Pinned here because the ordering is a choice: move the board FIRST
+  // and this window inverts to board-ahead-of-lane, which isOneHopLag does not
+  // model and which therefore stop-lanes (losing qaBounces and qaNotes).
+  test("crash between the apply and the move is recovered by the existing one-hop resync, on both the forward advance and a bounce", () => {
+    // forward: apply advanced the lane to qa, the QA move never went out
+    const fwd = state([ticket(1, "Building")], [lane(1, "qa", { outcome: { kind: "qa-pass" }, lastWroteStatus: "QA" })]);
+    expect(nextAction(fwd, 0)).toEqual({ kind: "advance", ticket: 1, to: "reviewer", resyncStatus: "QA" });
+
+    // bounce: apply bounced the lane back to builder, the Building move did not
+    // go out. The bounce counter it just spent is what gates the resync, and it
+    // survives -- the QA note rides on the advance the loop is about to make.
+    const bounce = state([ticket(1, "QA")], [lane(1, "builder", { qaBounces: 1, lastWroteStatus: "Building", outcome: { kind: "built" } })]);
+    expect(nextAction(bounce, 0)).toEqual({ kind: "advance", ticket: 1, to: "qa", resyncStatus: "Building" });
+  });
+
+  // KNOWN GAP, pinned so it cannot be mistaken for the recovered case above.
+  // #130's skip-qa walk is the ONE advance that is not one hop: resolveOutcome
+  // sends a labeled builder straight to `reviewer`, i.e. Building -> Review,
+  // while PRECEDING_BOARD_STATUS maps a reviewer lane's lag to `QA` alone. So a
+  // missed step-3 move on THAT advance is not a lag the guard recognizes -- it
+  // stop-lanes, and the re-claim reads the board's stale Building and comes back
+  // as a *builder*, rebuilding an already-built, already-approved ticket.
+  //
+  // This is the pre-#205 outcome for EVERY skip-qa advance (the row wrote
+  // nothing, so the board never left Building), now narrowed to the crash window
+  // -- so the board write is a strict improvement here too. Closing the window
+  // means widening isOneHopLag, which this ticket's Out of scope list holds back
+  // ("the #125 resync guard's logic, which is correct given a truthful marker"),
+  // so the gap is pinned rather than silently patched.
+  test("KNOWN GAP: the skip-qa two-hop advance is NOT recovered -- a missed move there still re-claims as a builder", () => {
+    const skip = state(
+      [ticket(1, "Building", [], { skipQa: true })],
+      [lane(1, "reviewer", { outcome: approve(100), lastWroteStatus: "Review" })]
+    );
+    const stop = nextAction(skip, 0);
+    expect(stop).toMatchObject({ kind: "stop-lane", ticket: 1 });
+    // ...and that stop-lane is what hands the ticket back to a builder.
+    expect(nextAction(applyAction(skip, stop, 0), 0)).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+
+    // The same lane WITHOUT the two-hop jump resyncs, which is what isolates the
+    // cause to the hop distance rather than to the reviewer stage itself.
+    const oneHop = state([ticket(1, "QA")], [lane(1, "reviewer", { outcome: approve(100), lastWroteStatus: "Review" })]);
+    expect(nextAction(oneHop, 0)).not.toMatchObject({ kind: "stop-lane" });
+  });
+});
+
 // -- #124: resync-on-lag also covers advance->builder bounce-backs ------------
 // #116 mapped only the two FORWARD advances (qa lagging at Building, reviewer
 // at QA) and omitted builder on the false premise that no advance reaches it.
@@ -3998,6 +4310,73 @@ describe("loop CLI", () => {
     const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", statePath, "--now", "0"], { stdout: "pipe", stderr: "pipe" });
     expect(proc.exitCode).toBe(0);
     expect(JSON.parse(proc.stdout.toString())).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+  });
+
+  // #205: `apply` prints the board move the row still owes, derived in code from
+  // STATUS_FOR_STAGE, so a row that skipped its move is visible in the tick
+  // output instead of living only in a SKILL row a reader can skim past.
+  function runApply(name: string, s: LoopState, action: Action, subdir = ""): { exitCode: number | null; stdout: string } {
+    const base = subdir ? join(dir, subdir) : dir;
+    mkdirSync(base, { recursive: true });
+    const statePath = join(base, `${name}-state.json`);
+    const actionPath = join(base, `${name}-action.json`);
+    writeFileSync(statePath, JSON.stringify(s));
+    writeFileSync(actionPath, JSON.stringify(action));
+    const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "apply", statePath, actionPath, "--now", "0"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, ZSTACK_SLUG: "" },
+    });
+    return { exitCode: proc.exitCode, stdout: proc.stdout.toString() };
+  }
+
+  test("apply prints the board write an advance owes (#205)", () => {
+    const s = state([ticket(1, "Building")], [lane(1, "builder", { outcome: { kind: "built" } })]);
+    const { exitCode, stdout } = runApply("advance", s, { kind: "advance", ticket: 1, to: "qa" });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("applied advance #1");
+    expect(stdout).toContain("board write for #1 = QA");
+    expect(stdout).toContain(`"$Z_BOARD" move 1 QA --if-present`);
+  });
+
+  // The printed line has to be runnable as printed: lib/config.ts resolveSlug
+  // THROWS "Multiple zstack projects configured" on a machine with more than one
+  // project, which is the machine the loop runs on, so a slug-less command line
+  // is dead on arrival. The slug comes from the state path the caller passed --
+  // ~/.zstack/projects/<slug>/loop/state.json -- so nothing has to remember it.
+  test("apply's printed board move carries --slug, derived from the state path (#205)", () => {
+    const s = state([ticket(1, "Building")], [lane(1, "builder", { outcome: { kind: "built" } })]);
+    const { stdout } = runApply("advance", s, { kind: "advance", ticket: 1, to: "qa" }, join(".zstack", "projects", "acme-app", "loop"));
+    expect(stdout).toContain(`"$Z_BOARD" move 1 QA --if-present --slug "acme-app"`);
+  });
+
+  // The env fallback is what covers a state path that is not under
+  // ~/.zstack/projects/<slug>/loop/, and it rides `slugFromStatePath`'s DEFAULT
+  // `env = process.env` binding -- which every other test replaces, so nothing
+  // exercised it end to end. Without this, changing that default to `{}` is
+  // green across the whole suite while the real loop silently loses its slug.
+  test("apply falls back to ZSTACK_SLUG when the state path names no project (#205)", () => {
+    const s = state([ticket(1, "Building")], [lane(1, "builder", { outcome: { kind: "built" } })]);
+    const statePath = join(dir, "envfallback-state.json");
+    const actionPath = join(dir, "envfallback-action.json");
+    writeFileSync(statePath, JSON.stringify(s));
+    writeFileSync(actionPath, JSON.stringify({ kind: "advance", ticket: 1, to: "qa" }));
+    const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "apply", statePath, actionPath, "--now", "0"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, ZSTACK_SLUG: "env-slug" },
+    });
+    expect(proc.exitCode).toBe(0);
+    expect(proc.stdout.toString()).toContain(`"$Z_BOARD" move 1 QA --if-present --slug "env-slug"`);
+  });
+
+  test("apply prints the owed write for a claim, and nothing for an action that owns no stage status (#205)", () => {
+    const claimed = runApply("claim", state([ticket(1, "Ready")]), { kind: "claim", ticket: 1, stage: "builder" });
+    expect(claimed.stdout).toContain("board write for #1 = Building");
+
+    const parked = runApply("park", state([ticket(1, "Building")], [lane(1, "builder")]), { kind: "park", ticket: 1, status: "Questions", note: "q" });
+    expect(parked.exitCode).toBe(0);
+    expect(parked.stdout).not.toContain("board write for");
   });
 
   // -- fix 7: ingest must not treat a corrupt state as a first ingest ---------
