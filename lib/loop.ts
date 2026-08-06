@@ -1753,6 +1753,16 @@ export function boardWriteFor(action: Action): { ticket: number; status: BoardSt
   }
 }
 
+// A project slug as `setup` writes it: the GitHub repo name, which GitHub itself
+// restricts to this charset. Everything downstream of `slugFromStatePath` depends
+// on that -- the value is interpolated into a command line the orchestrator is
+// told to run, and joined into a path under ~/.zstack/projects -- so `..` and a
+// leading `-` are refused on top of the charset: the first traverses out of the
+// projects dir, the second is read as a flag by the command it lands in.
+function isProjectSlug(v: string): boolean {
+  return /^[A-Za-z0-9._-]+$/.test(v) && !v.startsWith("-") && v !== "." && v !== "..";
+}
+
 // The project slug a loop state path belongs to. State files live at
 // ~/.zstack/projects/<slug>/loop/state.json (z-loop Step 0), so the slug is in
 // the path the caller already passed -- no config read, no guess. Falls back to
@@ -1762,15 +1772,20 @@ export function boardWriteFor(action: Action): { ticket: number; status: BoardSt
 // "Multiple zstack projects configured" whenever ~/.zstack/projects holds more
 // than one project, so a printed `z-board move` without `--slug` is not runnable
 // on the machines the loop actually runs on.
-// The segment is matched against the slug charset rather than `[^/]+` on
-// purpose: the result is interpolated into a command line a human or the
-// orchestrator RUNS, so a path segment holding a space or a shell metacharacter
-// must not become a `--slug` argument. Refusing to match is the safe direction --
-// the printed line then carries no --slug, and `resolveSlug` fails loudly at the
-// point of use instead of quietly naming some other configured project.
+//
+// Anchored on the `.zstack/projects/<slug>/loop/` layout lib/config.ts
+// `projectsDir` BUILDS, and taking the LAST match, because an unanchored
+// `/projects/<x>/loop/` is shadowed by any ancestor directory shaped the same
+// way: `$HOME=/home/z/projects/scratch/loop` yielded "scratch" and would have
+// aimed the printed board write at a DIFFERENT configured project. Both the path
+// segment and the env fallback go through isProjectSlug -- guarding only the
+// path branch leaves `ZSTACK_SLUG` a hole straight into that command line.
+// Returning undefined is the safe direction: the line then carries no --slug and
+// resolveSlug fails loudly at the point of use.
 export function slugFromStatePath(statePath: string, env: Record<string, string | undefined> = process.env): string | undefined {
-  const m = statePath.replace(/\\/g, "/").match(/\/projects\/([A-Za-z0-9._-]+)\/loop\//);
-  return m ? m[1] : env.ZSTACK_SLUG || undefined;
+  const matches = [...statePath.replace(/\\/g, "/").matchAll(/\.zstack\/projects\/([A-Za-z0-9._-]+)\/loop\//g)];
+  const chosen = matches.length > 0 ? matches[matches.length - 1][1] : env.ZSTACK_SLUG;
+  return chosen && isProjectSlug(chosen) ? chosen : undefined;
 }
 
 // Applies an Action to the loop state, returning the new state (pure -- input
@@ -3401,8 +3416,14 @@ export function main(argv: string[]): number {
       const owed = boardWriteFor(action);
       if (owed) {
         const slug = slugFromStatePath(statePath);
+        // Naming the owing row matters: the `claim` row moves at its step 2, so
+        // its line is a post-condition to CHECK, while the `advance` row still
+        // owes its step-3 move. One wording for both would teach the reader that
+        // the line is advisory on the very tick the advance row says never to
+        // skip it.
+        const owedBy = action.kind === "claim" ? "the claim row moved it at step 2 -- verify" : "your step 3 owes it";
         console.log(
-          `board write for #${owed.ticket} = ${owed.status} -- run it now unless this action's row already did: ` +
+          `board write for #${owed.ticket} = ${owed.status} (${owedBy}): ` +
             `"$Z_BOARD" move ${owed.ticket} ${owed.status} --if-present${slug ? ` --slug "${slug}"` : ""}`
         );
       }

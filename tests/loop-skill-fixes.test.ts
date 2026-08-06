@@ -659,6 +659,25 @@ describe("#205: the advance row moves the board to the new stage's status", () =
     expect(shared).toContain("the `advance` row's step-3 move"); // enumeration kept current
   });
 
+  // The three carve-outs the adversarial pass forced into the row. Each is a
+  // claim a reader acts on, and each was deletable with the suite green before
+  // this: the skip-qa window is the one advance the resync does NOT cover, the
+  // move is a blind write rather than a compare-and-set, and the recovery has to
+  // dump the worktree because "fires at a boundary" is not "the tree is clean".
+  test("the row names the skip-qa two-hop gap, the blind-write race, and the unconditional salvage dump", () => {
+    const row = advanceRow();
+    expect(row).toMatch(/is NOT recovered/);
+    expect(row).toContain("skip-qa");
+    expect(row).toMatch(/re-claimed as a \*builder\*/);
+    expect(row).toMatch(/blind write, not a compare-and-set/);
+    expect(row).toMatch(/TERMINAL status/);
+    // The salvage clause lives on the `stop-lane N` row, which is where the
+    // recovery is actually performed -- the advance row delegates to it.
+    const stopRow = zLoop().split("\n").find((l) => l.startsWith("| `stop-lane N`")) ?? "";
+    expect(stopRow).toMatch(/Salvage dump\*\* block before `lane-remove`, always/);
+    expect(stopRow).toMatch(/is not "the worktree is clean"/);
+  });
+
   // The tick output carries the same derivation, so a skipped move is visible
   // on the spot rather than a stage later as a rebuild. Pinned against the
   // PRODUCING format string, not a second copy of it: reword the print and this

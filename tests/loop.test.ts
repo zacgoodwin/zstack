@@ -2900,6 +2900,26 @@ describe("#205: every stage transition writes the board", () => {
     expect(slugFromStatePath("/home/z/.zstack/projects/a;rm -rf ~/loop/state.json", {})).toBeUndefined();
     // ...and it falls back rather than inventing one, same as any other non-match
     expect(slugFromStatePath("/home/z/.zstack/projects/my app/loop/state.json", { ZSTACK_SLUG: "real" })).toBe("real");
+    // The ENV branch goes through the same guard. Guarding only the path branch
+    // left ZSTACK_SLUG a hole straight into the printed command line: driven
+    // through the real CLI, `ZSTACK_SLUG='evil"; cat ~/.ssh/id_rsa; echo "'`
+    // printed `--slug "evil"; cat ~/.ssh/id_rsa; echo ""` under an instruction
+    // to run the line verbatim.
+    expect(slugFromStatePath("/tmp/x/state.json", { ZSTACK_SLUG: 'evil"; cat ~/.ssh/id_rsa; echo "' })).toBeUndefined();
+    expect(slugFromStatePath("/tmp/x/state.json", { ZSTACK_SLUG: "has space" })).toBeUndefined();
+    // `..` would traverse out of ~/.zstack/projects; a leading `-` is read as a
+    // flag by the command the value is pasted into. Both refused on both branches.
+    expect(slugFromStatePath("/home/z/.zstack/projects/../loop/state.json", {})).toBeUndefined();
+    expect(slugFromStatePath("/home/z/.zstack/projects/--if-present/loop/state.json", {})).toBeUndefined();
+    expect(slugFromStatePath("/tmp/x/state.json", { ZSTACK_SLUG: ".." })).toBeUndefined();
+    expect(slugFromStatePath("/tmp/x/state.json", { ZSTACK_SLUG: "-rf" })).toBeUndefined();
+    // Anchored on the real layout and taking the LAST match, so an ancestor
+    // directory shaped `projects/<x>/loop/` cannot shadow the true slug and aim
+    // the printed board write at a different configured project. Unanchored,
+    // this returned "scratch".
+    expect(
+      slugFromStatePath("/home/zac/projects/scratch/loop/.zstack/projects/my-real-repo/loop/state.json", {})
+    ).toBe("my-real-repo");
     // The regex hardcodes the on-disk layout that lib/throttle.ts defaultLoopDir
     // CONSTRUCTS, and nothing else couples them -- so a layout change would make
     // this return undefined silently and drop --slug from a repair line the
@@ -4326,7 +4346,7 @@ describe("loop CLI", () => {
   // ~/.zstack/projects/<slug>/loop/state.json -- so nothing has to remember it.
   test("apply's printed board move carries --slug, derived from the state path (#205)", () => {
     const s = state([ticket(1, "Building")], [lane(1, "builder", { outcome: { kind: "built" } })]);
-    const { stdout } = runApply("advance", s, { kind: "advance", ticket: 1, to: "qa" }, join("projects", "acme-app", "loop"));
+    const { stdout } = runApply("advance", s, { kind: "advance", ticket: 1, to: "qa" }, join(".zstack", "projects", "acme-app", "loop"));
     expect(stdout).toContain(`"$Z_BOARD" move 1 QA --if-present --slug "acme-app"`);
   });
 
