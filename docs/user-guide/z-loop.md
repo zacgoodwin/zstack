@@ -744,10 +744,9 @@ the one question a bulk read cannot answer:
   the flagged ticket's board status: a claim is taken at whatever stage the
   ticket resumes at (Ready/Building → `builder`, QA → `qa`, Review →
   `reviewer`), so that status names the budget the holding lane is working to.
-  Keying every foreign claim to `builder` measured a live reviewer against
-  25 × 3 minutes instead of 40 × 3 and parked its dependents while it was still
-  inside its own watchdog. One resolver serves both the throttle above and the
-  bound below, so they can never end up on different clocks.
+  Keying every foreign claim to `builder` asked about a live reviewer 15 minutes
+  early, every period. That per-stage resolution is the **throttle's** alone; the
+  bound below deliberately does not share it.
 - **A clock that jumps delays these exits, never removes them.** A timestamp in
   the future (an NTP step backwards, a VM snapshot restore, a `state.json`
   written on a faster-clocked machine) used to make both comparisons negative
@@ -755,17 +754,26 @@ the one question a bulk read cannot answer:
   spin this section exists to remove. The two now absorb it in opposite
   directions, each failing safe: an untrustworthy stamp is not evidence the
   board was read recently, so the **throttle treats it as due** (worst case, one
-  extra read); it is not evidence of a long wait either, so the **bound clamps
-  it to now** and starts over (worst case, a later park — never a dependent
-  Blocked early over a clock jump).
+  extra read); it is not evidence of a long wait either, so the **bound resets it
+  to now** and starts over (worst case, a later park — never a dependent
+  Blocked early over a clock jump). That reset happens *on the way in*, when the
+  next attempt is recorded: merely clamping the subtraction and leaving the field
+  looked equivalent and was the same wedge in disguise, because the anchor is
+  written once and a stamp a year ahead then held the elapsed time at zero for a
+  year. A stamp that is not a time at all — `null`, which is what a non-numeric
+  `--now` used to leave on disk — reads as **never asked**, so it can reach the
+  confirm and never the park.
 - **The clearing rule is `Board.claim()`'s rule.** The flag drops only for an
   assignee set that a real claim would accept: empty, or solely this loop's own
   login. The ticket becomes claimable on the very next tick — including under a
   ticket cap, where clearing the flag also re-admits the freed ticket to
-  `batchTickets`. It was excluded from the batch only because it was flagged
-  when the batch was cut, and something in that batch depends on it; without the
-  re-admission the next tick parked the dependent as a phantom "dependency
-  cycle" on the tick right after the read. Any other set is somebody else's: the
+  `batchTickets` **and** to the human-needed safety control's scope. It was
+  excluded from both only because it was flagged when the batch was cut, and
+  something in that batch depends on it; without the re-admission the next tick
+  parked the dependent as a phantom "dependency cycle" on the tick right after
+  the read, and a ticket the loop then went on to build could park Questions
+  without ever counting toward the mid-run "a human is needed" notification. Any
+  other set is somebody else's: the
   flag stays, the holding login is recorded, and the wait resumes without
   another read for a full watchdog period.
 - **The answer must be for the ticket it is applied to.** `z-board assignees N`
@@ -791,20 +799,42 @@ the one question a bulk read cannot answer:
   `confirm-claim` on every single tick, which costs a call and an agent turn per
   tick — worse than the `wait` this replaced.
 - **The wait is bounded — from the first confirm, not from the claim.** Once
-  `watchdogMinutes * 3` have passed **since the first recorded confirm attempt**
-  with the claim still standing — the answer coming back foreign, the read
-  failing, or any mix of the two — the loop stops asking and parks the
+  **three whole-ticket budgets** have passed **since the first recorded confirm
+  attempt** with the claim still standing — the answer coming back foreign, the
+  read failing, or any mix of the two — the loop stops asking and parks the
   dependents Blocked, naming the login that holds the ticket when a read ever
   returned one. An abandoned claim and a broken read both end the run instead of
   spinning. The flagged ticket itself is left exactly as it is — parking
   releases *your* work, never someone else's. The note reports how long it has
   actually been since that first attempt, not the bound it crossed, because a
   state carried in from an earlier run can be days past it.
-- **The park is not a one-way door.** A **new run** drops the anchor and re-earns
-  the bound with a fresh read: the flag and its throttle still carry (the claim
-  may well still be held, and a bulk read cannot say otherwise), but
-  `claimConfirmingSince` resets on the same fresh-batch boundary
-  `mergedThisRun` uses. Without that reset the anchor outlived every future run,
+
+  A **whole-ticket** budget — every stage's `watchdogMinutes` summed, so 3 ×
+  (25 + 15 + 40 + 15) = 285 minutes on the defaults — and not three of the
+  holder's *current* stage. A watchdog period measures one silent stage of yours;
+  a foreign claim is held for a whole ticket, builder through merge. Bounding one
+  by the other parked the dependents of a perfectly healthy sibling loop about an
+  hour in (3 × 25), against a single-stage ceiling of 480 minutes in the same
+  loop, and made the deadline *move* whenever the holder's own board status did:
+  an ordinary Review → Ready bounce in the other session could push time already
+  accrued past a shorter stage's bound. One claim, one deadline, whatever they
+  are doing.
+- **The park is not a one-way door — and the bound still arrives.** A **new run**
+  re-earns the park with a fresh read. What resets is the **throttle**
+  (`claimedByOtherAt`), never the bound's clock: the park needs both stamps, so
+  the first idle tick of every run finds the confirm due, spends one live read,
+  and only then may Block anything. A run is the invocation's `--session`, which
+  every ingest carries, and a run boundary is not a batch boundary — a
+  context-clear resume and a crash resume both re-enter an *un-drained* batch, so
+  keying on the batch alone left an operator who cleared context over lunch
+  Blocking a dependent on the first idle tick with no read spent. Resetting the
+  *anchor* instead would be worse than either: `context-clear` is returned before
+  this branch is even reached, so a loop that hits its context ceiling mid-wait
+  exits and resumes, and the bound would restart every time — measured at six
+  resumes and 360 minutes against a 120-minute bound with no park, which is this
+  section's own livelock wearing a different hat. The clock accrues across
+  resumes; only the permission to skip the read resets. Without any reset at all
+  the anchor outlived every future run,
   so a ticket parked once could never be re-confirmed again — an operator doing
   exactly what the park note says ("move it back to Ready once that claim is
   released") got the same park back, days later, having spent no reads at all.
@@ -834,9 +864,9 @@ least once.**
 It is also the only anchor that can work. The `claimedByOtherAt` throttle is
 re-stamped by *every* foreign answer, so on a claim that keeps coming back
 foreign it never ages past the bound at all: an "assignee set still foreign for
-`watchdogMinutes * 3`" gate reading that field would never fire, and the wait
+three budgets" gate reading that field would never fire, and the wait
 would be unbounded. Counting from the first attempt is what makes "still foreign
-three periods later" a condition that can actually arrive.
+three budgets later" a condition that can actually arrive.
 
 The same rule covers a `state.json` written before this existed: it carries the
 flag with no timestamps, which reads as infinitely stale, so such a run confirms

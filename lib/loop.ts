@@ -324,6 +324,13 @@ export interface LaneState {
 export interface LoopState {
   tickets: TicketSnapshot[];
   lanes: LaneState[];
+  // #223 review: the SESSION of the invocation that last ingested into this file
+  // (SKILL Step 1's "$ME-$(date +%s)"). The ONE thing here that identifies a RUN
+  // rather than a batch -- ingestBoardItems resets the bounded-park anchor when it
+  // changes, so a context-clear or crash resume re-earns the park with a fresh
+  // read instead of inheriting an hours-old clock. Optional: a caller that passes
+  // no --session leaves it untouched and gets the pre-existing batch boundary.
+  runSession?: string;
   maxLanes: number;
   // #256: a scalar (one budget for every stage, every pre-#256 state file) or the
   // per-stage object. Never read directly -- resolveWatchdogMinutes(state, stage)
@@ -711,13 +718,59 @@ export type Action =
   | { kind: "context-clear" }
   | { kind: "drain-complete" };
 
-// #223: how many watchdog periods a claim may keep coming back FOREIGN before
-// the drain stops waiting on it and parks its dependents Blocked. 3 rather than
-// 1 because a real sibling loop building a ticket routinely outlives one
-// watchdog period -- the watchdog measures a silent worker, this measures a
-// whole other run -- while an abandoned claim still ends this run in bounded
-// time instead of confirming forever.
-export const ABANDONED_CLAIM_WATCHDOGS = 3;
+// #223: how many WHOLE-TICKET budgets a claim may keep coming back FOREIGN
+// before the drain stops waiting on it and parks its dependents Blocked. 3
+// rather than 1 because a sibling loop's ticket bounces (QA passes, review
+// bounces, respawns) well past one clean pass, while an abandoned claim still
+// ends this run in bounded time instead of confirming forever.
+export const ABANDONED_CLAIM_TICKET_BUDGETS = 3;
+
+// The budget the bounded park measures against, and it is deliberately NOT the
+// throttle's budget (#223 review).
+//
+// A watchdog period measures ONE silent stage of OURS. A foreign claim is held
+// for a WHOLE TICKET -- builder -> qa -> reviewer -> merge -- so keying the bound
+// to the holder's current stage measured the wrong thing twice over:
+//
+//  - It parked far too early. On the pack's own defaults a builder budget is 25
+//    minutes, so the bound was 75 -- against a single-stage ceiling of
+//    STAGE_CEILING_MINUTES (480) in this very file. A perfectly healthy sibling
+//    loop had its dependents Blocked about an hour in, turning the ordinary
+//    two-session case into a human-needed escalation.
+//  - It moved under an already-running bound. The holder's board status changes
+//    as its own lanes advance (Review -> Ready on a bounce), and reading the
+//    budget off that status let a longer stage's elapsed time cross a shorter
+//    stage's bound the instant the status moved -- a park triggered by someone
+//    else's progress. Summing every stage makes the bound a constant for the
+//    life of the claim, which is what a "has this been abandoned?" clock has to
+//    be.
+//
+// The THROTTLE still reads the holder's own current stage: "how long may we
+// believe this observation before re-reading it" genuinely is a per-stage
+// question, and being wrong there costs one extra `gh` read, not a Blocked
+// ticket.
+export function abandonedClaimBoundMs(watchdogMinutes: number | StageWatchdogMinutes): number {
+  const perTicketMinutes = (Object.keys(DEFAULT_STAGE_WATCHDOG_MINUTES) as Stage[]).reduce(
+    (sum, stage) => sum + resolveWatchdogMinutes(watchdogMinutes, stage),
+    0
+  );
+  return perTicketMinutes * 60_000 * ABANDONED_CLAIM_TICKET_BUDGETS;
+}
+
+// #223 review: a stamp this file may compute elapsed time from. `undefined` is
+// "never recorded" and is handled separately by each caller, but a stamp can
+// also arrive NON-FINITE, and that is the dangerous shape: `null` (what
+// JSON.stringify writes for the NaN a bad `--now` produces, and what a
+// hand-edited state.json can carry -- troubleshooting.md tells operators to edit
+// this file) passes a bare `!== undefined` gate, and `Math.min(null, nowMs)`
+// then reads it as epoch 0. Measured: one `loop next --now abc` parked a
+// dependent Blocked on the very next tick with a note reading "30000000 minutes
+// after the first confirm attempt" and ZERO board reads ever spent -- the exact
+// invariant tests/safety.test.ts asserts by name. Every read of these stamps
+// goes through this predicate so no caller can forget.
+function isStamp(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
 
 // The two config-driven QA bounce knobs resolveOutcome needs. Threaded in by
 // nextAction (already defaulted there) rather than read off a global, so the
@@ -1667,12 +1720,14 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
       // live reviewer against 25*3 minutes instead of 40*3 and parked its
       // dependents while it was still inside its own watchdog.
       //
-      // One resolver, called by both exits below, so the throttle (one read per
-      // period) and the bound can never end up reading different clocks for the
-      // same dep. A status outside CLAIMABLE_STAGE cannot be a live foreign lane
-      // at all, so it falls back to the builder budget rather than throwing.
+      // This resolver serves the THROTTLE only. The bound used to share it and
+      // no longer does (#223 review): see abandonedClaimBoundMs, which sums every
+      // stage because a claim is held for a whole ticket, not one stage of it. A
+      // status outside CLAIMABLE_STAGE cannot be a live foreign lane at all, so it
+      // falls back to the builder budget rather than throwing.
       const wdFor = (dep: TicketSnapshot): number =>
         budgetFor(isWorkableStatus(dep.status) ? claimStage(dep.status) : "builder");
+      const boundMs = abandonedClaimBoundMs(state.watchdogMinutes);
       // A stamp in the FUTURE (an NTP step backwards, a VM snapshot restore, a
       // state.json written on a faster-clocked machine, a stray --now) makes a
       // bare `nowMs - stamp` negative, which disabled the confirm AND the park
@@ -1692,8 +1747,19 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
       // Symmetric clamping looked right and was not: with both stamps clamped,
       // `elapsed` stays 0 for as long as the stamp leads the clock, so a jump of
       // a year wedges the drain for a year. Only the bound may absorb the skew.
-      const stale = (stamp: number | undefined, wdMs: number): boolean =>
-        stamp === undefined || stamp > nowMs || nowMs - stamp >= wdMs;
+      //
+      // #223 review: that absorption is done ON THE WAY IN, by recordConfirmAttempt
+      // and claimConfirmed, which REPAIR a future anchor to now rather than leaving
+      // it and clamping the subtraction here. Clamping only the arithmetic looked
+      // equivalent and was the year-long wedge in disguise: `??=` never overwrites
+      // a stamp that is merely wrong, so `nowMs - Math.min(stamp, nowMs)` stayed 0
+      // on every tick until the wall clock caught the stamp. Measured against an
+      // anchor one year ahead: confirm-claim at +0, +1h, +1d and +30d, the anchor
+      // unchanged after three recorded asks, and the park -- AC5's "the wait is
+      // bounded" -- unreachable for a year. The clamp below stays as the last line
+      // of defence for a state file whose anchor was never written by this code.
+      const stale = (stamp: unknown, wdMs: number): boolean =>
+        !isStamp(stamp) || stamp > nowMs || nowMs - stamp >= wdMs;
       const sinceFirstAsk = (stamp: number): number => nowMs - Math.min(stamp, nowMs);
       // Bounded wait, checked FIRST so a claim already proved abandoned is not
       // re-confirmed one more time before parking.
@@ -1713,7 +1779,7 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
       //    Plan step 4 bounds ("if the confirm KEEPS COMING BACK foreign").
       //    Anchoring on claim-loss (or on claimedByOtherAt, which markClaimLost
       //    does stamp) parked the dependents of any claim lost more than
-      //    wd * ABANDONED_CLAIM_WATCHDOGS before the drain first went idle
+      //    abandonedClaimBoundMs before the drain first went idle
       //    WITHOUT EVER ASKING THE BOARD -- the run-12 shape this ticket exists
       //    to fix, re-Blocking #149 instead of un-wedging it. It is also the only
       //    anchor that CAN work. claimConfirmingSince <= claimedByOtherAt always
@@ -1732,15 +1798,43 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
       // on the orchestrator obeying SKILL.md Step 4's "never skip that command".
       // A compliant orchestrator only sharpens it, replacing the bare attempt
       // with the login it read or the failure it hit.
+      //
+      // isStamp, not `!== undefined` (#223 review). A `null` anchor is neither
+      // "never asked" nor a time: it survived a bare existence gate and then read
+      // as epoch 0 through Math.min, so the FIRST idle tick parked a dependent
+      // Blocked having spent no reads at all -- the one thing this whole branch
+      // exists to make impossible. Reachable without any hand-editing: `loop next
+      // --now <not-a-number>` stamps NaN, and JSON.stringify writes NaN as null.
+      //
+      // TWO stamps gate the park, and they answer two different questions
+      // (#223 review pass 3):
+      //
+      //   claimConfirmingSince -- "how long have we been re-confirming?" It is the
+      //     bound's clock, it accrues across runs, and NOTHING resets it short of a
+      //     successful confirm or a fresh claim loss. Resetting it per run made the
+      //     bound unreachable on the context-clear cycle: the loop hits its context
+      //     ceiling mid-wait, exits, resumes with a new session, and the clock
+      //     starts over. Measured at 6 resumes / 360 minutes against a 120-minute
+      //     bound with no park -- the #223 livelock restored through the resume
+      //     door, by the very fix meant to open it.
+      //   claimedByOtherAt -- "have we asked the board THIS RUN?" ingest drops it on
+      //     a new run/batch, so the first idle tick of every run finds the throttle
+      //     due, spends one read, and only then may park. That is what the park
+      //     note's own remediation ("move it back to Ready once that claim is
+      //     released") needs to work, and it is a per-RUN guarantee rather than a
+      //     per-claim one.
+      //
+      // Together: the bound always arrives, and no dependent is ever Blocked over a
+      // claim this run has not read at least once.
       for (const dep of foreignDeps) {
-        if (dep.claimConfirmingSince === undefined) continue;
-        const wd = wdFor(dep);
+        if (!isStamp(dep.claimConfirmingSince)) continue;
+        if (!isStamp(dep.claimedByOtherAt)) continue; // never asked THIS run -- confirm below first
         const waited = sinceFirstAsk(dep.claimConfirmingSince);
-        if (waited < wd * 60_000 * ABANDONED_CLAIM_WATCHDOGS) continue;
+        if (waited < boundMs) continue;
         const blocked = unclaimed.find((t) => t.dependsOn.includes(dep.number));
         if (!blocked) continue; // unreachable: foreignDeps is built from unclaimed's own deps
         // The REAL elapsed time, not the bound it crossed: a state carried in
-        // from an earlier run can be days past `wd * 3`, and printing the
+        // from an earlier run can be days past the bound, and printing the
         // constant told an operator triaging a Blocked ticket that the loop had
         // tried more recently than it had.
         const mins = Math.round(waited / 60_000);
@@ -2370,13 +2464,77 @@ export function claimConfirmed(
       );
       if (wantedByBatch) next.batchTickets = [...next.batchTickets, ticket].sort((a, b) => a - b);
     }
+    // ...and into the SAFETY CONTROL's scope, which is a SEPARATE list on a
+    // SEPARATE condition (#223 review pass 3). batchTickets is the ticket cap's
+    // allow-list and is undefined on an uncapped run -- which is the default
+    // (DEFAULT_TICKET_LIMIT is 0, and bin/z-loop-tick passes no --ticket-limit at
+    // all). initialBatchTickets is captured on EVERY run, capped or not, and is
+    // what humanNeededStatus (#150) counts. Pass 2 nested this inside the cap's
+    // guard, so on an ordinary run it never ran: measured, a freed ticket parked
+    // Questions and the mid-run "a human is needed" breakdown counted 0 for it,
+    // letting a drain finish "clean" with a person waiting -- the exact failure
+    // the re-admission exists to stop, still live on the path everyone uses.
+    addInitialBatchTicket(next, ticket);
     return next;
   }
   t.claimedByOther = true;
   t.claimedByOtherAt = nowMs;
-  t.claimConfirmingSince ??= nowMs; // this attempt starts the bounded-park clock
+  // Repaired, not merely defaulted (#223 review): `??=` keeps a stamp that
+  // exists but is not a time -- a null from a NaN clock, or one in the FUTURE
+  // after an NTP step back -- and both shapes break the bound in opposite
+  // directions (instant park, or a park that can never arrive). See stampAnchor.
+  stampAnchor(t, nowMs);
   t.claimedByOtherLogin = assignees.filter((a) => a !== me).join(", ");
   return next;
+}
+
+// #223 review: start the bounded-park clock, or repair an anchor that cannot be
+// one. The plain `??=` this replaces was right about the ONE thing that matters
+// -- a real anchor is written once and never re-stamped, or a claim that keeps
+// coming back foreign would push its own deadline forever -- and wrong about
+// every other shape the field can hold:
+//
+//  - non-finite (`null` on disk, from the NaN a bad `--now` produces): read as
+//    epoch 0, so the very next idle tick parks with zero reads spent.
+//  - in the FUTURE (NTP step back, VM snapshot restore, a state.json from a
+//    faster-clocked machine): `nowMs - Math.min(stamp, nowMs)` is 0 for as long
+//    as the stamp leads the clock, so the bound never arrives. Measured: an
+//    anchor one year ahead still emitting confirm-claim 30 days later.
+//
+// Neither is evidence of anything, so both are treated as "this attempt is the
+// first one" -- the park then waits out a full bound from HERE, which is what
+// nextAction's comment always claimed and only now does.
+function stampAnchor(t: TicketSnapshot, nowMs: number): void {
+  if (!isStamp(t.claimConfirmingSince) || t.claimConfirmingSince > nowMs) t.claimConfirmingSince = nowMs;
+}
+
+// The other half of the batch re-admission above: put a freed ticket into the
+// scope humanNeededStatus counts (#150), so a ticket this run goes on to build
+// and park Questions is visible to the mid-run "a human is needed" control.
+//
+// Only when something already in that scope DEPENDS on it -- the same
+// in-scope-because-something-needs-it rule the ticket-cap re-admission uses. A
+// freed ticket nobody waits on was never this batch's business.
+//
+// `undefined` is a state file predating #150, where humanNeededStatus already
+// falls back to counting every ticket: there is no list to add to, and spreading
+// undefined would throw on the one tick this feature exists to spend.
+//
+// initialReadyCount moves WITH it (#223 review pass 3), because it is the
+// denominator of the same fraction: humanNeededTripped is
+// (blocked+skipped+questions)/initialReadyCount, and initialReadyCount is
+// captured by a readyCount that filters `!claimedByOther` -- so a ticket flagged
+// at capture is in NEITHER side. Growing only the numerator's scope makes the
+// gate trip below its configured percent and latch the fire-once flag, so the
+// real crossing is never announced. Both sides move or neither does.
+function addInitialBatchTicket(state: LoopState, ticket: number): void {
+  if (state.initialBatchTickets === undefined || state.initialBatchTickets.includes(ticket)) return;
+  const wantedByScope = state.tickets.some(
+    (o) => state.initialBatchTickets!.includes(o.number) && o.dependsOn.includes(ticket)
+  );
+  if (!wantedByScope) return;
+  state.initialBatchTickets = [...state.initialBatchTickets, ticket].sort((a, b) => a - b);
+  state.initialReadyCount = (state.initialReadyCount ?? 0) + 1;
 }
 
 // #223: ONE confirm attempt happened and it decided nothing about the claim.
@@ -2405,7 +2563,7 @@ export function recordConfirmAttempt(state: LoopState, ticket: number, nowMs: nu
   const t = findTicket(next, ticket);
   if (t.claimedByOther !== true) return next; // nothing to pace: the flag is already gone
   t.claimedByOtherAt = nowMs;
-  t.claimConfirmingSince ??= nowMs;
+  stampAnchor(t, nowMs); // repairs a null/NaN or future anchor; see stampAnchor
   return next;
 }
 
@@ -2565,6 +2723,7 @@ export function ingestBoardItems(
     ticketLimit?: number; // #131: cap used to compute batchTickets on a fresh batch
     contextTokens?: number; // #131: live orchestrator context reading, stored fresh
     contextTokenLimit?: number; // #131: context ceiling, captured once like the other knobs
+    session?: string; // #223 review: this invocation's SESSION -- a change means a new RUN
   },
   // #138: one of the two inputs that remove a ticket (and its lane) from loop
   // state -- the other being an unknown board status (partitionKnownStatus
@@ -2808,22 +2967,54 @@ export function ingestBoardItems(
   // remediation the loop itself prints could not work, and the only escape was
   // the state.json hand-edit this ticket exists to remove.
   //
-  // The throttle (claimedByOtherAt) and the flag itself still carry: the claim
-  // may well still be held, and the bulk read cannot say otherwise. Only the
-  // anchor resets, so a new run always spends one read before Blocking anything.
-  // Within a run nothing resets, so the bound still ends a drain exactly as
-  // before -- this boundary is the same one mergedThisRun/initialReadyCount use.
-  const carried = startingFreshBatch
-    ? tickets.map((t) => {
-        if (t.claimConfirmingSince === undefined) return t;
-        const { claimConfirmingSince: _dropped, ...rest } = t; // deleted, not set to undefined
-        return rest;
-      })
-    : tickets;
+  // WHICH stamp resets is the whole point, and pass 2 got it backwards
+  // (#223 review pass 3). It reset the ANCHOR, claimConfirmingSince. That made
+  // the bounded park unreachable on the context-clear cycle: a loop that crosses
+  // contextTokenLimit while waiting out the bound returns context-clear (step 5b,
+  // BEFORE the #223 branch at step 6), exits, and resumes with a fresh session --
+  // so the clock restarted every resume and the dependent was never parked.
+  // Measured: 6 resumes, 360 minutes, a 120-minute bound, no park. That is the
+  // #223 livelock itself, re-entered through the resume door.
+  //
+  // So the anchor now carries like the flag, and the THROTTLE resets instead.
+  // Dropping claimedByOtherAt makes the first idle tick of every run find the
+  // confirm due; the park additionally requires that stamp to exist, so a run
+  // must spend one live read before it may Block anything -- which is what the
+  // park note's remediation needs -- while the bound keeps accruing across
+  // resumes and still ends the drain. One read per run, not a fresh bound.
+  //
+  // #223 review, second half: startingFreshBatch is a BATCH predicate, not a run
+  // one, and the two come apart on exactly the paths that matter here. A
+  // context-clear resume (#131) and a crash resume both re-enter an UN-DRAINED
+  // batch, so drainComplete(prev) is false and the reset above never fires -- the
+  // comment three lines up ("a new run always spends one read") was true of a new
+  // BATCH only. An operator who clears context over lunch and re-invokes /z-loop
+  // comes back to an hours-old anchor and gets the dependent parked Blocked on the
+  // first idle tick, no read spent: the one-way door again, through the resume
+  // door instead of the new-batch one.
+  //
+  // The run identity is already in hand and needs no new bookkeeping: SKILL Step 1
+  // mints SESSION="$ME-$(date +%s)" once per invocation and both ingest call sites
+  // (Step 3 and bin/z-loop-tick) carry it. A session that differs from the stored
+  // one IS a new run. Absent (a caller that passes nothing, every pre-existing
+  // test) it degrades to the batch boundary alone, exactly as before.
+  const newRun = cfg?.session !== undefined && cfg.session !== prev?.runSession;
+  const carried =
+    startingFreshBatch || newRun
+      ? tickets.map((t) => {
+          if (t.claimedByOtherAt === undefined) return t;
+          const { claimedByOtherAt: _dropped, ...rest } = t; // deleted, not set to undefined
+          return rest;
+        })
+      : tickets;
 
   return {
     tickets: carried,
     lanes: structuredClone(lanes),
+    // #223 review: the run identity the anchor reset above keys on. Preserved
+    // when the caller passes nothing so a mixed fleet (an ingest with --session,
+    // a per-tick one without) never reads as a run change on alternate ticks.
+    runSession: cfg?.session ?? prev?.runSession,
     maxLanes: cfg?.maxLanes ?? prev?.maxLanes ?? DEFAULT_MAX_LANES,
     // #256: the per-stage TABLE is the last-resort default, not the scalar, so a
     // state built with no config flag at all still gets the four derived budgets.
@@ -3515,10 +3706,14 @@ const USAGE = `loop <command> [args]
                       [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N]
                       [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off]
                       [--max-review-bounces N] [--min-skeptic-quorum N] [--ticket-limit N]
-                      [--context-token-limit N] [--context-tokens N]
+                      [--context-token-limit N] [--context-tokens N] [--session ID]
                                                      build/refresh the snapshot (creates state.json)
+                                                     --session is this invocation's SESSION (SKILL Step 1's
+                                                     "$ME-$(date +%s)"): a change means a NEW RUN, which
+                                                     re-earns #223's bounded park with a fresh confirm read
 
-  --now defaults to the wall clock; tests pass it explicitly.`;
+  --now defaults to the wall clock; tests pass it explicitly. It is MILLISECONDS
+  since the epoch (a non-numeric value is rejected: \`next\` persists it).`;
 
 // readJson / atomicWrite come from lib/cli.ts: atomicWrite's tmp+rename keeps a
 // crash mid-write from leaving a truncated state.json for the next ingest to
@@ -3798,7 +3993,36 @@ export function main(argv: string[]): number {
 
     // The only Date.now() in this file: the CLI boundary. Pure functions above
     // always take nowMs.
-    const nowMs = Number(str(flags, "now") ?? Date.now());
+    //
+    // Validated since #223 review, and it is the flag's own commands that made it
+    // matter. `--now` used to feed pure readers and reducers whose output a caller
+    // could simply discard; `loop next` now PERSISTS this number into
+    // claimConfirmingSince, so a garbage clock outlives the command. Unvalidated,
+    // `--now abc` stored NaN, JSON.stringify wrote it as `null`, and the next real
+    // tick read that as epoch 0 and parked a dependent Blocked with no board read
+    // ever spent. Reject at the boundary rather than defending in five reducers.
+    // Number() alone is NOT the check (#223 review pass 3). It maps "" and " " to
+    // 0 and "0x10" to 16, all finite -- and epoch 0 is the worst possible value
+    // here, because stampAnchor repairs any anchor that leads the clock DOWN to
+    // nowMs. One `--now ""` would drag every foreign ticket's bound clock to 1970
+    // and park its dependents on the next real tick. A millisecond epoch is an
+    // integer, so require exactly that and let Number() do only the conversion.
+    // NON-NEGATIVE, and a safe integer. A millisecond epoch is never negative,
+    // and allowing `-?` was a hole in the guard rather than a feature of it:
+    // `--now -1` persists an anchor BEFORE the epoch that stampAnchor will never
+    // repair (it only pulls back stamps that LEAD the clock), so the next real
+    // tick sees the full bound elapsed and parks the dependent. Same shape as the
+    // `--now ""` hole one line of regex above it was written to close.
+    const rawNow = str(flags, "now");
+    if (rawNow !== undefined && (!/^\d+$/.test(rawNow.trim()) || !Number.isSafeInteger(Number(rawNow.trim())))) {
+      throw new ZError(
+        `--now must be a non-negative integer number of MILLISECONDS since the epoch, got ${JSON.stringify(rawNow)}.`
+      );
+    }
+    const nowMs = Number(rawNow ?? Date.now());
+    if (!Number.isFinite(nowMs)) {
+      throw new ZError(`--now must be an integer number of MILLISECONDS since the epoch, got ${JSON.stringify(rawNow)}.`);
+    }
     const statePath = positionals[0];
     if (!statePath) throw new ZError(`Usage:\n${USAGE}`);
 
@@ -4041,7 +4265,7 @@ export function main(argv: string[]): number {
       return 0;
     }
     if (cmd === "ingest") {
-      if (!positionals[1] || !positionals[2]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--lookups <F>] [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off] [--max-review-bounces N] [--min-skeptic-quorum N] [--ticket-limit N] [--context-token-limit N] [--context-tokens N]");
+      if (!positionals[1] || !positionals[2]) throw new ZError("Usage: loop ingest <state.json> <items.json> <bodies.json> [--lookups <F>] [--max-lanes N] [--watchdog-minutes M] [--max-qa-passes N] [--qa-investigate-after N] [--human-needed-percent N] [--min-reviewer-confidence N] [--reviewer-below-threshold-action block|retry|off] [--max-review-bounces N] [--min-skeptic-quorum N] [--ticket-limit N] [--context-token-limit N] [--context-tokens N] [--session ID]");
       const prev = readPrevState(statePath);
       let items = readJson(positionals[1]) as BoardItemLike[];
       let bodies = readJson(positionals[2]) as Record<string, string>;
@@ -4075,6 +4299,9 @@ export function main(argv: string[]): number {
         // `undefined` (flag absent) leaves ingestBoardItems' preserve-then-default
         // chain untouched, exactly like every numeric flag below.
         watchdogMinutes: watchdogFromFlag(str(flags, "watchdog-minutes")),
+        // #223 review: not a knob -- the RUN identity. Absent leaves the stored
+        // one alone, so a caller that never passes it behaves exactly as before.
+        session: str(flags, "session"),
       };
       for (const flag of INGEST_NUMBERS) {
         const raw = str(flags, flag);
