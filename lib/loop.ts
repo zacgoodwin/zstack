@@ -678,11 +678,20 @@ function markerNote(lines: string[], markerIdx: number, rest: string): string {
 // The marker's own remainder goes FIRST. parseReviewerConfidence and
 // parseSkepticQuorum both read the FIRST `confidence=` / `skeptics=` token in the
 // note, so hoisting the marker line means a token the reviewer put ON its verdict
-// wins over any number in its surrounding prose. It does not make the read
-// airtight: a marker line carrying NO token still scores off the prose, exactly as
-// the line-1 path always has (a `confidence=` below a line-1 marker has always
-// been read), so this ordering narrows that pre-existing hole rather than closing
-// it. See the notes on parseSkepticQuorum for the direction that still fails open.
+// wins over any number in its surrounding prose.
+//
+// It does not make the read airtight, and the residual is WIDER here than on the
+// line-1 path, which is worth saying plainly rather than calling it unchanged. A
+// marker line carrying no token at all still scores off the prose -- that much the
+// line-1 path has always done, since a `confidence=` written BELOW a line-1 marker
+// has always landed in its note. What is new is the reach: prose ABOVE the marker
+// was previously unreadable and now vouches for it too, so
+// `<prose: confidence=95 skeptics=3/3>` + a bare `REVIEW-APPROVE:` clears both
+// #62's floor and #191's quorum on numbers the reviewer never claimed. Same
+// fail-open class, one more direction to reach it; pinned deliberately in
+// tests/loop.test.ts so it cannot drift into being an accident. Closing it means
+// scoring `rest` alone, which is a change to MARKERS.reviewer affecting BOTH
+// paths, not to this function.
 function scanMarkerNote(lines: string[], markerIdx: number, rest: string): string {
   return [rest, ...lines.slice(0, markerIdx), ...lines.slice(markerIdx + 1)].join("\n").trim();
 }

@@ -2881,6 +2881,22 @@ describe("parseStageResult finds a marker that is not the first line (#307)", ()
     expect(thrice.kind === "merged" && thrice.note.split("\n")[0]).toBe("c");
   });
 
+  // The accepted residual, pinned so its REACH is deliberate rather than an
+  // accident nobody wrote down. A marker line with NO token of its own scores off
+  // the surrounding prose; the line-1 path has always done that for prose BELOW,
+  // and the scan adds prose ABOVE. Asserting the two are EQUAL is the point: it
+  // documents that this is one fail-open class reachable from one more direction,
+  // not a new hole the scan invented. Closing it means scoring the marker
+  // remainder alone in MARKERS.reviewer, which changes both paths.
+  test("a token-less marker still scores off the prose -- above it now, as well as below", () => {
+    const tokens = "The bar here is confidence=95 and skeptics=3/3.";
+    const above = [tokens, "", "REVIEW-APPROVE: looks fine to me"].join("\n");
+    const below = ["REVIEW-APPROVE: looks fine to me", "", tokens].join("\n");
+    const scored = approve(95, { received: 3, of: 3 });
+    expect(parseStageResult("reviewer", below)).toEqual(scored); // line-1 path, unchanged
+    expect(parseStageResult("reviewer", above)).toEqual(scored); // scan path, the new reach
+  });
+
   test("an unusable first line falls through to the scan", () => {
     // A line-1 marker belonging to ANOTHER stage is not this stage's verdict, so
     // the fast path cannot use it -- and the scan then reads the real closing
@@ -2909,6 +2925,79 @@ describe("parseStageResult finds a marker that is not the first line (#307)", ()
     // path always did, so a builder closing with QA-PASS is not a pass.
     expect(parseStageResult("builder", "summary\n\nQA-PASS: all good").kind).toBe("confused");
     expect(parseStageResult("qa", "summary\n\nMERGED: https://pr/9").kind).toBe("confused");
+  });
+
+  // -- the scan's verdicts through their CONSUMERS -----------------------------
+  //
+  // Parsing a verdict correctly is half the contract; the other half is that the
+  // widened path reaches the same guards the line-1 path does. These three drive
+  // recordOutcome -> nextAction, because each pins a safety claim #307's design
+  // argument actually leans on -- and a claim with no test is the shape this
+  // ticket's own review kept finding.
+  describe("a scanned verdict meets the same guards as a line-1 one", () => {
+    const CLEAN = "## z/ticket-1-thing...origin/main [ahead 1]\n";
+
+    // The residual is bounded by "#177 re-verifies BUILT against the worktree".
+    // That sentence is only true if the SCAN path reaches builtGuardFailure too.
+    test("a scanned BUILT over a dirty tree bounces to the builder, never to QA", () => {
+      let s = state([ticket(1, "Building")], [lane(1, "builder")]);
+      s = recordOutcome(s, 1, "All criteria pass, suite green.\n\nBUILT: narrowed the assertion", 0, {
+        porcelain: `${CLEAN}M  lib/loop.ts\n`,
+        headSha: "a".repeat(40),
+        baseSha: "a".repeat(40),
+      });
+      expect(s.lanes[0]!.outcome).toMatchObject({ kind: "built", unverified: expect.stringContaining("uncommitted work") });
+      expect(nextAction(s, 0)).toMatchObject({ kind: "advance", to: "builder" });
+    });
+
+    // scanMarkerNote keeps the prose above the marker SPECIFICALLY so QA's repros
+    // survive into qaNotes. This proves the advance actually carries them.
+    test("a scanned QA-BUGS delivers the repros above the marker as the builder's notes", () => {
+      let s = state([ticket(3, "QA")], [lane(3, "qa")]);
+      s = recordOutcome(s, 3, "1) click X, expect Y, got Z\n2) null deref at a.ts:10\n\nQA-BUGS: 2 issues, above", 0);
+      const a = nextAction(s, 0);
+      expect(a).toMatchObject({ kind: "advance", to: "builder" });
+      expect(a.kind === "advance" && a.note).toContain("1) click X, expect Y, got Z");
+      expect(a.kind === "advance" && a.note).toContain("2) null deref at a.ts:10");
+    });
+
+    // #191's quorum floor has to bite on a scanned approve as well, or the note
+    // ordering that finds a `skeptics=` token above the marker buys nothing.
+    test("a scanned REVIEW-APPROVE with a starved quorum does not reach merge", () => {
+      let s = state([ticket(1, "Review")], [lane(1, "reviewer")]);
+      s.minSkepticQuorum = 2;
+      s = recordOutcome(s, 1, "Only 1 of 3 skeptics reported: skeptics=1/3.\n\nREVIEW-APPROVE: confidence=100 nobody refuted", 0);
+      expect(s.lanes[0]!.outcome).toMatchObject({ kind: "review-approve", skeptics: { received: 1, of: 3 } });
+      const starved = nextAction(s, 0);
+      expect(starved).toMatchObject({ kind: "advance", ticket: 1, to: "reviewer" });
+      expect(starved.kind === "advance" && starved.note).toContain("skeptic quorum not met");
+      // The positive control, so the assertion above is discrimination and not just
+      // "nextAction returned something": the SAME scanned shape with the quorum met
+      // does reach the merge gate.
+      let ok = state([ticket(1, "Review")], [lane(1, "reviewer")]);
+      ok.minSkepticQuorum = 2;
+      ok = recordOutcome(ok, 1, "All three reported.\n\nREVIEW-APPROVE: confidence=100 skeptics=3/3 nobody refuted", 0);
+      expect(nextAction(ok, 0)).toMatchObject({ kind: "merge-gate", ticket: 1 });
+    });
+  });
+
+  // This repo pins documented promises with a grep gate (see the #209 doc canary
+  // above). #307 tells a human to recognize three specific skip notes while
+  // recovering a ticket, so a reworded note must not be able to leave the recovery
+  // page naming text the loop no longer emits.
+  test("the user docs carry the exact skip notes #307 tells a human to look for", () => {
+    const docs = (...p: string[]) => readFileSync(join(import.meta.dir, "..", ...p), "utf8");
+    const trouble = docs("docs", "user-guide", "troubleshooting.md");
+    for (const note of [
+      "only QUOTED its exit markers",
+      "ended without a recognized exit marker",
+      "none of them on the first line",
+    ]) {
+      expect(trouble).toContain(note);
+      // ...and each one is a string parseStageResult actually produces.
+      expect(readFileSync(join(import.meta.dir, "..", "lib", "loop.ts"), "utf8")).toContain(note);
+    }
+    expect(docs("docs", "user-guide", "z-loop.md")).toContain("A marker on a line of its own is read wherever it sits");
   });
 });
 
