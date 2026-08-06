@@ -6,7 +6,7 @@
 import { test, expect, describe, afterAll } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   adversarialActive,
   builderPrompt,
@@ -261,7 +261,11 @@ describe("pointer prompts are size-invariant to the payload (AC1)", () => {
     // The adversarial reviewer branch fans out skeptics but STILL points at the
     // file for its payload -- it must stay size-invariant too.
     { stage: "reviewer (adversarial)", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH, true), cap: 6144, payloads: [HUGE, AC] },
-    { stage: "merge", build: () => mergePrompt(MERGE_INPUT, INPUT_PATH), cap: 4096, payloads: [] },
+    // Merge carries a second mandatory command block (the Step 0 version claim,
+    // with its own absolute CLI path and six flags), so it sits in the same
+    // higher band the adversarial reviewer does. Still payload-invariant, which
+    // is the property this case exists to pin.
+    { stage: "merge", build: () => mergePrompt(MERGE_INPUT, INPUT_PATH), cap: 6144, payloads: [] },
   ];
 
   for (const c of CASES) {
@@ -590,7 +594,7 @@ describe("merge prompt", () => {
   test("plain merge: PR steps, conflict gauntlet, no branch deletion mid-batch, input pointer", () => {
     const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
     expect(p).toContain("gh pr create --base main");
-    expect(p).toContain("re-run Step 0's gate command exactly as written"); // the conflict path re-gates
+    expect(p).toContain("re-run Step 0's claim command AND Step 1's gate command exactly as written"); // the conflict path re-claims AND re-gates
 
     expect(p).toContain("Never pass --delete-branch");
     expect(p).toContain("MERGED:");
@@ -620,7 +624,7 @@ describe("merge prompt", () => {
     const gateIdx = p.indexOf("merge-gate");
     expect(gateIdx).toBeGreaterThan(-1);
     expect(gateIdx).toBeLessThan(p.indexOf("## Steps")); // before every numbered step, including the merge
-    expect(p).toMatch(/Step 0/);
+    expect(p).toMatch(/## Step 1 -- run the green gate/);
     expect(p).toMatch(/Run this yourself, in THIS session, before any gh pr merge -- unconditionally/);
     // No unverifiable assurance about a run the agent cannot see.
     expect(p).not.toMatch(/returned GREEN/i);
@@ -661,7 +665,7 @@ describe("merge prompt", () => {
     const p = mergePrompt({ ...MERGE_INPUT, statePath }, INPUT_PATH);
     expect(p).toContain(`--state '${resolve(statePath)}' --ticket 42`);
     // Step 2 sends the agent back to the very same command, stamp included.
-    expect(p).toMatch(/re-run Step 0's gate command exactly as written/);
+    expect(p).toMatch(/re-run Step 0's claim command AND Step 1's gate command exactly as written/);
     expect(p).toMatch(/the verdict records the commit sha it tested/);
   });
 
@@ -669,8 +673,81 @@ describe("merge prompt", () => {
     const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
     expect(p).toContain("merge-gate");
     expect(p).not.toContain("--state");
-    expect(p).not.toContain("--ticket");
+    // Scoped to the GATE command line, not the whole prompt: the Step 0 version
+    // claim legitimately carries --ticket (it reads that issue's labels), so a
+    // whole-prompt assertion would now pass or fail for the wrong reason.
+    const gateCmd = p.split(/\r?\n/).find((l) => l.includes("merge-gate"))!;
+    expect(gateCmd).not.toContain("--ticket");
+    expect(gateCmd).not.toContain("--state");
     expect(p).toMatch(/ANY nonzero exit = stop and exit BLOCKED/);
+  });
+
+  // -- per-PR version claiming ------------------------------------------------
+  // gstack's /review reads a PR's claimed version off the BRANCH, so the bump
+  // has to be a commit on the branch before the PR is opened. These pin the
+  // three properties that makes true.
+  test("the version claim is Step 0, ahead of the gate and of every numbered step", () => {
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const claimIdx = p.indexOf("## Step 0 -- claim this PR's version slot");
+    expect(claimIdx).toBeGreaterThan(-1);
+    // Before the gate: the claim COMMITS to the branch, so a gate run ahead of
+    // it would stamp a verdict for a commit that is not the one being merged.
+    expect(claimIdx).toBeLessThan(p.indexOf("## Step 1 -- run the green gate"));
+    expect(claimIdx).toBeLessThan(p.indexOf("## Steps"));
+    expect(p).toMatch(/It runs BEFORE the gate because it commits to the branch/);
+  });
+
+  test("the claim command names the version CLI by absolute pack path, with every argument quoted inertly", () => {
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const cli = p.match(/bun '([^']*version\.ts)' claim/)![1];
+    expect(isAbsolute(cli)).toBe(true);
+    expect(cli).toBe(join(REPO_ROOT, "lib", "version.ts"));
+    expect(p).toContain(`claim --ticket 42 --worktree '${resolve(MERGE_INPUT.worktreePath)}'`);
+    expect(p).toContain(`--base 'main'`);
+    expect(p).toContain(`--title ${shSingleQuote(MERGE_INPUT.prTitle)}`);
+  });
+
+  // The number is deterministic space; the prose is not. The prompt must hand
+  // the agent exactly one job (the entry) and forbid the other (the version).
+  test("the agent writes the CHANGELOG prose and NOTHING else -- the number is refused to it explicitly", () => {
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    expect(p).toMatch(/The NUMBER is not yours to pick/);
+    expect(p).toMatch(/that prose is the ONLY part of this step that is yours/);
+    expect(p).toMatch(/Never edit VERSION, package\.json or a CHANGELOG heading yourself, and never type a version number anywhere/);
+    expect(p).toMatch(/Nonzero exit = stop and exit BLOCKED with its message; do NOT open the PR/);
+  });
+
+  // Both scratch files sit beside the stage input, NOT in the worktree: an
+  // untracked file in the tree the gate measures is noise the claim would then
+  // have to avoid staging.
+  test("the entry and title files live beside the stage input, never inside the worktree", () => {
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const entry = p.match(/--entry-file '([^']+)'/)![1];
+    const title = p.match(/--title-out '([^']+)'/)![1];
+    for (const f of [entry, title]) {
+      expect(isAbsolute(f)).toBe(true);
+      expect(dirname(f)).toBe(dirname(INPUT_PATH));
+      expect(f.startsWith(resolve(MERGE_INPUT.worktreePath))).toBe(false);
+    }
+    expect(entry).toContain("changelog-42");
+    expect(title).toContain("pr-title-42");
+  });
+
+  // The PR title carries the claimed version, and only the CLI knows it -- so
+  // the prompt must read the file rather than interpolate a title the
+  // orchestrator computed before any slot existed.
+  test("gh pr create reads the title from the file the claim wrote, not from a retyped string", () => {
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const titlePath = p.match(/--title-out '([^']+)'/)![1];
+    expect(p).toContain(`gh pr create --base main --head ${MERGE_INPUT.branch} --title "$(cat '${titlePath}')"`);
+    expect(p).toMatch(/do not retype it/);
+  });
+
+  test("a conflict resolution re-runs the CLAIM before the gate, and keeps both CHANGELOG sections", () => {
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    expect(p).toMatch(/re-run Step 0's claim command AND Step 1's gate command exactly as written, in that order/);
+    expect(p).toMatch(/the base VERSION just moved/);
+    expect(p).toMatch(/a CHANGELOG conflict resolves by KEEPING BOTH sections, newest version on top/);
   });
 
   test("stacked chain: parent first, no deletion, retarget, delete last", () => {
@@ -681,6 +758,18 @@ describe("merge prompt", () => {
     expect(p).toContain("retarget this PR");
     expect(p).toContain("gh pr edit --base main");
     expect(p).toContain("Delete branches only after the whole batch");
+  });
+
+  // Review finding. The conflict path re-claims because resolving moves the base
+  // VERSION -- but a stacked child's RETARGET moves it for the same reason and
+  // needs no conflict to do so. Without this, a child merges carrying a slot it
+  // claimed before its parent was on the base: a version going backwards.
+  test("a stacked child re-claims after the retarget, not only after a conflict", () => {
+    const p = mergePrompt({ ...MERGE_INPUT, stackedOn: [40] }, INPUT_PATH);
+    expect(p).toMatch(/A parent landing MOVES main's VERSION/);
+    expect(p).toMatch(/after the last retarget re-run Step 0's claim command and then Step 1's gate/);
+    // Only on the stacked branch -- an unstacked merge has no parent to wait on.
+    expect(mergePrompt(MERGE_INPUT, INPUT_PATH)).not.toMatch(/A parent landing MOVES/);
   });
 
   // -- fix 1: PR-title shell injection ---------------------------------------
