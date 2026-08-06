@@ -78,7 +78,14 @@ export function resolveWorktreesDir(
   root: string | undefined
 ): { dir: string; note?: string } {
   if (explicit !== undefined) return { dir: explicit };
-  if (root === undefined) return { dir: join(cwd, ".worktrees") };
+  // No root resolved. Only sweep-review reaches here (scan/plan/apply refuse
+  // above), and it must not fail a batch-end cleanup -- but a silent fallback is
+  // #280's own defect one verb over: "swept 0 throwaway review worktree(s)" from
+  // the wrong directory is byte-identical to a clean one. Degrade, and SAY SO.
+  if (root === undefined) {
+    const dir = join(cwd, ".worktrees");
+    return { dir, note: `could not resolve a repo root from cwd ${cwd}; falling back to ${dir}.` };
+  }
   const dir = join(root, ".worktrees");
   // Both sides through resolve() so the comparison is about the LOCATION, not
   // about which of git's or the OS's spelling of it we happen to hold.
@@ -113,6 +120,20 @@ export type BoardTicketStatus = Pick<TicketSnapshot, "number" | "status">;
 //                Absence is not proof of an unmerged PR (#138), so a merge lane
 //                that lands here is left alone for a human rather than requeued.
 export type PrOutcome = "merged" | "open";
+
+// The one place a GitHub PR state becomes a recovery decision, exported so it can
+// be gate-tested directly. Inline in the CLI it was unreachable from a test: the
+// plan tests hand-set prOutcome and the board tests only assert pass-through, so
+// inverting this comparison would requeue merged work with the suite green.
+//
+// ONLY the exact "MERGED" is a merge. Everything else -- OPEN, CLOSED (closed
+// unmerged is a rebuild, not a Done), a lower-cased spelling, a state this code
+// has never heard of -- takes the ordinary recovery, which is the conservative
+// direction: parking a ticket back to Ready is undoable, marking landed work Done
+// and pruning its state is not.
+export function prOutcomeOf(state: string): PrOutcome {
+  return state === "MERGED" ? "merged" : "open";
+}
 
 // A lane lock left behind by a crashed loop. How it is reconciled depends on the
 // ticket's current board status (issue #14 C4): an INFLIGHT lane is released +
@@ -369,6 +390,21 @@ export function unresolvedMergeLanes(orphans: Orphans): number[] {
     .sort((a, b) => a - b);
 }
 
+// What the operator is told about those lanes. A pure function so the message
+// itself is gate-testable: the plan for a held lane is deliberately EMPTY, so if
+// this text ever stops being printed, `reconciled: nothing` becomes the whole
+// answer and a wedged lane looks like a clean board -- #280's lesson, applied to
+// #272's fail-closed case.
+export function unresolvedMergeLanesMessage(tickets: number[], locksDir: string): string {
+  return (
+    `reconcile: left ${tickets.length} crashed merge lane(s) untouched -- ticket(s) ` +
+    `${tickets.join(", ")}. Their board status is Review and their PR state could not be read, ` +
+    `and an unreadable PR is not proof of an unmerged one (#138): requeuing would rebuild work that ` +
+    `may already be on main. Check each PR by hand, then move the ticket to Done (merged) or Ready ` +
+    `(not merged) and remove its lane lock from ${locksDir}.`
+  );
+}
+
 // A crashed lane sitting exactly where a merge can be lost: stage `merge` with
 // the board still showing Review (STATUS_FOR_STAGE.merge). Anywhere else, no PR
 // lookup is performed and nothing about the recovery changes (#272 AC5).
@@ -505,6 +541,15 @@ export async function applyReconcile(actions: ReconcileAction[], fx: ReconcileEf
       case "drop-retained":
         await fx.dropRetained(a.ticket, a.path);
         break;
+      // A kind with no arm used to fall through this switch silently, which for a
+      // RECOVERY dispatcher means "reconciled: 1 record-merged" printed over an
+      // effect that never ran. The never-typed binding makes that a compile error
+      // when the union grows, and the throw makes it loud if one is ever
+      // constructed at runtime (a hand-written plan, a stale JSON payload).
+      default: {
+        const unhandled: never = a;
+        throw new ZError(`applyReconcile: unhandled action ${JSON.stringify(unhandled)}`);
+      }
     }
   }
 }
@@ -550,14 +595,27 @@ function pruneWorktreeReal(path: string): void {
 // EXACTLY ONE match or nothing. Two branches for one ticket (a re-claim under a
 // different title slug) is ambiguity, and guessing which one carried the merge is
 // exactly the guess that gets a ticket rebuilt or wrongly marked Done.
+//
+// BOTH sources are scoped to `z/ticket-<N>-`, and the first one has to be: `git
+// -C <dir>` ASCENDS out of a directory that is not a repo. A bare
+// `.worktrees/ticket-<N>` directory -- which is exactly what a `worktree add`
+// that died mid-action leaves, the #272 failure this function serves -- answers
+// `rev-parse --abbrev-ref HEAD` with the MAIN checkout's current branch, exit 0.
+// Measured on this repo: an empty `.worktrees/ticket-99999` reported
+// `z/ticket-280-271-272-reconcile-recovery`. Unscoped, that name reaches
+// prState() and some unrelated PR's merge decides whether ticket N is moved to
+// Done and force-pruned. A lane branch is always `z/ticket-<N>-<slug>`
+// (z-loop/SKILL.md's claim row), so anything else is not this lane's branch and
+// the honest answer is nothing -- which fails closed.
 export function resolveLaneBranch(root: string, ticket: number, worktreePath?: string): string | undefined {
+  const prefix = `z/ticket-${ticket}-`;
   if (worktreePath !== undefined) {
     const head = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"], {
       stdout: "pipe",
       stderr: "pipe",
     });
     const name = head.exitCode === 0 ? head.stdout.toString().trim() : "";
-    if (name !== "" && name !== "HEAD") return name;
+    if (name.startsWith(prefix)) return name;
   }
   const listed = Bun.spawnSync(
     ["git", "-C", root, "for-each-ref", "--format=%(refname:short)", `refs/heads/z/ticket-${ticket}-*`],
@@ -568,13 +626,26 @@ export function resolveLaneBranch(root: string, ticket: number, worktreePath?: s
   return names.length === 1 ? names[0] : undefined;
 }
 
-function realEffects(board: Board, locksDir: string): ReconcileEffects {
+// Exported for the gate tests: the wiring here is where a per-DIRECTORY prune met
+// a per-TICKET record and quietly deleted the wrong one, and a pure-plan test
+// cannot see that -- the plan was right, the effect was not.
+export function realEffects(board: Board, locksDir: string): ReconcileEffects {
   // A pruned worktree's disposition record is dropped with it (#271): the record
   // describes a directory, so outliving that directory makes it litter that a
   // later re-claim of the same ticket would read as a stale intent.
+  //
+  // But ONLY when the pruned path is the directory the record describes. A
+  // throwaway `review-<N>` carries the same ticket number as the lane worktree
+  // `ticket-<N>` -- the number names the ticket the review was FOR -- and both can
+  // be on disk at once (a reviewed ticket parked to Questions keeps its lane
+  // worktree, and a leftover reviewer checkout is the ordinary outcome). Dropping
+  // worktree-<N>.json on a review-<N> prune leaves the retained lane worktree with
+  // no record, which the NEXT scan reads as a crash and force-deletes: #271
+  // resurrected by the commit that fixes it. The record is per-ticket, the prune
+  // is per-directory, and only one of the two directories is the record's subject.
   const prune = (t: number, p: string) => {
     pruneWorktreeReal(p);
-    removeWorktreeRecord(locksDir, t);
+    if (!isThrowawayWorktreePath(p)) removeWorktreeRecord(locksDir, t);
   };
   return {
     removeLock: (p) => rmSync(p, { force: true }),
@@ -796,9 +867,21 @@ export async function main(argv: string[]): Promise<number> {
       if (!isMergeLane(c)) continue; // the SAME predicate reconcilePlan holds on
       c.branch = resolveLaneBranch(repoRoot ?? process.cwd(), c.ticket, c.worktreePath);
       if (c.branch === undefined) continue;
-      const pr = await board.prState(c.branch);
+      // Caught, or "best-effort" is a lie: prState THROWS on a network failure, a
+      // GraphQL error, and on its own >20-PRs page guard. Uncaught, one
+      // unreachable PR aborted the entire command through main's outer catch --
+      // no plan, no actions, non-zero exit -- so a single flaky lookup blocked the
+      // recovery of every OTHER crashed lane too. Swallowing it here is what makes
+      // the documented contract true: the lane keeps prOutcome undefined, the plan
+      // leaves it exactly as found, and unresolvedMergeLanes names it for a human.
+      let pr: Awaited<ReturnType<Board["prState"]>>;
+      try {
+        pr = await board.prState(c.branch);
+      } catch {
+        continue;
+      }
       if (pr === undefined) continue;
-      c.prOutcome = pr.state === "MERGED" ? "merged" : "open";
+      c.prOutcome = prOutcomeOf(pr.state);
       c.prUrl = pr.url;
     }
 
@@ -807,13 +890,7 @@ export async function main(argv: string[]): Promise<number> {
     // Never silent: a lane the plan deliberately skipped must be named, or "0
     // actions" reads as "nothing to do" (#272 AC4, and #280's whole lesson).
     if (unresolved.length > 0) {
-      console.error(
-        `reconcile: left ${unresolved.length} crashed merge lane(s) untouched -- ticket(s) ` +
-          `${unresolved.join(", ")}. Their board status is Review and their PR state could not be read, ` +
-          `and an unreadable PR is not proof of an unmerged one (#138): requeuing would rebuild work that ` +
-          `may already be on main. Check each PR by hand, then move the ticket to Done (merged) or Ready ` +
-          `(not merged) and remove its lane lock from ${locksDir}.`
-      );
+      console.error(unresolvedMergeLanesMessage(unresolved, locksDir));
     }
 
     if (cmd === "scan") {

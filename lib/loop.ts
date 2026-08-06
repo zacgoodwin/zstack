@@ -757,10 +757,15 @@ const RESPAWN_STAGES: readonly Stage[] = ["builder", "qa"];
 // predecessor left behind instead of guessing.
 //
 // The park note must not promise a worktree the loop itself deletes. Parking
-// removes the lane lock, and a LOCKLESS worktree is an orphan to the next run's
-// reconcile scan (lib/reconcile.ts) whatever the board says: its plan prunes it
-// with `git worktree remove --force`, and Step 0(b) refuses to start until that
-// prune has run. Every other park's work is already committed on a branch, and
+// removes the lane lock, and since #271 what happens next is decided by the
+// DISPOSITION the park records, not by the missing lock: this park carries
+// `salvage: true`, so z-loop/SKILL.md records it `disposable` -- which keeps
+// exactly the pre-#271 behavior. It is an orphan to the next run's reconcile scan
+// (lib/reconcile.ts) whatever the board says: its plan prunes it with `git
+// worktree remove --force`, and Step 0(b) refuses to start until that prune has
+// run. (A park WITHOUT the salvage flag records `retained` and its worktree
+// survives -- that is #271, and it is why this note is scoped to this park rather
+// than to parking in general.) Every other park's work is already committed on a branch, and
 // branches are never deleted (issue #2) -- this is the ONE park whose only copy of
 // real work is uncommitted, so the note names the salvage patch the orchestrator
 // dumps first (z-loop/SKILL.md `park N Blocked`, triggered by the action's own
@@ -990,11 +995,14 @@ function deadWorkerAction(lane: LaneState, wd: number, parkedByHuman: boolean): 
   //
   // The uncommitted work is salvaged here for exactly the reason the skip below
   // salvages it, and the note must not say otherwise: stop-lane removes the lane
-  // lock too, so this worktree is an orphan to the next run's reconcile scan
-  // (lib/reconcile.ts orphanWorktrees -> pruneWorktreeReal -> `git worktree
-  // remove --force`) whatever the board says. An earlier cut of this branch
-  // promised the tree was "kept for inspection" 33 lines above the code that
-  // proves it is not.
+  // lock too, and because THIS stop-lane carries `salvage: true`, z-loop/SKILL.md
+  // records the worktree `disposable` -- so it is an orphan to the next run's
+  // reconcile scan (lib/reconcile.ts orphanWorktrees -> pruneWorktreeReal -> `git
+  // worktree remove --force`) whatever the board says. Since #271 a stop-lane
+  // WITHOUT the salvage flag records `retained` instead and its worktree does
+  // survive; the two cases are opposite, so the note has to be built from the flag
+  // rather than from "stop-lane". An earlier cut of this branch promised the tree
+  // was "kept for inspection" 33 lines above the code that proves it is not.
   if (parkedByHuman) {
     const dirty = lane.worktreeDirty === true;
     return {

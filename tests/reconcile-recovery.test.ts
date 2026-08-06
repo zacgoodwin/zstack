@@ -31,13 +31,16 @@ import {
   applyReconcile,
   hasOrphans,
   planCleanRetained,
+  prOutcomeOf,
   main as reconcileMain,
+  realEffects,
   reconcilePlan,
   resolveLaneBranch,
   resolveRepoRoot,
   resolveWorktreesDir,
   scanOrphans,
   unresolvedMergeLanes,
+  unresolvedMergeLanesMessage,
   type Orphans,
   type ReconcileEffects,
 } from "../lib/reconcile.ts";
@@ -467,5 +470,205 @@ describe("#272: a crashed merge lane is checked for merged-ness before requeue",
     git(root, "worktree", "add", join(".worktrees", "ticket-77"), "-b", "z/ticket-77-real");
     git(root, "branch", "z/ticket-77-decoy");
     expect(resolveLaneBranch(root, 77, join(root, ".worktrees", "ticket-77"))).toBe("z/ticket-77-real");
+  });
+});
+
+// ============================================================================
+// Second pass: defects /review found IN the #280/#271/#272 diff itself
+// ============================================================================
+// Every case below fails without its fix. They sit apart from the three ticket
+// truth tables above because they are regressions of those tickets' OWN fixes --
+// the shapes that make a recovery path destroy something, or lie, again.
+describe("review regressions in the crash-recovery diff", () => {
+  // #271, resurrected by its own fix. realEffects wired ONE prune closure to both
+  // `pruneWorktree` and `dropRetained`, and that closure dropped
+  // `worktree-<N>.json` for whatever ticket the action named. But a throwaway
+  // `review-<N>` carries the same ticket number as the lane worktree `ticket-<N>`
+  // -- the number names the ticket the review was FOR -- and the two sit on disk
+  // together whenever a reviewed ticket is parked to Questions. Pruning the review
+  // checkout therefore deleted the record protecting the RETAINED lane worktree,
+  // and the next scan read it as a crash and force-removed it. The plan was
+  // correct at every step; only the effect was wrong, which is why no pure-plan
+  // test could see it.
+  test("pruning a throwaway review-<N> does NOT delete ticket <N>'s retained record", () => {
+    const root = initRepo();
+    const locksDir = tmp();
+    mkdirSync(join(root, ".worktrees"));
+    git(root, "worktree", "add", join(".worktrees", "ticket-42"), "-b", "z/ticket-42-parked");
+    git(root, "worktree", "add", join(".worktrees", "review-42"), "-b", "z/review-42-scratch");
+    writeWorktreeRecord(locksDir, { ticket: 42, disposition: "retained", session: "s1", writtenAt: 0 });
+
+    realEffects({} as never, locksDir).pruneWorktree(42, join(root, ".worktrees", "review-42"));
+
+    expect(existsSync(worktreeRecordPath(locksDir, 42))).toBe(true);
+    // ...and the retained lane worktree is still retained, not an orphan awaiting
+    // a force prune.
+    const o = scanOrphans(locksDir, join(root, ".worktrees"), [{ number: 42, status: "Questions" as const }], 0);
+    expect(o.retainedWorktrees.map((w) => w.ticket)).toEqual([42]);
+    expect(o.orphanWorktrees.map((w) => w.ticket)).toEqual([]);
+  });
+
+  // The other half: a lane worktree's own prune still drops its record, so
+  // deleting the guard outright cannot pass either.
+  test("pruning the lane worktree DOES drop its record", () => {
+    const root = initRepo();
+    const locksDir = tmp();
+    mkdirSync(join(root, ".worktrees"));
+    git(root, "worktree", "add", join(".worktrees", "ticket-42"), "-b", "z/ticket-42-gone");
+    writeWorktreeRecord(locksDir, { ticket: 42, disposition: "disposable", session: "s1", writtenAt: 0 });
+
+    realEffects({} as never, locksDir).pruneWorktree(42, join(root, ".worktrees", "ticket-42"));
+    expect(existsSync(worktreeRecordPath(locksDir, 42))).toBe(false);
+  });
+
+  // `git -C <dir>` ASCENDS out of a directory that is not a repo. A bare
+  // `.worktrees/ticket-<N>` -- exactly what a `worktree add` that died mid-action
+  // leaves behind, which is the #272 crash this function exists to serve --
+  // answers `rev-parse --abbrev-ref HEAD` with the MAIN checkout's branch at exit
+  // 0. Unscoped, that name reached prState() and an unrelated PR's merge decided
+  // whether ticket N was moved to Done, pruned and unlocked.
+  test("a bare directory named ticket-<N> resolves to NO branch, not the main checkout's", () => {
+    const root = initRepo();
+    git(root, "checkout", "-b", "z/ticket-999-someone-else");
+    mkdirSync(join(root, ".worktrees", "ticket-77"), { recursive: true });
+
+    // The trap itself, demonstrated rather than asserted about: git answers, and
+    // answers confidently.
+    const raw = Bun.spawnSync(
+      ["git", "-C", join(root, ".worktrees", "ticket-77"), "rev-parse", "--abbrev-ref", "HEAD"],
+      { stdout: "pipe", stderr: "pipe" }
+    );
+    expect(raw.exitCode).toBe(0);
+    expect(raw.stdout.toString().trim()).toBe("z/ticket-999-someone-else");
+
+    expect(resolveLaneBranch(root, 77, join(root, ".worktrees", "ticket-77"))).toBeUndefined();
+  });
+
+  // Same scoping, the ordinary direction: a real lane worktree still answers, and
+  // a detached HEAD falls through to the ticket-scoped listing instead of
+  // returning the literal "HEAD".
+  test("a real lane worktree still resolves its own branch, detached or not", () => {
+    const root = initRepo();
+    mkdirSync(join(root, ".worktrees"));
+    git(root, "worktree", "add", join(".worktrees", "ticket-77"), "-b", "z/ticket-77-real");
+    const wt = join(root, ".worktrees", "ticket-77");
+    expect(resolveLaneBranch(root, 77, wt)).toBe("z/ticket-77-real");
+    git(wt, "checkout", "--detach");
+    expect(resolveLaneBranch(root, 77, wt)).toBe("z/ticket-77-real");
+  });
+
+  test("resolveLaneBranch answers nothing outside a git repo", () => {
+    expect(resolveLaneBranch(tmp("zstack-nogit-"), 77)).toBeUndefined();
+  });
+
+  // The single place a GitHub PR state becomes a recovery decision. Inline in the
+  // CLI it was unreachable from a test -- the plan cases hand-set prOutcome and
+  // the board cases only assert pass-through -- so inverting this comparison would
+  // have requeued merged work with the whole suite green.
+  test("only the exact MERGED state is a merge", () => {
+    expect(prOutcomeOf("MERGED")).toBe("merged");
+    expect(prOutcomeOf("OPEN")).toBe("open");
+    expect(prOutcomeOf("CLOSED")).toBe("open"); // closed-unmerged is a rebuild, not a Done
+    expect(prOutcomeOf("merged")).toBe("open"); // GraphQL enums are upper-case
+    expect(prOutcomeOf("")).toBe("open");
+  });
+
+  // sweep-review is the ONE command allowed to degrade to cwd rather than refuse.
+  // It degraded SILENTLY, which is #280's own defect one verb over: "swept 0
+  // throwaway review worktree(s)" from the wrong directory reads exactly like a
+  // clean one.
+  test("an unresolvable root still names itself on the fallback", () => {
+    const cwd = tmp("zstack-nogit-");
+    const r = resolveWorktreesDir(undefined, cwd, undefined);
+    expect(r.dir).toBe(join(cwd, ".worktrees"));
+    expect(r.note).toBeDefined();
+    expect(r.note).toContain(cwd);
+  });
+
+  // The plan for a held merge lane is deliberately EMPTY, so this message is the
+  // operator's entire answer. Stop printing it and "reconciled: nothing" means
+  // "wedged until a human intervenes" while reading as "clean".
+  test("held merge lanes are named, with the reason and the lock directory", () => {
+    const msg = unresolvedMergeLanesMessage([91, 77], "/locks/dir");
+    expect(msg).toContain("77");
+    expect(msg).toContain("91");
+    expect(msg).toContain("/locks/dir");
+    expect(msg).toMatch(/not proof/i);
+  });
+
+  // Both new action kinds were dispatched by zero tests, and the switch had no
+  // default -- so a missing arm was a silent no-op that still printed
+  // "reconciled: 1 record-merged".
+  test("applyReconcile dispatches the two new kinds, and refuses an unknown one", async () => {
+    const calls: string[] = [];
+    const fx: ReconcileEffects = {
+      removeLock: (p) => void calls.push(`removeLock:${p}`),
+      pruneWorktree: (t, p) => void calls.push(`pruneWorktree:${t}:${p}`),
+      parkReady: (n) => void calls.push(`parkReady:${n}`),
+      releaseClaim: (n) => void calls.push(`releaseClaim:${n}`),
+      recordMerged: (t, url) => void calls.push(`recordMerged:${t}:${url}`),
+      dropRetained: (t, p) => void calls.push(`dropRetained:${t}:${p}`),
+    };
+    await applyReconcile(
+      [
+        { kind: "record-merged", ticket: 77, url: "https://pr/77" },
+        { kind: "drop-retained", ticket: 41, path: "/w/ticket-41" },
+      ],
+      fx
+    );
+    expect(calls).toEqual(["recordMerged:77:https://pr/77", "dropRetained:41:/w/ticket-41"]);
+
+    await expect(applyReconcile([{ kind: "nope" } as never], fx)).rejects.toThrow(ZError);
+  });
+
+  // A record that is written but can never be read back is the worst failure this
+  // file has: "retained" degrades to "no record", which means "a crash", which
+  // force-prunes the worktree a human parked. Number.isInteger admitted all three
+  // of these and none of them match the reader's /^worktree-\d+\.json$/.
+  test("a ticket the reader could never match is refused at write time", () => {
+    const d = tmp();
+    for (const bad of [0, -5, 1e21]) {
+      expect(() => worktreeRecordPath(d, bad)).toThrow(ZError);
+      expect(() =>
+        writeWorktreeRecord(d, { ticket: bad, disposition: "retained", session: "s", writtenAt: 0 })
+      ).toThrow(ZError);
+      expect(() => removeWorktreeRecord(d, bad)).toThrow(ZError);
+    }
+    expect(() => worktreeRecordPath(d, 42)).not.toThrow();
+    // The CLI refuses too, rather than reporting a record it did not write.
+    expect(locksMain(["worktree-record", "-5", "retained", "--dir", d, "--session", "s"])).toBe(1);
+    expect(listWorktreeRecords(d)).toEqual([]);
+  });
+
+  // Source-string gates. None of the three lines below has an injectable seam --
+  // reconcile's CLI loads its own config and builds its own Board, so reaching
+  // them needs a real project and a real GraphQL endpoint, which a gate test may
+  // not have. Each is one line, and each fails SILENTLY and expensively when
+  // removed. Same case, same treatment as the sole-gh-caller grep in
+  // tests/board.test.ts. (`assertNotReconcilingLiveLoop`'s own behavior is covered
+  // directly in tests/safety.test.ts; what is pinned here is which commands are
+  // routed through it.)
+  test("clean-retained is behind the #198 live-loop refusal, exactly as apply is", async () => {
+    const src = await Bun.file(join(import.meta.dir, "..", "lib", "reconcile.ts")).text();
+    // It force-removes worktrees, which IS the damage #198's refusal exists to
+    // prevent -- a retained worktree belongs to a human who is reading it.
+    expect(src).toContain('if (cmd === "apply" || cmd === "clean-retained") {');
+    expect(src).toContain("assertNotReconcilingLiveLoop(locksDir, nowMs, cfg, str(flags, \"session\"));");
+  });
+  test("the #272 PR lookup catches, so one unreadable PR cannot abort the whole recovery", async () => {
+    const src = await Bun.file(join(import.meta.dir, "..", "lib", "reconcile.ts")).text();
+    const from = src.indexOf('for (const c of cmd === "clean-retained"');
+    expect(from).toBeGreaterThan(-1);
+    const body = src.slice(from, src.indexOf("\n    }\n", from));
+    expect(body).toContain("board.prState");
+    // prState throws on a network failure, on a GraphQL error, and on its own
+    // >20-PRs page guard. Uncaught, that reached main's outer catch and every
+    // OTHER crashed lane lost its recovery to one flaky lookup.
+    expect(body).toMatch(/try\s*\{[\s\S]*board\.prState[\s\S]*\}\s*catch/);
+  });
+
+  test("the throwaway-prune guard is wired into the shared prune closure", async () => {
+    const src = await Bun.file(join(import.meta.dir, "..", "lib", "reconcile.ts")).text();
+    expect(src).toContain("if (!isThrowawayWorktreePath(p)) removeWorktreeRecord(locksDir, t);");
   });
 });

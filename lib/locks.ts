@@ -191,7 +191,18 @@ export interface WorktreeRecord {
 // neither listLaneLocks's /^ticket-\d+\.json$/ nor currentClaimGen's
 // `loop.lock.reconcile` prefix scan, so the three kinds of file in this directory
 // can never be read as one another.
+//
+// The ticket is validated HERE, in the one place a number becomes a filename, so
+// the writer and the remover cannot disagree with the reader. `Number.isInteger`
+// alone was not enough: it admits 0, negatives and exponential forms, and
+// `worktree--5.json` / `worktree-1e+21.json` do not match listWorktreeRecords's
+// /^worktree-\d+\.json$/. A record that is written but can never be read back is
+// the worst possible failure for this file -- "retained" degrades to "no record",
+// which means "a crash", which force-prunes the worktree a human parked.
 export function worktreeRecordPath(locksDir: string, ticket: number): string {
+  if (!Number.isInteger(ticket) || ticket <= 0 || !/^\d+$/.test(String(ticket))) {
+    throw new ZError(`Worktree record ticket must be a positive integer, got "${ticket}".`);
+  }
   return join(locksDir, `worktree-${ticket}.json`);
 }
 
@@ -785,7 +796,9 @@ export function main(argv: string[]): number {
       const { locksDir } = resolveDir(flags);
       const ticket = Number(positionals[0]);
       const disposition = positionals[1] as WorktreeDisposition;
-      if (!Number.isInteger(ticket) || (disposition !== "retained" && disposition !== "disposable")) {
+      // The ticket's own shape is enforced by worktreeRecordPath below, which is
+      // what the READER's filename regex actually agrees with.
+      if (disposition !== "retained" && disposition !== "disposable") {
         throw new ZError("Usage: locks worktree-record --slug S <ticket> <retained|disposable> --session ID");
       }
       writeWorktreeRecord(locksDir, {
@@ -801,8 +814,7 @@ export function main(argv: string[]): number {
     if (cmd === "worktree-forget") {
       const { locksDir } = resolveDir(flags);
       const ticket = Number(positionals[0]);
-      if (!Number.isInteger(ticket)) throw new ZError("Usage: locks worktree-forget --slug S <ticket>");
-      removeWorktreeRecord(locksDir, ticket);
+      removeWorktreeRecord(locksDir, ticket); // ticket shape enforced by worktreeRecordPath
       console.log(`forgot worktree record ticket-${ticket}`);
       return 0;
     }
