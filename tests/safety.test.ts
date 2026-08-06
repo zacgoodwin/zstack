@@ -54,8 +54,11 @@ import {
 import { SUBTREE_STALE_MS } from "../lib/transcripts.ts";
 import {
   applyAction,
+  claimConfirmed,
   ingestBoardItems,
   nextAction,
+  parseAssignees,
+  recordConfirmAttempt,
   recordMergeGate,
   recordOutcome,
   type LaneState,
@@ -1543,5 +1546,144 @@ describe("item 18: corrupt locks fail with ZErrors on the recovery path", () => 
     expect(() => readLoopLock(d)).toThrow(ZError);
     expect(() => readLoopLock(d)).toThrow(/loop\.lock must be \{session, startedAt, pid\?\}/);
     expect(() => inspectLoopLock(d, 0, 60_000)).toThrow(/must be \{session, startedAt, pid\?\}/);
+  });
+});
+
+// ============================================================================
+// #223 -- a confirmed FOREIGN claim is never stolen
+// ============================================================================
+// #223 gave the loop the power to CLEAR a claimedByOther flag, which is the
+// power to start building a ticket another live session owns. The clearing rule
+// therefore mirrors Board.claim() exactly (lib/board.ts): the flag drops only
+// for an assignee set that call would accept -- empty, or solely this loop's own
+// login. Every other set is somebody else's ticket and the drain keeps waiting.
+// (#14 C8's cross-machine limitation is untouched: claims are keyed on login,
+// not session, here as there.)
+describe("control 7: a live foreign claim is never stolen (#223)", () => {
+  const T0 = 1_000_000;
+  const WD_MS = 10 * 60_000; // state()'s watchdogMinutes
+
+  // #1 flagged, #2 depends on it, both Ready, no lanes: the step-6 wait branch.
+  // Exactly what markClaimLost leaves behind -- the throttle stamp and nothing
+  // else, so the bounded park's anchor is only ever set by a real confirm.
+  const flagged = (over: Partial<TicketSnapshot> = {}) => {
+    const s = state([ticket(1, "Ready"), ticket(2, "Ready", [1])]);
+    Object.assign(s.tickets[0], { claimedByOther: true, claimedByOtherAt: T0 }, over);
+    return s;
+  };
+
+  test("a foreign assignee set keeps the flag and the loop waits -- it never claims", () => {
+    const now = T0 + WD_MS;
+    const s = claimConfirmed(flagged(), 1, ["someone-else"], "me", now);
+    expect(s.tickets[0].claimedByOther).toBe(true);
+    expect(s.tickets[0].claimedByOtherAt).toBe(now);
+    const a = nextAction(s, now);
+    expect(a).toEqual({ kind: "wait" });
+    expect(a.kind).not.toBe("claim");
+  });
+
+  test("no assignee set with a foreign login in it ever produces a claim action", () => {
+    // Exhaustive over the shapes a live read can return: the ONLY two that may
+    // clear the flag are the two Board.claim() accepts.
+    const clears = [[], ["me"]];
+    const keeps = [["someone-else"], ["me", "someone-else"], ["someone-else", "me"], ["a", "b"]];
+    for (const set of clears) {
+      const s = claimConfirmed(flagged(), 1, set, "me", T0 + WD_MS);
+      expect(nextAction(s, T0 + WD_MS)).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+    }
+    for (const set of keeps) {
+      const s = claimConfirmed(flagged(), 1, set, "me", T0 + WD_MS);
+      expect(nextAction(s, T0 + WD_MS).kind).not.toBe("claim");
+      expect(s.tickets[0].claimedByOther).toBe(true);
+    }
+  });
+
+  test("the bounded park releases the DEPENDENT, never the foreign ticket itself", () => {
+    // Ending the run must not mean handing #1 to this loop: it parks #2 and
+    // leaves #1 flagged and untouched for its real owner.
+    let s = claimConfirmed(flagged(), 1, ["someone-else"], "me", T0 + WD_MS);
+    const late = T0 + WD_MS + 3 * WD_MS; // three watchdogs after that first confirm
+    const park = nextAction(s, late);
+    expect(park).toMatchObject({ kind: "park", ticket: 2, status: "Blocked" });
+    s = applyAction(s, park, late);
+    expect(s.tickets[0]).toMatchObject({ status: "Ready", claimedByOther: true });
+    expect(nextAction(s, late)).toEqual({ kind: "drain-complete" });
+  });
+
+  test("no dependent is ever parked Blocked over a claim the loop never once read", () => {
+    // The mirror safety case. Stealing a live claim is one failure mode; the
+    // other is Blocking a perfectly workable ticket on a claim that was released
+    // and never re-checked -- the run-12 wedge, relabelled. The bound therefore
+    // anchors on a RECORDED CONFIRM ATTEMPT, never on when the flag was set, so
+    // no elapsed time alone can reach the park.
+    const s = flagged(); // markClaimLost's output: throttle stamped, no attempt
+    for (const elapsed of [3, 10, 100, 10_000]) {
+      expect(nextAction(s, T0 + elapsed * WD_MS)).toEqual({ kind: "confirm-claim", ticket: 1 });
+    }
+  });
+
+  test("a FAILED read is never read as unassigned -- it decides nothing and claims nothing", () => {
+    // The most dangerous misread available: treating a thrown lookup as an empty
+    // assignee set would clear the flag and start a lane on another session's
+    // in-flight ticket. recordConfirmAttempt records the attempt and nothing else.
+    const s = recordConfirmAttempt(claimConfirmed(flagged(), 1, ["someone-else"], "me", T0 + WD_MS), 1, T0 + 2 * WD_MS);
+    expect(s.tickets[0]).toMatchObject({ claimedByOther: true, claimedByOtherLogin: "someone-else" });
+    expect(nextAction(s, T0 + 2 * WD_MS).kind).not.toBe("claim");
+  });
+
+  test("a read for a DIFFERENT ticket can never clear this ticket's claim", () => {
+    // The widest hole this control had. `parseAssignees` used to discard the
+    // `number` z-board prints, so `{"number":999,"assignees":[]}` folded into #1
+    // cleared a live foreign claim and the next tick claimed another session's
+    // in-flight ticket. The orchestrator row types the ticket number twice (once
+    // to produce the file, once to apply it), so a transposition is a real input,
+    // not a hypothetical one -- and an EMPTY set is the dangerous direction.
+    expect(() => parseAssignees({ number: 999, assignees: [] }, 1)).toThrow(ZError);
+    // The flag survives because the parse throws BEFORE any reducer runs; and
+    // even if a numberless read for the wrong ticket got through, an unflagged
+    // ticket is a no-op rather than a newly invented claim.
+    const s = flagged();
+    expect(nextAction(claimConfirmed(s, 1, [], "me", T0 + WD_MS), T0 + WD_MS)).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+    const unflagged = state([ticket(1, "Ready"), ticket(2, "Ready", [1])]);
+    expect(claimConfirmed(unflagged, 1, ["someone-else"], "me", T0 + WD_MS)).toEqual(unflagged);
+  });
+
+  test("the bound never depends on the orchestrator obeying the SKILL: `next` records its own ask", () => {
+    // The token-burn half of this control. An orchestrator that emits the read
+    // and writes nothing back would otherwise get confirm-claim on EVERY tick --
+    // a gh call plus an agent turn per tick, with nothing able to end it, which
+    // is worse than the pre-#223 wait. `loop next` stamps the attempt as it hands
+    // the action over (recordConfirmAttempt), so both the one-read-per-watchdog
+    // throttle and the bounded park hold in code rather than in SKILL.md prose.
+    let s = flagged();
+    let now = T0;
+    const kinds: string[] = [];
+    for (let i = 0; i < 60 && kinds[kinds.length - 1] !== "drain-complete"; i++) {
+      now += 60_000;
+      const a = nextAction(s, now);
+      kinds.push(a.kind);
+      if (a.kind === "confirm-claim") s = recordConfirmAttempt(s, a.ticket, now); // the driver's write, and nothing else
+      else if (a.kind !== "wait" && a.kind !== "drain-complete") s = applyAction(s, a, now);
+    }
+    expect(kinds.filter((k) => k === "confirm-claim").length).toBe(3); // one per watchdog period, bounded
+    expect(kinds).toContain("park");
+    expect(kinds[kinds.length - 1]).toBe("drain-complete");
+    expect(kinds).not.toContain("claim"); // and it never took the ticket
+    expect(s.tickets[0]).toMatchObject({ status: "Ready", claimedByOther: true }); // #1 left for its owner
+  });
+
+  test("a re-ingest cannot launder the flag away -- only a live read clears it", () => {
+    // The bulk board read carries no assignees, so a snapshot showing #1 as a
+    // plain Ready ticket is not evidence of anything about its claim.
+    const s = ingestBoardItems(
+      claimConfirmed(flagged(), 1, ["someone-else"], "me", T0 + WD_MS),
+      [
+        { number: 1, title: "t1", fields: { Status: "Ready" } },
+        { number: 2, title: "t2", fields: { Status: "Ready" } },
+      ],
+      { "1": "", "2": "Depends on #1" }
+    );
+    expect(s.tickets[0].claimedByOther).toBe(true);
+    expect(nextAction(s, T0 + WD_MS).kind).not.toBe("claim");
   });
 });

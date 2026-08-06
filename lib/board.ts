@@ -814,6 +814,16 @@ export class Board {
     return logins;
   }
 
+  // The live assignee set, read-only (#223). claim() answers "can I have it?"
+  // by mutating; the loop's claim re-confirm needs the same fact WITHOUT
+  // touching the issue, because the ticket it asks about may belong to another
+  // session. A missing issue throws out of lookup() rather than returning an
+  // empty set -- an empty set is what CLEARS a foreign-claim flag, so a failed
+  // read must never look like "unassigned".
+  async assignees(n: number): Promise<string[]> {
+    return (await this.lookup(n)).assignees.nodes.map((a) => a.login);
+  }
+
   // -- helpers ---------------------------------------------------------------
   private assertStatus(status: string): void {
     const valid = Object.keys(this.cfg.statusField.options ?? {});
@@ -1143,6 +1153,8 @@ const USAGE = `z-board <command> [args]
   create --title T --body-file F --milestone M [--label L]
   link <N> <M>                      record N depends on M (both directions)
   claim <N> <assignee>             atomic assignee claim
+  assignees <N>                    {"number":N,"assignees":["login",...]} -- the read-only claim check
+                                   the loop's confirm-claim action feeds to \`loop claim-confirmed\` (#223)
   release <N>                      remove every assignee (reconcile a stale claim)
   pr-state <branch>                what happened to this branch's PR, as JSON:
                                    {branch,found:true,state,url,number} or
@@ -1167,6 +1179,7 @@ const COMMANDS = new Set([
   "create",
   "link",
   "claim",
+  "assignees",
   "release",
   "pr-state",
   "quota",
@@ -1318,6 +1331,12 @@ export async function main(
         if (!assignee) throw new ZError("Usage: z-board claim <N> <assignee>");
         await board.claim(n, assignee);
         console.log(`claimed #${n} for ${assignee}`);
+        return 0;
+      }
+      case "assignees": {
+        // One JSON object on one line, the shape loop.ts parseAssignees takes.
+        const n = requireInt(positionals[0], "issue");
+        console.log(JSON.stringify({ number: n, assignees: await board.assignees(n) }));
         return 0;
       }
       case "release": {
