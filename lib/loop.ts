@@ -1658,14 +1658,43 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
       .sort((a, b) => a.number - b.number);
     if (foreignDeps.length > 0) {
       // #256 made the watchdog per-stage, and a foreign claim is not a stage of
-      // ours: nobody here is running anything, we are re-reading someone else's
-      // assignee set. `builder` is the budget that matches what is actually being
-      // waited on -- Board.claim() is taken at builder-claim time, so the holder
-      // is a builder lane in the other session -- and it keys both the throttle
-      // (one read per period) and the bound below off one resolved number, so a
-      // per-stage config can never leave those two reading different clocks.
-      const wd = budgetFor("builder");
-      const wdMs = wd * 60_000;
+      // OURS -- nobody here is running anything, we are re-reading someone else's
+      // assignee set. But it is a stage of THEIRS, and which one is readable: a
+      // claim is taken at whatever stage the ticket resumes at (lanes.ts
+      // CLAIMABLE_STAGE -- Ready/Building -> builder, QA -> qa, Review ->
+      // reviewer), so the dep's own board status names the budget the holding
+      // lane is working to. Keying every foreign claim to `builder` measured a
+      // live reviewer against 25*3 minutes instead of 40*3 and parked its
+      // dependents while it was still inside its own watchdog.
+      //
+      // One resolver, called by both exits below, so the throttle (one read per
+      // period) and the bound can never end up reading different clocks for the
+      // same dep. A status outside CLAIMABLE_STAGE cannot be a live foreign lane
+      // at all, so it falls back to the builder budget rather than throwing.
+      const wdFor = (dep: TicketSnapshot): number =>
+        budgetFor(isWorkableStatus(dep.status) ? claimStage(dep.status) : "builder");
+      // A stamp in the FUTURE (an NTP step backwards, a VM snapshot restore, a
+      // state.json written on a faster-clocked machine, a stray --now) makes a
+      // bare `nowMs - stamp` negative, which disabled the confirm AND the park
+      // together: `wait` forever with zero lanes, the pre-#223 spin restored
+      // verbatim (measured at +0/+30/+59 min against a stamp one hour ahead).
+      //
+      // The two exits handle it in OPPOSITE directions, because their safe
+      // directions are opposite:
+      //
+      //  - THROTTLE: an untrustworthy stamp is not evidence we read the board
+      //    recently, so it is treated as DUE. Worst case is one extra gh read.
+      //  - BOUND: an untrustworthy stamp is not evidence we have been asking for
+      //    a long time either, so it is clamped to now and the park waits out a
+      //    full bound from here. Worst case is a later park; the alternative
+      //    would Block a dependent early over a clock jump.
+      //
+      // Symmetric clamping looked right and was not: with both stamps clamped,
+      // `elapsed` stays 0 for as long as the stamp leads the clock, so a jump of
+      // a year wedges the drain for a year. Only the bound may absorb the skew.
+      const stale = (stamp: number | undefined, wdMs: number): boolean =>
+        stamp === undefined || stamp > nowMs || nowMs - stamp >= wdMs;
+      const sinceFirstAsk = (stamp: number): number => nowMs - Math.min(stamp, nowMs);
       // Bounded wait, checked FIRST so a claim already proved abandoned is not
       // re-confirmed one more time before parking.
       //
@@ -1704,14 +1733,21 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
       // A compliant orchestrator only sharpens it, replacing the bare attempt
       // with the login it read or the failure it hit.
       for (const dep of foreignDeps) {
-        const confirmingSince = dep.claimConfirmingSince;
-        if (confirmingSince === undefined || nowMs - confirmingSince < wdMs * ABANDONED_CLAIM_WATCHDOGS) continue;
+        if (dep.claimConfirmingSince === undefined) continue;
+        const wd = wdFor(dep);
+        const waited = sinceFirstAsk(dep.claimConfirmingSince);
+        if (waited < wd * 60_000 * ABANDONED_CLAIM_WATCHDOGS) continue;
         const blocked = unclaimed.find((t) => t.dependsOn.includes(dep.number));
         if (!blocked) continue; // unreachable: foreignDeps is built from unclaimed's own deps
+        // The REAL elapsed time, not the bound it crossed: a state carried in
+        // from an earlier run can be days past `wd * 3`, and printing the
+        // constant told an operator triaging a Blocked ticket that the loop had
+        // tried more recently than it had.
+        const mins = Math.round(waited / 60_000);
         const held =
           dep.claimedByOtherLogin !== undefined
-            ? `still claimed by ${dep.claimedByOtherLogin} after ${wd * ABANDONED_CLAIM_WATCHDOGS} minutes of re-confirming its live assignee set`
-            : `still flagged as claimed by another session after ${wd * ABANDONED_CLAIM_WATCHDOGS} minutes in which no confirm read ever returned its live assignee set`;
+            ? `still claimed by ${dep.claimedByOtherLogin} ${mins} minutes after the first confirm attempt`
+            : `still flagged as claimed by another session ${mins} minutes after the first confirm attempt, in which no confirm read ever returned its live assignee set`;
         return {
           kind: "park",
           ticket: blocked.number,
@@ -1726,7 +1762,7 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
       // storm): a flag stamped inside the window is still believed. The stamp
       // moves on the ASK (`loop next` records the emission) as well as on the
       // answer, so the throttle holds even when no answer ever arrives.
-      const due = foreignDeps.find((dep) => nowMs - (dep.claimedByOtherAt ?? 0) >= wdMs);
+      const due = foreignDeps.find((dep) => stale(dep.claimedByOtherAt, wdFor(dep) * 60_000));
       if (due) return { kind: "confirm-claim", ticket: due.number };
       return { kind: "wait" };
     }
@@ -2252,16 +2288,31 @@ export function mergeGateBaseKey(state: LoopState): string {
 //
 // #223 stamps WHEN, because the flag alone is a permanent observation of a
 // transient fact. claimedByOtherAt throttles the re-confirm read -- and that is
-// the ONLY stamp a claim loss writes. It deliberately does not touch
+// the only stamp a claim loss SETS. It deliberately does not set
 // claimConfirmingSince: this is a fresh observation to be checked, not a
 // confirm attempt, and the bounded park anchors on attempts. Stamping the anchor
 // here is what made the park fire with zero reads ever tried, parking the
 // dependents of a claim lost long before the drain went idle (the run-12 shape).
+//
+// It must, however, CLEAR the anchor and the recorded login, because a new
+// observation inherits neither. Both fields describe re-confirmation of the
+// PREVIOUS observation, and leaving them is the same defect from the other side:
+// measured, a state carrying a 10-hour-old anchor plus `claimedByOtherLogin:
+// "ghost"` (a claim confirmed foreign earlier, then cleared) took one fresh
+// markClaimLost and parked its dependents Blocked on the very next idle tick --
+// zero reads spent on the new claim, and the note naming a login that no longer
+// held anything. Reachable in one step from this diff's own troubleshooting
+// page, which tells an operator to hand-delete the boolean and re-invoke.
+// Clearing them is also what makes a released-then-re-lost claim start a fresh
+// bound rather than resume a stale one: time spent flagged under a claim that is
+// GONE is not time spent re-confirming the claim that replaced it.
 export function markClaimLost(state: LoopState, ticket: number, nowMs: number): LoopState {
   const next = structuredClone(state);
   const t = findTicket(next, ticket);
   t.claimedByOther = true;
   t.claimedByOtherAt = nowMs;
+  delete t.claimConfirmingSince;
+  delete t.claimedByOtherLogin;
   return next;
 }
 
@@ -2296,11 +2347,29 @@ export function claimConfirmed(
   const next = structuredClone(state);
   const t = findTicket(next, ticket);
   if (t.claimedByOther !== true) return next; // nothing was ever observed to confirm
-  if (assignees.length === 0 || assignees.every((a) => a === me)) {
+  if (clearsClaim(assignees, me)) {
     delete t.claimedByOther;
     delete t.claimedByOtherAt;
     delete t.claimConfirmingSince;
     delete t.claimedByOtherLogin;
+    // #223 review: freeing the flag is not enough under a ticket cap. selectBatch
+    // filters `!t.claimedByOther`, so a ticket flagged when the batch was cut was
+    // never admitted to batchTickets, and that list only ever shrinks. Clearing
+    // the flag left it workable but OUT OF BATCH, and the next tick parked its
+    // dependent Blocked with "Likely a dependency cycle in the batch" -- a
+    // fabricated diagnosis (there is no cycle), on the tick right after the
+    // targeted read this whole feature exists to spend. Measured end to end
+    // through ingestBoardItems + nextAction with --ticket-limit 5.
+    //
+    // Re-admit it the way #157's closure would have, had the flag been down at
+    // cut time: it is in scope precisely because something in the batch depends
+    // on it. An uncapped run has no batchTickets and needs nothing here.
+    if (next.batchTickets !== undefined && !next.batchTickets.includes(ticket)) {
+      const wantedByBatch = next.tickets.some(
+        (o) => next.batchTickets!.includes(o.number) && o.dependsOn.includes(ticket)
+      );
+      if (wantedByBatch) next.batchTickets = [...next.batchTickets, ticket].sort((a, b) => a - b);
+    }
     return next;
   }
   t.claimedByOther = true;
@@ -2363,7 +2432,15 @@ export function recordConfirmAttempt(state: LoopState, ticket: number, nowMs: nu
 // number (GitHub's raw node list, a hand-written login array) cannot be checked
 // and is accepted as before -- the check tightens the sanctioned path without
 // rejecting the debug ones.
-export function parseAssignees(raw: unknown, ticket: number): string[] {
+// The one rule that decides whether an assignee set frees a ticket, shared by
+// the reducer that acts on it and the parser that guards it (#223 review). Two
+// copies of "would this clear?" could disagree, and the direction they would
+// disagree in is the destructive one.
+export function clearsClaim(assignees: string[], me: string): boolean {
+  return assignees.length === 0 || assignees.every((a) => a === me);
+}
+
+export function parseAssignees(raw: unknown, ticket: number, me?: string): string[] {
   const nodes = Array.isArray(raw) ? raw : (raw as { assignees?: unknown } | null)?.assignees;
   if (!Array.isArray(nodes)) {
     throw new ZError(
@@ -2379,13 +2456,37 @@ export function parseAssignees(raw: unknown, ticket: number): string[] {
         `Re-run \`z-board assignees ${ticket}\` and fold THAT file back.`
     );
   }
-  return nodes.map((n) => {
+  const logins = nodes.map((n) => {
     const login = typeof n === "string" ? n : (n as { login?: unknown } | null)?.login;
     if (typeof login !== "string" || login === "") {
       throw new ZError(`Assignee read contains an entry with no login: ${JSON.stringify(n)}.`);
     }
     return login;
   });
+  // #223 review: an UNVERIFIABLE read may CONFIRM a claim, never CLEAR one.
+  //
+  // The check above only runs when the read carries a number, so for the two
+  // debug shapes it was skipped entirely -- and `parseAssignees([], 999)` or
+  // `parseAssignees({assignees: []}, 999)` was accepted for ANY ticket. An empty
+  // set is exactly what frees a ticket, so the shapes with no identity were the
+  // ones that could free the wrong one, which is the whole failure this guard
+  // exists to stop. Requiring the number outright would reject GitHub's own raw
+  // node list; refusing only the CLEARING direction keeps every documented shape
+  // working, because a confirm that keeps the flag is safe even when it is
+  // about the wrong ticket (it costs a re-stamp and a wrong login, not a lane).
+  //
+  // `me` is passed by the one state-changing caller (the claim-confirmed CLI)
+  // and omitted by read-only inspection, which cannot clear anything.
+  if (me !== undefined && readNumber === undefined && clearsClaim(logins, me)) {
+    throw new ZError(
+      `Assignee read for #${ticket} carries no issue number, and it reads as "nobody else holds this" ` +
+        `(${logins.length === 0 ? "unassigned" : logins.join(", ")}) -- which would CLEAR the claim. ` +
+        `Refusing: with no number there is nothing to prove this read is about #${ticket}, and clearing ` +
+        `the wrong ticket starts a second lane on work another session is building. ` +
+        `Re-run \`z-board assignees ${ticket}\` (it prints the number) and fold THAT file back.`
+    );
+  }
+  return logins;
 }
 
 // A safety-control acknowledgement (issue #63): the orchestrator calls this
@@ -2696,8 +2797,32 @@ export function ingestBoardItems(
       readyCount > 0 &&
       (!priorBatchActive || ticketLimitProvided));
 
+  // #223 review: a NEW RUN must re-earn the bounded park with a fresh read.
+  //
+  // claimConfirmingSince is set once (`??=`) and cleared only by a successful
+  // confirm, so without this the park is a ONE-WAY DOOR that survives every
+  // future run. Measured: park at the bound, then the operator does exactly what
+  // the park note tells them ("move it back to Ready once that claim is
+  // released") -- ten days later the very first idle tick re-parks with the same
+  // note, and confirm-claim is not emitted once across a 500-tick sweep. The
+  // remediation the loop itself prints could not work, and the only escape was
+  // the state.json hand-edit this ticket exists to remove.
+  //
+  // The throttle (claimedByOtherAt) and the flag itself still carry: the claim
+  // may well still be held, and the bulk read cannot say otherwise. Only the
+  // anchor resets, so a new run always spends one read before Blocking anything.
+  // Within a run nothing resets, so the bound still ends a drain exactly as
+  // before -- this boundary is the same one mergedThisRun/initialReadyCount use.
+  const carried = startingFreshBatch
+    ? tickets.map((t) => {
+        if (t.claimConfirmingSince === undefined) return t;
+        const { claimConfirmingSince: _dropped, ...rest } = t; // deleted, not set to undefined
+        return rest;
+      })
+    : tickets;
+
   return {
-    tickets,
+    tickets: carried,
     lanes: structuredClone(lanes),
     maxLanes: cfg?.maxLanes ?? prev?.maxLanes ?? DEFAULT_MAX_LANES,
     // #256: the per-stage TABLE is the last-resort default, not the scalar, so a
@@ -3697,10 +3822,21 @@ export function main(argv: string[]): number {
       // on every tick forever. The pass-2 rule survives intact: the park still
       // requires a recorded attempt, and an attempt is still only ever recorded
       // by actually asking.
+      //
+      // PRINTED FIRST, on purpose (#223 review). `next` was a pure reader before
+      // this ticket, so no caller was built for it failing a write: atomicWrite
+      // rethrows after three retries (Windows AV holding the destination open, a
+      // full disk, a read-only volume), and bin/z-loop-tick runs under
+      // `set -euo pipefail` -- so a stamp that threw before the log killed the
+      // whole tick, every tick, for as long as the loop sat in the confirm
+      // state. Emitting the action first means the worst case degrades to the
+      // unstamped-ask shape the reducer already tolerates (paced by the
+      // orchestrator's own claim-confirmed/claim-confirm-failed write) instead
+      // of taking the drain down.
+      console.log(JSON.stringify(action));
       if (action.kind === "confirm-claim") {
         atomicWrite(statePath, JSON.stringify(recordConfirmAttempt(state, action.ticket, nowMs), null, 2));
       }
-      console.log(JSON.stringify(action));
       return 0;
     }
     if (cmd === "apply") {
@@ -3850,7 +3986,9 @@ export function main(argv: string[]): number {
         );
       }
       const state = readJson(statePath) as LoopState;
-      const assignees = parseAssignees(readJson(file), ticket);
+      // `me` is passed so the parser can refuse an UNVERIFIABLE read that would
+      // CLEAR the flag (#223 review): this is the one state-changing caller.
+      const assignees = parseAssignees(readJson(file), ticket, me);
       const next = claimConfirmed(state, ticket, assignees, me, nowMs);
       atomicWrite(statePath, JSON.stringify(next, null, 2));
       const after = next.tickets.find((t) => t.number === ticket)!;
@@ -3871,7 +4009,16 @@ export function main(argv: string[]): number {
       if (!Number.isInteger(ticket)) throw new ZError("Usage: loop claim-confirm-failed <state.json> <ticket>");
       const state = readJson(statePath) as LoopState;
       atomicWrite(statePath, JSON.stringify(recordConfirmAttempt(state, ticket, nowMs), null, 2));
-      console.log(`#${ticket} confirm read failed; attempt recorded, flag unchanged, retry in one watchdog period`);
+      // This verb takes its ticket from prose with no file to cross-check it
+      // against, so a mistyped number is a real input. recordConfirmAttempt
+      // already no-ops on an unflagged ticket -- say so rather than reporting a
+      // write that did not happen, because "attempt recorded" on the wrong
+      // number is what would let an operator believe a bound is running.
+      console.log(
+        state.tickets.find((t) => t.number === ticket)?.claimedByOther !== true
+          ? `#${ticket} is not flagged claimedByOther; nothing to record (no change) -- check the ticket number`
+          : `#${ticket} confirm read failed; attempt recorded, flag unchanged, retry in one watchdog period`
+      );
       return 0;
     }
     if (cmd === "human-needed") {

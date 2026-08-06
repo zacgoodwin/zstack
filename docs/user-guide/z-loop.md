@@ -740,22 +740,45 @@ the one question a bulk read cannot answer:
   `wait`. The orchestrator spends one targeted read — `z-board assignees N` —
   and folds the answer back with `loop claim-confirmed`. It touches nothing else
   on that ticket; it may still belong to someone. Under a per-stage
-  `watchdogMinutes` object (#256) the period read here is the **`builder`** one:
-  a foreign claim is not a stage of ours, and the thing being waited on is the
-  other session's builder — `Board.claim()` is taken at builder-claim time. Both
-  the throttle above and the bound below read that one number, so they can never
-  end up on different clocks.
+  `watchdogMinutes` object (#256) the period is **the holder's own**, read off
+  the flagged ticket's board status: a claim is taken at whatever stage the
+  ticket resumes at (Ready/Building → `builder`, QA → `qa`, Review →
+  `reviewer`), so that status names the budget the holding lane is working to.
+  Keying every foreign claim to `builder` measured a live reviewer against
+  25 × 3 minutes instead of 40 × 3 and parked its dependents while it was still
+  inside its own watchdog. One resolver serves both the throttle above and the
+  bound below, so they can never end up on different clocks.
+- **A clock that jumps delays these exits, never removes them.** A timestamp in
+  the future (an NTP step backwards, a VM snapshot restore, a `state.json`
+  written on a faster-clocked machine) used to make both comparisons negative
+  and switch off the confirm *and* the park together — `wait` forever, the exact
+  spin this section exists to remove. The two now absorb it in opposite
+  directions, each failing safe: an untrustworthy stamp is not evidence the
+  board was read recently, so the **throttle treats it as due** (worst case, one
+  extra read); it is not evidence of a long wait either, so the **bound clamps
+  it to now** and starts over (worst case, a later park — never a dependent
+  Blocked early over a clock jump).
 - **The clearing rule is `Board.claim()`'s rule.** The flag drops only for an
   assignee set that a real claim would accept: empty, or solely this loop's own
-  login. The ticket becomes claimable on the very next tick. Any other set is
-  somebody else's: the flag stays, the holding login is recorded, and the wait
-  resumes without another read for a full watchdog period.
+  login. The ticket becomes claimable on the very next tick — including under a
+  ticket cap, where clearing the flag also re-admits the freed ticket to
+  `batchTickets`. It was excluded from the batch only because it was flagged
+  when the batch was cut, and something in that batch depends on it; without the
+  re-admission the next tick parked the dependent as a phantom "dependency
+  cycle" on the tick right after the read. Any other set is somebody else's: the
+  flag stays, the holding login is recorded, and the wait resumes without
+  another read for a full watchdog period.
 - **The answer must be for the ticket it is applied to.** `z-board assignees N`
   prints the number it read alongside the logins, and `loop claim-confirmed`
   refuses a file whose number is not the ticket on its own command line. The
   orchestrator types that number twice — once to produce the file, once to apply
   it — and an *empty* set folded into the wrong ticket clears a live foreign
-  claim just as effectively as a misparse would. A read for a ticket that is not
+  claim just as effectively as a misparse would. A read that carries **no**
+  number (GitHub's raw `{"assignees":[…]}`, a hand-written login list) cannot be
+  checked, so it may **confirm** a claim but never **clear** one: the shapes with
+  no identity are exactly the ones that could free the wrong ticket, and freeing
+  is the only irreversible direction. Fold back a `z-board assignees` file and
+  every shape works. A read for a ticket that is not
   flagged at all is a no-op for the mirror reason: folding a read back can
   confirm or clear an existing observation, never invent one, which would drop a
   perfectly workable ticket out of the batch.
@@ -774,7 +797,21 @@ the one question a bulk read cannot answer:
   dependents Blocked, naming the login that holds the ticket when a read ever
   returned one. An abandoned claim and a broken read both end the run instead of
   spinning. The flagged ticket itself is left exactly as it is — parking
-  releases *your* work, never someone else's.
+  releases *your* work, never someone else's. The note reports how long it has
+  actually been since that first attempt, not the bound it crossed, because a
+  state carried in from an earlier run can be days past it.
+- **The park is not a one-way door.** A **new run** drops the anchor and re-earns
+  the bound with a fresh read: the flag and its throttle still carry (the claim
+  may well still be held, and a bulk read cannot say otherwise), but
+  `claimConfirmingSince` resets on the same fresh-batch boundary
+  `mergedThisRun` uses. Without that reset the anchor outlived every future run,
+  so a ticket parked once could never be re-confirmed again — an operator doing
+  exactly what the park note says ("move it back to Ready once that claim is
+  released") got the same park back, days later, having spent no reads at all.
+  Nothing resets *within* a run, so the bound still ends a drain as described
+  above. A **fresh claim loss** clears the anchor for the same reason: it starts
+  a new observation, and it inherits neither the previous one's clock nor its
+  recorded login.
 - **The attempt is the *ask*, not the answer.** `loop next` records the confirm
   as it hands the action over. So the pacing and the bound above hold in code
   even when the orchestrator never reports back: without that write, `next`

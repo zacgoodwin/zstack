@@ -510,7 +510,9 @@ its retry instead of asking every tick. Once `watchdogMinutes * 3` have passed
 dependents park Blocked — naming the holding login when a read ever returned one
 — and the run ends. The bound counts from the first attempt, not from when the
 claim was lost, so a claim lost hours before the drain went idle still gets read
-once: no dependent is ever Blocked over a claim the loop never checked. The
+once: no dependent is ever Blocked over a claim the loop never checked. That
+holds across runs too — a **new run** resets the anchor, so moving a parked
+dependent back to Ready really does get the claim re-read rather than re-parked. The
 "attempt" is the **ask**, not the answer: `loop next` stamps it as it hands the
 `confirm-claim` over, so both the one-read-per-period pacing and the bound hold
 even if the orchestrator never writes an outcome back. See [z-loop.md → Waiting
