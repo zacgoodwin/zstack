@@ -116,8 +116,16 @@ read -r MAX_LANES WATCHDOG AUDIT_EVERY_N MAX_QA_PASSES QA_INVESTIGATE_AFTER HUMA
 # a) Second-invocation guard: refuse if another loop is live, naming its session.
 #    A crashed loop leaves a STALE lock; --reconcile clears it (a LIVE lock never
 #    clears -- you cannot reconcile over a running loop).
+#    Liveness is PROVEN, not guessed from age (#288): acquire records CLAUDE_PID,
+#    the Claude Code harness process that owns this session, whose lifetime is the
+#    drain's lifetime. A dead or recycled pid reads stale at ANY age (so a crash no
+#    longer wedges the next run for the whole lockStalenessMinutes window), and a
+#    live confirmed pid reads live at any age (so a long drain is never reconciled
+#    out from under itself, #198). Do NOT pass --pid: the default is the right one,
+#    and `$$` is this shell, not the loop (#164). When neither arm can decide, the
+#    refusal prints a `force-release` line naming the exact session to clear.
 bun "$PACK/lib/locks.ts" acquire --slug "$SLUG" --session "$SESSION" ${RECONCILE:+--reconcile} \
-  || exit 1   # the CLI already printed which session holds it and what to do
+  || exit 1   # the CLI already printed which session holds it, the evidence, and what to do
 
 # a2) Sweep leftover throwaway review worktrees (#209). The command removes
 #     nothing while any sub-agent of THIS session is still unproven (a skeptic
@@ -971,12 +979,18 @@ Three file kinds live under `$LOCKS` (`~/.zstack/projects/<slug>/locks/`):
   like a crash. **No record at all = a crash**, and that keeps its old behavior
   byte-for-byte — which is why absence is never read as permission to keep
   something.
-- **Loop lock** `loop.lock` `{session, startedAt, pid?, host?}` — one per project. A
-  second `/z-loop` on the same project reads it and **refuses to start, naming
-  the live session**: `Refusing to start: a /z-loop is already running on this
-  project in session "<session>" ...`. A crashed loop's lock is judged *stale*
-  (dead pid on the SAME host, or older than the config `lockStalenessMinutes`) and
-  reported as such rather than live.
+- **Loop lock** `loop.lock` `{session, startedAt, pid?, host?, startTime?}` — one
+  per project. A second `/z-loop` on the same project reads it and **refuses to
+  start, naming the live session**: `Refusing to start: a /z-loop is already
+  running on this project in session "<session>" ...`. Liveness is PROVEN where it
+  can be (#288): `acquire` records `CLAUDE_PID` — the Claude Code harness process
+  that owns the session — plus this host and the pid's OS start-time, and a dead
+  or recycled pid reads *stale at any age* while a live confirmed pid reads *live
+  at any age*. Only when no arm can decide (no pid recorded, a lock from another
+  host, an unreadable start-time) does `lockStalenessMinutes` decide, and that
+  refusal prints a `force-release` line naming the exact session to clear. A pid
+  is meaningful only on the host that assigned it, so a foreign-host lock is
+  always judged by age — never by probing that integer here.
 
 > **UNSUPPORTED: two loops under the same GitHub login on different machines.**
 > The second-invocation guard is the `loop.lock`, and that lock lives in local

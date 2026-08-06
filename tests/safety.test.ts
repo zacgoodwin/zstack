@@ -145,7 +145,11 @@ describe("control 1: loop lock (second-invocation refusal)", () => {
   });
 
   test("pid decides liveness: a dead pid reads stale, a live pid reads live", () => {
-    const withPid = (pid: number): LoopLock => ({ session: "s", startedAt: 0, pid });
+    // #288: the lock must record the host too. A pid integer means nothing off the
+    // machine that assigned it, so the pid arm is gated on sameHost -- a host-less
+    // (pre-#14) lock now falls to the age heuristic in BOTH directions instead of
+    // letting an unattributable pid decide. See the foreign-host case below.
+    const withPid = (pid: number): LoopLock => ({ session: "s", startedAt: 0, pid, host: hostname() });
     expect(loopLockLiveness(withPid(4242), 0, STALE, () => false)).toBe("stale");
     expect(loopLockLiveness(withPid(4242), 0, STALE, () => true)).toBe("live");
     // Real check against this very process (definitely alive) and pid 1 semantics.
@@ -167,7 +171,16 @@ describe("control 1: loop lock (second-invocation refusal)", () => {
     const foreign: LoopLock = { session: "s", startedAt: 0, pid: 4242, host: "some-other-host" };
     expect(loopLockLiveness(foreign, STALE + 1, STALE, () => true)).toBe("stale"); // past staleness -> clearable
     expect(loopLockLiveness(foreign, STALE - 1, STALE, () => true)).toBe("live"); // within window -> don't nuke
-    expect(loopLockLiveness(foreign, 0, STALE, () => false)).toBe("stale"); // dead pid -> stale, host regardless
+    // RETIRED by #288, deliberately. This line used to assert "dead pid -> stale,
+    // host regardless", which was safe only while production recorded no pid at
+    // all: the branch was unreachable. Now every lock carries the harness pid, so
+    // "pid 41644 is not alive here" would be read as proof that ANOTHER machine's
+    // loop is dead, and --reconcile would park its tickets and delete its
+    // worktrees -- #198's exact loss, reached across machines. A foreign lock now
+    // falls to the age heuristic, the same answer the two lines above already give
+    // for a foreign lock whose pid happens to be alive.
+    expect(loopLockLiveness(foreign, 0, STALE, () => false)).toBe("live"); // fresh -> age decides, pid ignored
+    expect(loopLockLiveness(foreign, STALE + 1, STALE, () => false)).toBe("stale"); // ...and age still clears it
 
     // (c) A same-host lock with NO stored start-time is a legacy lock -> unconfirmable
     // -> age decides, both directions (fresh -> live, old -> stale). This is what the
@@ -537,11 +550,20 @@ describe("orphaned reconcile claim self-heals (#144)", () => {
   });
 
   // The claim of a process that is provably alive (this very process: same host,
-  // matching OS start-time) stays untouched even PAST the staleness window.
-  test("a claim held by a live process still defers, and is left untouched", () => {
+  // matching OS start-time) stays untouched while the claim is FRESH.
+  //
+  // #288 review retired the old "even PAST the staleness window" half of this
+  // assertion. It was safe only while claims carried no pid: once the claim body
+  // began carrying the harness pid, a run that died inside the claimed section
+  // while Claude Code stayed open left a claim that read live FOREVER, and every
+  // later --reconcile deferred to it while reporting "stale" -- sending the
+  // operator back to the --reconcile that had just no-opped. A claim is held
+  // across a handful of filesystem ops, so a real racer's claim is always fresh;
+  // age is the right ceiling for one that is not. See claimLiveness.
+  test("a claim held by a live process still defers while it is fresh", () => {
     const dir = tmp();
     seedStale(dir);
-    const claim = { session: "racer-A", startedAt: 0, pid: process.pid, host: hostname(), startTime: processStartTime(process.pid)! };
+    const claim = { session: "racer-A", startedAt: NOW, pid: process.pid, host: hostname(), startTime: processStartTime(process.pid)! };
     const claimPath = seedClaim(dir, claim);
 
     const res = reconcile(dir, "racer-B");
@@ -549,6 +571,20 @@ describe("orphaned reconcile claim self-heals (#144)", () => {
     expect(res.reason).toBe("stale"); // still stale under A's claim
     expect(readLoopLock(dir)!.session).toBe("crashed"); // B did not overwrite the lock
     expect(JSON.parse(readFileSync(claimPath, "utf8"))).toEqual(claim); // claim untouched
+  });
+
+  // The other side of that rule, and the wedge it removes: the SAME live pid on an
+  // OLD claim is an orphan, not a racer, and must be superseded.
+  test("a live-pid claim that has aged out is superseded, not deferred to forever", () => {
+    const dir = tmp();
+    seedStale(dir);
+    // Identical to the claim above except for its age: written long ago by a run
+    // that died inside the claimed section, in a Claude Code that stayed open.
+    seedClaim(dir, { session: "died-in-section", startedAt: 0, pid: process.pid, host: hostname(), startTime: processStartTime(process.pid)! });
+
+    const res = reconcile(dir, "next-run");
+    expect(res.acquired).toBe(true); // the orphan no longer wedges every future --reconcile
+    expect(readLoopLock(dir)!.session).toBe("next-run");
   });
 
   // Real processes, all seeing the same dead claim: every one of them clears it and
@@ -626,7 +662,9 @@ describe("orphaned reconcile claim self-heals (#144)", () => {
     const dir = tmp();
     seedStale(dir);
     const gen0 = seedClaim(dir, { session: "killed", startedAt: 0 }); // the orphan A superseded
-    const live = { session: "racer-A", startedAt: 0, pid: process.pid, host: hostname(), startTime: processStartTime(process.pid)! };
+    // Fresh, like any real racer's claim: it is held across a few filesystem ops,
+    // and since #288's review an aged one is superseded whatever pid it names.
+    const live = { session: "racer-A", startedAt: NOW, pid: process.pid, host: hostname(), startTime: processStartTime(process.pid)! };
     writeFileSync(`${gen0}.1`, JSON.stringify(live) + "\n"); // A, provably running
 
     const res = reconcile(dir, "racer-B");

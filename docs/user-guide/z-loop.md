@@ -1242,6 +1242,39 @@ the ticket is named on stderr for a human. An unreadable PR is not proof of an
 unmerged one, and leaving a lane wedged is recoverable where rebuilding merged work
 is not.
 
+### The loop lock proves liveness instead of guessing it from age
+
+`acquire` records `CLAUDE_PID` — the Claude Code harness process that owns the
+session, whose lifetime is the drain's lifetime — along with this host and the
+pid's OS start-time. That makes three readings possible where there used to be
+one: a **dead or recycled** pid is stale at *any* age (so a crash no longer wedges
+the next run for the whole `lockStalenessMinutes` window — this is the case that
+forced a by-hand `rm loop.lock` on 2026-08-02), a **live, start-time-confirmed**
+pid is live at *any* age (so a long drain is never reconciled out from under
+itself), and only an **unprovable** lock — no pid recorded, written on another
+host, or an unreadable start-time — falls back to the age heuristic.
+`lockStalenessMinutes` is therefore now the fallback, not the primary judgment.
+
+Two cases still need a human, and both print the exact command:
+
+```bash
+bun ~/.claude/skills/zstack/lib/locks.ts force-release --slug <slug> --session "<holder>"
+```
+
+— the unprovable lock whose age says "live", and the lock whose harness process is
+alive but whose *loop* is not (the orchestrator's turn died while Claude Code
+stayed open, so the pid outlives the drain). The session id must match the holder
+exactly, and the command clears only the loop lock and its heartbeat; run
+`/z-loop --reconcile` afterwards to recover the lanes.
+
+The second case additionally requires `--even-if-running`. The session id cannot be
+the whole gate there, because the refusal that sends you to this command prints
+that id and Step 0 hands the same output to the orchestrator — so a copy-paste,
+human or agent, would clear a provably-running loop's lock and let `reconcile
+apply` park its tickets and delete its worktrees. Without the flag the command
+refuses and explains; with it, you are stating you have confirmed the drain
+stopped.
+
 ### Run the recovery commands from anywhere in the repo
 
 `reconcile scan` / `apply` / `clean-retained` / `sweep-review` resolve
