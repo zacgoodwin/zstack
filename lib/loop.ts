@@ -626,37 +626,48 @@ export function builtGuardFailure(facts: BuilderCommitFacts): string | null {
 // Measured over every retained reviewer message in this repo: 82 approves put
 // `confidence=` on the marker line and 0 put it only elsewhere; 8 put `skeptics=`
 // on the marker line and 0 put it only elsewhere. So this costs nothing real in
-// either direction -- it only removes the two ways a gate could be fooled.
-const MARKERS: Record<Stage, Record<string, (note: string, rest: string) => StageOutcome>> = {
+// either direction -- it only removes the ways a gate could be fooled.
+//
+// `MERGED` takes `rest`, not the note, for a different reason: the orchestrator
+// writes a merge lane's note into the completion note's PR-URL slot, and a rescued
+// mid-message marker would put model-authored multi-line prose there. Its own
+// payload IS the URL.
+interface MarkerEvidence {
+  note: string; // human-facing text for the outcome
+  rest: string; // the winning marker line's own payload
+  markerLines: string[]; // every accepted line of the winning marker, payload only
+  unquoted: string; // the message with fenced regions dropped
+}
+const MARKERS: Record<Stage, Record<string, (ev: MarkerEvidence) => StageOutcome>> = {
   builder: {
     "BUILT": () => ({ kind: "built" }),
-    "NEEDS-INPUT": (note) => ({ kind: "needs-input", note }),
-    "BLOCKED": (note) => ({ kind: "stage-blocked", note }),
-    "CONFUSED": (note) => ({ kind: "confused", note }),
+    "NEEDS-INPUT": (ev) => ({ kind: "needs-input", note: ev.note }),
+    "BLOCKED": (ev) => ({ kind: "stage-blocked", note: ev.note }),
+    "CONFUSED": (ev) => ({ kind: "confused", note: ev.note }),
   },
   qa: {
     "QA-PASS": () => ({ kind: "qa-pass" }),
-    "QA-BUGS": (note) => ({ kind: "qa-bugs", note }),
-    "NEEDS-HUMAN": (note) => ({ kind: "human-question", note }),
-    "BLOCKED": (note) => ({ kind: "stage-blocked", note }),
-    "CONFUSED": (note) => ({ kind: "confused", note }),
+    "QA-BUGS": (ev) => ({ kind: "qa-bugs", note: ev.note }),
+    "NEEDS-HUMAN": (ev) => ({ kind: "human-question", note: ev.note }),
+    "BLOCKED": (ev) => ({ kind: "stage-blocked", note: ev.note }),
+    "CONFUSED": (ev) => ({ kind: "confused", note: ev.note }),
   },
   reviewer: {
-    "REVIEW-APPROVE": (note, rest) => ({
+    "REVIEW-APPROVE": (ev) => ({
       kind: "review-approve",
-      confidence: parseReviewerConfidence(rest),
-      skeptics: parseSkepticQuorum(rest) ?? parseSkepticQuorum(note),
+      confidence: lowestMarkerConfidence(ev.markerLines),
+      skeptics: pessimisticSkepticQuorum(ev.markerLines.join("\n")) ?? pessimisticSkepticQuorum(ev.unquoted),
     }),
-    "REVIEW-FINDINGS": (note) => ({ kind: "review-findings", note }),
-    "NEEDS-HUMAN": (note) => ({ kind: "human-question", note }),
-    "BLOCKED": (note) => ({ kind: "stage-blocked", note }),
-    "CONFUSED": (note) => ({ kind: "confused", note }),
+    "REVIEW-FINDINGS": (ev) => ({ kind: "review-findings", note: ev.note }),
+    "NEEDS-HUMAN": (ev) => ({ kind: "human-question", note: ev.note }),
+    "BLOCKED": (ev) => ({ kind: "stage-blocked", note: ev.note }),
+    "CONFUSED": (ev) => ({ kind: "confused", note: ev.note }),
   },
   merge: {
-    "MERGED": (note) => ({ kind: "merged", note }),
-    "NEEDS-HUMAN": (note) => ({ kind: "human-question", note }),
-    "BLOCKED": (note) => ({ kind: "stage-blocked", note }),
-    "CONFUSED": (note) => ({ kind: "confused", note }),
+    "MERGED": (ev) => ({ kind: "merged", note: ev.rest }),
+    "NEEDS-HUMAN": (ev) => ({ kind: "human-question", note: ev.note }),
+    "BLOCKED": (ev) => ({ kind: "stage-blocked", note: ev.note }),
+    "CONFUSED": (ev) => ({ kind: "confused", note: ev.note }),
   },
 };
 
@@ -691,26 +702,66 @@ const CLOSING_LINE_ONLY: Partial<Record<Stage, ReadonlySet<string>>> = {
 // accepted there and only there.
 const MARKER_LINE = /^([A-Z][A-Z-]*):\s*(.*)$/;
 
-// A fenced-code delimiter, captured as its full RUN of backticks or tildes.
-// Markers inside a fence are QUOTED, not reported (see the scan), and a fence's
-// contents sit at column 0 -- so the leading-whitespace rule above does nothing
-// about them and this is the check that does.
+// A fenced-code delimiter line: up to three leading spaces, then a RUN of at least
+// three backticks or tildes, then an optional info string. Markers inside a fence
+// are QUOTED, not reported (see the scan), and a fence's contents sit at COLUMN 0 --
+// so the leading-whitespace rule above does nothing about them and this is the check
+// that does.
 //
-// The run length is captured, not just the first three characters, because a plain
-// boolean toggle is wrong on nested fences and that is not hypothetical: an agent
-// documenting the exit contract writes ````markdown ... ``` ... ``` ... ```` , and
-// a toggle flips OFF at the inner delimiter, so the marker inside the real code
-// block reads as a live verdict. CommonMark's own rule is the fix -- a fence closes
-// only on a run of the SAME character at least as long as the opener -- so the
-// inner ``` cannot close a ```` block.
-const FENCE_LINE = /^\s*(`{3,}|~{3,})/;
+// Three CommonMark rules are implemented, and each one is load-bearing because
+// missing it turns a quoted marker back into a live verdict:
+//   1. The run length is captured, not just the first three characters, and a fence
+//      closes only on a run of the SAME character at least as long as the opener. A
+//      plain boolean toggle is wrong on NESTED fences, which is not hypothetical: an
+//      agent documenting the exit contract writes ````markdown ... ``` ... ```` , and
+//      a toggle flips OFF at the inner delimiter.
+//   2. A CLOSING fence carries nothing but the delimiter. ```ts is an opener's info
+//      string, never a closer -- without this, "``` still inside the block" ends the
+//      fence early and exposes every marker below it.
+//   3. A backtick opener's info string may not contain a backtick (so `` `a` `` in
+//      prose is an inline code span, not a fence).
+// At most three leading spaces, per CommonMark, so a deeply indented delimiter
+// inside a block cannot change fence state.
+const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 
-// A marker payload that is still the exit contract's own placeholder, e.g.
-// `BUILT: <one-line summary>`. A stage that pastes one line of its instructions is
+// A marker payload that OPENS with the exit contract's own placeholder, e.g.
+// `BUILT: <one-line summary>`. Anchored at the start but NOT at the end, because the
+// contract's real lines carry a trailing description on the same line
+// (`QA-PASS: <one-line evidence summary>       everything above verified green`) --
+// a full-match rule missed a verbatim paste, i.e. exactly the input it exists for.
+// A stage that pastes one line of its instructions is
 // quoting the contract, not reporting a verdict, and no real verdict is a bare
 // angle-bracket token: measured over every retained stage final message in this
 // repo (507 messages, 135 with a marker off line 1), zero real verdicts match.
-const PLACEHOLDER_PAYLOAD = /^<[^>]*>$/;
+const PLACEHOLDER_PAYLOAD = /^<[^>]*>(\s|$)/;
+
+// The pessimistic reading of every `skeptics=k/of` token in a text: the LOWEST `k`.
+// #191's quorum floor blocks on a low denominator, so taking the minimum is the
+// fail-closed direction and it is immune to a quoted `3/3` outranking a real `1/3`
+// -- which the first-match parseSkepticQuorum was not, whichever order the note
+// happened to put them in.
+function pessimisticSkepticQuorum(text: string): { received: number; of: number } | null {
+  let worst: { received: number; of: number } | null = null;
+  for (const line of text.split("\n")) {
+    const q = parseSkepticQuorum(line);
+    if (q && (worst === null || q.received < worst.received)) worst = q;
+  }
+  return worst;
+}
+
+// The lowest `confidence=` on any of the winning marker's own lines, or null if none
+// of them carried one. Lowest, so a stage that narrates a high score and then
+// reports a real lower one is held to the real one; per-marker-line, so a number
+// anywhere else in the message -- prose, or a diff hunk the reviewer pasted -- can
+// never score the gate.
+function lowestMarkerConfidence(rests: string[]): number | null {
+  let low: number | null = null;
+  for (const rest of rests) {
+    const c = parseReviewerConfidence(rest);
+    if (c !== null && (low === null || c < low)) low = c;
+  }
+  return low;
+}
 
 // The note a LINE-1 marker carries: the remainder of its own line plus every line
 // after it. Unchanged since the contract shipped.
@@ -754,16 +805,7 @@ function scanMarkerNote(lines: string[], markerIdx: number, rest: string): strin
 
 export function parseStageResult(stage: Stage, finalMessage: string): StageOutcome {
   const lines = finalMessage.split(/\r?\n/);
-  // Fast path, byte-identical to the contract as it shipped: the marker is the
-  // first non-empty line, which is what a well-formed stage message looks like.
-  // It stays FIRST so today's messages parse exactly as before -- including the
-  // case where line 1 is a marker and a later line holds a different one, which
-  // has always resolved to line 1 and still does.
   const firstIdx = lines.findIndex((l) => l.trim() !== "");
-  const first = firstIdx === -1 ? "" : lines[firstIdx]!.trim();
-  const m = first.match(MARKER_LINE);
-  const leading = m ? MARKERS[stage][m[1]!] : undefined;
-  if (m && leading) return leading(markerNote(lines, firstIdx, m[2]!), m[2]!);
 
   // #307: a stage that did the work, spelled its marker correctly, and put it
   // anywhere but line 1 used to be CONFUSED by definition -- and CONFUSED skips
@@ -773,6 +815,15 @@ export function parseStageResult(stage: Stage, finalMessage: string): StageOutco
   // summary with `BUILT:` / `QA-PASS:` as the LAST line, work committed, suite
   // green. A marker that is present, correctly spelled, and unambiguous is not
   // unparseable output, so scan every line before falling back.
+  //
+  // ONE pass collects every candidate, and only then is the verdict chosen. The
+  // line-1 fast path is still preferred, but it no longer SHORT-CIRCUITS: the
+  // quoted-marker and contradiction guards below apply to it too. Skipping them
+  // there was a hole -- a line-1 `MERGED: <the PR URL>` (the contract's own
+  // template) completed a ticket, and a line-1 `REVIEW-APPROVE` shipped a diff its
+  // own next line called defective. AC3's "additive" promise is about WELL-FORMED
+  // messages, and every one of those still parses exactly as before; a message that
+  // quotes its template or reports two verdicts was never well-formed.
   //
   // LAST hit wins, and it does NOT have to be the closing line. That was measured,
   // not assumed: over every retained stage final message in this repo (507 with
@@ -815,21 +866,32 @@ export function parseStageResult(stage: Stage, finalMessage: string): StageOutco
   //                   input payload here, which this function does not have; see the
   //                   #307 follow-up note in docs/user-guide/troubleshooting.md.
   const hits: { idx: number; marker: string; rest: string }[] = [];
+  const unquoted: string[] = []; // fenced regions dropped, for token scanning
   let quoted = 0;
-  // The OPEN fence's delimiter run, or null outside a fence. CommonMark's closing
-  // rule (same character, at least as long) so a nested shorter fence cannot open
-  // the block back up -- see FENCE_LINE.
+  // The OPEN fence's delimiter run, or null outside a fence. See FENCE_LINE for the
+  // three CommonMark rules that decide when this opens and closes.
   let fence: string | null = null;
   let lastNonEmpty = -1;
   for (const [idx, line] of lines.entries()) {
     const trimmedEnd = line.replace(/\s+$/, "");
     if (trimmedEnd !== "") lastNonEmpty = idx;
-    const delim = trimmedEnd.match(FENCE_LINE)?.[1];
-    if (delim) {
-      if (fence === null) fence = delim;
-      else if (delim[0] === fence[0] && delim.length >= fence.length) fence = null;
+    const f = trimmedEnd.match(FENCE_LINE);
+    if (f) {
+      const delim = f[1]!;
+      const info = f[2]!;
+      if (fence === null) {
+        // An opener may carry an info string -- but a BACKTICK opener's info string
+        // may not contain a backtick, or `` `x` `` in prose would open a fence.
+        if (!(delim[0] === "`" && info.includes("`"))) fence = delim;
+      } else if (delim[0] === fence[0] && delim.length >= fence.length && info.trim() === "") {
+        // A closer carries the delimiter and nothing else. Without the info check,
+        // "``` still inside the block" ends the fence early and exposes every
+        // marker below it.
+        fence = null;
+      }
       continue;
     }
+    if (fence === null) unquoted.push(trimmedEnd);
     const hit = trimmedEnd.match(MARKER_LINE);
     if (!hit || !MARKERS[stage][hit[1]!]) continue;
     if (fence !== null || PLACEHOLDER_PAYLOAD.test(hit[2]!.trim())) {
@@ -838,30 +900,59 @@ export function parseStageResult(stage: Stage, finalMessage: string): StageOutco
     }
     hits.push({ idx, marker: hit[1]!, rest: hit[2]! });
   }
+  // A line-1 marker is matched on the FULLY trimmed line, so an indented one is
+  // still accepted there and only there -- unchanged since the contract shipped.
+  // It joins `hits` (deduped by index) so the contradiction guard can see it.
+  const firstTrimmed = firstIdx === -1 ? "" : lines[firstIdx]!.trim();
+  const fm = firstTrimmed.match(MARKER_LINE);
+  if (
+    fm &&
+    MARKERS[stage][fm[1]!] &&
+    !PLACEHOLDER_PAYLOAD.test(fm[2]!.trim()) &&
+    !hits.some((h) => h.idx === firstIdx)
+  ) {
+    hits.unshift({ idx: firstIdx, marker: fm[1]!, rest: fm[2]! });
+  } else if (fm && MARKERS[stage][fm[1]!] && PLACEHOLDER_PAYLOAD.test(fm[2]!.trim())) {
+    quoted++;
+  }
   const distinct = [...new Set(hits.map((h) => h.marker))].sort();
   const snippet = finalMessage.trim().slice(0, 200);
 
-  // Two DIFFERENT markers of the same stage, neither on line 1, is genuinely
-  // unparseable: the stage reported two verdicts and nothing here can say which
-  // it meant. Resolving that silently by position would be worse than the skip,
-  // so it stays CONFUSED and names both so the human note is actionable. Checked
-  // BEFORE last-hit-wins, so a contradiction is never resolved by whichever
-  // verdict happened to land last.
+  // Two DIFFERENT markers of the same stage is genuinely unparseable: the stage
+  // reported two verdicts and nothing here can say which it meant. Resolving that
+  // silently by position would be worse than the skip, so it stays CONFUSED and
+  // names both. Checked BEFORE any winner is chosen -- including before the line-1
+  // preference -- because "the first one wins" is exactly how a reviewer's
+  // REVIEW-APPROVE shipped a diff its own REVIEW-FINDINGS called defective.
   if (distinct.length > 1) {
     return {
       kind: "confused",
-      note: `Stage "${stage}" reported ${distinct.length} different exit markers (${distinct.join(", ")}), none of them on the first line, so no single verdict can be read. Message began: ${JSON.stringify(snippet)}`,
+      note: `Stage "${stage}" reported ${distinct.length} different exit markers (${distinct.join(", ")}), so no single verdict can be read. Message began: ${JSON.stringify(snippet)}`,
     };
   }
 
+  // The winner: the line-1 marker when there is one (its note keeps the shipped
+  // "remainder plus every line after" shape), else the last hit.
+  const leading = hits[0]?.idx === firstIdx ? hits[0] : undefined;
   const last = hits[hits.length - 1];
-  if (last && CLOSING_LINE_ONLY[stage]?.has(last.marker) && last.idx !== lastNonEmpty) {
+  const winner = leading ?? last;
+  if (!winner) {
+    // fall through to the CONFUSED notes below
+  } else if (CLOSING_LINE_ONLY[stage]?.has(winner.marker) && winner.idx !== firstIdx && winner.idx !== lastNonEmpty) {
     return {
       kind: "confused",
-      note: `Stage "${stage}" mentioned ${last.marker} on a line of its own but did not CLOSE with it. ${last.marker} is terminal and nothing re-reads it, so the loop only accepts it as the first or the last line -- put it on line 1. Message began: ${JSON.stringify(snippet)}`,
+      note: `Stage "${stage}" mentioned ${winner.marker} on a line of its own but did not CLOSE with it. ${winner.marker} is terminal and nothing re-reads it, so the loop only accepts it as the first or the last line -- put it on line 1. Message began: ${JSON.stringify(snippet)}`,
     };
+  } else {
+    return MARKERS[stage][winner.marker]!({
+      note: leading
+        ? markerNote(lines, winner.idx, winner.rest)
+        : scanMarkerNote(lines, winner.idx, winner.rest),
+      rest: winner.rest,
+      markerLines: hits.filter((h) => h.marker === winner.marker).map((h) => h.rest),
+      unquoted: unquoted.join("\n"),
+    });
   }
-  if (last) return MARKERS[stage][last.marker]!(scanMarkerNote(lines, last.idx, last.rest), last.rest);
 
   // A stage whose ONLY markers were quoted ones gets told that, rather than the
   // generic "no marker" note: the difference is what a human needs to recover the

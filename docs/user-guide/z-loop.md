@@ -329,14 +329,29 @@ records the result. It never re-derives a scheduling decision in prose.
   - **What is excluded is a marker the stage was quoting**, filtered by mechanism
     rather than position: a marker inside a fenced code block (fenced content sits
     at column 0, so the line-leading rule alone never excluded it), and a marker
-    whose payload is still the contract's own `<placeholder>` — what pasting one
-    instruction line produces. Both cost nothing on the real corpus (0 of the 80
-    hits are fenced, 0 carry a placeholder) and both close a route an agent can
-    actually take, since every stage prompt hands it the literal marker strings.
-    Such a message gets its own note: `only QUOTED its exit markers`. Fences follow
-    CommonMark's closing rule — same character, at least as long as the opener — so
-    a ``` block nested inside a ```` block cannot re-open the outer one and expose
-    the marker it contains.
+    whose payload **opens with** the contract's own `<placeholder>` — what pasting
+    one instruction line produces, and the contract's real lines carry a trailing
+    description after the placeholder, so the match cannot be anchored at both ends.
+    Both cost nothing on the real corpus (0 of the 80 hits are fenced, 0 carry a
+    placeholder) and both close a route an agent can actually take, since every
+    stage prompt hands it the literal marker strings. Such a message gets its own
+    note: `only QUOTED its exit markers`.
+  - **Fence tracking follows CommonMark**, and each rule is load-bearing rather than
+    pedantry — skipping any one of them turned a quoted marker back into a live
+    verdict in a reproducible probe. A fence closes only on a run of the **same
+    character, at least as long** as the opener (so a ``` block nested in a ````
+    block cannot re-open the outer one); a **closing** delimiter carries nothing
+    else (so `` ``` still inside the block `` is content, not a closer); a backtick
+    opener's info string may not contain a backtick (so an inline code span in prose
+    does not open a fence); and a delimiter takes at most three leading spaces.
+  - **Both positions get every guard.** The line-1 preference is not a
+    short-circuit: the quoted-marker and contradiction checks run over the whole
+    message first, then the verdict is chosen. That closes two holes a line-1-only
+    fast path had — a line-1 `MERGED: <the PR URL>` (the contract's own template)
+    completed a ticket, and a line-1 `REVIEW-APPROVE` shipped a diff its own next
+    line called defective. Every **well-formed** message still parses exactly as it
+    did before; a message that quotes its template or reports two verdicts was never
+    well-formed.
   - **The residual, and what bounds each verdict.** A stage that writes a
     fully-formed marker line at column 0 inside prose that disowns it ("if the tests
     pass I will write `REVIEW-APPROVE: confidence=95 …`") is still read as reporting
@@ -344,15 +359,19 @@ records the result. It never re-derives a scheduling decision in prose.
     outright would cost, so it is accepted — but only where a mechanism bounds it:
     - `BUILT` — re-verified against the lane worktree (a dirty tree or a HEAD still
       at the base bounces the lane back to the builder).
-    - `REVIEW-APPROVE` — its `confidence=` is read from the **marker line only**, so
-      a number narrated in prose, or quoted inside a pasted diff hunk, cannot score
-      the gate. A bare approve scores null, which the truth-check gate refuses to
-      merge on. `skeptics=` is read from the marker line first and then from
-      anywhere, because a denominator can only ever *block*.
-    - `MERGED` — accepted on the **first or the closing line only**. It is terminal
-      and nothing re-reads it, so it does not get the loose rule. Cost: 3 real
-      messages, against a false Done that would delete an unmerged branch at batch
-      cleanup.
+    - `REVIEW-APPROVE` — its `confidence=` is the **lowest on the marker's own
+      lines**, so a number narrated in prose, or quoted inside a pasted diff hunk,
+      cannot score the gate, and a stage that narrates a high score then reports a
+      real lower one is held to the real one. A bare approve scores null, which the
+      truth-check gate refuses to merge on. `skeptics=` takes the **lowest**
+      denominator anywhere outside a fence, because a denominator can only ever
+      *block* — so an honest "only 1 of 3 came back" in prose still stops the merge,
+      and a quoted `3/3` cannot outrank a real `1/3` in either order.
+    - `MERGED` — accepted on the **first or the closing line only**, and its note is
+      only its own payload, because the orchestrator writes that note into the
+      completion note's PR-URL slot. It is terminal and nothing re-reads it, so it
+      does not get the loose rule. Cost: 3 real messages, against a false Done that
+      would delete an unmerged branch at batch cleanup.
     - `QA-PASS` — the one verdict where the residual is live, by choice: 17 real
       mid-message occurrences make the strict rule expensive, and a false pass still
       has to clear the blinded reviewer and then the merge gate's own suite run. The

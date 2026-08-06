@@ -202,10 +202,12 @@ Four cases deliberately still skip:
   inside a fenced code block, or one whose payload is still the contract's own
   `<placeholder>` (`BUILT: <one-line summary>`), is the stage echoing its
   instructions, not reporting. Read the transcript and move the ticket by hand.
-- **Two different markers of that stage, neither on line 1.** The stage reported two
-  verdicts and nothing can say which it meant. Skip note:
-  `reported 2 different exit markers (…), none of them on the first line`. Fix it by
-  hand; do not guess.
+- **Two different markers of that stage.** The stage reported two verdicts and
+  nothing can say which it meant. Skip note:
+  `reported 2 different exit markers (…), so no single verdict can be read`. This
+  applies even when one of them is on line 1 — a `REVIEW-APPROVE` followed by a
+  `REVIEW-FINDINGS` must not ship the diff its own next line calls defective. Fix it
+  by hand; do not guess.
 - **A `MERGED` that is neither the first nor the closing line.** Skip note:
   `mentioned MERGED on a line of its own but did not CLOSE with it`. `MERGED` is the
   only marker held to that stricter rule, because it is terminal — it sets the ticket
