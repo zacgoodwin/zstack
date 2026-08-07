@@ -1095,6 +1095,18 @@ clock can see — a stall with no ceiling-eligible lane to park, such as a state
 file written before per-lane stage stamps existed, or a scheduling stall with no
 lane at all.
 
+**On a healthy v1.2+ state, the per-stage ceiling fires first by construction;
+this detector is the net beneath it for legacy or hand-edited states.** Every
+lane this binary writes gets its `stageStartedMs` when the stage starts, and
+`stagnantSinceMs` can only be stamped afterward — a tick only starts counting
+stagnation once it finds nothing to do, which is always later than the stage's
+own start. That ordering is an inequality, not a tuning result, so it holds on
+every state this binary produces: the ceiling reaches a stamped lane before this
+detector can. What is left for this detector to actually catch is a state file
+without that stamp — a pre-#256 file, or one edited by hand, as
+[troubleshooting.md](troubleshooting.md) tells operators they may need to — plus
+standing as a regression check if the ceiling or its stamping ever breaks.
+
 **What happens.** `next` returns a `livelock` action instead of `wait`, carrying
 a per-lane dump and writing it to
 `~/.zstack/projects/<slug>/loop/livelock-<runId>.json` (run-keyed, so a later

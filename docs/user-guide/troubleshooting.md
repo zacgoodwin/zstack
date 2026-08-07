@@ -608,8 +608,12 @@ response, by design — auto-breaking a livelock is a human's call.
 This is deliberately the *last* backstop. Anything a per-lane timer could have
 caught — a quiet agent, a single stage running away — was already the watchdog's
 or the stage ceiling's case and would have been answered hours earlier, at the
-cost of one lane rather than the whole run. Reaching this exit means no lane
-clock could see the problem.
+cost of one lane rather than the whole run. On a healthy v1.2+ state the
+per-stage ceiling fires first by construction, every time; this detector is the
+net beneath it for legacy or hand-edited states the ceiling cannot see. Reaching
+this exit means no lane clock could see the problem — see
+[Livelock detection](z-loop.md#livelock-detection) for why that ordering always
+holds.
 
 Read the dump; it is plain JSON and it explains itself:
 

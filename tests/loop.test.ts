@@ -8681,6 +8681,24 @@ describe("#246: livelock detection", () => {
       expect(row).toContain("safety-violation"); // the human-needed notification, naming the dump
       expect(row).toContain("lane-remove"); // ...named only to say it is NOT run: locks and worktrees stay
     });
+
+    // QA pass 3's backstop-scope decision: on any state THIS binary produces,
+    // stageStartedMs <= stagnantSinceMs always (a stage must start before a tick
+    // can find it stagnant), so the per-stage ceiling reaches every stamped lane
+    // before this detector can. Pinned as doc prose, not just as the "a lane with
+    // a stage stamp is the CEILING's case" behavioral test above, so an editor
+    // cannot drop the operator-facing framing while leaving the code's invariant
+    // intact.
+    test("both docs state the ceiling-first invariant explicitly, not just the mechanism", () => {
+      const zLoop = readFileSync(join(REPO_ROOT, "docs", "user-guide", "z-loop.md"), "utf8");
+      const trouble = readFileSync(join(REPO_ROOT, "docs", "user-guide", "troubleshooting.md"), "utf8");
+      for (const docs of [zLoop, trouble]) {
+        expect(docs).toMatch(/v1\.2\+/);
+        expect(docs).toMatch(/ceiling fires first/i);
+        expect(docs).toMatch(/construction/);
+        expect(docs).toMatch(/legacy|hand-edited/i);
+      }
+    });
   });
 
   // -- AC4: pure and clock-injected -------------------------------------------
