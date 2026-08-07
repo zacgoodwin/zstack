@@ -49,6 +49,7 @@ import {
   recordActivity,
   recordConfirmAttempt,
   recordMergeGate,
+  confirmMerged,
   recordOutcome,
   recordProbe,
   resolveStageModel,
@@ -175,6 +176,13 @@ function drainHappy(s: LoopState): { state: LoopState; log: Action[]; maxConcurr
       s = recordMergeGate(s, a.ticket, GREEN_GATE, 0);
       continue;
     }
+    // #324: the Done gate. On the happy path GitHub agrees the verdict's PR
+    // merged, so the read comes back MERGED and `complete` unlocks -- exactly
+    // the fold the orchestrator's confirm-merge row performs.
+    if (a.kind === "confirm-merge") {
+      s = confirmMerged(s, a.ticket, { found: true, state: "MERGED", url: `https://x/pull/${a.pr}`, number: a.pr }, a.pr);
+      continue;
+    }
     s = applyAction(s, a, 0);
     maxConcurrent = Math.max(maxConcurrent, s.lanes.length);
   }
@@ -219,9 +227,18 @@ describe("dependency-order claiming", () => {
     expect(end.tickets.every((t) => t.status === "Done")).toBe(true);
   });
 
-  test("a dep absent from the snapshot counts as merged", () => {
-    const s = state([ticket(40, "Building", [7])]); // #7 landed in an earlier batch
-    expect(claimableTickets(s.tickets, s.lanes).map((t) => t.number)).toEqual([40]);
+  test("a dep absent from the snapshot satisfies ONLY with a positive gone-proof (#324, was #274's hole)", () => {
+    const s = state([ticket(40, "Building", [7])]); // #7 is not in the snapshot
+    // Unproven absence no longer counts as merged: the dependent waits out the
+    // confirm pass instead of building on a non-observation.
+    expect(claimableTickets(s.tickets, s.lanes).map((t) => t.number)).toEqual([]);
+    // A targeted lookup that proved #7 CLOSED (it shipped, its human closed it)
+    // is the positive evidence that satisfies...
+    expect(claimableTickets(s.tickets, s.lanes, undefined, { "7": "closed" }).map((t) => t.number)).toEqual([40]);
+    // ...and one that proved it OPEN off the board is a dead dep (#292): never
+    // claimable, and deadDeps names it so the dependent parks.
+    expect(claimableTickets(s.tickets, s.lanes, undefined, { "7": "open" }).map((t) => t.number)).toEqual([]);
+    expect(deadDeps(s.tickets[0], new Map(s.tickets.map((t) => [t.number, t])), { "7": "open" })).toEqual([7]);
   });
 
   test("claim resumes at the stage matching the ticket's status", () => {
@@ -679,7 +696,13 @@ describe("stage transitions", () => {
     expect(toMerge).toMatchObject({ kind: "advance", to: "merge", stackedOn: [] });
     s = applyAction(s, toMerge, 0);
     expect(s.tickets[0].status).toBe("Review"); // merge runs under Review
-    expect(step(HAPPY.merge)).toMatchObject({ kind: "complete", note: "https://github.com/x/y/pull/1" });
+    // #324: a merge VERDICT alone asks for the board-side read; only the
+    // observed MERGED unlocks complete (#313).
+    expect(step(HAPPY.merge)).toMatchObject({ kind: "confirm-merge", ticket: 1, pr: 1 });
+    s = confirmMerged(s, 1, { found: true, state: "MERGED", url: "https://github.com/x/y/pull/1", number: 1 }, 1);
+    const done = nextAction(s, 0);
+    expect(done).toMatchObject({ kind: "complete", note: "https://github.com/x/y/pull/1" });
+    s = applyAction(s, done, 0);
     expect(s.tickets[0].status).toBe("Done");
     expect(s.lanes).toEqual([]);
   });
@@ -1529,6 +1552,9 @@ describe("merge ordering", () => {
     // Child stays gated while the parent is mid-merge.
     expect(nextAction(s, 0)).toEqual({ kind: "wait" });
     s = recordOutcome(s, 20, HAPPY.merge, 0);
+    // #324: the merged verdict asks for the board read; fold MERGED, then complete.
+    expect(nextAction(s, 0)).toMatchObject({ kind: "confirm-merge", ticket: 20, pr: 1 });
+    s = confirmMerged(s, 20, { found: true, state: "MERGED", url: "https://github.com/x/y/pull/1", number: 1 }, 1);
     s = applyAction(s, nextAction(s, 0), 0); // complete #20
     // #20 merging moved the base under #21, so its pre-parent green stops
     // counting and it re-gates first (review finding 3).
@@ -1581,6 +1607,7 @@ describe("merge-gate cycle parks instead of throwing (#146)", () => {
     expect(a).toEqual({ kind: "advance", ticket: 30, to: "merge", stackedOn: [] });
     s = applyAction(s, a, 0);
     s = recordOutcome(s, 30, HAPPY.merge, 0);
+    s = confirmMerged(s, 30, { found: true, state: "MERGED", url: "https://github.com/x/y/pull/1", number: 1 }, 1); // #324
     s = applyAction(s, nextAction(s, 0), 0); // complete #30
     expect(s.tickets.find((t) => t.number === 30)!.status).toBe("Done");
     // #30 out of the way: only the cycle remains, and it now parks.
@@ -1776,8 +1803,12 @@ describe("dead merge worker path", () => {
 
   test("recording MERGED on the dead merge lane completes it and counts mergedThisRun", () => {
     let s = state([ticket(1, "Review")], [lane(1, "merge", { workerDead: true })]);
-    // The SKILL's gh pr view found the PR landed before the worker died.
-    s = recordOutcome(s, 1, { kind: "merged", note: "https://pr/9" }, 0);
+    // The SKILL's pr-state read found the PR landed before the worker died and
+    // wrote the recovery verdict; #324 still demands the by-number confirm
+    // before Done -- the same read cycle every merged outcome walks.
+    s = recordOutcome(s, 1, { kind: "merged", note: "https://github.com/x/y/pull/9" }, 0);
+    expect(nextAction(s, 0)).toMatchObject({ kind: "confirm-merge", ticket: 1, pr: 9 });
+    s = confirmMerged(s, 1, { found: true, state: "MERGED", url: "https://github.com/x/y/pull/9", number: 9 }, 9);
     const a = nextAction(s, 0);
     expect(a).toMatchObject({ kind: "complete", ticket: 1 });
     s = applyAction(s, a, 0);
@@ -2266,7 +2297,8 @@ describe("#138 positive-evidence ingest: absence carries forward", () => {
     // The 66 unobserved tickets are byte-identical to what prev held -- status,
     // deps, everything -- and the 2 observed ones took the read's values.
     const byNum = new Map(s.tickets.map((t) => [t.number, t]));
-    expect(byNum.get(7)).toEqual(prev.tickets.find((t) => t.number === 7)!);
+    // #324: carried tickets are MARKED as carried -- the one deliberate delta.
+    expect(byNum.get(7)).toEqual({ ...prev.tickets.find((t) => t.number === 7)!, carriedForward: true });
     expect(byNum.get(41)!.status).toBe("Done");
     expect(byNum.get(68)!.status).toBe("Ready");
 
@@ -2299,7 +2331,13 @@ describe("#138 positive-evidence ingest: absence carries forward", () => {
       undefined,
       []
     );
-    expect(JSON.stringify(empty.tickets)).toBe(JSON.stringify(oneNoOp.tickets));
+    // #324: the two reads differ in exactly one legitimate way -- #40 was
+    // OBSERVED by one and carried by the other -- so compare with the mark
+    // stripped, then assert the mark itself.
+    const strip = (ts: TicketSnapshot[]) => JSON.stringify(ts.map(({ carriedForward: _c, ...rest }) => rest));
+    expect(strip(empty.tickets)).toBe(strip(oneNoOp.tickets));
+    expect(empty.tickets.every((t) => t.carriedForward === true)).toBe(true);
+    expect(oneNoOp.tickets.find((t) => t.number === 40)!.carriedForward).toBeUndefined();
     expect(empty.lanes).toEqual(prev.lanes);
     expect(drainComplete(empty.tickets, empty.lanes, empty.batchTickets)).toBe(false);
     expect(nextAction(empty, 0).kind).not.toBe("drain-complete");
@@ -2333,7 +2371,7 @@ describe("#138 positive-evidence ingest: absence carries forward", () => {
     expect(s.lanes[0].goneReason).toEqual({ kind: "confirmed-gone" });
     expect(s.tickets.find((t) => t.number === 40)).toBeDefined();
     expect(s.tickets.length).toBe(68); // every other ticket untouched
-    expect(s.tickets.find((t) => t.number === 39)).toEqual(prev.tickets.find((t) => t.number === 39)!);
+    expect(s.tickets.find((t) => t.number === 39)).toEqual({ ...prev.tickets.find((t) => t.number === 39)!, carriedForward: true });
     // The action is the removal, and it is the FIRST thing nextAction returns.
     const a = nextAction(s, 0);
     expect(a.kind).toBe("stop-lane");
@@ -2357,9 +2395,11 @@ describe("#138 positive-evidence ingest: absence carries forward", () => {
     // watches lanes -- so the number would come back onto the target list for that
     // window. It does not: a lane already carrying a goneReason is skipped, because
     // it was marked BY a positive observation and a lookup can prove nothing new.
-    // Zero wasted lookups both before the stop and after it.
-    expect(confirmTargets(s, [])).toEqual([]);
-    expect(confirmTargets(applyAction(s, nextAction(s, 0), 0), [])).toEqual([]);
+    // Zero wasted lookups on #40 both before the stop and after it. (#3 IS a
+    // target -- #324's dep confirms: workable #7 depends on carried #3, and a
+    // carried dep now earns exactly one lookup instead of satisfying by absence.)
+    expect(confirmTargets(s, [])).toEqual([3]);
+    expect(confirmTargets(applyAction(s, nextAction(s, 0), 0), [])).toEqual([3]);
     expect(prev.batchTickets).toEqual([40]); // and prev is untouched
     // The capture-once contract is otherwise intact: nothing was re-selected.
     expect(ingestBoardItems(prev, [], {}, undefined, []).batchTickets).toEqual([40]);
@@ -2479,7 +2519,7 @@ describe("#138 applyConfirmations", () => {
     const r = applyConfirmations(items, bodies, [{ number: 1, present: false, reason: "not-on-project" }]);
     expect(r.confirmedGone).toEqual([1]);
     expect(r.items.map((i) => i.number)).toEqual([5]);
-    expect(r.notes[0]).toContain("gone from the board (not-on-project)");
+    expect(r.notes[0]).toContain("gone from the board (not-on-project, issue state unknown)");
     // #273: the note must not claim the confirm pass released anything -- it
     // proves a removal, and a lane still holding the ticket is torn down by the
     // stop-lane action that follows, not by this pass.
@@ -2538,7 +2578,7 @@ describe("ingest preserves state on a transient empty snapshot (#127)", () => {
 // -- fresh-stage guarantee (AC4): lane state carries no conversation id -------
 
 describe("fresh-stage lane state", () => {
-  test("LaneState carries exactly its seventeen scheduling fields and no session/conversation id", () => {
+  test("LaneState carries exactly its nineteen scheduling fields and no session/conversation id", () => {
     // Compile-time half: this constant stops typechecking if LaneState's key
     // set ever drifts from the seventeen named here (issue #76 added reviewBounces,
     // mirroring qaBounces; #125 added lastWroteStatus, the resync origin marker;
@@ -2556,7 +2596,7 @@ describe("fresh-stage lane state", () => {
     type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
     const _laneKeysExact: Exact<
       keyof LaneState,
-      "ticket" | "stage" | "lastActivityMs" | "stageStartedMs" | "qaBounces" | "reviewBounces" | "quorumRetries" | "commitRetries" | "respawns" | "workerDead" | "worktreeDirty" | "outcome" | "lastWroteStatus" | "goneReason" | "mergeGate" | "mergeGateRuns" | "mergeGateBase"
+      "ticket" | "stage" | "lastActivityMs" | "stageStartedMs" | "qaBounces" | "reviewBounces" | "quorumRetries" | "commitRetries" | "respawns" | "workerDead" | "worktreeDirty" | "outcome" | "lastWroteStatus" | "goneReason" | "mergeGate" | "mergeGateRuns" | "mergeGateBase" | "mergeObserved" | "mergeConfirmAttempts"
     > = true;
     void _laneKeysExact;
     // Runtime half: a fully-populated lane exposes exactly those keys, and none
@@ -2564,8 +2604,9 @@ describe("fresh-stage lane state", () => {
     const full: Required<LaneState> = {
       ticket: 1, stage: "builder", lastActivityMs: 0, stageStartedMs: 0, qaBounces: 0, reviewBounces: 0, quorumRetries: 0, commitRetries: 0, respawns: { builder: 0 }, workerDead: false, worktreeDirty: false, outcome: { kind: "built" }, lastWroteStatus: "Building", goneReason: { kind: "confirmed-gone" },
       mergeGate: { green: true, attempts: 1, failCount: 0, note: "green" }, mergeGateRuns: 1, mergeGateBase: "",
+      mergeObserved: { number: 1, url: "https://x/pull/1", mergeSha: "a" }, mergeConfirmAttempts: 0, // #324
     };
-    expect(Object.keys(full).sort()).toEqual(["commitRetries", "goneReason", "lastActivityMs", "lastWroteStatus", "mergeGate", "mergeGateBase", "mergeGateRuns", "outcome", "qaBounces", "quorumRetries", "respawns", "reviewBounces", "stage", "stageStartedMs", "ticket", "workerDead", "worktreeDirty"]);
+    expect(Object.keys(full).sort()).toEqual(["commitRetries", "goneReason", "lastActivityMs", "lastWroteStatus", "mergeConfirmAttempts", "mergeGate", "mergeGateBase", "mergeGateRuns", "mergeObserved", "outcome", "qaBounces", "quorumRetries", "respawns", "reviewBounces", "stage", "stageStartedMs", "ticket", "workerDead", "worktreeDirty"]);
     for (const k of Object.keys(full)) {
       expect(k).not.toMatch(/conversation|session|context|transcript|agent/i);
     }
@@ -2936,6 +2977,10 @@ describe("#205: every stage transition writes the board", () => {
       // loop does not own. It moves nothing and writes nothing to the board --
       // the answer comes back through claimConfirmed, not the reducer.
       "confirm-claim": [{ before: withLane("Building", "builder"), action: { kind: "confirm-claim", ticket: 1 } }],
+      // #324's confirm-merge is the Done gate's read request -- same shape as
+      // confirm-claim: one pr-state read, folded back via `loop confirm-merged`,
+      // no board write and no transition from the reducer.
+      "confirm-merge": [{ before: withLane("Review", "merge", { outcome: { kind: "merged", note: "https://x/pull/9" } }), action: { kind: "confirm-merge", ticket: 1, pr: 9 } }],
       "context-clear": [{ before: withLane("Building", "builder"), action: { kind: "context-clear" } }],
       "drain-complete": [{ before: state([ticket(1, "Done")]), action: { kind: "drain-complete" } }],
     };
@@ -3083,34 +3128,33 @@ describe("#205: every stage transition writes the board", () => {
     expect(nextAction(bounce, 0)).toEqual({ kind: "advance", ticket: 1, to: "qa", resyncStatus: "Building" });
   });
 
-  // KNOWN GAP, pinned so it cannot be mistaken for the recovered case above.
-  // #130's skip-qa walk is the ONE advance that is not one hop: resolveOutcome
-  // sends a labeled builder straight to `reviewer`, i.e. Building -> Review,
-  // while PRECEDING_BOARD_STATUS maps a reviewer lane's lag to `QA` alone. So a
-  // missed step-3 move on THAT advance is not a lag the guard recognizes -- it
-  // stop-lanes, and the re-claim reads the board's stale Building and comes back
-  // as a *builder*, rebuilding an already-built, already-approved ticket.
-  //
-  // This is the pre-#205 outcome for EVERY skip-qa advance (the row wrote
-  // nothing, so the board never left Building), now narrowed to the crash window
-  // -- so the board write is a strict improvement here too. Closing the window
-  // means widening isOneHopLag, which this ticket's Out of scope list holds back
-  // ("the #125 resync guard's logic, which is correct given a truthful marker"),
-  // so the gap is pinned rather than silently patched.
-  test("KNOWN GAP: the skip-qa two-hop advance is NOT recovered -- a missed move there still re-claims as a builder", () => {
+  // #324 closed #205's pinned KNOWN GAP (#297): #130's skip-qa walk is the one
+  // advance that is not one status-hop -- Building -> Review in ONE write --
+  // and isOneHopLag used to map a reviewer lane's lag to QA alone, so a missed
+  // move there stop-laned and the re-claim read the board's stale Building and
+  // rebuilt an already-approved ticket. The lag rule now accepts Building for
+  // a reviewer lane WHEN the ticket carries skip-qa AND the origin marker
+  // still points at the loop's own write -- a human drag onto an ordinary
+  // reviewer lane still stop-lanes.
+  test("#297: the skip-qa advance's missed move resyncs instead of re-claiming as a builder", () => {
     const skip = state(
       [ticket(1, "Building", [], { skipQa: true })],
-      [lane(1, "reviewer", { outcome: approve(100), lastWroteStatus: "Review" })]
+      [lane(1, "reviewer", { outcome: approve(100), lastWroteStatus: "Review", mergeGate: GREEN_GATE })]
     );
-    const stop = nextAction(skip, 0);
-    expect(stop).toMatchObject({ kind: "stop-lane", ticket: 1 });
-    // ...and that stop-lane is what hands the ticket back to a builder.
-    expect(nextAction(applyAction(skip, stop, 0), 0)).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+    // Recovered: the lane proceeds at its real stage (the gate/advance path),
+    // never a stop-lane, never a builder re-claim.
+    const a = nextAction(skip, 0);
+    expect(a).not.toMatchObject({ kind: "stop-lane" });
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "merge", resyncStatus: "Review" });
 
-    // The same lane WITHOUT the two-hop jump resyncs, which is what isolates the
-    // cause to the hop distance rather than to the reviewer stage itself.
-    const oneHop = state([ticket(1, "QA")], [lane(1, "reviewer", { outcome: approve(100), lastWroteStatus: "Review" })]);
-    expect(nextAction(oneHop, 0)).not.toMatchObject({ kind: "stop-lane" });
+    // The guard stays narrow, both ways: without the label the two-hop lag is
+    // still a human move (stop-lane)...
+    const unlabeled = state([ticket(1, "Building")], [lane(1, "reviewer", { outcome: approve(100), lastWroteStatus: "Review" })]);
+    expect(nextAction(unlabeled, 0)).toMatchObject({ kind: "stop-lane", ticket: 1 });
+    // ...and with the label but NO origin marker (the loop never wrote Review),
+    // a genuine human drag back to Building still stops the lane.
+    const humanMove = state([ticket(1, "Building", [], { skipQa: true })], [lane(1, "reviewer", { outcome: approve(100) })]);
+    expect(nextAction(humanMove, 0)).toMatchObject({ kind: "stop-lane", ticket: 1 });
   });
 });
 

@@ -48,23 +48,40 @@ export function isWorkableStatus(status: BoardStatus): boolean {
   return CLAIMABLE_STAGE[status] !== undefined;
 }
 
-// A dependency is satisfied when it is Done on this board, or absent from the
-// snapshot entirely (already merged/closed in an earlier batch).
-function depsSatisfied(t: TicketSnapshot, byNumber: Map<number, TicketSnapshot>): boolean {
-  return t.dependsOn.every((d) => {
-    const dep = byNumber.get(d);
-    return dep === undefined || dep.status === "Done";
-  });
+// A dependency satisfies on POSITIVE EVIDENCE only (#324, was #274's hole):
+//   - present and observed Done in the current read -- satisfied;
+//   - present but CARRIED FORWARD (even at Done) -- not yet: it is on the
+//     confirm pass's target list, and one targeted read either re-observes it
+//     (clearing the mark) or proves it gone;
+//   - absent with a positive gone-proof (LoopState.depsGone): "closed" = the
+//     issue shipped and its human closed it -- satisfied; "open" = it left the
+//     board un-Done -- dead (#292), the dependent parks rather than building
+//     on a base that never got it;
+//   - absent with NO proof yet -- not satisfied; the dependent waits out the
+//     confirm pass instead of treating a non-observation as a fact.
+// The old rule's `dep === undefined ||` arm read absence as Done, which is the
+// one place absence was still evidence after #224.
+function depSatisfied(d: number, byNumber: Map<number, TicketSnapshot>, depsGone: Record<string, "closed" | "open"> | undefined): boolean {
+  const dep = byNumber.get(d);
+  if (dep !== undefined) return dep.status === "Done" && dep.carriedForward !== true;
+  return depsGone?.[String(d)] === "closed";
+}
+
+function depsSatisfied(t: TicketSnapshot, byNumber: Map<number, TicketSnapshot>, depsGone?: Record<string, "closed" | "open">): boolean {
+  return t.dependsOn.every((d) => depSatisfied(d, byNumber, depsGone));
 }
 
 // Dependencies that can never complete in this batch: the loop must not let the
 // dependent sit and burn tokens waiting on them (PROCESS.md global rule). Dead =
 // terminal (lib/config.ts TERMINAL_STATUSES) minus Done -- a Done dep is
-// satisfied, not dead.
-export function deadDeps(t: TicketSnapshot, byNumber: Map<number, TicketSnapshot>): number[] {
+// satisfied, not dead -- plus (#324/#292) a dep POSITIVELY proven off the board
+// while still open: it can never reach Done from there, and its dependent must
+// park with that named rather than wait forever or build without it.
+export function deadDeps(t: TicketSnapshot, byNumber: Map<number, TicketSnapshot>, depsGone?: Record<string, "closed" | "open">): number[] {
   return t.dependsOn.filter((d) => {
     const dep = byNumber.get(d);
-    return dep !== undefined && dep.status !== "Done" && TERMINAL_STATUSES.includes(dep.status);
+    if (dep === undefined) return depsGone?.[String(d)] === "open";
+    return dep.status !== "Done" && TERMINAL_STATUSES.includes(dep.status);
   });
 }
 
@@ -84,7 +101,7 @@ export function deadDeps(t: TicketSnapshot, byNumber: Map<number, TicketSnapshot
 // and self-containment is impossible by definition. Captured ONCE per batch in
 // ingestBoardItems (persisted on LoopState.batchTickets), not recomputed per
 // tick.
-export function selectBatch(tickets: TicketSnapshot[], ticketLimit: number): number[] | undefined {
+export function selectBatch(tickets: TicketSnapshot[], ticketLimit: number, depsGone?: Record<string, "closed" | "open">): number[] | undefined {
   if (ticketLimit <= 0) return undefined;
   const byNumber = new Map(tickets.map((t) => [t.number, t]));
   const workable = tickets
@@ -96,10 +113,13 @@ export function selectBatch(tickets: TicketSnapshot[], ticketLimit: number): num
       .filter(
         (t) =>
           !flagged.has(t.number) &&
-          t.dependsOn.every((d) => {
-            const dep = byNumber.get(d);
-            return dep === undefined || dep.status === "Done" || flagged.has(d);
-          })
+          // #324: same positive-evidence rule as depSatisfied, plus "already
+          // flagged this round". An unproven-absent dep keeps its dependent out
+          // of this batch capture rather than assuming it shipped -- the
+          // confirm pass runs BEFORE the capturing ingest (Step 3 and the tick
+          // both fold lookups in first), so a genuinely-shipped dep is proven
+          // by the time this runs.
+          t.dependsOn.every((d) => flagged.has(d) || depSatisfied(d, byNumber, depsGone))
       )
       .map((t) => t.number);
     if (ready.length === 0) break; // nothing further can be closed within the cap
@@ -151,14 +171,14 @@ export function selectBatch(tickets: TicketSnapshot[], ticketLimit: number): num
 // = ascending issue number; dependency order falls out because a dependent is
 // simply not claimable until its deps are Done. `batchTickets` undefined = no
 // cap (every workable ticket is in the batch).
-export function claimableTickets(tickets: TicketSnapshot[], lanes: LaneState[], batchTickets?: number[]): TicketSnapshot[] {
+export function claimableTickets(tickets: TicketSnapshot[], lanes: LaneState[], batchTickets?: number[], depsGone?: Record<string, "closed" | "open">): TicketSnapshot[] {
   const inLane = new Set(lanes.map((l) => l.ticket));
   const allow = batchTickets ? new Set(batchTickets) : undefined;
   const byNumber = new Map(tickets.map((t) => [t.number, t]));
   return tickets
     .filter((t) => isWorkableStatus(t.status) && !inLane.has(t.number) && !t.claimedByOther)
     .filter((t) => allow === undefined || allow.has(t.number))
-    .filter((t) => depsSatisfied(t, byNumber))
+    .filter((t) => depsSatisfied(t, byNumber, depsGone))
     .sort((a, b) => a.number - b.number);
 }
 

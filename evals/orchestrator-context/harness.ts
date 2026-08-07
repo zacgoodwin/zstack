@@ -16,6 +16,7 @@ import {
   applyAction,
   nextAction,
   recordMergeGate,
+  confirmMerged,
   recordOutcome,
   type LoopState,
   type StageOutcome,
@@ -140,7 +141,7 @@ const HAPPY: Record<Stage, StageOutcome> = {
   // confidence 100 clears the default 70 floor (issue #62) so the happy-path
   // drain actually reaches merge instead of fail-closing to Blocked.
   reviewer: { kind: "review-approve", confidence: 100, skeptics: null },
-  merge: { kind: "merged", note: "https://pr/1" },
+  merge: { kind: "merged", note: "https://x/pull/1" },
 };
 
 export interface DrainStats {
@@ -173,6 +174,11 @@ export function simulateDrain(nTickets: number): DrainStats {
       continue;
     }
     if (a.kind === "check-worker") throw new Error("simulateDrain: unexpected watchdog on the happy path");
+    // #324: fold the happy-path MERGED read so complete unlocks.
+    if (a.kind === "confirm-merge") {
+      s = confirmMerged(s, a.ticket, { found: true, state: "MERGED", url: "https://x/pull/1", number: a.pr }, a.pr);
+      continue;
+    }
     // #178: the loop runs its own merge gate before a lane may advance to the
     // merge stage. It is a bash command, not a spawn, so it costs no
     // orchestrator context beyond the one-line tick this loop already counts.

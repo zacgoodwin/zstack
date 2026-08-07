@@ -822,7 +822,9 @@ describe("item (#138)", () => {
 
   test("an issue that is not on THIS project answers not-on-project (never another board's item)", async () => {
     const board = new Board(CFG, makeExecutor({ overrides: { ItemLookup: otherBoardOnly } }));
-    expect(await board.item(5)).toEqual({ number: 5, present: false, reason: "not-on-project" });
+    // #324: the issue's own open/closed state rides the not-on-project answer,
+    // so a gone DEPENDENCY's two meanings are distinguishable (#274/#292).
+    expect(await board.item(5)).toEqual({ number: 5, present: false, reason: "not-on-project", issueState: "OPEN" });
   });
 
   test("a deleted issue answers issue-not-found -- also positive, also safe to release", async () => {
