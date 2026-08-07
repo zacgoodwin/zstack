@@ -1662,6 +1662,30 @@ Mid-run, dragging a Building/QA ticket to Blocked or Questions on the board is
 respected: the loop stops that one lane cleanly at its next stage boundary and
 keeps the others running, with its worktree recorded `retained` so it survives.
 
+**Except your own merge landing (#330).** The merge prompt's PR body carries
+`Closes #N` by design, so `gh pr merge` closes the issue and the project's
+built-in workflow moves its card to Done before the loop ever reads a PR
+state — a raw Done that looks, at the board layer, identical to a human
+dragging the card there. A merge-stage lane whose *own* verdict was `MERGED`
+is exempted from the stop-lane above: it falls through to the ordinary Done
+gate (`confirm-merge` → `complete`) instead, which is what actually verifies —
+via `pr-state --pr` — that the exact PR the verdict named landed before Done
+sticks (#324; a raw board Done is never proof by itself, #313). This is safe
+even on the off chance a human really did drag the card while the merge was
+in flight: if the PR turns out not to be merged, the read comes back a
+positive divergence and the lane parks Blocked naming it, which beats
+believing the board either way. A merge-stage lane with a *recorded* outcome
+that is not `merged` (a real conflict, say) dragged to Done — nothing the loop
+did explains that Done — still stops the lane exactly as above. A merge-stage
+lane with **no** outcome recorded at all is a different shape: the worker may
+still be mid-`gh pr merge`, and the check above only ever runs once a lane has
+reached a boundary (an outcome recorded) — the same reasoning that already
+holds a dead merge worker at `check-worker` instead of skipping it (#14) — so
+`next` returns `wait` and defers the read to that boundary rather than risk
+stopping a live merge. Only a *recorded* `merged` + Done combination is ever
+read as the loop's own landing; every other Done at this stage either stops
+(a recorded non-merged outcome) or waits (none recorded yet).
+
 ## Done when
 
 Every in-flight ticket is Done/Questions/Blocked/Skipped; Done tickets stay OPEN

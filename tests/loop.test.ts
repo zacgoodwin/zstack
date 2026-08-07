@@ -6887,28 +6887,31 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
         expect(nextAction(s, 0)).toEqual({ kind: "park", ticket: 8, status: "Blocked", note: red.note });
       });
 
-      // The base-move check reads `mergedThisRun`, which `complete` was the only
-      // writer of -- so a merge that resolved through `stop-lane` instead (a
-      // human dragging the merging card to Done mid-run) dropped the lane
-      // without recording it, the base key stayed "", and every waiting lane's
-      // pre-parent green stayed live merge permission. Reproduced end to end:
-      // #8 depends on #7, both stamped at t0, #7 resolved by stop-lane, and #8
-      // still advanced with `stackedOn:[]` -- the reducer no longer even aware
-      // its parent had landed.
-      test("a merge that resolves through stop-lane still moves the base (it is not only `complete`)", () => {
-        // #7 is in the merge stage and its card is already Done -- the human
-        // moved it mid-run, so the lane resolves by stop-lane rather than by
-        // `complete`. #8 depends on it and was stamped green at t0.
+      // The base-move check reads `mergedThisRun`, which only `complete` writes.
+      // Before #330, #7's card already reading Done here (gh pr merge's
+      // `Closes #N` auto-closes the issue, and GitHub's own board automation
+      // races the loop's `complete` to Done) resolved through `stop-lane`
+      // instead -- misread as a human dragging the merging card -- and the #178
+      // patch below is what kept `mergedThisRun` alive across THAT path. #330
+      // closed the misreading itself: this exact shape now falls through to the
+      // ordinary Done gate (confirm-merge -> complete), so the base-move
+      // consequence for a stacked dependent is reached the SAME way any other
+      // merge reaches it, not through a stop-lane special case. Reproduced end
+      // to end: #8 depends on #7, both stamped at t0.
+      test("an auto-closed merge (#330) still moves the base -- through the Done gate, not stop-lane", () => {
         let s = state(
           [ticket(7, "Done"), ticket(8, "Review", [7])],
-          [lane(7, "merge", { outcome: { kind: "merged", note: "https://x/1" } }), lane(8, "reviewer", { outcome: approve(100) })]
+          [lane(7, "merge", { outcome: { kind: "merged", note: "https://x/pull/1" } }), lane(8, "reviewer", { outcome: approve(100) })]
         );
         s = recordMergeGate(s, 8, GREEN_GATE, 0);
         expect(s.lanes[1].mergeGateBase).toBe("");
-        const stop = nextAction(s, 0);
-        expect(stop).toMatchObject({ kind: "stop-lane", ticket: 7 });
-        s = applyAction(s, stop, 0);
-        expect(s.mergedThisRun).toEqual([7]); // the landing is recorded, not lost with the lane
+        const confirm = nextAction(s, 0);
+        expect(confirm).toEqual({ kind: "confirm-merge", ticket: 7, pr: 1 }); // never stop-lane (#330 AC1)
+        s = confirmMerged(s, 7, { found: true, state: "MERGED", url: "https://x/pull/1", number: 1 }, 1);
+        const complete = nextAction(s, 0);
+        expect(complete).toEqual({ kind: "complete", ticket: 7, note: "https://x/pull/1" });
+        s = applyAction(s, complete, 0);
+        expect(s.mergedThisRun).toEqual([7]); // the landing is recorded via the ordinary gate
         expect(nextAction(s, 0)).toEqual({ kind: "merge-gate", ticket: 8 }); // ...so #8 re-gates
       });
 
@@ -7065,6 +7068,92 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
       const s = recordMergeGate(approved(), 7, GREEN_GATE, 0);
       const after = ingestBoardItems(s, [{ number: 7, title: "Ticket 7", fields: { Status: "Review" } }], { "7": "" });
       expect(after.lanes[0].mergeGate).toEqual(GREEN_GATE);
+    });
+
+    // -- #330: gh pr merge's `Closes #N` (the merge prompt's own convention, by
+    // design) auto-closes the issue, and the project's built-in workflow reads
+    // that as Done before the loop's own `complete` ever runs -- byte-identical,
+    // at raw board status, to a human dragging the card. reconcileBoardMoves
+    // (parkedByHuman above) classifies by status alone and the stage/status
+    // desync guard classifies by status-vs-stage alone, so EITHER one used to
+    // stop-lane this shape -- pre-empting the #324 Done gate at exactly the
+    // moment it was supposed to run, and losing what only `complete` records:
+    // the `mergedThisRun` entry a stacked child's retarget depends on, the
+    // completion note, and Step 6's worktree removal (a stop-lane row leaves it
+    // `retained` instead). Fixed by autoClosedByOwnMerge: this exact shape now
+    // falls through to the ordinary `merged` resolution, which never trusts a
+    // raw Done -- `confirm-merge`'s `pr-state --pr` read is the only thing
+    // allowed to move this ticket to Done for real (#313).
+    describe("a merge-stage lane's own Done is not a human stop (#330)", () => {
+      test("AC1: a merged outcome observed at Done routes to the Done gate, never stop-lane", () => {
+        const s = state([ticket(7, "Done")], [lane(7, "merge", { outcome: { kind: "merged", note: "https://x/pull/1" } })]);
+        expect(nextAction(s, 0)).toEqual({ kind: "confirm-merge", ticket: 7, pr: 1 });
+      });
+
+      test("AC2: Done with no merged outcome (a human's own call mid-merge) still stops the lane", () => {
+        // The merge stage's own verdict here is BLOCKED (a real conflict, say)
+        // -- MERGED is the only outcome autoClosedByOwnMerge ever exempts, so
+        // nothing the loop did explains the board's Done, and the human-stop
+        // meaning holds exactly as it did before #330.
+        let s = state([ticket(7, "Done")], [lane(7, "merge", { outcome: { kind: "stage-blocked", note: "merge conflict" } })]);
+        const a = nextAction(s, 0);
+        expect(a).toMatchObject({ kind: "stop-lane", ticket: 7 });
+        expect((a as { note: string }).note).toContain("A human moved #7 to Done");
+        // Review catch: applyAction's own `landed` guess (#178) used to derive
+        // "landed" from stage+status alone, with no outcome check -- so THIS
+        // shape (a stop-lane at the merge stage with the ticket at Done) still
+        // got recorded into `mergedThisRun` even though nothing merged. Once
+        // #330 diverts every genuine merged+Done lane away from stop-lane
+        // entirely (AC1), that old heuristic could no longer see a single true
+        // positive -- every lane still reaching stop-lane here has a non-merged
+        // outcome by construction, so recording it as landed is ALWAYS wrong.
+        // A stacked dependent would read this false `mergedThisRun` entry and
+        // retarget onto #7 as an already-merged parent, re-running its
+        // claim+gate against a base that never moved.
+        s = applyAction(s, a, 0);
+        expect(s.mergedThisRun).toEqual([]);
+        expect(s.lanes).toEqual([]); // still dropped -- only the false "landed" record is fixed
+      });
+
+      // Companion pin (AC2): the IDENTICAL Done board state as the test just
+      // above, but with NO outcome recorded at all, is a different shape --
+      // the merge worker may still be mid-`gh pr merge`, and the human-stop
+      // check (parkedByHuman/autoClosed) never even runs for an outcome-less
+      // lane; step 1's per-lane loop skips it before either check, deferring
+      // to this lane's own boundary (same general rule every other stage
+      // gets, not something #330 introduced). Reviewer attempt 2 on this
+      // ticket blocked because the ORIGINAL AC wording asked for `stop-lane`
+      // here instead -- which would mean killing a lane that might still be
+      // mid-merge, the same class of hazard #14's H9 already guards the
+      // dead-worker watchdog against -- so the ticket's wording was corrected
+      // rather than the code. Pinned as its own case so a future change to
+      // the exemption cannot silently start stopping an in-flight worker.
+      test("Companion pin: the same Done board state with NO recorded outcome returns wait, never stop-lane", () => {
+        const s = state([ticket(7, "Done")], [lane(7, "merge")]);
+        expect(nextAction(s, 0)).toEqual({ kind: "wait" });
+      });
+
+      test("AC3: confirm-merged folding a positive MERGED read then completes, recording mergedThisRun", () => {
+        let s = state([ticket(7, "Done")], [lane(7, "merge", { outcome: { kind: "merged", note: "https://x/pull/1" } })]);
+        s = confirmMerged(s, 7, { found: true, state: "MERGED", url: "https://x/pull/1", number: 1 }, 1);
+        const a = nextAction(s, 0);
+        expect(a).toEqual({ kind: "complete", ticket: 7, note: "https://x/pull/1" });
+        s = applyAction(s, a, 0);
+        expect(s.mergedThisRun).toEqual([7]);
+        expect(s.lanes).toEqual([]); // dropped, same as any other `complete`
+      });
+
+      // A Done with no lane at all (the ordinary case: no merge in flight for
+      // this ticket right now) is not this predicate's concern -- nothing here
+      // reaches for a ticket that has no lane, same as every other check in
+      // step 1. Pinned so a future refactor cannot widen the exemption past
+      // "there is a live merge-stage lane that just said MERGED".
+      test("a Blocked/Questions/Skipped board status is never exempted, even with a merged outcome -- only Done is GitHub's own auto-close", () => {
+        for (const status of ["Blocked", "Questions", "Skipped"] as const) {
+          const s = state([ticket(7, status)], [lane(7, "merge", { outcome: { kind: "merged", note: "https://x/pull/1" } })]);
+          expect(nextAction(s, 0)).toMatchObject({ kind: "stop-lane", ticket: 7 });
+        }
+      });
     });
   });
 
