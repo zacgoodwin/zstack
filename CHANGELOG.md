@@ -10,6 +10,12 @@ There is no `[Unreleased]` section: since 1.1.0.0 every PR opens its own version
 
 Fix merge PR auto-close to avoid masquerading as a human action. Stop-lane now pre-empts the Done-gate transition, ensuring ticket state is confirmed before auto-close.
 
+## [1.3.0.1] - 2026-08-07
+
+### Changed
+
+[loop] Detect livelocked drain and stop with per-lane diagnostic dump. Prevents infinite loops when lanes get stuck and improves observability by dumping detailed lane state.
+
 ## [1.3.0.0] - 2026-08-07
 
 ### Added
