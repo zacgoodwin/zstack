@@ -20,7 +20,13 @@
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { handleCliError, parseFlags, str } from "./cli.ts";
-import { ADVERSARIAL_MODES, DEFAULT_ADVERSARIAL_MODE, ZError, type AdversarialMode } from "./config.ts";
+import {
+  ADVERSARIAL_MODES,
+  DEFAULT_ADVERSARIAL_MODE,
+  DEFAULT_STAGE_WATCHDOG_MINUTES,
+  ZError,
+  type AdversarialMode,
+} from "./config.ts";
 // Type-only: erased at build, so this cannot introduce a runtime cycle (and
 // lib/loop.ts imports nothing from here -- it only names this module in prose).
 import type { Stage } from "./loop.ts";
@@ -117,8 +123,56 @@ BLOCKED: could not read stage prompt at ${promptPath}`;
 // generic rule goes to all three and the single-pass reviewer's golden file was
 // regenerated rather than protected. Merge is excluded: it runs `gh pr merge`,
 // not a gauntlet, and H9 already refuses to blind-skip a dead merge worker.
-const FOREGROUND_RULE = `## Verification runs in the FOREGROUND
-Every command you verify with -- the test suite, typecheck, build, anything you would cite as evidence -- must run to completion IN THE FOREGROUND before your final message. Never background a gate and end your turn waiting on it: no one will wake you (this loop sends a stage agent exactly one message, by design), so the run's result reaches nobody. The same goes for anything else you are waiting on, a sub-agent included: report what you actually hold. Ending your turn with a background job still pending is parsed as CONFUSED, the same as any final message with no marker, and CONFUSED skips this ticket -- the worst outcome available to you. If a check is too slow to finish, report what you actually ran and what you did not.`;
+//
+// #307 added the affordability sentence, which is why this is a function of the
+// stage rather than one constant. Run 16's #286 builder backgrounded `bun test`
+// and ended its turn to await the completion notification -- the rule above told
+// it not to, but never told it that waiting in the foreground FITS. The suite is
+// 128-234s measured against a 25-minute builder budget, so the numbers are the
+// argument.
+//
+// The minutes come from DEFAULT_STAGE_WATCHDOG_MINUTES, the one definition of the
+// budget, and are stated as the DEFAULT because a project can override
+// `watchdogMinutes` and these constructors are not handed config today. That is a
+// choice, not a constraint -- the `prompt` CLI verb below already takes
+// config-derived flags (--adversarial-mode, --labels) and a resolved budget could
+// ride in the same way. It costs nothing today because a live agent is probed
+// alive rather than killed at the bound, so an over-generous number in the prompt
+// never loses work; the day the watchdog kills on age, thread the resolved value.
+//
+// ponytail: "128-234s" is a literal here, matching the ~11 existing copies of the
+// measurement across z-loop/SKILL.md, docs/user-guide/z-loop.md, lib/lanes.ts and
+// the CHANGELOG. No constant owns it. The ceiling: one measured-runtime constant
+// every consumer (including MERGE_GATE_BUDGET_MS, already derived from it) reads,
+// so re-measuring moves one number. Out of #307's scope -- it would touch every
+// copy -- and the gate test below pins only the string, so a stale figure here
+// fails no test.
+function foregroundRule(stage: Stage): string {
+  return `## Verification runs in the FOREGROUND
+Every command you verify with -- the test suite, typecheck, build, anything you would cite as evidence -- must run to completion IN THE FOREGROUND before your final message. Never background a gate and end your turn waiting on it: no one will wake you (this loop sends a stage agent exactly one message, by design), so the run's result reaches nobody. The same goes for anything else you are waiting on, a sub-agent included: report what you actually hold. Ending your turn with a background job still pending is parsed as CONFUSED, the same as any final message with no marker, and CONFUSED skips this ticket -- the worst outcome available to you. Waiting is affordable: this repo's full suite runs 128-234s measured, against the ${DEFAULT_STAGE_WATCHDOG_MINUTES[stage]} minutes of silence your stage's watchdog allows by default. If a check is too slow to finish, report what you actually ran and what you did not.`;
+}
+
+// #307, the other half. Every exit contract already said the marker must be the
+// FIRST line; two haiku stages in run 16 wrote a prose summary and closed with a
+// correctly spelled `BUILT:` / `QA-PASS:` anyway, and both tickets were skipped
+// with the work committed and green. lib/loop.ts now reads a marker on a line of
+// its own wherever it sits rather than losing the ticket, but the CONTRACT does not
+// loosen and the prompt deliberately does not advertise that. The parser's leniency
+// is a NET, not the spec: a quoted marker (fenced, or still carrying this
+// placeholder) is not read at all, two different markers below line 1 are still
+// CONFUSED, and only a line-1 marker is guaranteed unambiguous. An agent told "any
+// line will do" aims at the loose target and lands in the cases the net misses. So
+// the rule is restated with the exact failing shape as a worked negative example --
+// positive templates alone were demonstrably not sticky enough.
+//
+// `example` is the stage's own success marker, so the negative example names the
+// token that stage would actually have gotten wrong. Placed LAST in every prompt,
+// after the marker list, because that is the closing instruction the agent reads
+// immediately before acting on it.
+function markerPositionRule(example: string): string {
+  return `
+POSITION IS PART OF THE CONTRACT: the marker is line 1, column 1. A summary followed by \`${example}: ...\` is a FAILURE of this contract even though the marker is spelled correctly -- line 1 is the only position the loop is guaranteed to read. Nothing precedes it: no "Perfect!", no criteria table, no code fence. Everything you want to say goes on the lines AFTER it.`;
+}
 
 // #209: the briefing a stage gets when it is a RE-SPAWN of a worker that died
 // without ever reporting. Its predecessor's changes are still in the worktree,
@@ -184,13 +238,14 @@ ${bounce}${review}${commit}${respawn}
 - Fix root causes, not symptoms: grep every caller of anything you change.
 - Do not edit the issue body, comment on issues, close issues, or expand scope beyond the ticket.
 
-${FOREGROUND_RULE}
+${foregroundRule("builder")}
 
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
 BUILT: <one-line summary>            all acceptance criteria pass, tests green in the worktree, work committed on ${i.branch} -- VERIFIED before the lane advances: \`git status --porcelain\` empty AND HEAD off ${i.baseBranch}. A BUILT with work still uncommitted sends this lane straight back to you.
 NEEDS-INPUT: <the exact question>    a human decision is required; stop immediately, commit nothing half-wired
 BLOCKED: <reason>                    cannot proceed (broken dependency, failing environment) after a real attempt
-CONFUSED: <what makes no sense>      the ticket cannot be understood as written`;
+CONFUSED: <what makes no sense>      the ticket cannot be understood as written
+${markerPositionRule("BUILT")}`;
 }
 
 // -- QA -----------------------------------------------------------------------
@@ -223,14 +278,15 @@ ${respawnSection(i.respawnNotes, inputPath)}
 1. Functional: exercise the built behavior end to end as a user would. Verify every "### Acceptance Criteria" case (setup -> action -> expected outcome) AS WRITTEN -- a case the diff quietly weakened counts as a bug.${web}
 2. Technical: typecheck, the full test suite, and the build all green in this worktree; tests + evals + docs the ticket demanded actually present in the diff; the repo's programming principles respected.
 
-${FOREGROUND_RULE}
+${foregroundRule("qa")}
 
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
 QA-PASS: <one-line evidence summary>       everything above verified green
 QA-BUGS: <numbered findings>               each with concrete repro steps (do X, expect Y, got Z)
 NEEDS-HUMAN: <the judgment call>           a human must decide; state the question precisely
 BLOCKED: <reason>                          the worktree cannot be exercised at all
-CONFUSED: <what makes no sense>`;
+CONFUSED: <what makes no sense>
+${markerPositionRule("QA-PASS")}`;
 }
 
 // -- adversarial reviewer -----------------------------------------------------
@@ -378,14 +434,15 @@ Run the typecheck and the tests this diff touches here. Nothing you do in it lan
 - Scope creep, dead code, abstractions the ticket never asked for.
 - Security holes at trust boundaries; data-loss edges; error paths that swallow failures.
 ${superTruth}
-${FOREGROUND_RULE}
+${foregroundRule("reviewer")}
 
 ## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
 REVIEW-APPROVE: confidence=<0-100> ${skept}<one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green -- confidence is your certainty every criterion holds (aggregated per the super-truth pass above when it ran); a score below the project's configured floor will NOT merge
 REVIEW-FINDINGS: ${conf}${skept}<numbered findings>          each with file:line and why it blocks the merge
 NEEDS-HUMAN: <the judgment call>              a genuine spec ambiguity a human must settle
 BLOCKED: <reason>                             the throwaway worktree is unusable -- can't check out or execute the diff at all
-CONFUSED: <what makes no sense>`;
+CONFUSED: <what makes no sense>
+${markerPositionRule("REVIEW-APPROVE")}`;
 }
 
 // -- merge --------------------------------------------------------------------
@@ -495,7 +552,8 @@ Run it AGAIN -- the same command, byte for byte -- after any change you make to 
 MERGED: <the PR URL>
 NEEDS-HUMAN: <the judgment call>
 BLOCKED: <reason -- what failed and what you tried>
-CONFUSED: <what makes no sense>`;
+CONFUSED: <what makes no sense>
+${markerPositionRule("MERGED")}`;
 }
 
 // -- completion note ----------------------------------------------------------

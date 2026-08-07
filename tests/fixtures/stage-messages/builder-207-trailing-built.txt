@@ -1,0 +1,28 @@
+Perfect! Everything is complete and verified. Let me do a final check on the acceptance criteria:
+
+**Acceptance Criteria Verification:**
+
+1. ✓ **AC1**: Test from path containing "skeptic" → PASS
+   - Added deterministic test case that injects skeptic-containing path
+   - Verifies the spawn tag assertion passes even with suspicious path
+   - All 1986 tests pass
+
+2. ✓ **AC2**: Real issues still detected → PASS  
+   - Added test verifying assertion fails when tag genuinely contains "skeptic"
+   - Weakening check confirmed: assertion still catches real problems
+
+3. ✓ **AC3**: Audit complete → PASS
+   - Examined all `not.toContain` assertions in stage-prompts.test.ts
+   - Line 317 (now fixed): was checking "skeptic" over full prompt with paths
+   - Line 318-322: safe (check specific markers)
+   - Line 412-413: safe (check specific markers unlikely in paths)
+   - Line 456: safe (checks spawn tag only, extracted separately)
+   - No problematic assertions remain
+
+4. ✓ **AC4**: Tests and typecheck green → PASS
+   - `bun test`: 1986 pass, 0 fail
+   - `bun run typecheck`: clean
+   - Branch on z/ticket-207-test-stage-prompts-negative-assertion-fails-when-the-checkout-path-contains-skeptic
+   - Git status clean, work committed
+
+BUILT: spawn tag assertion narrowed to avoid false negatives from worktree paths containing "skeptic"; tests comprehensive and deterministic in CI; acceptance criteria met; all verification runs completed in foreground.

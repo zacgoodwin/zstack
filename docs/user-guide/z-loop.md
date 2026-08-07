@@ -303,7 +303,93 @@ records the result. It never re-derives a scheduling decision in prose.
   no more durable there than after a skip.
   Every stage prompt that runs the gauntlet now also states the other half: run
   verification in the FOREGROUND, because ending a turn with a background job
-  still pending is parsed as CONFUSED.
+  still pending is parsed as CONFUSED. Each of those prompts prices the wait too —
+  this repo's full suite runs 128-234s measured, against that stage's own watchdog
+  budget in minutes — so foreground is visibly affordable rather than merely
+  mandatory.
+- **A marker on a line of its own is read wherever it sits; a QUOTED one is not.**
+  The exit contract asks every stage to open its final message with the marker, and
+  the parser used to read nothing else, so a stage that wrote a prose summary and
+  put a correctly spelled `BUILT:` anywhere else was CONFUSED by definition —
+  skipped after spending its whole budget, work committed and green, ticket left for
+  a human. That was the dominant failure of loop 16: 3 of 3 tickets, two models, two
+  stage kinds, $2.33 paid for nothing merged. So the first line is still read first,
+  and when it is not a marker the whole message is scanned for line-leading markers
+  of that stage and the **last** one is the verdict. Last, not first, so a stage
+  narrating "I will close with `BLOCKED:` if the dependency is broken" cannot
+  pre-commit a verdict it goes on to contradict.
+  - **Position is not the filter, because the corpus says it cannot be.** Measured
+    over every retained stage final message in this repo — 507 with text, 135
+    carrying a marker off line 1 — only 55 put it on the closing line while **80**
+    put it mid-message, 71 of those as the second non-empty line (a one-line
+    headline, the verdict, then the evidence block). A "must be the closing line"
+    rule would skip all 80 and re-open #307 for the majority of its own population.
+    The whole change rescues **132 of 507** real messages — the 135 candidates
+    less the 3 mid-message `MERGED`s the stricter rule below still refuses — with
+    **zero** verdicts changed in any other direction.
+  - **What is excluded is a marker the stage was quoting**, filtered by mechanism
+    rather than position: a marker inside a fenced code block (fenced content sits
+    at column 0, so the line-leading rule alone never excluded it), and a marker
+    whose payload **opens with** the contract's own `<placeholder>` — what pasting
+    one instruction line produces, and the contract's real lines carry a trailing
+    description after the placeholder, so the match cannot be anchored at both ends.
+    Both cost nothing on the real corpus (0 of the 80 hits are fenced, 0 carry a
+    placeholder) and both close a route an agent can actually take, since every
+    stage prompt hands it the literal marker strings. Such a message gets its own
+    note: `only QUOTED its exit markers`.
+  - **Fence tracking follows CommonMark**, and each rule is load-bearing rather than
+    pedantry — skipping any one of them turned a quoted marker back into a live
+    verdict in a reproducible probe. A fence closes only on a run of the **same
+    character, at least as long** as the opener (so a ``` block nested in a ````
+    block cannot re-open the outer one); a **closing** delimiter carries nothing
+    else (so `` ``` still inside the block `` is content, not a closer); a backtick
+    opener's info string may not contain a backtick (so an inline code span in prose
+    does not open a fence); and a delimiter takes at most three leading spaces.
+  - **Both positions get every guard.** The line-1 preference is not a
+    short-circuit: the quoted-marker and contradiction checks run over the whole
+    message first, then the verdict is chosen. That closes two holes a line-1-only
+    fast path had — a line-1 `MERGED: <the PR URL>` (the contract's own template)
+    completed a ticket, and a line-1 `REVIEW-APPROVE` shipped a diff its own next
+    line called defective. Every **well-formed** message still parses exactly as it
+    did before; a message that quotes its template or reports two verdicts was never
+    well-formed.
+  - **The residual, and what bounds each verdict.** A stage that writes a
+    fully-formed marker line at column 0 inside prose that disowns it ("if the tests
+    pass I will write `REVIEW-APPROVE: confidence=95 …`") is still read as reporting
+    it. Zero occurrences in the corpus against 80 real tickets that refusing it
+    outright would cost, so it is accepted — but only where a mechanism bounds it:
+    - `BUILT` — re-verified against the lane worktree (a dirty tree or a HEAD still
+      at the base bounces the lane back to the builder).
+    - `REVIEW-APPROVE` — its `confidence=` is the **lowest on the marker's own
+      lines**, so a number narrated in prose, or quoted inside a pasted diff hunk,
+      cannot score the gate, and a stage that narrates a high score then reports a
+      real lower one is held to the real one. A bare approve scores null, which the
+      truth-check gate refuses to merge on. `skeptics=` takes the **lowest**
+      denominator anywhere outside a fence, because a denominator can only ever
+      *block* — so an honest "only 1 of 3 came back" in prose still stops the merge,
+      and a quoted `3/3` cannot outrank a real `1/3` in either order.
+    - `MERGED` — accepted on the **first or the closing line only**, and its note is
+      only its own payload, because the orchestrator writes that note into the
+      completion note's PR-URL slot. It is terminal and nothing re-reads it, so it
+      does not get the loose rule. Cost: 3 real messages, against a false Done that
+      would delete an unmerged branch at batch cleanup.
+    - `QA-PASS` — the one verdict where the residual is live, by choice: 17 real
+      mid-message occurrences make the strict rule expensive, and a false pass still
+      has to clear the blinded reviewer and then the merge gate's own suite run. The
+      open hazard is a QA agent echoing a marker line out of the ticket's own
+      Acceptance Criteria — this repo files tickets that contain them. Closing that
+      needs the stage's input payload at parse time; it is a follow-up, not shipped
+      here.
+  - Two **different** markers of one stage is a genuine contradiction and stays
+    CONFUSED naming both, judged before last-hit-wins so whichever landed last
+    cannot resolve it. A scanned marker's note carries the prose on **both** sides
+    of it with the marker's own remainder first, so QA's numbered repros and a
+    reviewer's `file:line` findings reach the rebuilding builder whichever side of
+    the marker they were written on, and a `skeptics=k/3` denominator in the
+    surrounding prose still counts against the quorum floor. A well-formed message
+    parses off line 1 exactly as before, and a message with no marker anywhere is
+    CONFUSED exactly as before: the widening rescues a stage that finished and said
+    so awkwardly, never one that did not finish.
 - **Actual per ticket.** After each stage the ticket's transcripts are priced with
   `bin/z-cost` (dedup by requestId) and written to the Actual field. A stage that
   died without reporting is priced too, at the moment it is found dead and before

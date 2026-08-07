@@ -1,0 +1,23 @@
+Perfect. The snapshot() function correctly handles only labels/fieldValues ceilings (lines 542-549), not assignees, matching the docs (lines 587-591). The OVER-CEILING paragraph is accurate.
+
+**Summary of Verification:**
+
+**AC1 - Docs Correction:** ✓ PASS
+- Verified commit removed `field-get` from the list of commands guarded by assignees ceiling
+- Verified all remaining commands (claim, move, comment, field-set, link, release) are lookup-based and do call assignSinglePage on assignees (line 896 of board.ts)
+- Verified fieldGet() queries Q_FIELD_VALUE directly, never calls lookup(), never touches assignees
+
+**AC2 - Functional Test:** ✓ PASS
+- Test "field-get succeeds on an issue with oversized assignee list (#192)" added to tests/board.test.ts
+- Test creates a fieldGet() call with 11 assignees (>10 ceiling) and verifies it succeeds, confirming the guard does not apply
+
+**AC3 - Build & Tests:** ✓ PASS
+- `bun test`: 1985 pass, 8 skip, 0 fail (exit code 0)
+- `bun run typecheck`: Clean, no errors
+- All tests from #148 still passing
+
+**OVER-CEILING Paragraph Check:** ✓ PASS
+- snapshot() correctly handles labels/fieldValues ceilings (not assignees), matching docs
+- lookup-based commands handle assignees ceiling, matching docs
+
+QA-PASS: All acceptance criteria met. Docs corrected to accurately list only lookup-based commands (claim, move, comment, field-set, link, release) as guarded by assignees ceiling. fieldGet removed from the list. New test verifies fieldGet succeeds with oversized assignee lists. Full test suite passes (1985 pass, 0 fail), typecheck clean.
