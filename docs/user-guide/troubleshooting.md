@@ -591,6 +591,62 @@ the next idle tick. The same applies to `loop next --now`, which persists the
 clock it is given when it hands a `confirm-claim` over: it is milliseconds, and a
 non-numeric value is rejected outright.
 
+## The drain stopped with a livelock dump
+
+The run ended early on a `livelock` action instead of `drain-complete`, no
+tickets were parked, and the loop printed a path like
+`~/.zstack/projects/<slug>/loop/livelock-run-20260807-113550-8b18.json`. That is
+the livelock detector (#246): for **190 consecutive ticks** — two full ticket
+cycles at the loop's one-poll-per-minute floor — no lane's stage, bounce/retry
+counters, `workerDead` flag, outcome or merge-confirm state changed, and no
+ticket changed board status, while every tick returned `wait`. Workers were
+alive the whole time; nothing finished. The detector **changed nothing**: no
+park, no skip, no board write, no lane torn down, no lock or worktree removed.
+The dump and this page are the whole response, by design — auto-breaking a
+livelock is a human's call.
+
+Read the dump; it is plain JSON and it explains itself:
+
+```bash
+jq '{stagnantTicks, livelockTicks, lanes: [.lanes[] | {ticket, stage, status, outcome, workerDead, silentMin: (.silentMs/60000|floor), stageAgeMin: (.stageAgeMs/60000|floor), qaBounces, reviewBounces, commitRetries, respawns, mergeGateRuns, mergeConfirmAttempts}], ticketsByStatus}' \
+  ~/.zstack/projects/<slug>/loop/livelock-*.json
+```
+
+What each shape usually means:
+
+- **A lane with `outcome: null` and a large `stageAgeMin` but a small
+  `silentMin`.** Its agent is alive and writing but has not produced a verdict
+  file for hours — the classic wedge. Check the harness's task list for that
+  spawn, read the transcript, and decide: kill it (the next run's watchdog then
+  sees a dead worker and re-spawns or skips it), or raise that stage's
+  `watchdogMinutes` if the work was genuinely that long.
+- **Every lane carrying an `outcome` that never resolves.** A scheduling stall:
+  something upstream of the transition is refusing. `mergeGateRuns` at its cap,
+  a `mergeGate` that is `red`, or a lane whose `status` disagrees with its
+  `stage` are the usual causes; the corresponding sections above cover each.
+- **Counters climbing but the ticket never leaving.** A bounce cycle. High
+  `qaBounces` or `reviewBounces` against a ticket whose acceptance criteria
+  cannot be satisfied — park it Questions by hand and let a human answer.
+- **`silentMin` large on every lane.** This is *not* the livelock shape and
+  should have been the watchdog's case; see
+  [A healthy stage was probed (or Skipped) while it was still working](#a-healthy-stage-was-probed-or-skipped-while-it-was-still-working)
+  for how the heartbeat is measured, and check the tick's stderr for the
+  "could not resolve the subtree" note.
+
+To resume: fix or kill whatever the dump named, then re-invoke `/z-loop`. The
+run left `state.json`, every lane lock, every worktree and every branch exactly
+as they were, so the next run picks the same batch up where it stopped — a
+resume, not a fresh batch. **Do not `--reconcile` first** unless a lane's agent
+is genuinely gone: reconcile force-removes worktrees whose lane locks it cannot
+match, and the livelock exit deliberately kept both. If you decide a lane is not
+worth resuming, park its ticket on the board by hand (Questions or Blocked); the
+next run's ingest sees the move and stops that lane cleanly.
+
+The counter itself lives in `state.json` as `stagnantTicks` alongside
+`lastFingerprint`, and any real change resets it, so there is nothing to clear
+by hand — the first tick of the resumed run that actually does something starts
+the count over.
+
 ## setup: "already exists as a separate install; skipping" — and its uninstall mirror
 
 Both ends of install honor one rule: **never touch a directory we did not

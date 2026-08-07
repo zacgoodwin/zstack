@@ -444,7 +444,7 @@ records the result. It never re-derives a scheduling decision in prose.
   anomaly — the reviewer checks each skeptic at most once and stops waiting. It is
   called at batch cleanup when the drain completes, and at the start of the next
   run right after the loop lock is acquired, which covers the exits batch cleanup
-  never reaches (a context-clear pause, a crash). Neither call assumes the session
+  never reaches (a context-clear pause, a livelock stop, a crash). Neither call assumes the session
   is quiet — both check and print what they found, because `/z-loop` can be invoked
   inside a session that already holds sub-agent transcripts. Those are the only
   two places the loop removes a review worktree by hand; a park, a skip, or a
@@ -1003,8 +1003,9 @@ the one question a bulk read cannot answer:
   and both invariants would rest on a SKILL instruction rather than on the state
   machine. Recording the outcome is still required; it only ever *sharpens* the
   record, replacing a bare attempt with the login that was read or the failure
-  that was hit. This is the one write `next` performs; for every other action it
-  is a pure reader.
+  that was hit. This is the only write `next` performs *about a ticket*: on
+  every other action it touches nothing but the livelock detector's own two
+  bookkeeping fields (see [Livelock detection](#livelock-detection) below).
 
 The clock starting at the first *confirm* rather than at the claim loss is the
 load-bearing part: time spent flagged is not time spent asking. A claim lost
@@ -1028,6 +1029,60 @@ park until an outcome of either kind has been recorded. The cross-machine
 limitation is unchanged — claims are keyed on the GitHub login, not the session,
 so two loops running as the *same* login on different machines are still
 unsupported.
+
+## Livelock detection
+
+The watchdog answers "is this lane quiet?" A drain can fail the opposite way:
+every worker alive and heartbeating, every tick returning `wait`, and no lane
+ever advancing — a bounce cycle, or a scheduling stall. Nothing caught that
+before, and it is what most of run 10's hand-recoveries actually were ("no lane
+state change across two full ticket cycles"). The dependency-cycle breaks catch
+cycles in the *ticket graph*, not stagnation.
+
+**How it is measured.** Every tick, `next` computes a **progress fingerprint**
+of the loop state: each lane's ticket, stage, bounce and retry counters
+(`qaBounces`, `reviewBounces`, `quorumRetries`, `commitRetries`, `respawns`,
+`mergeGateRuns`), its `workerDead` flag, its recorded outcome, its merge-gate
+verdict and its two Done-gate fields (`mergeConfirmAttempts`, `mergeObserved` —
+a confirm cycle is progress, not stagnation), plus every ticket's board status.
+It then counts how many consecutive `wait` ticks left that fingerprint
+unchanged. Any change — and any action that is not a `wait`, since a tick that
+found something to do has already proved the drain alive — resets the count to
+zero.
+
+**What is deliberately excluded.** A lane's two clocks, `lastActivityMs` and
+`stageStartedMs`. `lastActivityMs` is the watchdog heartbeat: it moves whenever
+anything in a stage's spawn subtree appends a line, which a wedged agent does as
+happily as a working one. Counting it as progress would mean "the drain is
+alive" reduces to "something is still typing" — and the detector could then
+never fire on the exact shape it exists to catch. Silence is the watchdog's
+question, not this one's.
+
+**The threshold.** `LIVELOCK_TICKS` is **190**, derived rather than picked: the
+drain polls at least once a minute (the `wait` step blocks for a finishing agent
+or one minute, whichever comes first), and one whole ticket costs one pass
+through every stage's watchdog budget — 25 + 15 + 40 + 15 = 95 minutes on the
+shipped defaults. The detector waits two of those cycles. That is long enough
+that nothing healthy reaches it (every stage boundary, bounce, probe, gate stamp
+and board move moves the fingerprint) and short enough to land well inside the
+480-minute stage ceiling that would otherwise be the only backstop. It is summed
+from the shipped budgets in code, so it cannot drift away from them.
+
+**What happens.** `next` returns a `livelock` action instead of `wait`, carrying
+a per-lane dump and writing it to
+`~/.zstack/projects/<slug>/loop/livelock-<runId>.json` (run-keyed, so a later
+drain cannot overwrite an earlier one's evidence). The loop notifies
+`safety-violation`, releases its lock, and exits **without** running the
+end-of-loop stage — nothing drained, so nothing deploys.
+
+**It repairs nothing, on purpose.** The detector parks no ticket, skips no lane,
+tears down no agent, removes no lane lock, and writes no board status. Which
+lane is wrong, and whether it deserves a park, a re-spawn or a config change, is
+a human's call — and every worktree, branch and lock is left exactly as it was
+stuck so that human has something to read. Auto-breaking a livelock is
+explicitly out of scope. See
+[troubleshooting.md → The drain stopped with a livelock dump](troubleshooting.md#the-drain-stopped-with-a-livelock-dump)
+for how to read the file and resume.
 
 ## Ticket and context limits
 
