@@ -420,12 +420,20 @@ export function isMergeLane(c: CrashedLane): boolean {
 // The explicit operator cleanup for retained worktrees (#271). Separate from
 // reconcilePlan on purpose: reconcile undoes a crashed run, and a retained
 // worktree is the opposite of that -- it is the thing a human asked to keep.
-export function planCleanRetained(orphans: Orphans): ReconcileAction[] {
-  return orphans.retainedWorktrees.map((w) => ({
-    kind: "drop-retained" as const,
-    ticket: w.ticket,
-    path: w.worktreePath,
-  }));
+//
+// #324 (#301): scoped and previewed, never a blanket. `ticket` filters the plan
+// to one worktree (the operator finished reading ONE park, not all of them),
+// and the CLI below prints this plan and STOPS unless --apply was passed --
+// force-removing every retained worktree because the operator wanted one gone
+// was exactly the loss #301 filed.
+export function planCleanRetained(orphans: Orphans, ticket?: number): ReconcileAction[] {
+  return orphans.retainedWorktrees
+    .filter((w) => ticket === undefined || w.ticket === ticket)
+    .map((w) => ({
+      kind: "drop-retained" as const,
+      ticket: w.ticket,
+      path: w.worktreePath,
+    }));
 }
 
 // Pure: orphans in, ordered action list out. For each crashed lane the board
@@ -669,7 +677,9 @@ const USAGE = `reconcile <command> [args] --slug S
 
   scan   [--now MS]   scan orphans + build the plan; print JSON {hasOrphans, orphans, plan}
   plan   [--now MS]   print the reconcile action list as JSON
-  clean-retained      remove the worktrees a park/skip/stop-lane deliberately KEPT
+  clean-retained      PREVIEW the worktrees a park/skip/stop-lane deliberately KEPT
+                      (prints the would-remove list, touches nothing); add --apply
+                      to remove them, --ticket <N> to scope to one (#324/#301)
                       (#271). Never part of scan/plan/apply: reconcile only undoes
                       a crashed run, and these are what a human asked to keep. This
                       is the explicit "I have finished inspecting them" verb.
@@ -885,8 +895,21 @@ export async function main(argv: string[]): Promise<number> {
       c.prUrl = pr.url;
     }
 
-    const plan = cmd === "clean-retained" ? planCleanRetained(orphans) : reconcilePlan(orphans);
+    // #324 (#301): clean-retained is scoped by --ticket when given...
+    const cleanTicketRaw = str(flags, "ticket");
+    const cleanTicket = cleanTicketRaw === undefined ? undefined : Number(cleanTicketRaw);
+    if (cleanTicket !== undefined && !Number.isInteger(cleanTicket)) {
+      throw new ZError(`--ticket must be an issue number, got ${JSON.stringify(cleanTicketRaw)}.`);
+    }
+    const plan = cmd === "clean-retained" ? planCleanRetained(orphans, cleanTicket) : reconcilePlan(orphans);
     const unresolved = cmd === "clean-retained" ? [] : unresolvedMergeLanes(orphans);
+    // ...and PREVIEWS by default: the target list prints and nothing is removed
+    // until the operator re-runs with --apply. A retained worktree is a thing a
+    // human asked to keep; deleting it must be an explicit, per-run decision.
+    if (cmd === "clean-retained" && flags["apply"] !== true) {
+      console.log(JSON.stringify({ wouldRemove: plan, note: "preview only -- re-run with --apply to remove these" }, null, 2));
+      return 0;
+    }
     // Never silent: a lane the plan deliberately skipped must be named, or "0
     // actions" reads as "nothing to do" (#272 AC4, and #280's whole lesson).
     if (unresolved.length > 0) {

@@ -428,7 +428,17 @@ export function loopLockLiveness(
     if (!isAlive(lock.pid)) return "stale"; // dead pid: our loop is definitely gone
     switch (identify(lock)) {
       case "confirmed":
-        return "live"; // alive AND provably ours (start-time matches)
+        // #324 (#300): a confirmed-alive pid alone must not pin the lock live
+        // forever. The recorded pid is the HARNESS process (the SKILL passes
+        // $CLAUDE_PID), and a harness session routinely outlives the drain it
+        // ran -- the orchestrator turn dies, the claude.exe stays open, and an
+        // unconditional "live" here wedges every later /z-loop on this project
+        // until the operator closes the app. So a confirmed pid must ALSO be
+        // beating: pid proves "the process exists", the heartbeat proves "the
+        // loop is running", and liveness needs both. With no beat anchor
+        // supplied (a legacy positional caller) the pid still decides alone,
+        // exactly as before.
+        return lastSeenAt !== undefined && nowMs - lastSeenAt > stalenessMs ? "stale" : "live";
       case "recycled":
         return "stale"; // alive but the pid was reused by an unrelated process
       case "unknown":

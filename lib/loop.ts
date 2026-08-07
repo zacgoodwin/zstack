@@ -50,6 +50,10 @@ import { validateWatchdogMinutes } from "./config-schema.ts";
 // erased, so there is no import cycle at run time.
 import { isRunId, mintRunId, readAgentMetas, subagentsDirFor, subtreeActivityMs, spawnTag, type AgentMeta } from "./transcripts.ts";
 import { quorumFromDisk, readVerdict, type QuorumFromDisk, type StageVerdict } from "./verdict.ts";
+// #324 (#204): the fold-in gate checks this session's own lane lock before a
+// me-only assignee read may clear a foreign-claim flag. locks.ts imports
+// nothing from here; no cycle.
+import { laneLockPath } from "./locks.ts";
 
 // -- ticket states ------------------------------------------------------------
 
@@ -126,10 +130,16 @@ const PRECEDING_BOARD_STATUS: Partial<Record<Stage, BoardStatus>> = {
 // when that bounce actually happened (its counter > 0), so a human drag onto a
 // never-bounced builder lane (counters at 0, or a status that is neither) still
 // stop-lanes.
-function isOneHopLag(lane: LaneState, boardStatus: BoardStatus): boolean {
+function isOneHopLag(lane: LaneState, boardStatus: BoardStatus, skipQa = false): boolean {
   if (lane.stage === "builder") {
     return (boardStatus === "QA" && lane.qaBounces > 0) || (boardStatus === "Review" && lane.reviewBounces > 0);
   }
+  // #324 (#297): a skip-qa ticket's one advance is Building -> Review -- two
+  // hops of STATUS but ONE write -- so a reviewer lane still reading Building
+  // is the loop's own not-yet-landed write exactly like QA is for the ordinary
+  // walk. Gated on the label so a human drag onto an ordinary reviewer lane
+  // still stop-lanes; the origin marker (lastWroteStatus) still has to agree.
+  if (lane.stage === "reviewer" && skipQa && boardStatus === "Building") return true;
   return boardStatus === PRECEDING_BOARD_STATUS[lane.stage];
 }
 
@@ -1510,6 +1520,20 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
   //     Lowest ticket number first so the choice is deterministic when two lanes
   //     go at once. This cannot starve the rest of the loop: each pass removes
   //     one gone lane for good, and there are finitely many.
+  // #324 (#202): a GHOST lane -- a lane with no ticket snapshot at all -- is
+  // judged in this same early pass, ahead of every claim and transition, so a
+  // corrupted or hand-edited state file stops loudly instead of crashing a
+  // later `byNumber.get(...)!` or occupying a lane slot forever. Reachable only
+  // outside ingest's tombstone guarantee, which is exactly why it is defended.
+  const ghost = lanes.filter((l) => !byNumber.has(l.ticket)).sort((a, b) => a.ticket - b.ticket)[0];
+  if (ghost) {
+    return {
+      kind: "stop-lane",
+      ticket: ghost.ticket,
+      dropTicket: true,
+      note: `ghost lane: #${ghost.ticket} has a lane but no ticket snapshot in state.json (observed: nothing; expected: a ${STATUS_FOR_STAGE[ghost.stage]} snapshot). Likely a hand-edited or corrupt state file -- releasing the lane; re-ingest will re-observe the board.`,
+    };
+  }
   const goneLane = lanes
     .filter((l) => l.goneReason !== undefined)
     .sort((a, b) => a.ticket - b.ticket)[0];
@@ -1579,10 +1603,12 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
     // showing Building no longer throws on the Building->Review advance) -- so
     // THIS origin-marker guard, not LEGAL_TRANSITIONS, is now what protects the
     // lagged-write case, and every other lane's progress survives.
+    // A missing snapshot cannot reach here: the #202 ghost pass at the top of
+    // this function stopped it before any claim or transition.
     const t = byNumber.get(lane.ticket);
     if (t && t.status !== STATUS_FOR_STAGE[lane.stage]) {
       if (
-        isOneHopLag(lane, t.status) &&
+        isOneHopLag(lane, t.status, t.skipQa ?? false) &&
         lane.lastWroteStatus === STATUS_FOR_STAGE[lane.stage]
       ) {
         resyncStatus.set(lane.ticket, STATUS_FOR_STAGE[lane.stage]);
@@ -2607,12 +2633,23 @@ export function claimConfirmed(
   ticket: number,
   assignees: string[],
   me: string,
-  nowMs: number
+  nowMs: number,
+  // #324 (#204): does THIS session hold a lane lock for the ticket? The fold-in
+  // gate reads "sole assignee is $ME" as "ours" -- which is dead the moment the
+  // operator runs the loop under their own login and ALSO claims tickets by
+  // hand: the loop then steals the human's claim. A me-only assignment clears
+  // the flag ONLY when this session's own lane lock backs it; without one, the
+  // $ME assignment is somebody else wearing our login (the operator, a second
+  // machine -- the UNSUPPORTED-but-real shape the locks doc warns about) and is
+  // held as foreign. `undefined` = the caller supplied no lock evidence, which
+  // keeps the pre-#324 behavior for legacy callers and tests.
+  ownLane?: boolean
 ): LoopState {
   const next = structuredClone(state);
   const t = findTicket(next, ticket);
   if (t.claimedByOther !== true) return next; // nothing was ever observed to confirm
-  if (clearsClaim(assignees, me)) {
+  const meOnly = assignees.length > 0 && assignees.every((a) => a === me);
+  if (clearsClaim(assignees, me) && !(meOnly && ownLane === false)) {
     delete t.claimedByOther;
     delete t.claimedByOtherAt;
     delete t.claimConfirmingSince;
@@ -2655,7 +2692,11 @@ export function claimConfirmed(
   // after an NTP step back -- and both shapes break the bound in opposite
   // directions (instant park, or a park that can never arrive). See stampAnchor.
   stampAnchor(t, nowMs);
-  t.claimedByOtherLogin = assignees.filter((a) => a !== me).join(", ");
+  const foreign = assignees.filter((a) => a !== me);
+  // #324 (#204): the me-only-without-our-lock case records WHO in a way the
+  // bounded park's note can explain -- "held by our own login" with no lane
+  // lock is the operator's manual claim, not a bug in the read.
+  t.claimedByOtherLogin = foreign.length > 0 ? foreign.join(", ") : `${me} (same login, no lane lock of this session -- an operator or second machine)`;
   return next;
 }
 
@@ -4555,7 +4596,13 @@ export function main(argv: string[]): number {
       // `me` is passed so the parser can refuse an UNVERIFIABLE read that would
       // CLEAR the flag (#223 review): this is the one state-changing caller.
       const assignees = parseAssignees(readJson(file), ticket, me);
-      const next = claimConfirmed(state, ticket, assignees, me, nowMs);
+      // #324 (#204): with --locks-dir, a me-only assignee set clears the flag
+      // only when THIS session's lane lock backs it -- the same-login operator
+      // claim is otherwise indistinguishable from our own. Omitted, legacy
+      // behavior stands (tests, and a caller with no locks dir at hand).
+      const locksDir = str(flags, "locks-dir");
+      const ownLane = locksDir === undefined ? undefined : existsSync(laneLockPath(locksDir, ticket));
+      const next = claimConfirmed(state, ticket, assignees, me, nowMs, ownLane);
       atomicWrite(statePath, JSON.stringify(next, null, 2));
       const after = next.tickets.find((t) => t.number === ticket)!;
       // Three outcomes, and the third is not "cleared": a ticket that was never

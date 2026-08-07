@@ -3128,34 +3128,33 @@ describe("#205: every stage transition writes the board", () => {
     expect(nextAction(bounce, 0)).toEqual({ kind: "advance", ticket: 1, to: "qa", resyncStatus: "Building" });
   });
 
-  // KNOWN GAP, pinned so it cannot be mistaken for the recovered case above.
-  // #130's skip-qa walk is the ONE advance that is not one hop: resolveOutcome
-  // sends a labeled builder straight to `reviewer`, i.e. Building -> Review,
-  // while PRECEDING_BOARD_STATUS maps a reviewer lane's lag to `QA` alone. So a
-  // missed step-3 move on THAT advance is not a lag the guard recognizes -- it
-  // stop-lanes, and the re-claim reads the board's stale Building and comes back
-  // as a *builder*, rebuilding an already-built, already-approved ticket.
-  //
-  // This is the pre-#205 outcome for EVERY skip-qa advance (the row wrote
-  // nothing, so the board never left Building), now narrowed to the crash window
-  // -- so the board write is a strict improvement here too. Closing the window
-  // means widening isOneHopLag, which this ticket's Out of scope list holds back
-  // ("the #125 resync guard's logic, which is correct given a truthful marker"),
-  // so the gap is pinned rather than silently patched.
-  test("KNOWN GAP: the skip-qa two-hop advance is NOT recovered -- a missed move there still re-claims as a builder", () => {
+  // #324 closed #205's pinned KNOWN GAP (#297): #130's skip-qa walk is the one
+  // advance that is not one status-hop -- Building -> Review in ONE write --
+  // and isOneHopLag used to map a reviewer lane's lag to QA alone, so a missed
+  // move there stop-laned and the re-claim read the board's stale Building and
+  // rebuilt an already-approved ticket. The lag rule now accepts Building for
+  // a reviewer lane WHEN the ticket carries skip-qa AND the origin marker
+  // still points at the loop's own write -- a human drag onto an ordinary
+  // reviewer lane still stop-lanes.
+  test("#297: the skip-qa advance's missed move resyncs instead of re-claiming as a builder", () => {
     const skip = state(
       [ticket(1, "Building", [], { skipQa: true })],
-      [lane(1, "reviewer", { outcome: approve(100), lastWroteStatus: "Review" })]
+      [lane(1, "reviewer", { outcome: approve(100), lastWroteStatus: "Review", mergeGate: GREEN_GATE })]
     );
-    const stop = nextAction(skip, 0);
-    expect(stop).toMatchObject({ kind: "stop-lane", ticket: 1 });
-    // ...and that stop-lane is what hands the ticket back to a builder.
-    expect(nextAction(applyAction(skip, stop, 0), 0)).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
+    // Recovered: the lane proceeds at its real stage (the gate/advance path),
+    // never a stop-lane, never a builder re-claim.
+    const a = nextAction(skip, 0);
+    expect(a).not.toMatchObject({ kind: "stop-lane" });
+    expect(a).toMatchObject({ kind: "advance", ticket: 1, to: "merge", resyncStatus: "Review" });
 
-    // The same lane WITHOUT the two-hop jump resyncs, which is what isolates the
-    // cause to the hop distance rather than to the reviewer stage itself.
-    const oneHop = state([ticket(1, "QA")], [lane(1, "reviewer", { outcome: approve(100), lastWroteStatus: "Review" })]);
-    expect(nextAction(oneHop, 0)).not.toMatchObject({ kind: "stop-lane" });
+    // The guard stays narrow, both ways: without the label the two-hop lag is
+    // still a human move (stop-lane)...
+    const unlabeled = state([ticket(1, "Building")], [lane(1, "reviewer", { outcome: approve(100), lastWroteStatus: "Review" })]);
+    expect(nextAction(unlabeled, 0)).toMatchObject({ kind: "stop-lane", ticket: 1 });
+    // ...and with the label but NO origin marker (the loop never wrote Review),
+    // a genuine human drag back to Building still stops the lane.
+    const humanMove = state([ticket(1, "Building", [], { skipQa: true })], [lane(1, "reviewer", { outcome: approve(100) })]);
+    expect(nextAction(humanMove, 0)).toMatchObject({ kind: "stop-lane", ticket: 1 });
   });
 });
 
