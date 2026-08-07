@@ -596,30 +596,38 @@ non-numeric value is rejected outright.
 The run ended early on a `livelock` action instead of `drain-complete`, no
 tickets were parked, and the loop printed a path like
 `~/.zstack/projects/<slug>/loop/livelock-run-20260807-113550-8b18.json`. That is
-the livelock detector (#246): for **190 consecutive ticks** — two full ticket
-cycles at the loop's one-poll-per-minute floor — no lane's stage, bounce/retry
-counters, `workerDead` flag, outcome or merge-confirm state changed, and no
-ticket changed board status, while every tick returned `wait`. Workers were
-alive the whole time; nothing finished. The detector **changed nothing**: no
-park, no skip, no board write, no lane torn down, no lock or worktree removed.
-The dump and this page are the whole response, by design — auto-breaking a
-livelock is a human's call.
+the livelock detector (#246): for at least **190 consecutive ticks** *and* at
+least **8 hours of real time** (longer, if you configured a longer
+`watchdogMinutes`), no lane's stage, bounce/retry counters, `workerDead` flag,
+outcome or merge-confirm state changed, and no ticket changed board status,
+while every tick returned `wait`. Workers were alive the whole time; nothing
+finished. The detector **changed nothing**: no park, no skip, no board write, no
+lane torn down, no lock or worktree removed. The dump and this page are the whole
+response, by design — auto-breaking a livelock is a human's call.
+
+This is deliberately the *last* backstop. Anything a per-lane timer could have
+caught — a quiet agent, a single stage running away — was already the watchdog's
+or the stage ceiling's case and would have been answered hours earlier, at the
+cost of one lane rather than the whole run. Reaching this exit means no lane
+clock could see the problem.
 
 Read the dump; it is plain JSON and it explains itself:
 
 ```bash
-jq '{stagnantTicks, livelockTicks, lanes: [.lanes[] | {ticket, stage, status, outcome, workerDead, silentMin: (.silentMs/60000|floor), stageAgeMin: (.stageAgeMs/60000|floor), qaBounces, reviewBounces, commitRetries, respawns, mergeGateRuns, mergeConfirmAttempts}], ticketsByStatus}' \
+jq '{stagnantTicks, livelockTicks, stagnantMin: (.stagnantMs/60000|floor), boundMin: (.livelockBoundMs/60000|floor), lanes: [.lanes[] | {ticket, stage, status, outcome, workerDead, silentMin: (.silentMs/60000|floor), stageAgeMin: (.stageAgeMs/60000|floor), qaBounces, reviewBounces, commitRetries, respawns, mergeGateRuns, mergeConfirmAttempts}], ticketsByStatus}' \
   ~/.zstack/projects/<slug>/loop/livelock-*.json
 ```
 
 What each shape usually means:
 
-- **A lane with `outcome: null` and a large `stageAgeMin` but a small
-  `silentMin`.** Its agent is alive and writing but has not produced a verdict
-  file for hours — the classic wedge. Check the harness's task list for that
-  spawn, read the transcript, and decide: kill it (the next run's watchdog then
-  sees a dead worker and re-spawns or skips it), or raise that stage's
-  `watchdogMinutes` if the work was genuinely that long.
+- **A lane with `outcome: null`, a `stageAgeMin` of `null`, and a small
+  `silentMin`.** A `null` stage age means the lane predates per-lane stage
+  stamps, so the stage ceiling could not see it — this is the shape that reaches
+  this exit most often. Its agent is alive and writing but has produced no
+  verdict file: check the harness's task list for that spawn, read the
+  transcript, and decide whether to kill it (the next run's watchdog then sees a
+  dead worker and re-spawns or skips it) or to raise that stage's
+  `watchdogMinutes` because the work was genuinely that long.
 - **Every lane carrying an `outcome` that never resolves.** A scheduling stall:
   something upstream of the transition is refusing. `mergeGateRuns` at its cap,
   a `mergeGate` that is `red`, or a lane whose `status` disagrees with its
@@ -642,10 +650,10 @@ match, and the livelock exit deliberately kept both. If you decide a lane is not
 worth resuming, park its ticket on the board by hand (Questions or Blocked); the
 next run's ingest sees the move and stops that lane cleanly.
 
-The counter itself lives in `state.json` as `stagnantTicks` alongside
-`lastFingerprint`, and any real change resets it, so there is nothing to clear
-by hand — the first tick of the resumed run that actually does something starts
-the count over.
+The bookkeeping itself lives in `state.json` as `stagnantTicks` and
+`stagnantSinceMs` alongside `lastFingerprint`, and any real change clears all
+three, so there is nothing to clear by hand — the first tick of the resumed run
+that actually does something starts both halves over.
 
 ## setup: "already exists as a separate install; skipping" — and its uninstall mirror
 

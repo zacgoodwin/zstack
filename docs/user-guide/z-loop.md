@@ -1046,12 +1046,13 @@ of the loop state: each lane's ticket, stage, bounce and retry counters
 verdict and its two Done-gate fields (`mergeConfirmAttempts`, `mergeObserved` —
 a confirm cycle is progress, not stagnation), plus every ticket's board status.
 It then counts how many consecutive `wait` ticks left that fingerprint
-unchanged. Any change — and any action that is not a `wait`, since a tick that
-found something to do has already proved the drain alive — resets the count to
-zero. The count lives in `state.json` (`stagnantTicks`, beside the fingerprint
-it was counted against) because no tick's process outlives itself, and it
-survives the board re-ingest each tick begins with: re-reading a board that has
-not moved is not progress.
+unchanged, and stamps the clock of the first of them. Any change — and any
+action that is not a `wait`, since a tick that found something to do has already
+proved the drain alive — resets both to zero. They live in `state.json`
+(`stagnantTicks` and `stagnantSinceMs`, beside the fingerprint they were counted
+against) because no tick's process outlives itself, and they survive the board
+re-ingest each tick begins with: re-reading a board that has not moved is not
+progress.
 
 **What is deliberately excluded.** A lane's two clocks, `lastActivityMs` and
 `stageStartedMs`. `lastActivityMs` is the watchdog heartbeat: it moves whenever
@@ -1061,15 +1062,38 @@ alive" reduces to "something is still typing" — and the detector could then
 never fire on the exact shape it exists to catch. Silence is the watchdog's
 question, not this one's.
 
-**The threshold.** `LIVELOCK_TICKS` is **190**, derived rather than picked: the
-drain polls at least once a minute (the `wait` step blocks for a finishing agent
-or one minute, whichever comes first), and one whole ticket costs one pass
-through every stage's watchdog budget — 25 + 15 + 40 + 15 = 95 minutes on the
-shipped defaults. The detector waits two of those cycles. That is long enough
-that nothing healthy reaches it (every stage boundary, bounce, probe, gate stamp
-and board move moves the fingerprint) and short enough to land well inside the
-480-minute stage ceiling that would otherwise be the only backstop. It is summed
-from the shipped budgets in code, so it cannot drift away from them.
+**The threshold has two halves, and the trip needs both.** A count of polls, and
+elapsed wall-clock time.
+
+- **The count**, `LIVELOCK_TICKS` — **190**, derived rather than picked: the
+  drain polls at least once a minute (the `wait` step blocks for a finishing
+  agent or one minute, whichever comes first), and one whole ticket costs one
+  pass through every stage's watchdog budget, 25 + 15 + 40 + 15 = 95 minutes on
+  the shipped defaults. The detector waits two of those cycles. Summed from the
+  shipped budgets in code, so it cannot drift away from them.
+- **The clock**, `livelockBoundMs` — twice the summed budgets of *your*
+  configured `watchdogMinutes`, floored at the 480-minute stage ceiling. On the
+  shipped defaults the floor wins, so the real bound is **8 hours**; configure a
+  300-minute builder and it becomes 40.
+
+Neither alone is safe. A tick is not a unit of time — "at least one poll per
+minute" is a convention this loop cannot enforce, so an orchestrator polling in
+a tight loop would reach 190 in seconds. And a stamp alone is not evidence: a
+state file resumed the next morning arrives hours "stagnant" having observed
+almost nothing.
+
+**Why the bound is so long.** Because both lane clocks are excluded from the
+fingerprint, a healthy heartbeating agent and a wedged one are *identical* to
+this detector for as long as they stay inside one stage — and the longest stage
+agent that ever returned normally in this repo ran 3.7 hours. A `livelock` ends
+the whole run, where the per-stage ceiling parks one lane and lets the rest keep
+draining, so the more expensive remedy must never fire first. Flooring the bound
+at the stage ceiling is what guarantees that: any lane the ceiling can see, it
+reaches first (stagnation can only begin after a stage did, so the stage is
+always the older clock). What is left for this detector is exactly what no lane
+clock can see — a stall with no ceiling-eligible lane to park, such as a state
+file written before per-lane stage stamps existed, or a scheduling stall with no
+lane at all.
 
 **What happens.** `next` returns a `livelock` action instead of `wait`, carrying
 a per-lane dump and writing it to
