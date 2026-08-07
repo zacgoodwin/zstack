@@ -31,6 +31,11 @@ import {
   foundNoTestFiles,
   isLaneBranch,
   laneWorktreePath,
+  livelockBoundMs,
+  livelockDump,
+  livelockDumpPath,
+  livelockExpired,
+  LIVELOCK_TICKS,
   mergeGate,
   mergeGateBaseKey,
   observeLaneHeads,
@@ -42,6 +47,8 @@ import {
   parseSuiteFailCount,
   stripAnsi,
   partitionKnownStatus,
+  progressFingerprint,
+  recordTick,
   MAX_COMMIT_RETRIES,
   MAX_DEAD_RESPAWNS,
   MAX_QUORUM_RETRIES,
@@ -135,7 +142,12 @@ function approve(confidence: number | null, skeptics: { received: number; of: nu
   return { kind: "review-approve", confidence, skeptics };
 }
 
-function state(tickets: TicketSnapshot[], lanes: LaneState[] = [], maxLanes = 3, watchdogMinutes = 10): LoopState {
+function state(
+  tickets: TicketSnapshot[],
+  lanes: LaneState[] = [],
+  maxLanes = 3,
+  watchdogMinutes: LoopState["watchdogMinutes"] = 10
+): LoopState {
   // schemaVersion/runId (#322): every fixture that reaches DISK must pass the
   // CLI boundary's readState contract; pure-reducer tests just carry them.
   return { schemaVersion: 2, runId: RUN_A, tickets, lanes, maxLanes, watchdogMinutes, mergedThisRun: [] };
@@ -2982,6 +2994,16 @@ describe("#205: every stage transition writes the board", () => {
       // no board write and no transition from the reducer.
       "confirm-merge": [{ before: withLane("Review", "merge", { outcome: { kind: "merged", note: "https://x/pull/9" } }), action: { kind: "confirm-merge", ticket: 1, pr: 9 } }],
       "context-clear": [{ before: withLane("Building", "builder"), action: { kind: "context-clear" } }],
+      // #246: the livelock detector REPORTS and mutates nothing -- no park, no
+      // skip, no advance, and no board status. It belongs in this table for
+      // exactly that reason: the assertion below is what pins "writes nothing"
+      // for it the same mechanical way it pins every other kind's write.
+      livelock: [
+        {
+          before: withLane("Building", "builder"),
+          action: { kind: "livelock", dump: livelockDump(withLane("Building", "builder"), 0, LIVELOCK_TICKS, "fp") },
+        },
+      ],
       "drain-complete": [{ before: state([ticket(1, "Done")]), action: { kind: "drain-complete" } }],
     };
 
@@ -7713,16 +7735,26 @@ describe("#223: re-confirming a carried-forward claimedByOther flag", () => {
       expect(run(first + BOUND)).toMatchObject({ kind: "park", ticket: 2, status: "Blocked" });
     });
 
-    test("`next` writes NOTHING for any other action (it is a reader everywhere else)", () => {
+    // #246 gave `next` one more thing to record -- the tick's progress
+    // fingerprint, which has to survive to the next process to be comparable at
+    // all -- so this is no longer "the file is byte-identical". It is the
+    // stronger, more useful statement, and it is exactly the #223 property this
+    // test was written for: on an action that is not a confirm, `next` moves no
+    // ticket, no lane, and no knob. Only the detector's own two bookkeeping
+    // fields appear.
+    test("`next` writes nothing but the livelock bookkeeping for any other action", () => {
       const statePath = join(CLI_DIR, "next-readonly.json");
       writeFileSync(statePath, JSON.stringify(livelock({ claimedByOtherAt: T0, claimConfirmingSince: T0 })));
-      const before = readFileSync(statePath, "utf8");
+      const before = JSON.parse(readFileSync(statePath, "utf8"));
       const p = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", statePath, "--now", String(T0 + MIN)], {
         stdout: "pipe",
         stderr: "pipe",
       });
       expect(JSON.parse(p.stdout.toString())).toEqual({ kind: "wait" });
-      expect(readFileSync(statePath, "utf8")).toBe(before);
+      const { stagnantTicks, lastFingerprint, ...rest } = JSON.parse(readFileSync(statePath, "utf8"));
+      expect(rest).toEqual(before);
+      expect(stagnantTicks).toBe(0);
+      expect(typeof lastFingerprint).toBe("string");
     });
   });
 
@@ -8097,6 +8129,779 @@ describe("#223: re-confirming a carried-forward claimedByOther flag", () => {
     test("a read that carries no number is still accepted (the debug shapes cannot be checked)", () => {
       expect(parseAssignees({ assignees: [] }, 7)).toEqual([]);
       expect(parseAssignees([], 7)).toEqual([]);
+    });
+  });
+});
+
+// -- #246: a livelocked drain is detected and dumped, never repaired ----------
+//
+// A drain can stop making progress with every worker ALIVE: a bounce cycle, or
+// a scheduling stall where every tick returns `wait` and no lane ever advances.
+// The dependency-cycle breaks inside nextAction catch cycles in the TICKET
+// GRAPH, not stagnation, so run 10's hand-recoveries ("no lane state change
+// across two full ticket cycles") had nothing watching for them.
+//
+// Everything here is a pure function over successive states with the clock
+// injected, exactly like watchdogExpired: no wall clock, no agents.
+describe("#246: livelock detection", () => {
+  const MIN = 60_000;
+  const T0 = 5_000_000; // non-zero, so "absent stamp" is distinguishable from "now"
+
+  // Two lanes mid-stage: nothing silent, nothing finished, nothing claimable --
+  // the exact state whose every tick is a `wait`.
+  //
+  // Neither lane carries a stageStartedMs, and that is the whole point of this
+  // fixture rather than an omission. A lane that HAS one is the per-stage
+  // ceiling's case and the ceiling always reaches it first (see the pin below);
+  // what is left for this detector is the stall with no ceiling-eligible lane to
+  // park -- a state file written before #256 added the stamp, or a scheduling
+  // stall with no lane at all. This is the first of those, and it is the only
+  // trippable shape that still has lanes for the dump to name.
+  const running = (): LoopState =>
+    state(
+      [ticket(1, "Building"), ticket(2, "QA")],
+      [lane(1, "builder", { lastActivityMs: T0 }), lane(2, "qa", { lastActivityMs: T0, qaBounces: 1 })]
+    );
+
+  // The same drain on a post-#256 state file: every lane stamped with the moment
+  // its stage started, so the per-stage ceiling can see it.
+  const runningStamped = (): LoopState =>
+    state(
+      [ticket(1, "Building"), ticket(2, "QA")],
+      [
+        lane(1, "builder", { lastActivityMs: T0, stageStartedMs: T0 }),
+        lane(2, "qa", { lastActivityMs: T0, stageStartedMs: T0, qaBounces: 1 }),
+      ]
+    );
+
+  // The first tick index that satisfies BOTH halves of the trip, derived from
+  // the thresholds rather than typed. `drive` starts at T0 and ticks a minute
+  // apart, so at tick i the count is exactly i (tick 0 only establishes the
+  // fingerprint) and the stamp landed on tick 1, making the elapsed time
+  // (i - 1) minutes. The clock half needs elapsed > bound, hence the + 2.
+  const BOUND_MIN = livelockBoundMs(10) / MIN; // 10 = the fixture's watchdogMinutes
+  const TRIP = Math.max(LIVELOCK_TICKS, BOUND_MIN + 2);
+
+  // One tick of the real drive: ask, then record, exactly as the `next` CLI
+  // does. `heartbeat` moves every lane's watchdog baseline forward the way
+  // z-loop-tick's per-tick `loop heartbeat` does for a worker still appending to
+  // its transcript -- which is what makes this the LIVELOCK shape (workers
+  // alive, nothing finishing) rather than a silent-lane watchdog case.
+  function tick(s: LoopState, nowMs: number, heartbeat = true): { state: LoopState; action: Action } {
+    let before = s;
+    if (heartbeat) {
+      before = structuredClone(s);
+      for (const l of before.lanes) l.lastActivityMs = nowMs;
+    }
+    const action = nextAction(before, nowMs);
+    return { state: recordTick(before, action, nowMs), action };
+  }
+
+  // Drive n ticks a minute apart from T0, returning the state and the log.
+  function drive(s: LoopState, ticks: number, heartbeat = true): { state: LoopState; log: Action[] } {
+    const log: Action[] = [];
+    let cur = s;
+    for (let i = 0; i < ticks; i++) {
+      const r = tick(cur, T0 + i * MIN, heartbeat);
+      cur = r.state;
+      log.push(r.action);
+    }
+    return { state: cur, log };
+  }
+
+  // The board `running()` is watching, as the snapshot shows it -- unchanged,
+  // tick after tick. The two tickets are OBSERVED (not carried forward), so an
+  // ingest of this read is the "nothing moved" case in its purest form.
+  const BOARD_ITEMS = [
+    { number: 1, title: "Ticket 1", fields: { Status: "Building", Model: "sonnet" } },
+    { number: 2, title: "Ticket 2", fields: { Status: "QA", Model: "sonnet" } },
+  ];
+  const BOARD_BODIES = { "1": "no deps", "2": "no deps" };
+
+  // One tick as bin/z-loop-tick really runs it: `loop ingest` (its step 2) BEFORE
+  // `loop next` (step 3), on EVERY iteration -- with the ingest arm's own
+  // re-stamp of the version header, which ingestBoardItems does not return.
+  function ingestTick(s: LoopState, nowMs: number): { state: LoopState; action: Action } {
+    const ingested: LoopState = {
+      ...ingestBoardItems(s, BOARD_ITEMS, BOARD_BODIES),
+      schemaVersion: s.schemaVersion,
+      runId: s.runId,
+    };
+    return tick(ingested, nowMs);
+  }
+
+  // -- AC1: stagnation trips the detector -------------------------------------
+
+  test("AC1: unchanged `wait` evaluations past BOTH thresholds return a livelock action", () => {
+    // Tick 0 only ESTABLISHES the fingerprint (there is nothing to compare it
+    // against); every tick after it that finds nothing moved adds one to the
+    // count and one minute to the elapsed time. The trip is the first tick that
+    // has crossed both thresholds, and nothing before it.
+    const { log } = drive(running(), TRIP + 1);
+    expect(log.length).toBe(TRIP + 1);
+    expect(log.slice(0, TRIP).every((a) => a.kind === "wait")).toBe(true);
+    expect(log[TRIP].kind).toBe("livelock");
+  });
+
+  test("AC1: the COUNT alone never trips -- 1000 evaluations at a frozen clock stay `wait`", () => {
+    // The count is a count of POLLS, and this loop does not control the poll
+    // cadence: "at least one poll per minute" is unenforced SKILL prose, so an
+    // orchestrator re-running `next` in a tight loop during a wait used to walk
+    // the counter to its threshold in seconds. Measured before the clock half
+    // existed: 191 evaluations at an IDENTICAL frozen clock ended the run
+    // human-needed after 0ms of elapsed time, with the dump self-reporting
+    // silentMs=0 stageAgeMs=0.
+    let s = running();
+    for (let i = 0; i < 1000; i++) {
+      const a = nextAction(s, T0);
+      expect(a.kind).toBe("wait");
+      s = recordTick(s, a, T0);
+    }
+    expect(s.stagnantTicks).toBe(999); // the count crossed its threshold five times over
+    expect(livelockExpired(s.stagnantSinceMs, T0, s.watchdogMinutes)).toBe(false);
+  });
+
+  test("AC1: the CLOCK alone never trips -- a resumed state's ancient stamp is not evidence", () => {
+    // The mirror failure. A state file carried across a pause (an operator
+    // resumes tomorrow, a #131 context-clear batch resumes after lunch) arrives
+    // with a stamp hours old; on the clock alone it would trip on its second
+    // evaluation having observed almost nothing. The count is what refuses.
+    const resumed: LoopState = {
+      ...running(),
+      lastFingerprint: progressFingerprint(running()),
+      stagnantTicks: 1,
+      stagnantSinceMs: T0 - 5000 * MIN, // yesterday, far past any bound
+    };
+    expect(livelockExpired(resumed.stagnantSinceMs, T0, resumed.watchdogMinutes)).toBe(true);
+    expect(nextAction(resumed, T0)).toEqual({ kind: "wait" });
+  });
+
+  test("AC1: the count survives the PER-TICK INGEST -- the real driver order is ingest -> next", () => {
+    // The drive above is `next` alone, which is not what production runs:
+    // bin/z-loop-tick runs `loop ingest` (its step 2) BEFORE `loop next` (step
+    // 3) on every single iteration. ingestBoardItems is the one writer of this
+    // state that BUILDS its result by enumerating fields rather than cloning, so
+    // a field it forgets to name is deleted -- and it forgot both of these (QA
+    // pass 1). The whole detector was dead in production while every unit test
+    // passed: the count reset to zero on every tick, so `next` never saw a
+    // stagnantTicks above 0 however long the board sat still.
+    const log: Action[] = [];
+    let s: LoopState = running();
+    for (let i = 0; i <= TRIP; i++) {
+      const r = ingestTick(s, T0 + i * MIN);
+      s = r.state;
+      log.push(r.action);
+    }
+    expect(log.slice(0, TRIP).every((a) => a.kind === "wait")).toBe(true);
+    expect(log[TRIP].kind).toBe("livelock");
+    expect(s.stagnantTicks).toBe(TRIP);
+    // ...and the clock stamp is carried by that same enumerating writer, so the
+    // elapsed half survives the ingest exactly as the count does. Dropped, the
+    // stamp would be re-set every tick and the elapsed time would read as zero
+    // forever -- the detector dead in production with every unit test green,
+    // which is precisely how the count half failed QA pass 1.
+    expect(s.stagnantSinceMs).toBe(T0 + MIN);
+  });
+
+  test("AC1: the ingest carries the detector's bookkeeping, and is not itself progress", () => {
+    // The same fact stated directly on the function that erased it, so a
+    // regression names the field rather than just failing a 190-tick drive.
+    const { state: primed } = drive(running(), 3);
+    expect(primed.stagnantTicks).toBe(2);
+    const after = ingestBoardItems(primed, BOARD_ITEMS, BOARD_BODIES);
+    expect(after.lastFingerprint).toBe(primed.lastFingerprint);
+    expect(after.stagnantTicks).toBe(2);
+    expect(after.stagnantSinceMs).toBe(primed.stagnantSinceMs);
+    // ...and re-reading an unchanged board is not a move, so the next
+    // evaluation continues the count instead of restarting it.
+    expect(progressFingerprint(after)).toBe(primed.lastFingerprint!);
+    expect(recordTick(after, { kind: "wait" }, T0 + 3 * MIN).stagnantTicks).toBe(3);
+  });
+
+  test("AC1: the COUNT half is two full ticket cycles at the one-poll-per-minute floor", () => {
+    // Derived from the shipped stage budgets, not typed: a whole ticket is one
+    // pass through every stage's watchdog (25+15+40+15 = 95 minutes), and the
+    // detector waits two of them. Pinned so a budget change cannot move the
+    // threshold without this test naming the new number.
+    const perTicket = (Object.keys(DEFAULT_STAGE_WATCHDOG_MINUTES) as Stage[]).reduce(
+      (sum, s) => sum + DEFAULT_STAGE_WATCHDOG_MINUTES[s],
+      0
+    );
+    expect(perTicket).toBe(95);
+    expect(LIVELOCK_TICKS).toBe(2 * perTicket);
+  });
+
+  test("AC1: the CLOCK half is config-aware and never shorter than the stage ceiling", () => {
+    // The floor is the load-bearing half. A `livelock` ENDS THE RUN; the stage
+    // ceiling parks ONE lane and lets the rest keep draining -- so the strictly
+    // worse remedy must never fire first, and this detector is the last backstop
+    // rather than a second, shorter ceiling. On the shipped defaults the summed
+    // budgets (2 x 95 = 190 minutes) lose to that floor outright, which is the
+    // fix: 190 minutes is 0.86x MEASURED_MAX_STAGE_MS, so the pre-floor constant
+    // would have ended a run on a builder that was going to finish.
+    expect(livelockBoundMs(DEFAULT_STAGE_WATCHDOG_MINUTES)).toBe(STAGE_CEILING_MINUTES * MIN);
+    expect(livelockBoundMs(undefined)).toBe(STAGE_CEILING_MINUTES * MIN);
+    // The floor inherits the ceiling's own safety proof against the measured
+    // population of stages that RETURNED NORMALLY (3.7h at the top).
+    expect(livelockBoundMs(DEFAULT_STAGE_WATCHDOG_MINUTES)).toBeGreaterThanOrEqual(2 * MEASURED_MAX_STAGE_MS);
+    // ...and a run configured with longer budgets gets a proportionally longer
+    // bound, the way abandonedClaimBoundMs does -- summed across every stage,
+    // because what is being timed is a whole ticket's worth of drain.
+    expect(livelockBoundMs({ builder: 300, qa: 300, reviewer: 300, merge: 300 })).toBe(2400 * MIN);
+    expect(livelockBoundMs(300)).toBe(2400 * MIN);
+    // A partial object falls back per key, exactly like resolveWatchdogMinutes.
+    const partial = (Object.keys(DEFAULT_STAGE_WATCHDOG_MINUTES) as Stage[]).reduce(
+      (sum, s) => sum + resolveWatchdogMinutes({ builder: 300 }, s),
+      0
+    );
+    expect(livelockBoundMs({ builder: 300 })).toBe(Math.max(2 * partial, STAGE_CEILING_MINUTES) * MIN);
+  });
+
+  test("AC1: the dump names EVERY lane with ticket, stage, age and counters", () => {
+    const { log } = drive(running(), TRIP + 1);
+    const a = log[TRIP];
+    if (a.kind !== "livelock") throw new Error(`expected livelock, got ${a.kind}`);
+    expect(a.dump.lanes.map((l) => l.ticket)).toEqual([1, 2]);
+    expect(a.dump.lanes.map((l) => l.stage)).toEqual(["builder", "qa"]);
+    // Age is measured from the injected clock against the watchdog's own
+    // baseline. The drive heartbeats every lane at the top of each tick, so the
+    // silence is 0 -- which is precisely the livelock's signature: alive the
+    // whole time, finished nothing. This fixture is a pre-#256 state file, so
+    // there is no stage stamp to age and the dump says so rather than inventing
+    // a number.
+    const nowMs = T0 + TRIP * MIN;
+    expect(a.dump.nowMs).toBe(nowMs);
+    expect(a.dump.lanes.map((l) => l.silentMs)).toEqual([0, 0]);
+    expect(a.dump.lanes.map((l) => l.stageAgeMs)).toEqual([null, null]);
+    // Both halves of the trip, each beside the threshold it crossed.
+    expect(a.dump.stagnantSinceMs).toBe(T0 + MIN);
+    expect(a.dump.stagnantMs).toBe((TRIP - 1) * MIN);
+    expect(a.dump.livelockBoundMs).toBe(livelockBoundMs(10));
+    expect(a.dump.stagnantMs!).toBeGreaterThan(a.dump.livelockBoundMs);
+    // Counters, one per lane, plus the board status the fingerprint watched.
+    expect(a.dump.lanes[1]).toMatchObject({
+      ticket: 2,
+      status: "QA",
+      qaBounces: 1,
+      reviewBounces: 0,
+      quorumRetries: 0,
+      commitRetries: 0,
+      respawns: {},
+      mergeConfirmAttempts: 0,
+      mergeGateRuns: 0,
+      mergeGate: null,
+      workerDead: false,
+      outcome: null,
+      mergeObserved: null,
+    });
+    expect(a.dump.ticketsByStatus).toEqual({ Building: [1], QA: [2] });
+    // The file explains itself: the count that tripped, the threshold it
+    // crossed, the run it belongs to, and the serialization that stopped moving.
+    expect(a.dump.stagnantTicks).toBe(TRIP);
+    expect(a.dump.livelockTicks).toBe(LIVELOCK_TICKS);
+    expect(a.dump.runId).toBe(RUN_A);
+    expect(a.dump.fingerprint).toBe(progressFingerprint(running()));
+  });
+
+  // -- the three remedies that must reach a stuck drain FIRST ------------------
+
+  test("a lane that is genuinely silent is the WATCHDOG's case, never the detector's", () => {
+    // No heartbeat: the lanes go quiet, so `next` probes them long before the
+    // livelock threshold. The detector must not be what answers a silent lane.
+    const { log } = drive(running(), 60, false);
+    expect(log.some((a) => a.kind === "check-worker")).toBe(true);
+    expect(log.some((a) => a.kind === "livelock")).toBe(false);
+  });
+
+  test("a silent lane under a LONG configured watchdog is still the watchdog's case", () => {
+    // The config-blind failure, pinned on the config that exposed it rather than
+    // on the fixture's own 10-minute budget. Under `watchdogMinutes: 300` the
+    // probe is not due until minute 301; a detector summing the SHIPPED defaults
+    // tripped at minute 190 and converted an auto-recoverable dead worker
+    // (check-worker -> re-spawn -> salvage, #209) into a human-needed stop with
+    // no repair attempted, 111 minutes before anything had even asked.
+    const wd = { builder: 300, qa: 300, reviewer: 300, merge: 300 };
+    const s = state([ticket(1, "Building")], [lane(1, "builder", { lastActivityMs: T0, stageStartedMs: T0 })], 3, wd);
+    let cur = s;
+    let first: { i: number; kind: string } | null = null;
+    for (let i = 0; i < 400 && first === null; i++) {
+      const now = T0 + i * MIN;
+      const a = nextAction(cur, now); // no heartbeat: the lane really is silent
+      if (a.kind !== "wait") first = { i, kind: a.kind };
+      cur = recordTick(cur, a, now);
+    }
+    expect(first).toEqual({ i: 301, kind: "check-worker" });
+  });
+
+  test("a lane with a stage stamp is the CEILING's case -- the detector never pre-empts it", () => {
+    // The false-positive that shipped. Both lane clocks are excluded from the
+    // fingerprint by design, and watchdogExpired cannot fire on a heartbeating
+    // lane, so WITHIN one long stage a healthy lane and a wedged one are
+    // byte-identical to this detector. The only honest answer is to let the
+    // remedy that costs less go first: the ceiling parks ONE lane and the drain
+    // keeps going, where a livelock ends the whole run. Stagnation can only
+    // BEGIN after a stage did, so the stage is always the older clock and this
+    // ordering holds by construction, not by tuning.
+    const { log } = drive(runningStamped(), STAGE_CEILING_MINUTES + 60);
+    const first = log.find((a) => a.kind !== "wait");
+    expect(first?.kind).toBe("park");
+    expect((first as { note: string }).note).toContain(`${STAGE_CEILING_MINUTES}-minute`);
+    expect(log.some((a) => a.kind === "livelock")).toBe(false);
+    // ...and the measured population that ordering protects: the longest stage
+    // agent that ever returned normally here ran 3.7 hours, which the shipped
+    // pre-floor threshold of 190 minutes would have killed mid-flight.
+    expect(LIVELOCK_TICKS * MIN).toBeLessThan(MEASURED_MAX_STAGE_MS);
+    expect(livelockBoundMs(10)).toBeGreaterThan(MEASURED_MAX_STAGE_MS);
+  });
+
+  test("a drain that keeps finishing stages never trips, however long it runs", () => {
+    // The healthy shape, driven past the threshold: each tick's outcome moves
+    // the fingerprint, so the counter never accumulates.
+    let s = state([ticket(1, "Building")], [lane(1, "builder", { lastActivityMs: T0 })]);
+    for (let i = 0; i < LIVELOCK_TICKS * 2; i++) {
+      const a = nextAction(s, T0);
+      expect(a.kind).not.toBe("livelock");
+      if (a.kind === "wait") {
+        const idle = s.lanes.find((l) => !l.outcome);
+        if (!idle) throw new Error("wait with no lane to progress");
+        s = recordOutcome(recordTick(s, a, T0), idle.ticket, HAPPY[idle.stage], T0);
+        continue;
+      }
+      if (a.kind === "merge-gate") {
+        s = recordMergeGate(recordTick(s, a, T0), a.ticket, GREEN_GATE, T0);
+        continue;
+      }
+      if (a.kind === "confirm-merge") {
+        s = confirmMerged(recordTick(s, a, T0), a.ticket, { found: true, state: "MERGED", url: `https://x/pull/${a.pr}`, number: a.pr }, a.pr);
+        continue;
+      }
+      if (a.kind === "drain-complete") return;
+      s = applyAction(recordTick(s, a, T0), a, T0);
+    }
+    throw new Error("the happy drain never completed");
+  });
+
+  // -- AC2: any progress resets it --------------------------------------------
+
+  describe("AC2: any progress returns stagnantTicks to zero", () => {
+    // Half-way to the trip, so a reset is visible as a number rather than as
+    // the absence of a livelock.
+    const HALF = Math.floor(TRIP / 2);
+    const halfway = (): LoopState => {
+      const { state: s } = drive(running(), HALF);
+      expect(s.stagnantTicks).toBe(HALF - 1);
+      return s;
+    };
+
+    test("a lane advance resets it -- the fingerprint moved", () => {
+      let s = halfway();
+      s = recordOutcome(s, 1, { kind: "built" }, T0);
+      s = applyAction(s, { kind: "advance", ticket: 1, to: "qa" }, T0);
+      expect(progressFingerprint(s)).not.toBe(s.lastFingerprint);
+      expect(recordTick(s, { kind: "wait" }, T0).stagnantTicks).toBe(0);
+      expect(nextAction(s, T0).kind).not.toBe("livelock");
+    });
+
+    test("a recorded outcome resets it -- the fingerprint moved", () => {
+      const s = recordOutcome(halfway(), 1, { kind: "built" }, T0);
+      expect(progressFingerprint(s)).not.toBe(s.lastFingerprint);
+      expect(recordTick(s, { kind: "wait" }, T0).stagnantTicks).toBe(0);
+    });
+
+    test("an alive probe resets it -- the tick that asked for it was not a wait", () => {
+      // The probe itself moves only lastActivityMs, which is deliberately OUT
+      // of the fingerprint (a heartbeat is not progress). What resets the
+      // counter is the `check-worker` the loop returned to ask for it: any
+      // action that is not a wait is the loop doing something.
+      const s = halfway();
+      const silent = T0 + (HALF + 20) * MIN; // past the 10-minute fixture budget
+      const asked = nextAction(s, silent);
+      expect(asked.kind).toBe("check-worker");
+      const afterAsk = recordTick(s, asked, silent);
+      expect(afterAsk.stagnantTicks).toBe(0);
+      const probed = recordProbe(afterAsk, 1, true, silent);
+      expect(progressFingerprint(probed)).toBe(afterAsk.lastFingerprint!); // the heartbeat alone changes nothing
+      expect(recordTick(probed, { kind: "wait" }, silent).stagnantTicks).toBe(1); // counting starts over, not resumed
+    });
+
+    test("a park, a claim, a merge gate -- every non-wait action resets it", () => {
+      const s = halfway();
+      for (const a of [
+        { kind: "claim", ticket: 3, stage: "builder" },
+        { kind: "park", ticket: 1, status: "Blocked", note: "x" },
+        { kind: "skip", ticket: 1, note: "x" },
+        { kind: "merge-gate", ticket: 1 },
+        { kind: "check-worker", ticket: 1 },
+        { kind: "confirm-claim", ticket: 1 },
+        { kind: "confirm-merge", ticket: 1, pr: 9 },
+        { kind: "context-clear" },
+        { kind: "drain-complete" },
+      ] as Action[]) {
+        expect(recordTick(s, a, T0).stagnantTicks).toBe(0);
+      }
+      // ...and the two that may continue a run do exactly that.
+      expect(recordTick(s, { kind: "wait" }, T0).stagnantTicks).toBe(HALF);
+      expect(recordTick(s, { kind: "livelock", dump: livelockDump(s, T0, HALF, "fp") }, T0).stagnantTicks).toBe(HALF);
+    });
+
+    test("progress clears the CLOCK stamp too, so the next stagnant run is timed from its own start", () => {
+      // The count and the stamp are written together and cleared together. A
+      // stamp that outlived its run would pre-age the next one: the drain would
+      // arrive at its 190th still tick already "hours" stagnant on a clock that
+      // belongs to a stretch it has since moved past.
+      const s = halfway();
+      expect(s.stagnantSinceMs).toBe(T0 + MIN);
+      const moved = recordOutcome(s, 1, { kind: "built" }, T0);
+      const reset = recordTick(moved, { kind: "wait" }, T0 + 999 * MIN);
+      expect(reset.stagnantTicks).toBe(0);
+      expect(reset.stagnantSinceMs).toBeUndefined();
+      const again = recordTick(reset, { kind: "wait" }, T0 + 1000 * MIN);
+      expect(again.stagnantTicks).toBe(1);
+      expect(again.stagnantSinceMs).toBe(T0 + 1000 * MIN);
+    });
+
+    test("a state that has never been recorded counts zero -- the detector is off until a tick records", () => {
+      // Every reducer-only caller (the unit fixtures here, the e2e sim) and
+      // every pre-#246 state file lands in this case: an absent lastFingerprint
+      // can never match, so the count restarts and no livelock is possible.
+      const fresh = running();
+      expect(fresh.lastFingerprint).toBeUndefined();
+      expect(recordTick(fresh, { kind: "wait" }, T0).stagnantTicks).toBe(0);
+      expect(nextAction(fresh, T0)).toEqual({ kind: "wait" });
+    });
+  });
+
+  // -- the fingerprint truth table --------------------------------------------
+
+  describe("progressFingerprint: what counts as progress, and what does not", () => {
+    // Every mutation here is the drain MOVING, so each must change the print.
+    const MOVES: [string, (s: LoopState) => void][] = [
+      ["stage", (s) => void (s.lanes[0].stage = "qa")],
+      ["qaBounces", (s) => void s.lanes[0].qaBounces++],
+      ["reviewBounces", (s) => void s.lanes[0].reviewBounces++],
+      ["quorumRetries", (s) => void (s.lanes[0].quorumRetries = 1)],
+      ["commitRetries", (s) => void (s.lanes[0].commitRetries = 1)],
+      ["respawns", (s) => void (s.lanes[0].respawns = { builder: 1 })],
+      ["workerDead", (s) => void (s.lanes[0].workerDead = true)],
+      ["outcome", (s) => void (s.lanes[0].outcome = { kind: "built" })],
+      ["mergeGateRuns", (s) => void (s.lanes[0].mergeGateRuns = 1)],
+      ["mergeGate", (s) => void (s.lanes[0].mergeGate = { green: true, attempts: 1, failCount: 0, note: "g" })],
+      // #324's two Done-gate fields: a confirm cycle is progress, not stagnation.
+      ["mergeConfirmAttempts", (s) => void (s.lanes[0].mergeConfirmAttempts = 1)],
+      ["mergeObserved", (s) => void (s.lanes[0].mergeObserved = { number: 9, url: "u" })],
+      ["a ticket's board status", (s) => void (s.tickets[0].status = "Review")],
+      ["a lane appearing", (s) => void s.lanes.push(lane(3, "builder"))],
+      ["a lane leaving", (s) => void s.lanes.pop()],
+      ["a ticket leaving", (s) => void s.tickets.pop()],
+    ];
+    for (const [name, mutate] of MOVES) {
+      test(`${name} moves the fingerprint`, () => {
+        const s = running();
+        const before = progressFingerprint(s);
+        mutate(s);
+        expect(progressFingerprint(s)).not.toBe(before);
+      });
+    }
+
+    // ...and every one of these leaves it alone. The two clocks are the
+    // load-bearing pair: a heartbeat is what a wedged agent produces as happily
+    // as a working one, so counting it as progress would disable the detector
+    // on the exact shape it exists to catch.
+    const STILL: [string, (s: LoopState) => void][] = [
+      ["lastActivityMs (the watchdog heartbeat)", (s) => void (s.lanes[0].lastActivityMs += 9 * MIN)],
+      ["stageStartedMs", (s) => void (s.lanes[0].stageStartedMs = T0 + MIN)],
+      ["lane array order", (s) => void s.lanes.reverse()],
+      ["ticket array order", (s) => void s.tickets.reverse()],
+      ["a foreign-claim confirm stamp", (s) => void (s.tickets[0].claimedByOtherAt = T0)],
+      ["the detector's own bookkeeping", (s) => void ((s.lastFingerprint = "x"), (s.stagnantTicks = 7))],
+      ["the live context reading", (s) => void (s.contextTokens = 123456)],
+    ];
+    for (const [name, mutate] of STILL) {
+      test(`${name} leaves the fingerprint alone`, () => {
+        const s = running();
+        const before = progressFingerprint(s);
+        mutate(s);
+        expect(progressFingerprint(s)).toBe(before);
+      });
+    }
+
+    test("key insertion order cannot fake progress", () => {
+      // structuredClone preserves insertion order and the reducers add optional
+      // keys as they first apply, so two lanes holding identical facts can
+      // serialize to different JSON. That difference reads as progress -- the
+      // direction that silently disables the detector -- so it is normalized.
+      const a = state(
+        [ticket(1, "Building")],
+        [{ ticket: 1, stage: "builder", lastActivityMs: T0, qaBounces: 0, reviewBounces: 0, workerDead: true, commitRetries: 2 }]
+      );
+      const b = state(
+        [ticket(1, "Building")],
+        [{ commitRetries: 2, workerDead: true, reviewBounces: 0, qaBounces: 0, lastActivityMs: T0, stage: "builder", ticket: 1 }]
+      );
+      expect(progressFingerprint(a)).toBe(progressFingerprint(b));
+    });
+
+    test("an explicit `undefined` is the same as an absent key", () => {
+      // JSON.stringify drops undefined-valued keys but a hand-built fixture and
+      // a reducer's `delete` must not print differently.
+      const a = state([ticket(1, "Building")], [lane(1, "builder", { quorumRetries: undefined })]);
+      const b = state([ticket(1, "Building")], [lane(1, "builder")]);
+      expect(progressFingerprint(a)).toBe(progressFingerprint(b));
+    });
+  });
+
+  // -- AC3: the detector never mutates board state ----------------------------
+
+  describe("AC3: no board mutation", () => {
+    test("the livelock drive emits no park, skip, advance, claim or complete", () => {
+      const { log } = drive(running(), TRIP + 1);
+      const mutating = log.filter((a) => ["park", "skip", "advance", "claim", "complete", "stop-lane", "respawn"].includes(a.kind));
+      expect(mutating).toEqual([]);
+    });
+
+    test("the action owns no board write and applying it changes nothing", () => {
+      const { state: s, log } = drive(running(), TRIP + 1);
+      const a = log[TRIP];
+      expect(a.kind).toBe("livelock");
+      expect(boardWriteFor(a)).toBeUndefined();
+      const after = applyAction(s, a, T0);
+      expect(after.tickets).toEqual(s.tickets);
+      expect(after.lanes).toEqual(s.lanes);
+      expect(after.mergedThisRun).toEqual(s.mergedThisRun);
+    });
+
+    test("the SKILL row stops the run for a human and names the dump, and moves nothing", () => {
+      const row = readFileSync(join(REPO_ROOT, "z-loop", "SKILL.md"), "utf8")
+        .split("\n")
+        .find((l) => l.startsWith("| `livelock` |"));
+      if (!row) throw new Error("z-loop/SKILL.md has no `livelock` action row");
+      expect(row).toContain("dumpPath");
+      expect(row).toMatch(/do NOT park, skip, move/i);
+      expect(row).toMatch(/WITHOUT running Step 7/i);
+      expect(row).toContain("safety-violation"); // the human-needed notification, naming the dump
+      expect(row).toContain("lane-remove"); // ...named only to say it is NOT run: locks and worktrees stay
+    });
+
+    // QA pass 3's backstop-scope decision: on any state THIS binary produces,
+    // stageStartedMs <= stagnantSinceMs always (a stage must start before a tick
+    // can find it stagnant), so the per-stage ceiling reaches every stamped lane
+    // before this detector can. Pinned as doc prose, not just as the "a lane with
+    // a stage stamp is the CEILING's case" behavioral test above, so an editor
+    // cannot drop the operator-facing framing while leaving the code's invariant
+    // intact.
+    test("both docs state the ceiling-first invariant explicitly, not just the mechanism", () => {
+      const zLoop = readFileSync(join(REPO_ROOT, "docs", "user-guide", "z-loop.md"), "utf8");
+      const trouble = readFileSync(join(REPO_ROOT, "docs", "user-guide", "troubleshooting.md"), "utf8");
+      for (const docs of [zLoop, trouble]) {
+        expect(docs).toMatch(/v1\.2\+/);
+        expect(docs).toMatch(/ceiling fires first/i);
+        expect(docs).toMatch(/construction/);
+        expect(docs).toMatch(/legacy|hand-edited/i);
+      }
+    });
+  });
+
+  // -- AC4: pure and clock-injected -------------------------------------------
+
+  describe("AC4: pure, and the clock is injected", () => {
+    test("the #246 code path contains no Date.now", () => {
+      const src = readFileSync(join(REPO_ROOT, "lib", "loop.ts"), "utf8");
+      const section = src.slice(
+        src.indexOf("// -- #246: livelock detection"),
+        src.indexOf("// The scheduler. Deterministic priority order:")
+      );
+      expect(section.length).toBeGreaterThan(1000); // the slice really found the section
+      expect(section).not.toContain("Date.now");
+      expect(section).not.toContain("new Date");
+      // ...and the same for the scheduler branch that calls it.
+      const scheduler = src.slice(src.indexOf("export function nextAction("), src.indexOf("export function drainComplete("));
+      expect(scheduler).not.toContain("Date.now");
+    });
+
+    test("progressFingerprint is a pure function of the state it is handed", () => {
+      const s = running();
+      const snapshot = structuredClone(s);
+      expect(progressFingerprint(s)).toBe(progressFingerprint(s));
+      expect(s).toEqual(snapshot); // it read the state, it did not touch it
+      // ...and it is a function of VALUES, not of identity.
+      expect(progressFingerprint(structuredClone(s))).toBe(progressFingerprint(s));
+    });
+
+    test("the threshold takes injected inputs -- watchdogExpired's exact shape", () => {
+      // AC4's contract. watchdogExpired is
+      //   `nowMs - lane.lastActivityMs > watchdogMinutes * 60_000`
+      // -- the clock injected, the budget injected, one subtraction, and the
+      // boundary itself still in budget. This is the same function over the
+      // drain's stamp instead of a lane's, and it is what the trip is gated on:
+      // before it existed the threshold was `stagnantTicks < LIVELOCK_TICKS`,
+      // which reads neither the clock nor the config.
+      const bound = livelockBoundMs(10);
+      expect(livelockExpired(T0, T0 + bound, 10)).toBe(false); // exactly the bound is still in budget
+      expect(livelockExpired(T0, T0 + bound + 1, 10)).toBe(true);
+      // The budget really is an input: the same elapsed time answers differently
+      // under a longer configured watchdog.
+      expect(livelockExpired(T0, T0 + bound + 1, { builder: 300, qa: 300, reviewer: 300, merge: 300 })).toBe(false);
+      // A stamp that is absent, or non-finite from a hand-edited state.json,
+      // fails OPEN: no baseline means no livelock, never a livelock measured
+      // from garbage. (`null` is what JSON.stringify writes for NaN, and
+      // `nowMs - null` reads as epoch 0 -- the shape #223 already paid for.)
+      expect(livelockExpired(undefined, T0 + 1e9, 10)).toBe(false);
+      expect(livelockExpired(null as never, T0 + 1e9, 10)).toBe(false);
+      expect(livelockExpired(NaN, T0 + 1e9, 10)).toBe(false);
+      // ...and it is pure: same inputs, same answer, no state touched.
+      expect(livelockExpired(T0, T0 + bound + 1, 10)).toBe(livelockExpired(T0, T0 + bound + 1, 10));
+    });
+
+    test("the dump's ages come from the injected clock, to the millisecond", () => {
+      // watchdogExpired's pattern: the caller passes nowMs, so a test pins the
+      // arithmetic exactly instead of tolerating a range.
+      const s = runningStamped();
+      const d0 = livelockDump(s, T0, 1, "fp");
+      const d1 = livelockDump(s, T0 + 7 * MIN + 1, 1, "fp");
+      expect(d0.lanes[0].silentMs).toBe(0);
+      expect(d1.lanes[0].silentMs).toBe(7 * MIN + 1);
+      expect(d1.lanes[0].stageAgeMs).toBe(7 * MIN + 1);
+      expect(d1.nowMs).toBe(T0 + 7 * MIN + 1);
+      // A pre-#256 lane has no stage start to age, and says so rather than
+      // reporting a number derived from a stamp it does not have.
+      expect(livelockDump(running(), T0 + MIN, 1, "fp").lanes[0].stageAgeMs).toBeNull();
+      // The stagnation clock is injected the same way, and an unstamped state
+      // reports null rather than a duration measured from nothing.
+      const stamped = { ...s, stagnantSinceMs: T0 };
+      expect(livelockDump(stamped, T0 + 7 * MIN + 1, 1, "fp").stagnantMs).toBe(7 * MIN + 1);
+      expect(d1.stagnantSinceMs).toBeNull();
+      expect(d1.stagnantMs).toBeNull();
+    });
+
+    test("nextAction stays deterministic: same inputs, same action", () => {
+      const { state: s } = drive(running(), TRIP);
+      const now = T0 + TRIP * MIN;
+      const a = nextAction(s, now);
+      const b = nextAction(s, now);
+      expect(a).toEqual(b);
+      expect(a.kind).toBe("livelock");
+    });
+  });
+
+  // -- the CLI edge: the dump file, and the per-tick record --------------------
+
+  describe("the `next` CLI writes the dump and records the tick", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zstack-livelock-"));
+    afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+    function runNext(name: string, s: LoopState, nowMs: number) {
+      const statePath = join(dir, `${name}.json`);
+      writeFileSync(statePath, JSON.stringify(s));
+      const proc = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", statePath, "--now", String(nowMs)], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      return {
+        exitCode: proc.exitCode,
+        action: JSON.parse(proc.stdout.toString()) as Action & { dumpPath?: string; dump?: unknown },
+        after: JSON.parse(readFileSync(statePath, "utf8")) as LoopState,
+        statePath,
+      };
+    }
+
+    test("a tripped state prints the livelock action, names the dump path, and writes that file", () => {
+      const { state: primed } = drive(running(), TRIP);
+      const nowMs = T0 + TRIP * MIN;
+      const { exitCode, action, after, statePath } = runNext("tripped", primed, nowMs);
+      expect(exitCode).toBe(0);
+      expect(action.kind).toBe("livelock");
+      expect(action.dumpPath).toBe(livelockDumpPath(statePath, RUN_A));
+      expect(existsSync(action.dumpPath!)).toBe(true);
+      // The file an operator opens and the JSON the orchestrator read are the
+      // same bytes computed the same way.
+      expect(JSON.parse(readFileSync(action.dumpPath!, "utf8"))).toEqual(action.dump);
+      // The dump is run-keyed (#322): a later drain cannot overwrite this one's
+      // evidence, and it sits beside the state file it describes.
+      expect(action.dumpPath!.endsWith(`livelock-${RUN_A}.json`)).toBe(true);
+      // ...and the detector wrote no status: tickets and lanes are exactly what
+      // went in.
+      expect(after.tickets).toEqual(primed.tickets);
+      expect(after.lanes).toEqual(primed.lanes);
+      expect(after.stagnantTicks).toBe(TRIP);
+      // The stamp the CLI carried across every one of those processes is what
+      // the clock half measured against, and the dump reports both halves.
+      expect(after.stagnantSinceMs).toBe(T0 + MIN);
+      expect((action.dump as { stagnantMs: number }).stagnantMs).toBe((TRIP - 1) * MIN);
+    });
+
+    test("every tick records the fingerprint, so the count accrues across processes", () => {
+      const fresh = runNext("fresh", running(), T0);
+      expect(fresh.action.kind).toBe("wait");
+      expect(fresh.after.stagnantTicks).toBe(0);
+      expect(fresh.after.lastFingerprint).toBe(progressFingerprint(running()));
+      // Feed the written state straight back in: the second process continues
+      // the count the first one started.
+      const second = runNext("second", fresh.after, T0 + MIN);
+      expect(second.after.stagnantTicks).toBe(1);
+      // ...and the clock stamp is minted by that second process, from the `--now`
+      // it was handed. It is the baseline every later tick measures against, so
+      // a process that failed to write it would restart the elapsed clock every
+      // minute and the trip could never arrive.
+      expect(fresh.after.stagnantSinceMs).toBeUndefined();
+      expect(second.after.stagnantSinceMs).toBe(T0 + MIN);
+      const third = runNext("third", second.after, T0 + 2 * MIN);
+      expect(third.after.stagnantSinceMs).toBe(T0 + MIN); // carried, not re-stamped
+    });
+
+    test(
+      "the count accrues through the driver's REAL per-tick pair: ingest -> next, three times",
+      () => {
+        // The test above feeds `next`'s own output straight back into `next`,
+        // which is a sequence production never runs -- bin/z-loop-tick puts an
+        // `ingest` between every pair. Three real ticks over an unchanged board,
+        // each one two processes against ONE state file, is the drive that
+        // catches an ingest arm that drops the count (it did: QA pass 1).
+        const statePath = join(dir, "driver-order.json");
+        writeFileSync(statePath, JSON.stringify(running()));
+        const items = join(dir, "driver-items.json");
+        const bodies = join(dir, "driver-bodies.json");
+        writeFileSync(items, JSON.stringify(BOARD_ITEMS));
+        writeFileSync(bodies, JSON.stringify(BOARD_BODIES));
+        const loop = join(REPO_ROOT, "lib", "loop.ts");
+        const counts: (number | undefined)[] = [];
+        const stamps: (number | undefined)[] = [];
+        for (let i = 0; i < 3; i++) {
+          const ing = Bun.spawnSync(["bun", loop, "ingest", statePath, items, bodies], { stdout: "pipe", stderr: "pipe" });
+          expect(ing.exitCode).toBe(0);
+          const nxt = Bun.spawnSync(["bun", loop, "next", statePath, "--now", String(T0 + i * MIN)], {
+            stdout: "pipe",
+            stderr: "pipe",
+          });
+          expect(nxt.exitCode).toBe(0);
+          expect(JSON.parse(nxt.stdout.toString()).kind).toBe("wait");
+          const written = JSON.parse(readFileSync(statePath, "utf8")) as LoopState;
+          counts.push(written.stagnantTicks);
+          stamps.push(written.stagnantSinceMs);
+        }
+        // Tick 1 only establishes the fingerprint; every tick after it that
+        // finds the board and the lanes unmoved adds one.
+        expect(counts).toEqual([0, 1, 2]);
+        // ...and the clock stamp survives the same ingest, minted once on the
+        // first still tick and carried untouched after that. Dropped by the
+        // ingest arm the way the count was, the elapsed time would reset every
+        // minute and the trip could never arrive however long the board sat.
+        expect(stamps).toEqual([undefined, T0 + MIN, T0 + MIN]);
+      },
+      // Six `bun lib/loop.ts` spawns. Measured 0.44s idle here, but bun's 5s
+      // default is a coin flip for spawn-driven tests under load, not a budget
+      // -- the same reason tests/z-loop-tick.test.ts pins TICK_TIMEOUT_MS (#252).
+      30_000
+    );
+
+    test("an ordinary action still records, and still stamps its own ask (#223)", () => {
+      // A tick with real work: the record must not swallow the confirm stamp
+      // `next` already owed, and both must land in ONE write.
+      const s = state([ticket(1, "Ready"), ticket(2, "Ready", [1], { claimedByOther: true })], []);
+      const { action, after } = runNext("claiming", s, T0);
+      expect(action.kind).toBe("claim");
+      expect(after.stagnantTicks).toBe(0);
+      expect(after.stagnantSinceMs).toBeUndefined();
+      expect(after.lastFingerprint).toBe(progressFingerprint(s));
     });
   });
 });

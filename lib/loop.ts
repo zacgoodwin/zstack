@@ -454,6 +454,27 @@ export interface LoopState {
   // ceiling, captured once like the other knobs; 0/absent disables the gate.
   contextTokens?: number;
   contextTokenLimit?: number;
+  // #246 (child of #240): the livelock detector's three carried fields.
+  //
+  // lastFingerprint is progressFingerprint() of the state the PREVIOUS tick
+  // wrote; stagnantTicks counts how many consecutive `wait` evaluations have
+  // since found that fingerprint unchanged; stagnantSinceMs is the injected
+  // clock of the FIRST of those, so the detector can measure real elapsed time
+  // and not just a count of polls it does not control the cadence of. All three
+  // are written by recordTick, which the `next` CLI runs on every tick; nothing
+  // else reads or writes them, and none is an input to progressFingerprint
+  // itself (so the comparison can never chase its own tail).
+  //
+  // Optional for the same reason every other counter here is: hundreds of
+  // hand-built reducer fixtures predate them, and absent must mean exactly what
+  // a fresh run means. An absent lastFingerprint can never MATCH, so a state
+  // that has never been through recordTick reads as "something changed" and the
+  // detector is simply off -- the fail-open direction, since a false livelock
+  // stops a healthy drain while a missed one is caught by the watchdog, the
+  // stage ceiling, or the next tick that does record.
+  lastFingerprint?: string;
+  stagnantTicks?: number;
+  stagnantSinceMs?: number;
 }
 
 // The state contract this binary reads and writes. Bumped when the on-disk
@@ -801,6 +822,15 @@ export type Action =
   // observation this action exists to collect.
   | { kind: "confirm-merge"; ticket: number; pr: number }
   | { kind: "context-clear" }
+  // #246: the drain has stopped making progress with every worker still alive
+  // -- LIVELOCK_TICKS consecutive `wait` evaluations with an unchanged progress
+  // fingerprint. A REPORT, never a repair: the detector emits no park, no skip,
+  // no advance and writes no board status (the exhaustive applyAction case
+  // below is a no-op, and boardWriteFor returns undefined), because "which lane
+  // is wrong" is a human's call. `dump` is the whole diagnostic, rendered by
+  // livelockDump; `dumpPath` is filled in by the `next` CLI, the only layer
+  // that knows where the state dir is, and names the file it wrote the dump to.
+  | { kind: "livelock"; dump: LivelockDump; dumpPath?: string }
   | { kind: "drain-complete" };
 
 // #223: how many WHOLE-TICKET budgets a claim may keep coming back FOREIGN
@@ -1426,6 +1456,290 @@ function withResync(action: Action, resyncStatus: Map<number, BoardStatus>): Act
   return status === undefined ? action : { ...action, resyncStatus: status };
 }
 
+// -- #246: livelock detection -------------------------------------------------
+//
+// A drain can stop making progress with every worker ALIVE: a bounce cycle, or
+// a scheduling stall where every tick returns `wait` and no lane ever advances.
+// Nothing detected that before this -- the dependency-cycle breaks inside
+// nextAction catch cycles in the TICKET GRAPH, not stagnation, and
+// initialBatchTickets/batchTickets are capture-once fields no tick ever
+// compares against its predecessor. Run 10's hand-recoveries were mostly this
+// shape ("no lane state change across two full ticket cycles").
+//
+// Detection is deterministic space: a pure function over successive loop
+// states, clock-injected exactly like watchdogExpired (lib/lanes.ts) -- the
+// caller passes nowMs, so a test pins the dump's ages to the millisecond.
+
+// The trip has TWO halves and needs BOTH -- a count of evaluations AND elapsed
+// wall-clock time. Either one alone is wrong in a direction that costs a run.
+//
+// Count alone: a tick is not a unit of time. "At least one poll per minute" is
+// unenforced SKILL prose, and an orchestrator that re-runs `next` in a tight
+// loop during a wait walks the counter to its threshold in seconds -- measured,
+// 191 evaluations at a FROZEN clock ended a run human-needed after 0ms of
+// elapsed time.
+//
+// Clock alone: a state file carried across a pause (an operator resumes
+// tomorrow, a context-clear batch resumes after lunch) arrives with a stamp
+// hours old and would trip on its second evaluation, having observed almost
+// nothing.
+//
+// So: LIVELOCK_TICKS evaluations that changed nothing, AND livelockBoundMs of
+// real time since the first of them.
+
+// The COUNT half. Derived, not picked: the orchestrator polls at LEAST once a
+// minute (the `wait` row in z-loop/SKILL.md blocks for a background agent OR one
+// minute, whichever comes first, then re-runs `next`), and one whole ticket
+// costs one pass through every stage's watchdog budget (25 + 15 + 40 + 15 = 95
+// minutes on the shipped defaults), so two full ticket cycles is 190 polls at
+// that floor. Summed from DEFAULT_STAGE_WATCHDOG_MINUTES rather than typed as
+// 190 so the derivation cannot drift away from the budgets it came from -- the
+// same reason abandonedClaimBoundMs sums them instead of hardcoding 285. This
+// half is deliberately NOT config-aware: it counts observations, not minutes,
+// and the clock half below is where a longer watchdog has to be honored.
+export const LIVELOCK_TICKS =
+  2 * (Object.keys(DEFAULT_STAGE_WATCHDOG_MINUTES) as Stage[]).reduce((sum, s) => sum + DEFAULT_STAGE_WATCHDOG_MINUTES[s], 0);
+
+// The CLOCK half: how long the drain must have been demonstrably still.
+//
+// Config-aware for the reason abandonedClaimBoundMs is -- a run configured with
+// a 300-minute builder budget has not stalled at minute 190; its own watchdog
+// has not even asked yet. Measured on the pre-fix constant: a genuinely SILENT
+// lane under `watchdogMinutes: 300` tripped livelock at tick 190 while its
+// check-worker probe was not due until tick 301, converting an auto-recoverable
+// dead worker (probe -> re-spawn -> salvage, #209) into a human-needed stop 111
+// minutes early. Summed across every stage for the same reason the abandoned
+// claim is: the thing being timed is a whole ticket's worth of drain, not one
+// stage of it.
+//
+// FLOORED AT THE STAGE CEILING, which is the load-bearing half of this number.
+// A `livelock` ENDS THE RUN; the stage ceiling PARKS ONE LANE and lets the rest
+// keep draining. A remedy that is strictly worse must never fire first, so this
+// detector is the last backstop and never a shorter second ceiling. The floor
+// also inherits the ceiling's own safety proof: STAGE_CEILING_MINUTES is
+// gate-tested at >= 2x MEASURED_MAX_STAGE_MS (13,304,097 ms = 3.7h, the longest
+// stage agent that ever RETURNED NORMALLY here), so a healthy long stage cannot
+// reach it. Without this floor the shipped default was 190 minutes -- 0.86x that
+// measured maximum -- and a healthy heartbeating builder was byte-identical to a
+// wedged one as far as the fingerprint is concerned, because both lane clocks
+// are excluded from it by design.
+//
+// Consequence, and it is intended: for any lane carrying a stageStartedMs the
+// ceiling always fires first (stagnation can only BEGIN after the stage did, so
+// the stage is always the older clock). What is left for this detector is
+// exactly what no lane clock can see -- a stall with no ceiling-eligible lane to
+// park: a pre-#256 state file whose lanes have no stage stamp, or a scheduling
+// stall with no lane at all.
+//
+// `undefined` is in the signature (where abandonedClaimBoundMs's is not) for the
+// reason resolveWatchdogMinutes documents: this value arrives from a state.json
+// on disk, and a hand-edited or half-written one can be missing it outright.
+// That case resolves per stage to the shipped defaults, so the bound is the
+// floor -- never NaN, which would make the comparison silently false.
+export function livelockBoundMs(watchdogMinutes: number | StageWatchdogMinutes | undefined): number {
+  const perTicketMinutes = (Object.keys(DEFAULT_STAGE_WATCHDOG_MINUTES) as Stage[]).reduce(
+    (sum, stage) => sum + resolveWatchdogMinutes(watchdogMinutes, stage),
+    0
+  );
+  return Math.max(2 * perTicketMinutes, STAGE_CEILING_MINUTES) * 60_000;
+}
+
+// The clock half as a predicate, shaped exactly like watchdogExpired: the caller
+// injects the clock AND the budget, and the comparison is one subtraction. Same
+// boundary convention too -- exactly the bound is still in budget.
+//
+// An absent or non-finite stamp is NOT expired. That is the fail-open direction
+// on purpose: a hand-edited state.json (troubleshooting.md tells operators to
+// edit this file) or a state written before this field existed answers "no
+// livelock" rather than "livelock with no baseline".
+export function livelockExpired(
+  stagnantSinceMs: number | undefined,
+  nowMs: number,
+  watchdogMinutes: number | StageWatchdogMinutes | undefined
+): boolean {
+  return isStamp(stagnantSinceMs) && nowMs - stagnantSinceMs > livelockBoundMs(watchdogMinutes);
+}
+
+// Recursively key-sorted, so the fingerprint is a function of the state's
+// VALUES and never of the order a reducer happened to assign them in.
+// structuredClone preserves insertion order, and the reducers here add optional
+// keys as they first apply (workerDead on a probe, quorumRetries on a retry),
+// so two lanes holding identical facts can serialize to different JSON. That
+// difference would read as PROGRESS -- the direction that silently disables the
+// detector -- so it is normalized away here rather than defended per field.
+function stableJson(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(stableJson);
+  if (v === null || typeof v !== "object") return v;
+  const o = v as Record<string, unknown>;
+  return Object.fromEntries(
+    Object.keys(o)
+      .sort()
+      .filter((k) => o[k] !== undefined)
+      .map((k) => [k, stableJson(o[k])])
+  );
+}
+
+// The tick's progress fingerprint: everything about this state that MOVING
+// would prove the drain is alive, and nothing that moves on its own.
+//
+// Lanes contribute every field EXCEPT their two clocks, and that exclusion is
+// the whole design. lastActivityMs is the watchdog heartbeat -- it moves every
+// time any descendant of a stage spawn appends a line to a transcript, which a
+// wedged agent does as happily as a working one -- and stageStartedMs moves
+// only when a stage starts, which is already visible as a stage/counter change.
+// Fingerprinting the heartbeat would make "the drain is alive" mean "something
+// is still typing", and the detector could then never fire on the exact shape
+// it exists to catch (workers alive, nothing finishing). Silence is not the
+// signal here; the per-stage watchdog already owns silence.
+//
+// Everything else on the lane is in by SUBTRACTION rather than by an
+// enumerated list -- ticket, stage, every bounce/retry counter (qaBounces,
+// reviewBounces, quorumRetries, commitRetries, respawns, mergeGateRuns),
+// workerDead, the outcome, the merge-gate verdict, and #324's two Done-gate
+// fields (mergeConfirmAttempts, mergeObserved -- a confirm cycle is progress,
+// not stagnation). A field added to LaneState later counts as progress
+// automatically, which is the safe default: forgetting to add it here would
+// cost a FALSE livelock on a healthy drain.
+//
+// Tickets contribute their board status only, as per-status number sets: a
+// ticket moving between statuses is progress, a re-read that changes nothing
+// about status is not. Their claim stamps (claimedByOtherAt,
+// claimConfirmingSince) are deliberately out -- those move when the loop
+// re-reads a FOREIGN claim, which is #223's business and not this batch making
+// progress.
+// Ticket numbers grouped by board status, each list ascending. One helper for
+// both readers below so the fingerprint and the dump can never disagree about
+// what the board looked like at the moment the drain stopped.
+function ticketsByStatus(tickets: TicketSnapshot[]): Record<string, number[]> {
+  const byStatus: Record<string, number[]> = {};
+  for (const t of [...tickets].sort((a, b) => a.number - b.number)) (byStatus[t.status] ??= []).push(t.number);
+  return byStatus;
+}
+
+export function progressFingerprint(state: LoopState): string {
+  const lanes = [...state.lanes]
+    .sort((a, b) => a.ticket - b.ticket)
+    .map(({ lastActivityMs: _activity, stageStartedMs: _started, ...progress }) => stableJson(progress));
+  return JSON.stringify({ lanes, byStatus: stableJson(ticketsByStatus(state.tickets)) });
+}
+
+// The one place the counting rule lives, shared by the decision (nextAction)
+// and the record (recordTick) so the two can never disagree about which tick
+// tripped: an unchanged fingerprint continues the run, ANY change restarts it
+// at zero. An absent lastFingerprint (a fresh state, a pre-#246 file, any
+// reducer-only caller) never matches, so those states count zero forever.
+function stagnationAfter(state: LoopState, fingerprint: string): number {
+  return fingerprint === state.lastFingerprint ? (state.stagnantTicks ?? 0) + 1 : 0;
+}
+
+// One lane, as the dump reports it. Ages are ms from the injected clock, never
+// pre-formatted: the renderer is a human's, the numbers are the loop's.
+export interface LivelockLane {
+  ticket: number;
+  stage: Stage;
+  status: BoardStatus | null; // the ticket's board status; null = no snapshot (a ghost lane)
+  silentMs: number; // nowMs - lastActivityMs, the watchdog's own baseline
+  stageAgeMs: number | null; // nowMs - stageStartedMs; null on a pre-#256 lane
+  qaBounces: number;
+  reviewBounces: number;
+  quorumRetries: number;
+  commitRetries: number;
+  respawns: Partial<Record<Stage, number>>;
+  mergeConfirmAttempts: number;
+  mergeGateRuns: number;
+  mergeGate: "green" | "red" | null;
+  workerDead: boolean;
+  outcome: string | null; // the outcome KIND, or null while the stage is still running
+  mergeObserved: number | null; // the PR number observed merged (#324), if any
+}
+
+// Both halves of the trip are reported, each beside the threshold it crossed,
+// so an operator reading the file never has to re-derive why it fired.
+export interface LivelockDump {
+  runId?: string;
+  nowMs: number;
+  stagnantTicks: number;
+  livelockTicks: number; // the COUNT threshold that tripped
+  stagnantSinceMs: number | null; // the clock the stagnant run began at
+  stagnantMs: number | null; // nowMs - stagnantSinceMs: how long it has really been still
+  livelockBoundMs: number; // the CLOCK threshold that tripped, resolved from this run's budgets
+  fingerprint: string; // the serialization that stopped changing
+  lanes: LivelockLane[];
+  ticketsByStatus: Record<string, number[]>;
+}
+
+// The dump, rendered by a pure function so the file an operator reads and the
+// JSON the action carries are the same bytes computed the same way.
+export function livelockDump(state: LoopState, nowMs: number, stagnantTicks: number, fingerprint: string): LivelockDump {
+  const byNumber = new Map(state.tickets.map((t) => [t.number, t]));
+  const since = isStamp(state.stagnantSinceMs) ? state.stagnantSinceMs : null;
+  return {
+    runId: state.runId,
+    nowMs,
+    stagnantTicks,
+    livelockTicks: LIVELOCK_TICKS,
+    stagnantSinceMs: since,
+    stagnantMs: since === null ? null : nowMs - since,
+    livelockBoundMs: livelockBoundMs(state.watchdogMinutes),
+    fingerprint,
+    lanes: [...state.lanes]
+      .sort((a, b) => a.ticket - b.ticket)
+      .map((l) => ({
+        ticket: l.ticket,
+        stage: l.stage,
+        status: byNumber.get(l.ticket)?.status ?? null,
+        silentMs: nowMs - l.lastActivityMs,
+        stageAgeMs: l.stageStartedMs === undefined ? null : nowMs - l.stageStartedMs,
+        qaBounces: l.qaBounces,
+        reviewBounces: l.reviewBounces,
+        quorumRetries: l.quorumRetries ?? 0,
+        commitRetries: l.commitRetries ?? 0,
+        respawns: l.respawns ?? {},
+        mergeConfirmAttempts: l.mergeConfirmAttempts ?? 0,
+        mergeGateRuns: l.mergeGateRuns ?? 0,
+        mergeGate: l.mergeGate === undefined ? null : l.mergeGate.green ? "green" : "red",
+        workerDead: l.workerDead === true,
+        outcome: l.outcome?.kind ?? null,
+        mergeObserved: l.mergeObserved?.number ?? null,
+      })),
+    ticketsByStatus: ticketsByStatus(state.tickets),
+  };
+}
+
+// The per-tick record, written by the `next` CLI the same way #223's confirm
+// stamp is: by the verb that HANDS THE ACTION OVER, so the counter cannot rest
+// on the orchestrator remembering to write anything back.
+//
+// The fingerprint recorded is the one of the state being WRITTEN, so the
+// comparison the next tick makes is exactly "has anything changed since the
+// last tick's write". Only `wait` (and the `livelock` it becomes) may continue
+// a run: every other action is the loop doing something, which is progress by
+// definition even when the action's own effects land outside this file (a
+// check-worker probe, a merge-gate run).
+export function recordTick(state: LoopState, action: Action, nowMs: number): LoopState {
+  const next = structuredClone(state);
+  const fingerprint = progressFingerprint(state);
+  const stagnantTicks = action.kind === "wait" || action.kind === "livelock" ? stagnationAfter(state, fingerprint) : 0;
+  next.stagnantTicks = stagnantTicks;
+  next.lastFingerprint = fingerprint;
+  // The clock half's baseline. Stamped when a stagnant run BEGINS and then
+  // carried untouched for as long as it continues, so what livelockExpired
+  // measures is the whole run's elapsed time and not this one tick's. Cleared
+  // the moment the count resets, so a stale stamp can never outlive the run it
+  // belongs to and pre-age the next one.
+  next.stagnantSinceMs = stagnantTicks === 0 ? undefined : isStamp(state.stagnantSinceMs) ? state.stagnantSinceMs : nowMs;
+  return next;
+}
+
+// The dump's path: the state dir (where the state file already lives) plus the
+// run id. Run-keyed rather than a bare `livelock.json` for the #322 reason
+// every other artifact is: a later drain must not overwrite the evidence of an
+// earlier one. A resume of the SAME run re-uses the name, which is correct --
+// it is the same run's evidence, freshly measured.
+export function livelockDumpPath(statePath: string, runId: string): string {
+  return join(dirname(statePath), `livelock-${runId}.json`);
+}
+
 // The scheduler. Deterministic priority order:
 //   1. wave reconciliation + finished stages: a human move that parked a lane's
 //      ticket out from under it stops that lane cleanly at its boundary;
@@ -1447,7 +1761,12 @@ function withResync(action: Action, resyncStatus: Map<number, BoardStatus>): Act
 //      (confirm-claim) once per watchdog period and, once ABANDONED_CLAIM_WATCHDOGS
 //      periods have passed SINCE THE FIRST CONFIRM ATTEMPT with the claim still
 //      standing, parks the dependents (#223) -- never before asking once;
-//   7. drain-complete when nothing workable remains; else wait.
+//   7. drain-complete when nothing workable remains; else wait -- and a wait
+//      that has repeated LIVELOCK_TICKS times AND spent livelockBoundMs of real
+//      time over an unchanged progress fingerprint is returned as `livelock`
+//      instead, carrying the per-lane dump (#246). That substitution is the ONLY
+//      thing the detector does: it parks nothing, skips nothing, and writes no
+//      board status.
 // "Workable" here is batch-scoped (#131): when state.batchTickets is set, a
 // Ready ticket outside the flagged allow-list is neither claimed nor counted
 // against the drain, so it waits for a future run instead of keeping this one
@@ -1483,6 +1802,24 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
     minSkepticQuorum: state.minSkepticQuorum ?? DEFAULT_MIN_SKEPTIC_QUORUM,
   };
   const byNumber = new Map(tickets.map((t) => [t.number, t]));
+  // #246: every `wait` this scheduler returns goes through here, and only a
+  // wait does -- a livelock is by definition the absence of any other action,
+  // so a tick that found something to do has already proved the drain alive.
+  //
+  // Both halves of the trip, and the order is the cheap test first. The count
+  // is recomputed here from the same shared rule recordTick uses, so the two
+  // can never disagree about which tick tripped; the stamp is read straight off
+  // the state because whenever the count is non-zero the stamp in the file is
+  // this same unbroken run's (recordTick writes them together, and clears the
+  // stamp with the count). A count at the threshold with no stamp is only
+  // reachable by hand-editing, and answers `wait`.
+  const waitOrLivelock = (): Action => {
+    const fingerprint = progressFingerprint(state);
+    const stagnantTicks = stagnationAfter(state, fingerprint);
+    if (stagnantTicks < LIVELOCK_TICKS) return { kind: "wait" };
+    if (!livelockExpired(state.stagnantSinceMs, nowMs, state.watchdogMinutes)) return { kind: "wait" };
+    return { kind: "livelock", dump: livelockDump(state, nowMs, stagnantTicks, fingerprint) };
+  };
   // Tickets this tick's desync guard judged as a lagged (not genuine) board
   // write -- see the guard below. Populated during step 1's lane loop, read by
   // both that loop's own return and the merge gate (step 2), which reaches a
@@ -1991,7 +2328,7 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
       // answer, so the throttle holds even when no answer ever arrives.
       const due = foreignDeps.find((dep) => stale(dep.claimedByOtherAt, wdFor(dep) * 60_000));
       if (due) return { kind: "confirm-claim", ticket: due.number };
-      return { kind: "wait" };
+      return waitOrLivelock();
     }
     const t = unclaimed[0];
     return { kind: "park", ticket: t.number, status: "Blocked", note: `Dependency deadlock: depends on #${t.dependsOn.join(", #")} and no lane can make progress. Likely a dependency cycle in the batch.` };
@@ -1999,7 +2336,7 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
 
   // 7. Drained, or waiting on running lanes / other sessions' claims.
   if (lanes.length === 0 && unclaimed.length === 0) return { kind: "drain-complete" };
-  return { kind: "wait" };
+  return waitOrLivelock();
 }
 
 // Batch drained = every ticket terminal for this batch (Done / Questions /
@@ -2370,6 +2707,13 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
     // no-op on state (like wait): batchTickets/lanes/tickets are untouched so
     // the re-invoked, context-cleared orchestrator resumes the same batch.
     case "context-clear":
+    // #246: a livelock is a REPORT. Applying it is a pure no-op by design, not
+    // by omission -- the detector's whole contract is that it never mutates
+    // board state (no park, no skip, no advance, no status write), so a human
+    // decides what the stuck lanes deserve. Grouped here with the other
+    // read-only kinds so any future branch added to it is visible as an
+    // exception to that rule rather than a natural extension of it.
+    case "livelock":
     case "drain-complete":
       return next;
   }
@@ -3291,6 +3635,26 @@ export function ingestBoardItems(
     // and re-buying the same lookup every tick is the waste confirmTargets
     // already refuses.
     depsGone: { ...(prev?.depsGone ?? {}), ...goneStates },
+    // #246: the livelock detector's three carried fields. Every OTHER writer of
+    // this file is a structuredClone reducer, so they survive by construction;
+    // this one BUILDS its result by enumerating fields, so anything not named
+    // here is deleted -- and bin/z-loop-tick runs `ingest` BEFORE `next` on
+    // every single tick. Omitted (QA pass 1 on this ticket), the count reset to
+    // zero on every real tick and the detector could never fire in production
+    // however long the board sat still, while every unit test passed because
+    // none of them put an ingest between two ticks.
+    //
+    // Carried unconditionally, like runSession and unlike mergedThisRun,
+    // because the reset does not belong here: a board move changes the
+    // fingerprint (stagnationAfter restarts the count at zero on its own), and
+    // every non-`wait` action -- the claim that starts a fresh batch, the
+    // drain-complete that ends one -- already zeroes it in recordTick. Every
+    // increment is a real observation of a tick that changed nothing, so a
+    // resume over a genuinely unchanged board keeping its count is the honest
+    // answer, not an inherited one.
+    lastFingerprint: prev?.lastFingerprint,
+    stagnantTicks: prev?.stagnantTicks,
+    stagnantSinceMs: prev?.stagnantSinceMs,
   };
 }
 
@@ -4340,8 +4704,15 @@ export function main(argv: string[]): number {
       // called it. That is what makes the commit binding an enforcement rather
       // than another thing the orchestrator could forget to do.
       const action = nextAction(state, nowMs, observeLaneHeads(state));
-      // #223: the driver records its own ask, and this is the ONLY write `next`
-      // performs. nextAction is pure, so "confirm-claim was emitted and ignored"
+      // #246: the pure reducer renders the dump but cannot know where it goes --
+      // the state dir is the CLI's fact, derived from the path it was handed.
+      // Stamped onto the action BEFORE it is printed so the one line the
+      // orchestrator reads names the file, and the dump is written below, after
+      // that print, for the same reason every other write in this arm is.
+      if (action.kind === "livelock") action.dumpPath = livelockDumpPath(statePath, state.runId);
+      // #223: the driver records its own ask -- the only write `next` performs
+      // about a TICKET (#246 added the per-tick stagnation record below, which
+      // touches nothing else). nextAction is pure, so "confirm-claim was emitted and ignored"
       // and "nobody ever asked" are the same state to it -- which left both the
       // throttle (one read per watchdog period) and the bounded park resting on
       // the orchestrator writing an outcome back through claim-confirmed /
@@ -4366,15 +4737,35 @@ export function main(argv: string[]): number {
       // orchestrator's own claim-confirmed/claim-confirm-failed write) instead
       // of taking the drain down.
       console.log(JSON.stringify(action));
+      // #246: one state write per tick, and it carries whichever per-action
+      // stamp this tick owed on top of the stagnation record. Composed rather
+      // than written separately so two atomicWrites can never race each other's
+      // read-modify-write on the same file.
+      //
+      // `next` is no longer a pure reader on every tick, and that is the price
+      // of the detector: a count of CONSECUTIVE ticks cannot live in a process
+      // that exits after one. It adds no new failure mode, though -- the same
+      // tick's `ingest` (bin/z-loop-tick step 2, not `|| true`) already writes
+      // this exact file three commands earlier, so a state file this machine
+      // cannot write has already killed the tick before `next` runs at all.
+      let stamped: LoopState = state;
       if (action.kind === "confirm-claim") {
-        atomicWrite(statePath, JSON.stringify(recordConfirmAttempt(state, action.ticket, nowMs), null, 2));
+        stamped = recordConfirmAttempt(state, action.ticket, nowMs);
       }
       // #324: same enforcement shape for the Done gate -- the ask is stamped by
       // the verb that hands the action over, so the bounded park arrives even
       // if the orchestrator never folds an answer back.
       if (action.kind === "confirm-merge") {
-        atomicWrite(statePath, JSON.stringify(recordMergeConfirmAsk(state, action.ticket), null, 2));
+        stamped = recordMergeConfirmAsk(state, action.ticket);
       }
+      // #246: the dump file. Written AFTER the print, like every other write
+      // here -- the action already carries the dump inline, so a write that
+      // throws (a full disk, AV holding the destination open) costs the
+      // operator a file, not the report. Nothing else in the drain reads it.
+      if (action.kind === "livelock") {
+        atomicWrite(livelockDumpPath(statePath, state.runId), JSON.stringify(action.dump, null, 2));
+      }
+      atomicWrite(statePath, JSON.stringify(recordTick(stamped, action, nowMs), null, 2));
       return 0;
     }
     if (cmd === "apply") {

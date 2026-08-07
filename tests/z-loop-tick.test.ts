@@ -220,8 +220,10 @@ describe("z-loop-tick", () => {
     expect(action).toEqual({ kind: "claim", ticket: 1, stage: "builder" });
 
     // The state file z-loop-tick wrote equals what the manual sequence produces:
-    // the only step that writes state is `ingest`, so run it directly on the same
-    // fixture and compare byte-for-byte. #131: the wrapper now threads a live
+    // TWO of its steps write state -- `ingest`, and (since #246) `next`, which
+    // records the tick's progress fingerprint so a count of consecutive
+    // no-progress ticks can survive a process that exits after one. Run both
+    // directly on the same fixture and compare byte-for-byte. #131: the wrapper now threads a live
     // context reading as `--context-tokens N`; under the temp $HOME there is no
     // ~/.claude/projects, so context-budget resolves nothing and reads 0
     // (fail-open) -- the manual ingest passes the same `--context-tokens 0` so
@@ -239,6 +241,11 @@ describe("z-loop-tick", () => {
       { stdout: "pipe", stderr: "pipe" }
     );
     expect(ing.exitCode).toBe(0);
+    // #246: the wrapper's third step, which is also a writer. Its stdout is the
+    // same Action already asserted above; what matters here is the tick record
+    // it leaves behind, without which the two states differ by exactly that.
+    const nxt = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", expectedState], { stdout: "pipe", stderr: "pipe" });
+    expect(nxt.exitCode).toBe(0);
     // #322: the runId is the ONE field designed to differ between two
     // independent first ingests (each mints its own), so it is normalized out
     // of the byte-compare -- and asserted well-formed on both sides so a
@@ -333,6 +340,10 @@ describe("z-loop-tick", () => {
       { stdout: "pipe", stderr: "pipe" }
     );
     expect(ing.exitCode).toBe(0);
+    // ...and its third step, `next`, which since #246 records the tick's
+    // progress fingerprint (see the sibling test above).
+    const nxt2 = Bun.spawnSync(["bun", join(REPO_ROOT, "lib", "loop.ts"), "next", expectedState], { stdout: "pipe", stderr: "pipe" });
+    expect(nxt2.exitCode).toBe(0);
     // Same #322 normalization as the sibling test above: two first ingests
     // legitimately mint two runIds; everything else must match byte-for-byte.
     const normRun2 = (s: string) => s.replace(/run-\d{8}-\d{6}-[0-9a-f]{4}/g, "run-NORMALIZED");
