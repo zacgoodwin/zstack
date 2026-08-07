@@ -179,7 +179,7 @@ describe("run-scoped pricing", () => {
 
 // -- z-cost CLI contract (#319, AC4) -------------------------------------------
 
-describe("z-cost CLI: run-dir / state-dir / legacy", () => {
+describe("z-cost CLI: run-dir / state-dir", () => {
   test("#319's exact shape -- positionals -- is refused loudly", async () => {
     let code: number | undefined;
     await captureStdout(async () => {
@@ -192,25 +192,9 @@ describe("z-cost CLI: run-dir / state-dir / legacy", () => {
     const { stateDir } = twoRunStateDir();
     let code: number | undefined;
     await captureStdout(async () => {
-      code = await costMain(["--run-dir", join(stateDir, "runs", RUN_A), "--legacy", "x/*.jsonl"]);
+      code = await costMain(["--run-dir", join(stateDir, "runs", RUN_A), "--state-dir", stateDir]);
     });
     expect(code).toBe(1);
-  });
-
-  test("--run-dir prices exactly one run; --legacy prices the same files identically (AC4 equivalence)", async () => {
-    const { stateDir, runBDir } = twoRunStateDir();
-    const ratesFile = join(mkTmp(), "rates.json");
-    writeFileSync(ratesFile, JSON.stringify(RATES));
-    const viaRun = await captureStdout(() =>
-      costMain(["--json", "--run-dir", join(stateDir, "runs", RUN_B), "--rates", ratesFile])
-    );
-    const viaLegacy = await captureStdout(() =>
-      costMain(["--json", "--legacy", join(runBDir, "*.jsonl"), "--rates", ratesFile])
-    );
-    const a = JSON.parse(viaRun);
-    const b = JSON.parse(viaLegacy);
-    expect(a.total).toBe(b.total);
-    expect(a.requests).toBe(1);
   });
 
   test("--state-dir resolves the CURRENT run from state.json; --run overrides it", async () => {
@@ -227,14 +211,27 @@ describe("z-cost CLI: run-dir / state-dir / legacy", () => {
     expect(current.total + overridden.total).toBeGreaterThan(current.total); // both runs really priced separately
   });
 
-  test("a state.json without a runId points at --legacy instead of guessing", async () => {
+  // Pre-1.3.0.0 this remedy read "price that drain with --legacy"; --legacy
+  // is gone, so the message no longer dangles a pointer at a removed flag
+  // (the source-grep in tests/cost.test.ts's "--legacy removal" describe pins
+  // this file-wide; this asserts it at the one call site that used to name it).
+  test("a state.json without a runId is refused rather than guessing, with no dangling --legacy pointer", async () => {
     const stateDir = mkTmp();
     writeFileSync(join(stateDir, "state.json"), JSON.stringify({ tickets: [], lanes: [] }));
     let code: number | undefined;
-    await captureStdout(async () => {
-      code = await costMain(["--json", "--state-dir", stateDir]);
-    });
+    const logs: string[] = [];
+    const origError = console.error;
+    console.error = (...a: unknown[]) => void logs.push(a.join(" "));
+    try {
+      await captureStdout(async () => {
+        code = await costMain(["--json", "--state-dir", stateDir]);
+      });
+    } finally {
+      console.error = origError;
+    }
     expect(code).toBe(1);
+    expect(logs.join("\n")).toMatch(/predates #322/);
+    expect(logs.join("\n")).not.toContain("--legacy");
   });
 });
 

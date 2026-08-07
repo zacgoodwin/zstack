@@ -193,7 +193,7 @@ describe("synthetic transcript entries are skipped, not priced (ticket #30)", ()
   test("--json surfaces skippedSynthetic for consumers (z-loop's Actual field-set)", async () => {
     const content = readFileSync(FIXTURE, "utf8").replace(/\n$/, "") + "\n" + syntheticLine("req_SYN") + "\n";
     const file = tmpFile(content);
-    const pattern = join(file, "..", "*.jsonl").replaceAll("\\", "/");
+    const dir = join(file, "..");
     const ratesFile = tmpFile(JSON.stringify(RATES), "rates.json");
 
     const logs: string[] = [];
@@ -201,7 +201,7 @@ describe("synthetic transcript entries are skipped, not priced (ticket #30)", ()
     console.log = (...a: unknown[]) => void logs.push(a.join(" "));
     let code: number;
     try {
-      code = await main(["--json", "--legacy", pattern, "--rates", ratesFile]);
+      code = await main(["--json", "--run-dir", dir, "--rates", ratesFile]);
     } finally {
       console.log = orig;
     }
@@ -218,7 +218,7 @@ describe("synthetic transcript entries are skipped, not priced (ticket #30)", ()
     console.log = (...a: unknown[]) => void logs.push(a.join(" "));
     let code: number;
     try {
-      code = await main(["--legacy", file]);
+      code = await main(["--run-dir", join(file, "..")]);
     } finally {
       console.log = orig;
     }
@@ -330,22 +330,21 @@ describe("expandGlob: absolute patterns (ticket #22)", () => {
     expect(expandGlob(pattern)).toEqual([]);
   });
 
-  test("AC3: main() raises the existing ZError naming the pattern for an absolute no-match glob", async () => {
+  test("AC3: main() raises the existing ZError naming the run dir for an empty --run-dir", async () => {
     const dir = mkdtempSync(join(tmpdir(), "zcost-abs-empty-cli-"));
     tmpPaths.push(dir);
-    const pattern = join(dir, "*.jsonl").replaceAll("\\", "/");
     const logs: string[] = [];
     const origError = console.error;
     console.error = (...a: unknown[]) => void logs.push(a.join(" "));
     let code: number;
     try {
-      code = await main(["--json", "--legacy", pattern]);
+      code = await main(["--json", "--run-dir", dir]);
     } finally {
       console.error = origError;
     }
     expect(code).not.toBe(0);
-    expect(logs.join("\n")).toContain(pattern);
-    expect(logs.join("\n")).toMatch(/No files matched/);
+    expect(logs.join("\n")).toContain(dir);
+    expect(logs.join("\n")).toMatch(/No transcript \.jsonl files under/);
   });
 });
 
@@ -373,20 +372,6 @@ describe("expandGlob: UNC patterns are refused (ticket #22 rework)", () => {
   test("a \\\\server\\share\\...-style pattern (native Windows UNC backslashes) throws naming UNC", () => {
     expect(() => expandGlob("\\\\myserver\\share\\*.jsonl")).toThrow(ZError);
     expect(() => expandGlob("\\\\myserver\\share\\*.jsonl")).toThrow(/UNC/);
-  });
-
-  test("main() exits 1 and prints the UNC error for a UNC pattern", async () => {
-    const logs: string[] = [];
-    const origError = console.error;
-    console.error = (...a: unknown[]) => void logs.push(a.join(" "));
-    let code: number;
-    try {
-      code = await main(["--json", "--legacy", "//myserver/share/*.jsonl"]);
-    } finally {
-      console.error = origError;
-    }
-    expect(code).toBe(1);
-    expect(logs.join("\n")).toMatch(/UNC/);
   });
 
   test("shadow-dir: a UNC pattern still throws even when a local dir mirrors its segments", () => {
@@ -542,9 +527,8 @@ describe("mixed-id responses dedup by BOTH keys (F14)", () => {
 // the machine-readable shape so that pipeline can't silently rot.
 describe("z-cost --json output (item 16b)", () => {
   test("emits one parseable object: total, per-model breakdown with tokens, requests", async () => {
-    // Same data as the AC3 fixture, via a glob pattern like z-loop passes.
+    // Same data as the AC3 fixture, run-dir'd like z-loop passes it.
     const file = tmpFile(readFileSync(FIXTURE, "utf8"));
-    const pattern = join(file, "..", "*.jsonl").replaceAll("\\", "/");
     const ratesFile = tmpFile(JSON.stringify(RATES), "rates.json");
 
     const logs: string[] = [];
@@ -552,7 +536,7 @@ describe("z-cost --json output (item 16b)", () => {
     console.log = (...a: unknown[]) => void logs.push(a.join(" "));
     let code: number;
     try {
-      code = await main(["--json", "--legacy", pattern, "--rates", ratesFile]);
+      code = await main(["--json", "--run-dir", join(file, ".."), "--rates", ratesFile]);
     } finally {
       console.log = orig;
     }
@@ -702,14 +686,13 @@ describe("--by-file attribution (ticket #83)", () => {
 
   test("AC2: --json output without --by-file has no by_file key (byte-identical to today)", async () => {
     const file = tmpFile(readFileSync(FIXTURE, "utf8"));
-    const pattern = join(file, "..", "*.jsonl").replaceAll("\\", "/");
     const ratesFile = tmpFile(JSON.stringify(RATES), "rates.json");
     const logs: string[] = [];
     const orig = console.log;
     console.log = (...a: unknown[]) => void logs.push(a.join(" "));
     let code: number;
     try {
-      code = await main(["--json", "--legacy", pattern, "--rates", ratesFile]);
+      code = await main(["--json", "--run-dir", join(file, ".."), "--rates", ratesFile]);
     } finally {
       console.log = orig;
     }
@@ -759,14 +742,13 @@ describe("--by-file attribution (ticket #83)", () => {
     tmpPaths.push(dir);
     writeFileSync(join(dir, "builder-1.jsonl"), line("req_A", "claude-sonnet-4-5", 100000, 0) + "\n");
     const ratesFile = tmpFile(JSON.stringify(RATES), "rates.json");
-    const pattern = join(dir, "*.jsonl").replaceAll("\\", "/");
 
     const logs: string[] = [];
     const orig = console.log;
     console.log = (...a: unknown[]) => void logs.push(a.join(" "));
     let code: number;
     try {
-      code = await main(["--by-file", "--legacy", pattern, "--rates", ratesFile]);
+      code = await main(["--by-file", "--run-dir", dir, "--rates", ratesFile]);
     } finally {
       console.log = orig;
     }
@@ -950,18 +932,108 @@ describe("cross-stage duplicate guard (ticket #152)", () => {
     writeFileSync(join(dir, "builder-1.jsonl"), line("req_DUP") + "\n");
     writeFileSync(join(dir, "merge-1.jsonl"), line("req_DUP") + "\n");
     const ratesFile = tmpFile(JSON.stringify(RATES), "rates.json");
-    const pattern = join(dir, "*.jsonl").replaceAll("\\", "/");
 
     const logs: string[] = [];
     const origError = console.error;
     console.error = (...a: unknown[]) => void logs.push(a.join(" "));
     let code: number;
     try {
-      code = await main(["--by-file", "--legacy", pattern, "--rates", ratesFile]);
+      code = await main(["--by-file", "--run-dir", dir, "--rates", ratesFile]);
     } finally {
       console.error = origError;
     }
     expect(code).not.toBe(0);
     expect(logs.join("\n")).toContain("req_DUP");
+  });
+});
+
+// -- --legacy removal (1.3.0.0, epic #321 C-final) ----------------------------
+//
+// --legacy was the only way to price a pre-#322 transcripts/ layout (added in
+// 1.2.0.0 alongside the run-id contract, kept for one release as an escape
+// hatch); it is gone as of 1.3.0.0, along with every test above that used to
+// invoke main() through it -- those were rewritten onto --run-dir, the
+// surviving input mode with the same "point at a directory of .jsonl files"
+// shape, except the one equivalence test that pinned --legacy itself
+// (tests/run-id.test.ts) and the two CLI-integration tests whose entire
+// premise was --legacy's own error plumbing (a raw-pattern echo and a UNC
+// pattern handed straight to expandGlob with no stat check first -- neither
+// surviving mode takes a raw glob at all).
+//
+// The flag is still RECOGNIZED, on purpose (AC1): main() checks for it before
+// computing the input-mode count, so a script or muscle-memory invocation
+// that still passes --legacy is told what happened and which version to pin,
+// not a generic "pass exactly one of" or a silent misparse into --run-dir's
+// positional-glob refusal. That one deliberate message is the sole exception
+// the AC2 grep tests below allow -- mirroring the sole-gh-caller allowlist in
+// tests/board.test.ts's "contract enforcement" describe block.
+describe("--legacy removal (1.3.0.0)", () => {
+  test('AC1: z-cost --legacy "x" exits 1 naming the removal and the last supporting version', async () => {
+    const logs: string[] = [];
+    const origError = console.error;
+    console.error = (...a: unknown[]) => void logs.push(a.join(" "));
+    let code: number;
+    try {
+      code = await main(["--legacy", "x"]);
+    } finally {
+      console.error = origError;
+    }
+    expect(code).toBe(1);
+    const msg = logs.join("\n");
+    expect(msg).toContain("--legacy");
+    expect(msg).toMatch(/removed/i);
+    expect(msg).toContain("1.3.0.0"); // the version that removed it
+    expect(msg).toContain("1.2.2.0"); // the last version that could still price a legacy layout
+  });
+
+  test("AC1: the removal is named ahead of the generic mode-count error even when combined with --run-dir", async () => {
+    const logs: string[] = [];
+    const origError = console.error;
+    console.error = (...a: unknown[]) => void logs.push(a.join(" "));
+    let code: number;
+    try {
+      code = await main(["--run-dir", ".", "--legacy", "x"]);
+    } finally {
+      console.error = origError;
+    }
+    expect(code).toBe(1);
+    expect(logs.join("\n")).toMatch(/removed/i);
+    expect(logs.join("\n")).not.toMatch(/pass exactly one of/i);
+  });
+
+  function trackedFiles(): string[] {
+    const proc = Bun.spawnSync(["git", "ls-files", "--cached", "--others", "--exclude-standard"], {
+      cwd: join(import.meta.dir, ".."),
+      stdout: "pipe",
+    });
+    return proc.stdout.toString().split(/\r?\n/).filter(Boolean);
+  }
+
+  test("AC2: no --legacy reference remains anywhere in docs/", () => {
+    const files = trackedFiles().filter((f) => f.startsWith("docs/"));
+    expect(files.length).toBeGreaterThan(0); // guards against the gate passing vacuously
+    const offenders = files.filter((f) => readFileSync(join(import.meta.dir, "..", f), "utf8").includes("--legacy"));
+    expect(offenders).toEqual([]);
+  });
+
+  test("AC2: no --legacy reference remains in lib/, except the single named removal message in lib/cost.ts", () => {
+    const files = trackedFiles().filter((f) => f.startsWith("lib/") && f !== "lib/cost.ts");
+    expect(files.length).toBeGreaterThan(0); // guards against the gate passing vacuously
+    const offenders = files.filter((f) => readFileSync(join(import.meta.dir, "..", f), "utf8").includes("--legacy"));
+    expect(offenders).toEqual([]);
+  });
+
+  test("AC2: lib/cost.ts's --legacy text is confined to the removal message -- not USAGE, not a live input branch", () => {
+    const content = readFileSync(join(import.meta.dir, "..", "lib", "cost.ts"), "utf8");
+    expect(content).toContain("--legacy"); // canary: the removal message itself must still name the flag (AC1)
+
+    // --help / bare-invocation text must not advertise it as a usable mode.
+    const usageMatch = content.match(/const USAGE = `([\s\S]*?)`;/);
+    expect(usageMatch).not.toBeNull();
+    expect(usageMatch![1]).not.toContain("--legacy");
+
+    // No live file-selection branch keyed on it survives.
+    expect(content).not.toMatch(/expandGlob\(legacy\)/);
+    expect(content).not.toMatch(/files\s*=\s*expandGlob/);
   });
 });
