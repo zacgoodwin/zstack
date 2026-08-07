@@ -8178,6 +8178,27 @@ describe("#246: livelock detection", () => {
     return { state: cur, log };
   }
 
+  // The board `running()` is watching, as the snapshot shows it -- unchanged,
+  // tick after tick. The two tickets are OBSERVED (not carried forward), so an
+  // ingest of this read is the "nothing moved" case in its purest form.
+  const BOARD_ITEMS = [
+    { number: 1, title: "Ticket 1", fields: { Status: "Building", Model: "sonnet" } },
+    { number: 2, title: "Ticket 2", fields: { Status: "QA", Model: "sonnet" } },
+  ];
+  const BOARD_BODIES = { "1": "no deps", "2": "no deps" };
+
+  // One tick as bin/z-loop-tick really runs it: `loop ingest` (its step 2) BEFORE
+  // `loop next` (step 3), on EVERY iteration -- with the ingest arm's own
+  // re-stamp of the version header, which ingestBoardItems does not return.
+  function ingestTick(s: LoopState, nowMs: number): { state: LoopState; action: Action } {
+    const ingested: LoopState = {
+      ...ingestBoardItems(s, BOARD_ITEMS, BOARD_BODIES),
+      schemaVersion: s.schemaVersion,
+      runId: s.runId,
+    };
+    return tick(ingested, nowMs);
+  }
+
   // -- AC1: stagnation trips the detector -------------------------------------
 
   test("AC1: LIVELOCK_TICKS consecutive unchanged `wait` evaluations return a livelock action", () => {
@@ -8188,6 +8209,41 @@ describe("#246: livelock detection", () => {
     expect(log.length).toBe(LIVELOCK_TICKS + 1);
     expect(log.slice(0, LIVELOCK_TICKS).every((a) => a.kind === "wait")).toBe(true);
     expect(log[LIVELOCK_TICKS].kind).toBe("livelock");
+  });
+
+  test("AC1: the count survives the PER-TICK INGEST -- the real driver order is ingest -> next", () => {
+    // The drive above is `next` alone, which is not what production runs:
+    // bin/z-loop-tick runs `loop ingest` (its step 2) BEFORE `loop next` (step
+    // 3) on every single iteration. ingestBoardItems is the one writer of this
+    // state that BUILDS its result by enumerating fields rather than cloning, so
+    // a field it forgets to name is deleted -- and it forgot both of these (QA
+    // pass 1). The whole detector was dead in production while every unit test
+    // passed: the count reset to zero on every tick, so `next` never saw a
+    // stagnantTicks above 0 however long the board sat still.
+    const log: Action[] = [];
+    let s: LoopState = running();
+    for (let i = 0; i <= LIVELOCK_TICKS; i++) {
+      const r = ingestTick(s, T0 + i * MIN);
+      s = r.state;
+      log.push(r.action);
+    }
+    expect(log.slice(0, LIVELOCK_TICKS).every((a) => a.kind === "wait")).toBe(true);
+    expect(log[LIVELOCK_TICKS].kind).toBe("livelock");
+    expect(s.stagnantTicks).toBe(LIVELOCK_TICKS);
+  });
+
+  test("AC1: the ingest carries the detector's bookkeeping, and is not itself progress", () => {
+    // The same fact stated directly on the function that erased it, so a
+    // regression names the field rather than just failing a 190-tick drive.
+    const { state: primed } = drive(running(), 3);
+    expect(primed.stagnantTicks).toBe(2);
+    const after = ingestBoardItems(primed, BOARD_ITEMS, BOARD_BODIES);
+    expect(after.lastFingerprint).toBe(primed.lastFingerprint);
+    expect(after.stagnantTicks).toBe(2);
+    // ...and re-reading an unchanged board is not a move, so the next
+    // evaluation continues the count instead of restarting it.
+    expect(progressFingerprint(after)).toBe(primed.lastFingerprint!);
+    expect(recordTick(after, { kind: "wait" }).stagnantTicks).toBe(3);
   });
 
   test("AC1: the threshold is two full ticket cycles at the one-poll-per-minute floor", () => {
@@ -8569,6 +8625,43 @@ describe("#246: livelock detection", () => {
       const second = runNext("second", fresh.after, T0 + MIN);
       expect(second.after.stagnantTicks).toBe(1);
     });
+
+    test(
+      "the count accrues through the driver's REAL per-tick pair: ingest -> next, three times",
+      () => {
+        // The test above feeds `next`'s own output straight back into `next`,
+        // which is a sequence production never runs -- bin/z-loop-tick puts an
+        // `ingest` between every pair. Three real ticks over an unchanged board,
+        // each one two processes against ONE state file, is the drive that
+        // catches an ingest arm that drops the count (it did: QA pass 1).
+        const statePath = join(dir, "driver-order.json");
+        writeFileSync(statePath, JSON.stringify(running()));
+        const items = join(dir, "driver-items.json");
+        const bodies = join(dir, "driver-bodies.json");
+        writeFileSync(items, JSON.stringify(BOARD_ITEMS));
+        writeFileSync(bodies, JSON.stringify(BOARD_BODIES));
+        const loop = join(REPO_ROOT, "lib", "loop.ts");
+        const counts: (number | undefined)[] = [];
+        for (let i = 0; i < 3; i++) {
+          const ing = Bun.spawnSync(["bun", loop, "ingest", statePath, items, bodies], { stdout: "pipe", stderr: "pipe" });
+          expect(ing.exitCode).toBe(0);
+          const nxt = Bun.spawnSync(["bun", loop, "next", statePath, "--now", String(T0 + i * MIN)], {
+            stdout: "pipe",
+            stderr: "pipe",
+          });
+          expect(nxt.exitCode).toBe(0);
+          expect(JSON.parse(nxt.stdout.toString()).kind).toBe("wait");
+          counts.push((JSON.parse(readFileSync(statePath, "utf8")) as LoopState).stagnantTicks);
+        }
+        // Tick 1 only establishes the fingerprint; every tick after it that
+        // finds the board and the lanes unmoved adds one.
+        expect(counts).toEqual([0, 1, 2]);
+      },
+      // Six `bun lib/loop.ts` spawns. Measured 0.44s idle here, but bun's 5s
+      // default is a coin flip for spawn-driven tests under load, not a budget
+      // -- the same reason tests/z-loop-tick.test.ts pins TICK_TIMEOUT_MS (#252).
+      30_000
+    );
 
     test("an ordinary action still records, and still stamps its own ask (#223)", () => {
       // A tick with real work: the record must not swallow the confirm stamp

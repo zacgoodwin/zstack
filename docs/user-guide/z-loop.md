@@ -1048,7 +1048,10 @@ a confirm cycle is progress, not stagnation), plus every ticket's board status.
 It then counts how many consecutive `wait` ticks left that fingerprint
 unchanged. Any change — and any action that is not a `wait`, since a tick that
 found something to do has already proved the drain alive — resets the count to
-zero.
+zero. The count lives in `state.json` (`stagnantTicks`, beside the fingerprint
+it was counted against) because no tick's process outlives itself, and it
+survives the board re-ingest each tick begins with: re-reading a board that has
+not moved is not progress.
 
 **What is deliberately excluded.** A lane's two clocks, `lastActivityMs` and
 `stageStartedMs`. `lastActivityMs` is the watchdog heartbeat: it moves whenever

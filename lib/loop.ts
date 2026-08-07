@@ -3539,6 +3539,25 @@ export function ingestBoardItems(
     // and re-buying the same lookup every tick is the waste confirmTargets
     // already refuses.
     depsGone: { ...(prev?.depsGone ?? {}), ...goneStates },
+    // #246: the livelock detector's two carried fields. Every OTHER writer of
+    // this file is a structuredClone reducer, so they survive by construction;
+    // this one BUILDS its result by enumerating fields, so anything not named
+    // here is deleted -- and bin/z-loop-tick runs `ingest` BEFORE `next` on
+    // every single tick. Omitted (QA pass 1 on this ticket), the count reset to
+    // zero on every real tick and the detector could never fire in production
+    // however long the board sat still, while every unit test passed because
+    // none of them put an ingest between two ticks.
+    //
+    // Carried unconditionally, like runSession and unlike mergedThisRun,
+    // because the reset does not belong here: a board move changes the
+    // fingerprint (stagnationAfter restarts the count at zero on its own), and
+    // every non-`wait` action -- the claim that starts a fresh batch, the
+    // drain-complete that ends one -- already zeroes it in recordTick. Every
+    // increment is a real observation of a tick that changed nothing, so a
+    // resume over a genuinely unchanged board keeping its count is the honest
+    // answer, not an inherited one.
+    lastFingerprint: prev?.lastFingerprint,
+    stagnantTicks: prev?.stagnantTicks,
   };
 }
 
