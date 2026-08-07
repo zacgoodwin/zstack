@@ -63,7 +63,7 @@ for fix in "${FIXTURES[@]}"; do
   #    three classification fixtures build byte-identically to before.
   MODE=off
   [ -f "$FIXDIR/adversarial-mode" ] && MODE="$(tr -d '[:space:]' < "$FIXDIR/adversarial-mode")"
-  bun "$REPO/lib/stage-prompts.ts" prompt reviewer "$OUT/input.json" --adversarial-mode "$MODE" > "$OUT/prompt.txt"
+  bun "$REPO/lib/stage-prompts.ts" prompt reviewer "$OUT/input.json" --adversarial-mode "$MODE" --verdict-path "$OUT/verdict.json" --run run-20260101-000000-aaaa --ticket 151 --attempt 1 --skeptic-dirs '["/tmp/sk1","/tmp/sk2","/tmp/sk3"]' > "$OUT/prompt.txt"
 
   # The JSON shape the grader must return. Per-fixture for the same reason as the
   # mode: skeptic-starved grades a DENOMINATOR, not a blocking decision, so

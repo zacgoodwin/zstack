@@ -72,6 +72,12 @@ const MERGE_INPUT: MergePromptInput = {
 // of the orchestrator inlining them. Tests pass a representative absolute path.
 const INPUT_PATH = join(REPO_ROOT, "loop", "tmp", "input-42.json");
 
+// #323 fixture verdict targets: every prompt constructor names the verdict
+// file the stage must write. VT42A adds the three orchestrator-composed
+// skeptic dirs an adversarial reviewer requires.
+const VT42 = { path: "/tmp/t42/verdict.json", runId: "run-20260101-000000-aaaa", ticket: 42, attempt: 1 };
+const VT42A = { ...VT42, skepticDirs: ["/tmp/t42/reviewer-1/skeptic-1", "/tmp/t42/reviewer-1/skeptic-2", "/tmp/t42/reviewer-1/skeptic-3"] };
+
 // -- reviewer blindness (AC3) -------------------------------------------------
 
 describe("reviewer blindness", () => {
@@ -88,15 +94,15 @@ describe("reviewer blindness", () => {
 
   test("a smuggled extra field is rejected at runtime", () => {
     const leaky = { ...REVIEWER_INPUT, prDescription: "trust me, it works" };
-    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH)).toThrow(ZError);
+    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH, VT42)).toThrow(ZError);
     const rationale = { ...REVIEWER_INPUT, planRationale: "we chose X because..." };
-    expect(() => reviewerPrompt(rationale as ReviewerPromptInput, INPUT_PATH)).toThrow(ZError);
+    expect(() => reviewerPrompt(rationale as ReviewerPromptInput, INPUT_PATH, VT42)).toThrow(ZError);
   });
 
   test("a missing or empty input is rejected -- a blinded reviewer with no diff is no reviewer", () => {
     const { diff: _dropped, ...missing } = REVIEWER_INPUT;
-    expect(() => reviewerPrompt(missing as ReviewerPromptInput, INPUT_PATH)).toThrow(ZError);
-    expect(() => reviewerPrompt({ ...REVIEWER_INPUT, diff: "" }, INPUT_PATH)).toThrow(ZError);
+    expect(() => reviewerPrompt(missing as ReviewerPromptInput, INPUT_PATH, VT42)).toThrow(ZError);
+    expect(() => reviewerPrompt({ ...REVIEWER_INPUT, diff: "" }, INPUT_PATH, VT42)).toThrow(ZError);
   });
 
   // AC2: the new `inputPath` param is a plain second argument, NOT a key of the
@@ -106,14 +112,14 @@ describe("reviewer blindness", () => {
   test("adding inputPath does not add a fifth key: the input stays exactly the four blinded keys", () => {
     expect(Object.keys(REVIEWER_INPUT).sort()).toEqual(["acceptanceCriteria", "diff", "ticketBody", "worktreePath"]);
     // A valid input + inputPath builds fine...
-    expect(() => reviewerPrompt(REVIEWER_INPUT, INPUT_PATH)).not.toThrow();
+    expect(() => reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, VT42)).not.toThrow();
     // ...but a fifth key is still rejected regardless of inputPath.
     const leaky = { ...REVIEWER_INPUT, builderTranscript: "..." };
-    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH)).toThrow(/blinded by design/);
+    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH, VT42)).toThrow(/blinded by design/);
   });
 
   test("the prompt is a POINTER: it references the input file, omits body/AC/diff, keeps the blindness contract", () => {
-    const p = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH);
+    const p = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, VT42);
     // The large payload is read from the file, NOT inlined into the prompt.
     expect(p).toContain(INPUT_PATH);
     expect(p).not.toContain(REVIEWER_INPUT.ticketBody);
@@ -122,11 +128,11 @@ describe("reviewer blindness", () => {
     // The throwaway worktree path is small/fixed and stays inline.
     expect(p).toContain(REVIEWER_INPUT.worktreePath);
     expect(p).toContain("no PR description, no plan rationale, no builder or QA transcript");
-    expect(p).toContain("REVIEW-APPROVE:");
-    expect(p).toContain("REVIEW-FINDINGS:");
-    // Fix 8a: the reviewer must be able to park Blocked (loop.ts MARKERS.reviewer
-    // parses BLOCKED:), so an unusable worktree parks instead of being Skipped.
-    expect(p).toContain("BLOCKED:");
+    expect(p).toContain('"REVIEW-APPROVE"');
+    expect(p).toContain('"REVIEW-FINDINGS"');
+    // Fix 8a: the reviewer must be able to park Blocked, so an unusable
+    // worktree parks instead of being Skipped -- "BLOCKED" is in its union.
+    expect(p).toContain('"BLOCKED"');
   });
 
   // AC11 (issue #62): the REVIEW-APPROVE contract carries the exact
@@ -136,18 +142,18 @@ describe("reviewer blindness", () => {
   // OUTPUT contract, never a fifth input key -- not even one literally named
   // "confidence".
   test("the REVIEW-APPROVE contract requires a confidence= token and the four-key blindness is unchanged", () => {
-    const p = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH);
-    expect(p).toContain("REVIEW-APPROVE: confidence=<0-100>");
+    const p = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, VT42);
+    expect(p).toContain('"confidence": <0-100>'); // the verdict evidence hint (#323)
     expect([...REVIEWER_INPUT_KEYS].sort()).toEqual(["acceptanceCriteria", "diff", "ticketBody", "worktreePath"]);
     const leaky = { ...REVIEWER_INPUT, confidence: 90 };
-    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH)).toThrow(ZError);
+    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH, VT42)).toThrow(ZError);
   });
 
   // AC6: the four-key gate is unchanged by the new THIRD parameter -- it fires
   // regardless of what `adversarial` is, because it is a scalar arg, never a key.
   test("the four-key gate holds with the adversarial param present", () => {
     // A clean input still builds and its key set is untouched by the true branch.
-    expect(typeof reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true)).toBe("string");
+    expect(typeof reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true ? VT42A : VT42, true)).toBe("string");
     expect(Object.keys(REVIEWER_INPUT).sort()).toEqual([
       "acceptanceCriteria",
       "diff",
@@ -157,8 +163,8 @@ describe("reviewer blindness", () => {
     // A smuggled fifth key throws EVEN with the adversarial flag on -- the gate
     // is not bypassed by the branch.
     const leaky = { ...REVIEWER_INPUT, prDescription: "x" };
-    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH, true)).toThrow(ZError);
-    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH, false)).toThrow(ZError);
+    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH, true ? VT42A : VT42, true)).toThrow(ZError);
+    expect(() => reviewerPrompt(leaky as ReviewerPromptInput, INPUT_PATH, false ? VT42A : VT42, false)).toThrow(ZError);
   });
 });
 
@@ -215,19 +221,19 @@ describe("prompt constructor purity", () => {
   test("every constructor is a pure function of its input: identical input, identical prompt, no carried state", () => {
     // Interleave calls with different inputs; the repeats must be byte-identical,
     // proving no hidden state leaks between spawns.
-    const b1 = builderPrompt(BUILDER_INPUT, INPUT_PATH);
-    const q1 = qaPrompt(QA_INPUT, INPUT_PATH);
-    const r1 = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH);
-    const ra1 = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true); // the adversarial branch is pure too
-    const m1 = mergePrompt(MERGE_INPUT, INPUT_PATH);
-    builderPrompt({ ...BUILDER_INPUT, ticketNumber: 99, qaNotes: "1) broken" }, INPUT_PATH);
-    reviewerPrompt({ ...REVIEWER_INPUT, diff: "other diff" }, INPUT_PATH);
-    reviewerPrompt({ ...REVIEWER_INPUT, diff: "other diff" }, INPUT_PATH, true);
-    expect(builderPrompt(BUILDER_INPUT, INPUT_PATH)).toBe(b1);
-    expect(qaPrompt(QA_INPUT, INPUT_PATH)).toBe(q1);
-    expect(reviewerPrompt(REVIEWER_INPUT, INPUT_PATH)).toBe(r1);
-    expect(reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true)).toBe(ra1);
-    expect(mergePrompt(MERGE_INPUT, INPUT_PATH)).toBe(m1);
+    const b1 = builderPrompt(BUILDER_INPUT, INPUT_PATH, VT42);
+    const q1 = qaPrompt(QA_INPUT, INPUT_PATH, VT42);
+    const r1 = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, VT42);
+    const ra1 = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true ? VT42A : VT42, true); // the adversarial branch is pure too
+    const m1 = mergePrompt(MERGE_INPUT, INPUT_PATH, VT42);
+    builderPrompt({ ...BUILDER_INPUT, ticketNumber: 99, qaNotes: "1) broken" }, INPUT_PATH, { ...VT42, ticket: 99 });
+    reviewerPrompt({ ...REVIEWER_INPUT, diff: "other diff" }, INPUT_PATH, VT42);
+    reviewerPrompt({ ...REVIEWER_INPUT, diff: "other diff" }, INPUT_PATH, VT42A, true);
+    expect(builderPrompt(BUILDER_INPUT, INPUT_PATH, VT42)).toBe(b1);
+    expect(qaPrompt(QA_INPUT, INPUT_PATH, VT42)).toBe(q1);
+    expect(reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, VT42)).toBe(r1);
+    expect(reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true ? VT42A : VT42, true)).toBe(ra1);
+    expect(mergePrompt(MERGE_INPUT, INPUT_PATH, VT42)).toBe(m1);
   });
 });
 
@@ -260,17 +266,17 @@ describe("pointer prompts are size-invariant to the payload (AC1)", () => {
   // Same reasoning each time -- these are FIXED instructions, so invariance (the
   // real contract, asserted on the line below the cap) is untouched.
   const CASES: { stage: string; build: (payload: string, ac: string) => string; cap: number; payloads: string[] }[] = [
-    { stage: "builder", build: (b) => builderPrompt({ ...BUILDER_INPUT, ticketBody: b }, INPUT_PATH), cap: 5120, payloads: [HUGE] },
-    { stage: "qa", build: (b) => qaPrompt({ ...QA_INPUT, ticketBody: b }, INPUT_PATH), cap: 5120, payloads: [HUGE] },
-    { stage: "reviewer", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH), cap: 5120, payloads: [HUGE, AC] },
+    { stage: "builder", build: (b) => builderPrompt({ ...BUILDER_INPUT, ticketBody: b }, INPUT_PATH, VT42), cap: 5120, payloads: [HUGE] },
+    { stage: "qa", build: (b) => qaPrompt({ ...QA_INPUT, ticketBody: b }, INPUT_PATH, VT42), cap: 5120, payloads: [HUGE] },
+    { stage: "reviewer", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH, VT42), cap: 5120, payloads: [HUGE, AC] },
     // The adversarial reviewer branch fans out skeptics but STILL points at the
     // file for its payload -- it must stay size-invariant too.
-    { stage: "reviewer (adversarial)", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH, true), cap: 8192, payloads: [HUGE, AC] },
+    { stage: "reviewer (adversarial)", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH, VT42A, true), cap: 16384, payloads: [HUGE, AC] },
     // Merge carries a second mandatory command block (the Step 0 version claim,
     // with its own absolute CLI path and six flags), so it sits in the same
     // higher band the adversarial reviewer does. Still payload-invariant, which
     // is the property this case exists to pin.
-    { stage: "merge", build: () => mergePrompt(MERGE_INPUT, INPUT_PATH), cap: 6144, payloads: [] },
+    { stage: "merge", build: () => mergePrompt(MERGE_INPUT, INPUT_PATH, VT42), cap: 7168, payloads: [] },
   ];
 
   for (const c of CASES) {
@@ -309,28 +315,29 @@ describe("adversarial reviewer prompt", () => {
   const SINGLE_PASS_BASELINE = readFileSync(join(import.meta.dir, "reviewer-single-pass.golden.txt"), "utf8");
 
   test("active prompt fans out skeptics and emits confidence; inactive prompt is still the single pass", () => {
-    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true ? VT42A : VT42, true);
     expect(active).toContain("skeptic");
     expect(active).toContain("Agent tool");
     expect(active).toContain("Super-truth pass");
     // REVIEW-APPROVE always carries confidence (#62); REVIEW-FINDINGS only
     // when the super-truth pass ran (#59's unchanged behavior).
-    expect(active).toContain("REVIEW-APPROVE: confidence=<0-100>");
-    expect(active).toContain("REVIEW-FINDINGS: confidence=<0-100>");
+    expect(active).toContain('"confidence": <0-100>'); // the verdict evidence hint (#62 via #323)
+    expect(active).toContain('"skepticVerdictPaths"');
+    expect(active).toContain("<<<SKEPTIC-1-BRIEF"); // #265: briefs are composed, not improvised
 
-    const inactive = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false);
-    expect(inactive).not.toContain("skeptic");
+    const inactive = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false ? VT42A : VT42, false);
     expect(inactive).not.toContain("Super-truth");
-    // The single pass still carries REVIEW-APPROVE's confidence (#62 is
-    // unconditional there) but never REVIEW-FINDINGS'.
-    expect(inactive).toContain("REVIEW-APPROVE: confidence=<0-100>");
-    expect(inactive).not.toContain("REVIEW-FINDINGS: confidence=");
+    expect(inactive).not.toContain("SKEPTIC-1-BRIEF");
+    // The single pass still demands confidence (#62 is unconditional there) --
+    // on the verdict's evidence field since #323 -- but never the fan-out table.
+    expect(inactive).toContain('"confidence": <0-100>');
+    expect(inactive).not.toContain("k=3: 3 UPHELD");
     // default arg: omitting the flag is the single pass.
-    expect(reviewerPrompt(REVIEWER_INPUT, INPUT_PATH)).toBe(inactive);
+    expect(reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, VT42)).toBe(inactive);
   });
 
   test("inactive prompt is byte-identical to the pinned single-pass baseline", () => {
-    expect(reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, false)).toBe(SINGLE_PASS_BASELINE);
+    expect(reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, VT42, false)).toBe(SINGLE_PASS_BASELINE);
     // And the active prompt is the single pass PLUS exactly the super-truth
     // block, REVIEW-FINDINGS' confidence token, and (#191) each marker's
     // skeptics=<k>/3 denominator -- REVIEW-APPROVE's confidence (present in
@@ -343,11 +350,12 @@ describe("adversarial reviewer prompt", () => {
     // shared section between this block and the exit contract, so the bound moved
     // to that one -- ending at "## Exit contract" would now strip the foreground
     // rule the single pass also carries.
-    const active = reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, true);
+    const active = reviewerPrompt(REVIEWER_INPUT, GOLDEN_INPUT_PATH, VT42A, true);
     const stripped = active
       .replace(/\n## Super-truth pass[\s\S]*?(?=\n## Verification runs in the FOREGROUND)/, "")
-      .replaceAll("skeptics=<k>/3 ", "")
-      .replace("REVIEW-FINDINGS: confidence=<0-100> ", "REVIEW-FINDINGS: ");
+      // #323: the two branch-variant phrases in the Result-meanings closer.
+      .replace("read it off the super-truth table above", "self-assessed on this single pass")
+      .replace(", including a skeptic fan-out so broken you cannot judge the diff at all (name what happened in notes)", "");
     expect(stripped).toBe(SINGLE_PASS_BASELINE);
   });
 
@@ -360,16 +368,16 @@ describe("adversarial reviewer prompt", () => {
   // reading was "end the turn and see", which is the very failure. The mandatory
   // denominator (this test's other half) is unchanged.
   test("the super-truth block still demands the denominator and forbids replacements", () => {
-    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true ? VT42A : VT42, true);
     expect(active).toContain("Do not spawn replacements");
     // #318: the polling instruction is GONE, not merely counterweighted. Its
     // presence alongside the new text would leave the failing reading available.
     expect(active).not.toContain("AT MOST ONCE per skeptic");
     expect(active).not.toContain("Delivery is BEST-EFFORT");
-    // Both markers carry the denominator, so a starved review is legible on
-    // either path.
-    expect(active).toContain("REVIEW-APPROVE: confidence=<0-100> skeptics=<k>/3");
-    expect(active).toContain("REVIEW-FINDINGS: confidence=<0-100> skeptics=<k>/3");
+    // The denominator is COUNTED off skeptic verdict files (#266 via #323); the
+    // prompt demands the honest paths list on every branch of the review.
+    expect(active).toContain('"skepticVerdictPaths"');
+    expect(active).toContain("ONLY the skeptic verdict files that exist");
   });
 
   // #318 AC2: collection happens INSIDE the reviewer's own turn, and the mechanism
@@ -380,7 +388,7 @@ describe("adversarial reviewer prompt", () => {
   // #191's block; they were following it, because "check for outstanding verdicts"
   // has no in-turn implementation once the spawn is backgrounded.
   test("skeptic collection is in-turn, and names the flag that makes it so (#318)", () => {
-    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true ? VT42A : VT42, true);
     expect(active).toContain("COLLECT THEM INSIDE THIS TURN");
     expect(active).toContain("`run_in_background: false`");
     // Spawned together, so in-turn does not mean serialized.
@@ -394,15 +402,15 @@ describe("adversarial reviewer prompt", () => {
   // which still emits a marker. Without a sanctioned way to say "I have fewer than
   // three", the reviewer invents the unsanctioned one -- silence.
   test("the degraded-collection path is named and still exits with a marker (#318)", () => {
-    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
-    expect(active).toContain("DEGRADED COLLECTION");
-    expect(active).toContain("never a reason to withhold a marker");
-    // k >= 1: report the honest tally and let the quorum gate (#191) decide.
-    expect(active).toContain("the quorum gate's call downstream, not yours");
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true ? VT42A : VT42, true);
+    expect(active).toContain("ONLY the skeptic verdict files that exist");
+    expect(active).toContain("0-3 of them; list none that you cannot read");
+    // k >= 1: the honest short list; the quorum gate (#191) decides downstream,
+    // counting files itself.
     // k = 0: either an honest single-read verdict, or a CONFUSED that NAMES the
     // collection failure -- both are markers.
-    expect(active).toContain("CONFUSED: skeptic collection failed --");
-    expect(active).toContain("A final message with no marker is not.");
+    expect(active).toContain("a skeptic fan-out so broken you cannot judge the diff at all");
+    expect(active).toContain("a missing file is not");
   });
 
   // #318 AC1: "wait for notifications" must not survive anywhere as an available
@@ -411,19 +419,19 @@ describe("adversarial reviewer prompt", () => {
   // checkout under a path containing any asserted word would fail this spuriously
   // (#207). The block is sliced out by its own headings first.
   test("no phrasing in the super-truth block permits ending the turn to await skeptics (#318)", () => {
-    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true ? VT42A : VT42, true);
     const block = active.slice(
       active.indexOf("## Super-truth pass"),
       active.indexOf("## Verification runs in the FOREGROUND")
     );
     expect(block.length).toBeGreaterThan(500); // the slice found the block, not ""
     expect(block).toContain("You therefore never wait for a skeptic");
-    expect(block).toContain("no notification is coming");
+    expect(block).toContain("a tally you write cannot vouch for a file that is not there");
     expect(block).toContain('do not end your turn to "wait"');
     // The observed loop-17 closing sentences, as the negative example the block
     // now rules out by name.
     expect(block).toContain("await completion notifications");
-    expect(block).toContain("they are how this ticket gets thrown away");
+    expect(block).toContain("all three thrown away with green, committed work");
   });
 
   // #318 AC1 + AC4: the exit marker is UNCONDITIONAL, on every stage, and that
@@ -432,34 +440,32 @@ describe("adversarial reviewer prompt", () => {
   // exits in the corpus span builder, QA and reviewer alike.
   test("every stage prompt states the marker is unconditional on every path (#318)", () => {
     const prompts: [string, string][] = [
-      ["builder", builderPrompt(BUILDER_INPUT, INPUT_PATH)],
-      ["qa", qaPrompt(QA_INPUT, INPUT_PATH)],
-      ["reviewer (single)", reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false)],
-      ["reviewer (adversarial)", reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true)],
-      ["merge", mergePrompt(MERGE_INPUT, INPUT_PATH)],
+      ["builder", builderPrompt(BUILDER_INPUT, INPUT_PATH, VT42)],
+      ["qa", qaPrompt(QA_INPUT, INPUT_PATH, VT42)],
+      ["reviewer (single)", reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false ? VT42A : VT42, false)],
+      ["reviewer (adversarial)", reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true ? VT42A : VT42, true)],
+      ["merge", mergePrompt(MERGE_INPUT, INPUT_PATH, VT42)],
     ];
     for (const [stage, p] of prompts) {
-      expect(p, stage).toContain("EXACTLY ONE MARKER, ON EVERY PATH OUT OF THIS STAGE");
-      expect(p, stage).toContain("There is no path out of this stage that ends without one");
-      // "I cannot reach a verdict" gets a sanctioned way to be said, or it gets
-      // said by saying nothing.
-      expect(p, stage).toContain("If you are unable to reach a verdict, that IS the verdict");
-      expect(p, stage).toContain("Ending your turn silent is not the careful choice");
-      // It closes the prompt, after the marker list it is talking about.
-      expect(p.indexOf("EXACTLY ONE MARKER"), stage).toBeGreaterThan(p.indexOf("## Exit contract"));
+      // #323: the unconditional rule survives inside verdictInstructions -- a
+      // file on every path out, with the honest result, never silence.
+      expect(p, stage).toContain("There is no path out of this stage that ends without this file");
+      expect(p, stage).toContain("write the file with the honest result");
+      expect(p, stage).toContain("a missing file is not");
+      expect(p.indexOf("There is no path out of this stage"), stage).toBeGreaterThan(p.indexOf("## Exit contract"));
     }
   });
 
   test("the k -> confidence mapping is an enumerated table, not a formula", () => {
-    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true ? VT42A : VT42, true);
     expect(active).toContain("do no arithmetic");
     // Every reachable (k, unrefuted) pair is spelled out, so the reviewer never
     // computes 100*u/k in prose (PRINCIPLES.md, latent vs deterministic).
-    expect(active).toContain("k=3: 3 unrefuted -> 100, 2 -> 67, 1 -> 33, 0 -> 0");
-    expect(active).toContain("k=2: 2 unrefuted -> 100, 1 -> 50, 0 -> 0");
-    expect(active).toContain("k=1: 1 unrefuted -> 100, 0 -> 0");
+    expect(active).toContain("k=3: 3 UPHELD -> 100, 2 -> 67, 1 -> 33, 0 -> 0");
+    expect(active).toContain("k=2: 2 UPHELD -> 100, 1 -> 50, 0 -> 0");
+    expect(active).toContain("k=1: 1 UPHELD -> 100, 0 -> 0");
     // The k=0 case is the one that used to merge on a fabricated 100.
-    expect(active).toContain("skeptics=0/3");
+    expect(active).toContain("k=0: nobody looked");
     expect(active).toContain("never 100");
   });
 
@@ -472,28 +478,30 @@ describe("adversarial reviewer prompt", () => {
   // super-truth block to hide the marker reminder in.
   test("the reviewer carries the foreground rule on both branches", () => {
     for (const adversarial of [false, true]) {
-      const p = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, adversarial);
+      const p = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, adversarial ? VT42A : VT42, adversarial);
       expect(p).toContain("Verification runs in the FOREGROUND");
       expect(p).toContain("Never background a gate and end your turn waiting on it");
-      expect(p).toContain("Ending your turn with a background job still pending is parsed as CONFUSED");
+      expect(p).toContain("Ending your turn with a background job still pending and no verdict file written is read as a dead stage");
       // The reviewer's wait is usually a sub-agent, not a test run.
       expect(p).toContain("a sub-agent included");
       // It lands before the markers it is talking about.
-      expect(p.indexOf("Verification runs in the FOREGROUND")).toBeLessThan(p.indexOf("## Exit contract"));
+      // lastIndexOf: an adversarial prompt embeds each skeptic BRIEF's own exit
+      // contract before the reviewer's; the reviewer's is the final one.
+      expect(p.indexOf("Verification runs in the FOREGROUND")).toBeLessThan(p.lastIndexOf("## Exit contract"));
     }
     // ...and the skeptic wait is named outright where the fan-out is described.
     // #318 moved this from "not an exception to the marker rule" to "not a thing
     // that can happen", since the fan-out is now collected in-turn.
-    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true ? VT42A : VT42, true);
     expect(active).toContain("You therefore never wait for a skeptic");
   });
 
   // The denominator is adversarial-only: with no fan-out there is no k, and
   // demanding one would invite an invented number.
   test("the single pass demands no denominator", () => {
-    const inactive = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false);
-    expect(inactive).not.toContain("skeptics=");
-    expect(inactive).not.toContain("DEGRADED COLLECTION");
+    const inactive = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false ? VT42A : VT42, false);
+    expect(inactive).not.toContain("k=3:");
+    expect(inactive).not.toContain("<<<SKEPTIC");
     expect(inactive).not.toContain("run_in_background");
   });
 });
@@ -509,11 +517,11 @@ describe("spawn tag stamp (#190)", () => {
   const TAG = "zs-a1b2c3d4e5f6";
   const STAMP = `<!-- ${SPAWN_TAG_MARKER} ${TAG} (orchestrator bookkeeping; ignore) -->\n`;
   const STAGES: [string, (tag?: string) => string][] = [
-    ["builder", (t) => builderPrompt(BUILDER_INPUT, INPUT_PATH, t)],
-    ["qa", (t) => qaPrompt(QA_INPUT, INPUT_PATH, t)],
-    ["reviewer (single pass)", (t) => reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false, t)],
-    ["reviewer (adversarial)", (t) => reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true, t)],
-    ["merge", (t) => mergePrompt(MERGE_INPUT, INPUT_PATH, t)],
+    ["builder", (t) => builderPrompt(BUILDER_INPUT, INPUT_PATH, VT42, t)],
+    ["qa", (t) => qaPrompt(QA_INPUT, INPUT_PATH, VT42, t)],
+    ["reviewer (single pass)", (t) => reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false ? VT42A : VT42, false, t)],
+    ["reviewer (adversarial)", (t) => reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true ? VT42A : VT42, true, t)],
+    ["merge", (t) => mergePrompt(MERGE_INPUT, INPUT_PATH, VT42, t)],
   ];
 
   for (const [name, build] of STAGES) {
@@ -541,7 +549,7 @@ describe("spawn tag stamp (#190)", () => {
   // constructor cannot enforce the value's shape, but it must not be the place
   // that composes a readable one -- it stamps exactly what it is handed.
   test("the reviewer's stamp carries only the opaque tag it was handed", () => {
-    const tagged = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true, TAG);
+    const tagged = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true ? VT42A : VT42, true, TAG);
     const stamp = tagged.split("\n")[0];
     expect(stamp).toBe(STAMP.trimEnd());
     for (const leak of ["attempt", "t42", "/reviewer/"]) expect(stamp).not.toContain(leak);
@@ -552,7 +560,7 @@ describe("spawn tag stamp (#190)", () => {
 
 describe("builder prompt", () => {
   test("points at the ticket file, carries worktree discipline, ponytail, and the exit contract", () => {
-    const p = builderPrompt(BUILDER_INPUT, INPUT_PATH);
+    const p = builderPrompt(BUILDER_INPUT, INPUT_PATH, VT42);
     expect(p).toContain('#42: "Add CSV export"');
     // Pointer prompt: the body is read from the input file, not inlined.
     expect(p).not.toContain(BUILDER_INPUT.ticketBody);
@@ -566,13 +574,14 @@ describe("builder prompt", () => {
     // re-discovering the same paths with fresh glob/grep.
     expect(p).toContain("If the ticket has a `## Files` section, it is the map");
     expect(p).toContain("implementation + gate tests + evals");
-    expect(p).toContain("BUILT:");
-    expect(p).toContain("NEEDS-INPUT:");
+    expect(p).toContain('"BUILT"');
+    expect(p).toContain('"NEEDS-INPUT"');
+    expect(p).toContain("verdict written"); // #323: one-line final message
     expect(p).toContain("never ask a question");
   });
 
   test("QA bounce points at qaNotes and (from the 2nd bounce) demands /investigate; review bounce points at reviewNotes", () => {
-    const p1 = builderPrompt({ ...BUILDER_INPUT, qaNotes: "1) header row missing" }, INPUT_PATH);
+    const p1 = builderPrompt({ ...BUILDER_INPUT, qaNotes: "1) header row missing" }, INPUT_PATH, VT42);
     // The findings themselves live in the input file (payload-independent), so
     // the section names the field + path rather than inlining the note text.
     expect(p1).toContain("QA findings from the previous pass");
@@ -580,9 +589,9 @@ describe("builder prompt", () => {
     expect(p1).toContain(INPUT_PATH);
     expect(p1).not.toContain("1) header row missing");
     expect(p1).not.toContain("/investigate");
-    const p2 = builderPrompt({ ...BUILDER_INPUT, qaNotes: "1) header row missing", investigateFirst: true }, INPUT_PATH);
+    const p2 = builderPrompt({ ...BUILDER_INPUT, qaNotes: "1) header row missing", investigateFirst: true }, INPUT_PATH, VT42);
     expect(p2).toContain("/investigate");
-    const pr = builderPrompt({ ...BUILDER_INPUT, reviewNotes: "1) AC weakened" }, INPUT_PATH);
+    const pr = builderPrompt({ ...BUILDER_INPUT, reviewNotes: "1) AC weakened" }, INPUT_PATH, VT42);
     expect(pr).toContain("Reviewer findings");
     expect(pr).toContain("`reviewNotes`");
     expect(pr).not.toContain("1) AC weakened");
@@ -592,20 +601,20 @@ describe("builder prompt", () => {
   // work may already exist, uncommitted, in the worktree -- a rebuild from scratch
   // is the wrong move -- and that BUILT is verified, so the same slip loops.
   test("the commit re-spawn points at commitNotes and says commit, do not rebuild", () => {
-    const p = builderPrompt({ ...BUILDER_INPUT, commitNotes: "uncommitted work: 3 uncommitted path(s)" }, INPUT_PATH);
+    const p = builderPrompt({ ...BUILDER_INPUT, commitNotes: "uncommitted work: 3 uncommitted path(s)" }, INPUT_PATH, VT42);
     expect(p).toContain("`commitNotes`");
     expect(p).toContain(INPUT_PATH);
     expect(p).not.toContain("3 uncommitted path(s)"); // payload lives in the input file
     expect(p).toContain("COMMIT whatever is already there");
     expect(p).toContain("git status");
     // Absent on every other spawn, so a first-pass builder prompt is unchanged.
-    expect(builderPrompt(BUILDER_INPUT, INPUT_PATH)).not.toContain("commitNotes");
+    expect(builderPrompt(BUILDER_INPUT, INPUT_PATH, VT42)).not.toContain("commitNotes");
   });
 
   // The exit contract itself has to state what BUILT is checked against, or the
   // guard is a surprise the builder learns by being re-spawned.
   test("the BUILT marker states the clean-tree + moved-HEAD requirement", () => {
-    const p = builderPrompt(BUILDER_INPUT, INPUT_PATH);
+    const p = builderPrompt(BUILDER_INPUT, INPUT_PATH, VT42);
     expect(p).toContain("git status --porcelain` empty");
     expect(p).toContain(`HEAD off ${BUILDER_INPUT.baseBranch}`);
   });
@@ -615,11 +624,11 @@ describe("builder prompt", () => {
   // agent exactly one message by design, so nothing could ever wake it. The
   // prompt told it to run the gauntlet and never said the run must FINISH first.
   test("AC1: the builder is told verification runs in the foreground and a pending job is CONFUSED", () => {
-    const p = builderPrompt(BUILDER_INPUT, INPUT_PATH);
+    const p = builderPrompt(BUILDER_INPUT, INPUT_PATH, VT42);
     expect(p).toContain("FOREGROUND");
     expect(p).toContain("Never background a gate and end your turn waiting on it");
-    expect(p).toContain("Ending your turn with a background job still pending is parsed as CONFUSED");
-    expect(p).toContain("skips this ticket");
+    expect(p).toContain("Ending your turn with a background job still pending and no verdict file written is read as a dead stage");
+    expect(p).toContain("your judgment of it is lost");
   });
 
   // #209 AC5. The re-spawned agent must be told the prior attempt's work is
@@ -627,7 +636,7 @@ describe("builder prompt", () => {
   // forward as trusted would defeat the fresh-agent guarantee, and dropping it
   // silently is the waste the re-spawn exists to prevent.
   test("AC5: the dead-worker re-spawn hands over unverified work and the keep/fix/drop call", () => {
-    const p = builderPrompt({ ...BUILDER_INPUT, respawnNotes: "predecessor died silent" }, INPUT_PATH);
+    const p = builderPrompt({ ...BUILDER_INPUT, respawnNotes: "predecessor died silent" }, INPUT_PATH, VT42);
     expect(p).toContain("died without reporting");
     expect(p).toContain("`respawnNotes`");
     expect(p).toContain(INPUT_PATH);
@@ -636,7 +645,7 @@ describe("builder prompt", () => {
     expect(p).toContain("whether to keep, fix, or drop them");
     expect(p).toContain("That call is yours");
     // Absent on every other spawn, so a first-pass builder prompt is unchanged.
-    expect(builderPrompt(BUILDER_INPUT, INPUT_PATH)).not.toContain("respawnNotes");
+    expect(builderPrompt(BUILDER_INPUT, INPUT_PATH, VT42)).not.toContain("respawnNotes");
     // And it is not the #177 commit re-spawn, which tells the builder to KEEP and
     // commit what is there -- a different predecessor and a different judgment.
     expect(p).not.toContain("COMMIT whatever is already there");
@@ -647,12 +656,13 @@ describe("builder prompt", () => {
 
 describe("qa prompt", () => {
   test("functional + technical checks, pass number, ticket-file pointer, exit contract", () => {
-    const p = qaPrompt(QA_INPUT, INPUT_PATH);
+    const p = qaPrompt(QA_INPUT, INPUT_PATH, VT42);
     expect(p).toContain("QA pass 1");
     expect(p).toContain("Functional");
     expect(p).toContain("Technical");
-    expect(p).toContain("QA-PASS:");
-    expect(p).toContain("QA-BUGS:");
+    expect(p).toContain('"QA-PASS"');
+    expect(p).toContain('"QA-BUGS"');
+    expect(p).toContain("verdict written"); // #323
     // Pointer prompt: the body is read from the input file, not inlined.
     expect(p).not.toContain(QA_INPUT.ticketBody);
     expect(p).toContain(INPUT_PATH);
@@ -661,18 +671,18 @@ describe("qa prompt", () => {
   });
 
   test("web targets are told to drive gstack /qa", () => {
-    expect(qaPrompt({ ...QA_INPUT, webTarget: true }, INPUT_PATH)).toContain("gstack /qa");
+    expect(qaPrompt({ ...QA_INPUT, webTarget: true }, INPUT_PATH, VT42)).toContain("gstack /qa");
   });
 
   // #209: QA runs the same gauntlet, so it carries the same foreground rule and
   // the same re-spawn briefing (a QA agent that did leave uncommitted changes
   // left exactly the same unverified state a fresh one must judge).
   test("QA carries the foreground rule, and a re-spawn briefing when it is one", () => {
-    const p = qaPrompt(QA_INPUT, INPUT_PATH);
+    const p = qaPrompt(QA_INPUT, INPUT_PATH, VT42);
     expect(p).toContain("FOREGROUND");
-    expect(p).toContain("Ending your turn with a background job still pending is parsed as CONFUSED");
+    expect(p).toContain("Ending your turn with a background job still pending and no verdict file written is read as a dead stage");
     expect(p).not.toContain("respawnNotes");
-    const r = qaPrompt({ ...QA_INPUT, respawnNotes: "predecessor died silent" }, INPUT_PATH);
+    const r = qaPrompt({ ...QA_INPUT, respawnNotes: "predecessor died silent" }, INPUT_PATH, VT42);
     expect(r).toContain("`respawnNotes`");
     expect(r).toContain("UNCOMMITTED and UNVERIFIED");
     expect(r).not.toContain("predecessor died silent");
@@ -683,12 +693,12 @@ describe("qa prompt", () => {
 
 describe("merge prompt", () => {
   test("plain merge: PR steps, conflict gauntlet, no branch deletion mid-batch, input pointer", () => {
-    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH, VT42);
     expect(p).toContain("gh pr create --base main");
     expect(p).toContain("re-run Step 0's claim command AND Step 1's gate command exactly as written"); // the conflict path re-claims AND re-gates
 
     expect(p).toContain("Never pass --delete-branch");
-    expect(p).toContain("MERGED:");
+    expect(p).toContain('"MERGED"');
     expect(p).toContain(INPUT_PATH); // AC1: every stage references its input file
     expect(p).not.toContain("Stacked chain");
   });
@@ -696,7 +706,7 @@ describe("merge prompt", () => {
   // #178: the merge agent must never judge green vs red -- the loop's own gate
   // does, and its exit code is the merge permission.
   test("the green gate is the loop's: the prompt hands the agent a command and an exit code, not a judgment", () => {
-    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH, VT42);
     expect(p).toMatch(/never decide green vs red/i);
     expect(p).toContain("merge-gate"); // the loop-owned CLI, by absolute pack path
     expect(p).toContain(resolve(MERGE_INPUT.worktreePath)); // ...against an ABSOLUTE worktree (QA finding 5)
@@ -711,7 +721,7 @@ describe("merge prompt", () => {
   // ran nothing and merged on an unverifiable claim. The gate command is now an
   // unconditional Step 0 and the prompt states no verdict as fact.
   test("the gate is an UNCONDITIONAL step 0, ahead of the numbered steps, with no claim that it already passed", () => {
-    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH, VT42);
     const gateIdx = p.indexOf("merge-gate");
     expect(gateIdx).toBeGreaterThan(-1);
     expect(gateIdx).toBeLessThan(p.indexOf("## Steps")); // before every numbered step, including the merge
@@ -736,7 +746,7 @@ describe("merge prompt", () => {
   // toContain(worktreePath) could never catch it -- the relative path is a
   // substring of the absolute one.
   test("the gate command's worktree argument is ABSOLUTE, so it runs from any cwd", () => {
-    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH, VT42);
     const arg = p.match(/merge-gate '([^']+)'/)![1];
     expect(isAbsolute(arg)).toBe(true);
     expect(arg).toBe(resolve(MERGE_INPUT.worktreePath));
@@ -753,7 +763,7 @@ describe("merge prompt", () => {
   // the agent had since changed.
   test("with a statePath the gate command STAMPS, so a post-conflict re-run is on the record", () => {
     const statePath = join("loop", "state.json");
-    const p = mergePrompt({ ...MERGE_INPUT, statePath }, INPUT_PATH);
+    const p = mergePrompt({ ...MERGE_INPUT, statePath }, INPUT_PATH, VT42);
     expect(p).toContain(`--state '${resolve(statePath)}' --ticket 42`);
     // Step 2 sends the agent back to the very same command, stamp included.
     expect(p).toMatch(/re-run Step 0's claim command AND Step 1's gate command exactly as written/);
@@ -761,7 +771,7 @@ describe("merge prompt", () => {
   });
 
   test("without a statePath the gate is still run, just unstamped -- the exit code still gates", () => {
-    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH, VT42);
     expect(p).toContain("merge-gate");
     expect(p).not.toContain("--state");
     // Scoped to the GATE command line, not the whole prompt: the Step 0 version
@@ -778,7 +788,7 @@ describe("merge prompt", () => {
   // has to be a commit on the branch before the PR is opened. These pin the
   // three properties that makes true.
   test("the version claim is Step 0, ahead of the gate and of every numbered step", () => {
-    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH, VT42);
     const claimIdx = p.indexOf("## Step 0 -- claim this PR's version slot");
     expect(claimIdx).toBeGreaterThan(-1);
     // Before the gate: the claim COMMITS to the branch, so a gate run ahead of
@@ -789,7 +799,7 @@ describe("merge prompt", () => {
   });
 
   test("the claim command names the version CLI by absolute pack path, with every argument quoted inertly", () => {
-    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH, VT42);
     const cli = p.match(/bun '([^']*version\.ts)' claim/)![1];
     expect(isAbsolute(cli)).toBe(true);
     expect(cli).toBe(join(REPO_ROOT, "lib", "version.ts"));
@@ -801,7 +811,7 @@ describe("merge prompt", () => {
   // The number is deterministic space; the prose is not. The prompt must hand
   // the agent exactly one job (the entry) and forbid the other (the version).
   test("the agent writes the CHANGELOG prose and NOTHING else -- the number is refused to it explicitly", () => {
-    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH, VT42);
     expect(p).toMatch(/The NUMBER is not yours to pick/);
     expect(p).toMatch(/that prose is the ONLY part of this step that is yours/);
     expect(p).toMatch(/Never edit VERSION, package\.json or a CHANGELOG heading yourself, and never type a version number anywhere/);
@@ -812,7 +822,7 @@ describe("merge prompt", () => {
   // untracked file in the tree the gate measures is noise the claim would then
   // have to avoid staging.
   test("the entry and title files live beside the stage input, never inside the worktree", () => {
-    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH, VT42);
     const entry = p.match(/--entry-file '([^']+)'/)![1];
     const title = p.match(/--title-out '([^']+)'/)![1];
     for (const f of [entry, title]) {
@@ -828,21 +838,21 @@ describe("merge prompt", () => {
   // the prompt must read the file rather than interpolate a title the
   // orchestrator computed before any slot existed.
   test("gh pr create reads the title from the file the claim wrote, not from a retyped string", () => {
-    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH, VT42);
     const titlePath = p.match(/--title-out '([^']+)'/)![1];
     expect(p).toContain(`gh pr create --base main --head ${MERGE_INPUT.branch} --title "$(cat '${titlePath}')"`);
     expect(p).toMatch(/do not retype it/);
   });
 
   test("a conflict resolution re-runs the CLAIM before the gate, and keeps both CHANGELOG sections", () => {
-    const p = mergePrompt(MERGE_INPUT, INPUT_PATH);
+    const p = mergePrompt(MERGE_INPUT, INPUT_PATH, VT42);
     expect(p).toMatch(/re-run Step 0's claim command AND Step 1's gate command exactly as written, in that order/);
     expect(p).toMatch(/the base VERSION just moved/);
     expect(p).toMatch(/a CHANGELOG conflict resolves by KEEPING BOTH sections, newest version on top/);
   });
 
   test("stacked chain: parent first, no deletion, retarget, delete last", () => {
-    const p = mergePrompt({ ...MERGE_INPUT, stackedOn: [40, 41] }, INPUT_PATH);
+    const p = mergePrompt({ ...MERGE_INPUT, stackedOn: [40, 41] }, INPUT_PATH, VT42);
     expect(p).toContain("Stacked chain");
     expect(p).toContain("#40, #41");
     expect(p).toContain("WITHOUT deleting its branch");
@@ -856,11 +866,11 @@ describe("merge prompt", () => {
   // needs no conflict to do so. Without this, a child merges carrying a slot it
   // claimed before its parent was on the base: a version going backwards.
   test("a stacked child re-claims after the retarget, not only after a conflict", () => {
-    const p = mergePrompt({ ...MERGE_INPUT, stackedOn: [40] }, INPUT_PATH);
+    const p = mergePrompt({ ...MERGE_INPUT, stackedOn: [40] }, INPUT_PATH, VT42);
     expect(p).toMatch(/A parent landing MOVES main's VERSION/);
     expect(p).toMatch(/after the last retarget re-run Step 0's claim command and then Step 1's gate/);
     // Only on the stacked branch -- an unstacked merge has no parent to wait on.
-    expect(mergePrompt(MERGE_INPUT, INPUT_PATH)).not.toMatch(/A parent landing MOVES/);
+    expect(mergePrompt(MERGE_INPUT, INPUT_PATH, VT42)).not.toMatch(/A parent landing MOVES/);
   });
 
   // -- fix 1: PR-title shell injection ---------------------------------------
@@ -876,7 +886,7 @@ describe("merge prompt", () => {
 
   test("a shell-metachar PR title is quoted inertly, never as an injectable double-quoted string", () => {
     const evil = "Fix $(rm -rf ~) and `whoami` in O'Brien's parser";
-    const p = mergePrompt({ ...MERGE_INPUT, prTitle: evil }, INPUT_PATH);
+    const p = mergePrompt({ ...MERGE_INPUT, prTitle: evil }, INPUT_PATH, VT42);
     // The title appears only inside the single-quoted literal shSingleQuote built.
     expect(p).toContain(`--title ${shSingleQuote(evil)}`);
     // ...and NOT via JSON.stringify, whose double quotes let bash expand $()/backticks.
@@ -884,39 +894,35 @@ describe("merge prompt", () => {
   });
 });
 
-// -- exit-contract hardening (#307 AC7) ---------------------------------------
+// -- exit-contract hardening (#307 AC7, superseded by #323) --------------------
 
 // Loop 16 lost 3 of 3 tickets to a marker that was present and correctly spelled
-// but not on line 1. lib/loop.ts now reads a trailing marker, and this is the
-// other half: the contract restated as a RULE with the exact failing shape as a
-// worked negative example, because the positive template alone was demonstrably
-// not sticky enough for haiku. All four stages carry it -- one exit contract, no
-// stage where the rule is weaker -- which is why
-// tests/reviewer-single-pass.golden.txt was regenerated in this commit.
-describe("marker position rule (#307)", () => {
-  const CASES: { stage: string; marker: string; prompt: string }[] = [
-    { stage: "builder", marker: "BUILT", prompt: builderPrompt(BUILDER_INPUT, INPUT_PATH) },
-    { stage: "qa", marker: "QA-PASS", prompt: qaPrompt(QA_INPUT, INPUT_PATH) },
-    { stage: "reviewer", marker: "REVIEW-APPROVE", prompt: reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false) },
-    { stage: "reviewer (adversarial)", marker: "REVIEW-APPROVE", prompt: reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true) },
-    { stage: "merge", marker: "MERGED", prompt: mergePrompt(MERGE_INPUT, INPUT_PATH) },
+// but not on line 1 (#307), and loop 17 to markerless waiting exits (#318). The
+// verdict-file contract (#323) deletes the position problem outright -- a file
+// has no line 1 to miss -- and keeps the existence rule: every path out of a
+// stage writes the file, with the honest result, never silence. These cases pin
+// that the contract text every stage renders carries its own verdict path, the
+// exact envelope, and its stage's result union.
+describe("verdict exit contract (#323, was #307's marker rule)", () => {
+  const CASES: { stage: string; result: string; vpath: string; prompt: string }[] = [
+    { stage: "builder", result: "BUILT", vpath: VT42.path, prompt: builderPrompt(BUILDER_INPUT, INPUT_PATH, VT42) },
+    { stage: "qa", result: "QA-PASS", vpath: VT42.path, prompt: qaPrompt(QA_INPUT, INPUT_PATH, VT42) },
+    { stage: "reviewer", result: "REVIEW-APPROVE", vpath: VT42.path, prompt: reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false ? VT42A : VT42, false) },
+    { stage: "reviewer (adversarial)", result: "REVIEW-APPROVE", vpath: VT42A.path, prompt: reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true ? VT42A : VT42, true) },
+    { stage: "merge", result: "MERGED", vpath: VT42.path, prompt: mergePrompt(MERGE_INPUT, INPUT_PATH, VT42) },
   ];
 
   for (const c of CASES) {
-    test(`${c.stage}: the first-line rule is stated with its own marker as the negative example`, () => {
-      expect(c.prompt).toContain("POSITION IS PART OF THE CONTRACT");
-      expect(c.prompt).toContain("the marker is line 1, column 1");
-      // The negative example names THIS stage's success marker, so the shape the
-      // stage would actually have gotten wrong is the one it is shown.
-      expect(c.prompt).toContain(`A summary followed by \`${c.marker}: ...\` is a FAILURE`);
-      expect(c.prompt).toContain('no "Perfect!"'); // the literal opener #207 and #192 both used
-      // It closes the prompt: the last instructions read before the agent acts.
-      // #318 appended the unconditional-marker paragraph to this same block, so
-      // the closer moved one paragraph down -- position and existence are two
-      // halves of one exit contract and are stated together, in that order.
-      expect(c.prompt.indexOf("POSITION IS PART OF THE CONTRACT")).toBeGreaterThan(c.prompt.indexOf("## Exit contract"));
-      expect(c.prompt.indexOf("EXACTLY ONE MARKER")).toBeGreaterThan(c.prompt.indexOf("POSITION IS PART OF THE CONTRACT"));
-      expect(c.prompt.trimEnd().endsWith("it throws away everything this stage just did.")).toBe(true);
+    test(`${c.stage}: the contract names its verdict file, envelope, and result union`, () => {
+      expect(c.prompt).toContain("Your verdict is a FILE, not prose");
+      expect(c.prompt).toContain(c.vpath); // the exact file this spawn must write
+      expect(c.prompt).toContain(`"${c.result}"`); // its stage's union, quoted verbatim
+      expect(c.prompt).toContain('"runId": "run-20260101-000000-aaaa"'); // envelope carries the spawn identity
+      // Existence is still unconditional (#318's surviving half)...
+      expect(c.prompt).toContain("There is no path out of this stage that ends without this file");
+      // ...and prose is explicitly inert -- #312's forgery route, closed by contract.
+      expect(c.prompt).toContain("Nothing you print in prose is read by the loop");
+      expect(c.prompt).toContain("verdict written");
     });
   }
 
@@ -927,9 +933,9 @@ describe("marker position rule (#307)", () => {
   // gauntlet.
   test("the foreground rule prices the wait against each stage's own watchdog budget", () => {
     const budgets: [string, string, number][] = [
-      ["builder", builderPrompt(BUILDER_INPUT, INPUT_PATH), DEFAULT_STAGE_WATCHDOG_MINUTES.builder],
-      ["qa", qaPrompt(QA_INPUT, INPUT_PATH), DEFAULT_STAGE_WATCHDOG_MINUTES.qa],
-      ["reviewer", reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false), DEFAULT_STAGE_WATCHDOG_MINUTES.reviewer],
+      ["builder", builderPrompt(BUILDER_INPUT, INPUT_PATH, VT42), DEFAULT_STAGE_WATCHDOG_MINUTES.builder],
+      ["qa", qaPrompt(QA_INPUT, INPUT_PATH, VT42), DEFAULT_STAGE_WATCHDOG_MINUTES.qa],
+      ["reviewer", reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false ? VT42A : VT42, false), DEFAULT_STAGE_WATCHDOG_MINUTES.reviewer],
     ];
     for (const [, prompt, minutes] of budgets) {
       expect(prompt).toContain("Waiting is affordable");
@@ -941,11 +947,11 @@ describe("marker position rule (#307)", () => {
     // Each stage gets ITS number, not a shared one: a builder told 15 or a QA
     // agent told 25 is being priced against a budget it does not have.
     expect(DEFAULT_STAGE_WATCHDOG_MINUTES.builder).not.toBe(DEFAULT_STAGE_WATCHDOG_MINUTES.qa);
-    expect(builderPrompt(BUILDER_INPUT, INPUT_PATH)).not.toContain(
+    expect(builderPrompt(BUILDER_INPUT, INPUT_PATH, VT42)).not.toContain(
       `against the ${DEFAULT_STAGE_WATCHDOG_MINUTES.qa} minutes of silence`
     );
     // Merge runs no gauntlet, so it carries neither the rule nor a budget.
-    expect(mergePrompt(MERGE_INPUT, INPUT_PATH)).not.toContain("Waiting is affordable");
+    expect(mergePrompt(MERGE_INPUT, INPUT_PATH, VT42)).not.toContain("Waiting is affordable");
   });
 });
 
@@ -1008,18 +1014,22 @@ describe("stage-prompts CLI", () => {
   afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
   const SP = join(REPO_ROOT, "lib", "stage-prompts.ts");
+  // #323: every `prompt` invocation names its verdict target; adversarial
+  // reviewer calls additionally pass the three skeptic dirs.
+  const VFLAGS = ["--verdict-path", "/tmp/t42/verdict.json", "--run", "run-20260101-000000-aaaa", "--ticket", "42", "--attempt", "1"];
+  const SKFLAGS = ["--skeptic-dirs", JSON.stringify(["/tmp/s1", "/tmp/s2", "/tmp/s3"])];
   const run = (...args: string[]) => Bun.spawnSync(["bun", SP, ...args], { stdout: "pipe", stderr: "pipe" });
 
   test("prompt reviewer builds from an input file; a leaky input file fails loudly", () => {
     const ok = join(dir, "reviewer.json");
     writeFileSync(ok, JSON.stringify(REVIEWER_INPUT));
-    const proc = run("prompt", "reviewer", ok);
+    const proc = run("prompt", "reviewer", ok, ...VFLAGS);
     expect(proc.exitCode).toBe(0);
     expect(proc.stdout.toString()).toContain("ADVERSARIAL REVIEWER");
 
     const leaky = join(dir, "leaky.json");
     writeFileSync(leaky, JSON.stringify({ ...REVIEWER_INPUT, builderTranscript: "..." }));
-    const bad = run("prompt", "reviewer", leaky);
+    const bad = run("prompt", "reviewer", leaky, ...VFLAGS);
     expect(bad.exitCode).toBe(1);
     expect(bad.stderr.toString()).toContain("blinded by design");
   });
@@ -1033,39 +1043,39 @@ describe("stage-prompts CLI", () => {
     const ok = join(dir, "reviewer-cli.json");
     writeFileSync(ok, JSON.stringify(REVIEWER_INPUT));
 
-    const always = run("prompt", "reviewer", ok, "--adversarial-mode", "always");
+    const always = run("prompt", "reviewer", ok, "--adversarial-mode", "always", ...VFLAGS, ...SKFLAGS);
     expect(always.exitCode).toBe(0);
-    expect(always.stdout.toString()).toContain("skeptic");
-    expect(always.stdout.toString()).toContain("confidence=");
+    expect(always.stdout.toString()).toContain("SKEPTIC-1-BRIEF");
+    expect(always.stdout.toString()).toContain('"confidence": <0-100>');
 
-    const labelled = run("prompt", "reviewer", ok, "--adversarial-mode", "non-trivial", "--labels", '["security"]');
+    const labelled = run("prompt", "reviewer", ok, "--adversarial-mode", "non-trivial", "--labels", '["security"]', ...VFLAGS, ...SKFLAGS);
     expect(labelled.exitCode).toBe(0);
-    expect(labelled.stdout.toString()).toContain("skeptic");
-    expect(labelled.stdout.toString()).toContain("confidence=");
+    expect(labelled.stdout.toString()).toContain("SKEPTIC-1-BRIEF");
+    expect(labelled.stdout.toString()).toContain('"confidence": <0-100>');
 
     // No flags: default non-trivial, 1-line diff, no labels -> single pass.
-    const plain = run("prompt", "reviewer", ok);
+    const plain = run("prompt", "reviewer", ok, ...VFLAGS);
     expect(plain.exitCode).toBe(0);
-    expect(plain.stdout.toString()).not.toContain("skeptic");
-    // REVIEW-APPROVE still carries confidence unconditionally (#62); only the
-    // super-truth fan-out and REVIEW-FINDINGS' confidence are adversarial-gated.
-    expect(plain.stdout.toString()).toContain("REVIEW-APPROVE: confidence=<0-100>");
-    expect(plain.stdout.toString()).not.toContain("REVIEW-FINDINGS: confidence=");
+    expect(plain.stdout.toString()).not.toContain("Super-truth");
+    // The approve contract still demands confidence unconditionally (#62), on
+    // the verdict evidence field since #323; only the fan-out is gated.
+    expect(plain.stdout.toString()).toContain('"confidence": <0-100>');
+    expect(plain.stdout.toString()).not.toContain("SKEPTIC-1-BRIEF");
 
     // off never fans out, even with a trigger label present.
-    const off = run("prompt", "reviewer", ok, "--adversarial-mode", "off", "--labels", '["security"]');
+    const off = run("prompt", "reviewer", ok, "--adversarial-mode", "off", "--labels", '["security"]', ...VFLAGS);
     expect(off.exitCode).toBe(0);
-    expect(off.stdout.toString()).not.toContain("skeptic");
+    expect(off.stdout.toString()).not.toContain("Super-truth");
 
     // A bad mode is rejected loudly, before any prompt is printed.
-    const badMode = run("prompt", "reviewer", ok, "--adversarial-mode", "sometimes");
+    const badMode = run("prompt", "reviewer", ok, "--adversarial-mode", "sometimes", ...VFLAGS);
     expect(badMode.exitCode).toBe(1);
     expect(badMode.stderr.toString()).toContain("adversarial-mode");
 
     // A leaky file still fails with the blindness error even under active flags.
     const leaky = join(dir, "leaky-cli.json");
     writeFileSync(leaky, JSON.stringify({ ...REVIEWER_INPUT, prDescription: "trust me" }));
-    const bad = run("prompt", "reviewer", leaky, "--adversarial-mode", "always");
+    const bad = run("prompt", "reviewer", leaky, "--adversarial-mode", "always", ...VFLAGS, ...SKFLAGS);
     expect(bad.exitCode).toBe(1);
     expect(bad.stderr.toString()).toContain("blinded by design");
   });
@@ -1085,11 +1095,11 @@ describe("stage-prompts CLI", () => {
       const file = join(dir, `spawn-${stage}.json`);
       writeFileSync(file, JSON.stringify(input));
 
-      const tagged = run("prompt", stage, file, "--spawn-tag", TAG);
+      const tagged = run("prompt", stage, file, "--spawn-tag", TAG, ...VFLAGS, ...(stage === "reviewer" ? SKFLAGS : []));
       expect(tagged.exitCode).toBe(0);
       expect(tagged.stdout.toString().split("\n")[0]).toContain(`${SPAWN_TAG_MARKER} ${TAG}`);
 
-      const plain = run("prompt", stage, file);
+      const plain = run("prompt", stage, file, ...VFLAGS, ...(stage === "reviewer" ? SKFLAGS : []));
       expect(plain.exitCode).toBe(0);
       expect(plain.stdout.toString()).not.toContain(SPAWN_TAG_MARKER);
       // The stamp is additive: strip the first line and the two agree byte for
@@ -1103,7 +1113,7 @@ describe("stage-prompts CLI", () => {
   test("--spawn-tag does not weaken the reviewer's blindness gate", () => {
     const leaky = join(dir, "leaky-spawn.json");
     writeFileSync(leaky, JSON.stringify({ ...REVIEWER_INPUT, planRationale: "because" }));
-    const bad = run("prompt", "reviewer", leaky, "--spawn-tag", "zs-000102030405");
+    const bad = run("prompt", "reviewer", leaky, "--spawn-tag", "zs-000102030405", ...VFLAGS);
     expect(bad.exitCode).toBe(1);
     expect(bad.stderr.toString()).toContain("blinded by design");
   });
@@ -1118,6 +1128,10 @@ describe("spawnStub", () => {
   const dir = mkdtempSync(join(tmpdir(), "zstack-stub-test-"));
   afterAll(() => rmSync(dir, { recursive: true, force: true }));
   const SP = join(REPO_ROOT, "lib", "stage-prompts.ts");
+  // #323: every `prompt` invocation names its verdict target; adversarial
+  // reviewer calls additionally pass the three skeptic dirs.
+  const VFLAGS = ["--verdict-path", "/tmp/t42/verdict.json", "--run", "run-20260101-000000-aaaa", "--ticket", "42", "--attempt", "1"];
+  const SKFLAGS = ["--skeptic-dirs", JSON.stringify(["/tmp/s1", "/tmp/s2", "/tmp/s3"])];
   const run = (...args: string[]) => Bun.spawnSync(["bun", SP, ...args], { stdout: "pipe", stderr: "pipe" });
 
   test("stub length is invariant to the prompt file's size", () => {

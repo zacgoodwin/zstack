@@ -148,7 +148,7 @@ That removes the retained ones and nothing else. `reconcile scan` lists them und
 
 ## A ticket I already merged came back as Ready, and its rebuild failed on an existing branch
 
-`gh pr merge` returning success and the loop recording its `MERGED:` marker are two
+`gh pr merge` returning success and the loop recording its `MERGED` verdict are two
 steps. A crash between them leaves a lane lock on a ticket whose code is already on
 `main` and whose board status is still Review — and Review is an in-flight status, so
 reconcile used to release it, prune it, and park it back to **Ready** to be rebuilt.
@@ -176,116 +176,51 @@ silently discard the commits the crashed lane had already made.
 
 ## A ticket was Skipped but its branch carries a finished, committed, green diff
 
-The stage did the work and reported it in the wrong shape. The exit contract asks
-every stage to OPEN its final message with its marker; a stage that wrote a prose
-acceptance-criteria summary and closed with `BUILT:` or `QA-PASS:` as the LAST line
-used to parse as CONFUSED, which skips the ticket — after the stage had spent its
-whole budget. Loop 16 lost three tickets that way, all three with the work already
-done.
+Since #323 a stage reports by writing ONE file — `verdict.json` in its run-scoped
+artifact directory (`runs/<runId>/t<N>/<stage>-<attempt>/`) — and `loop outcome`
+validates that file against the spawn the loop itself made. Nothing in the
+stage's prose is ever read, so the whole marker-position family that used to
+land here (#307's trailing `BUILT:`, loop 17's "waiting for skeptic
+notifications" exits, quoted markers, two-marker contradictions — each once its
+own bullet in this section) is gone as a CLASS: a stage that did the work but
+reported it in the wrong shape now has exactly one wrong shape available, a
+missing or invalid verdict file, and that routes to RECOVERY, not a blind skip
+— one re-spawn of the same stage with the same inputs, then the #209 salvage
+inspection of the worktree.
 
-What the loop does now: the first line is read first, as always; when it is not a
-marker, the whole message is scanned for markers of that stage on a line of their own
-and the **last** one is the verdict, wherever it sits. So the trailing-marker shape
-lands as `BUILT` / `QA-PASS` and the lane advances. The note carries the prose on
-**both** sides of the marker, so QA's repro steps and a reviewer's `file:line`
-findings reach the rebuilding builder whichever side they were written on.
+So a Skip with finished work on the branch now means the recovery budget was
+spent too: the stage (and its one re-spawn) both ended without a usable
+verdict. The skip comment carries `loop outcome`'s reason
+(`{"invalidVerdict":"…"}` — a missing file, malformed JSON, a mis-addressed
+envelope, a result outside the stage's union, or a pasted `<placeholder>`).
 
-Measured over this repo's own retained transcripts, that rescues 132 of 507 real
-stage messages — 135 carry a marker off line 1, less the 3 mid-message `MERGED`s
-the stricter rule below still refuses — and changes no other verdict.
-
-Four cases deliberately still skip:
-
-- **No marker anywhere.** The stage did not finish (the classic shape is an agent
-  that backgrounded `bun test` and ended its turn to await a notification nobody
-  will send). Skip note: `ended without a recognized exit marker (…)`.
-
-  **The reviewer variant of this is the most expensive one, and it looks like a
-  success.** An adversarial reviewer spawns its three skeptics, completes its own
-  verification, writes an accurate summary saying every criterion holds — and then
-  closes on a sentence about waiting. The real ones, from loop 17:
-
-  > Three skeptic agents are now running in the background … **Waiting for skeptic
-  > completion notifications.**
-
-  …and, on a different ticket and a different attempt:
-
-  > Now I'm awaiting skeptic verdicts. I've pinged all three once per stage
-  > instructions. **Let me wait briefly for responses before finalizing.**
-
-  Both tickets were Skipped with green, committed, QA-passed work on the branch,
-  and every skeptic then reported minutes later into a lane that had already
-  closed — two of them carrying real defects nobody ever read. The tell is the
-  closing sentence: the message ends mid-collection rather than mid-work, so the
-  ticket looks reviewed and is not. Search a suspect transcript for `waiting`,
-  `awaiting`, or `notification` near its end.
-
-  Why it happened: sub-agents spawn in the background by default, and a background
-  sub-agent's only delivery channel is a notification **between** turns — a channel
-  a stage agent does not have, since the loop sends it exactly one message by
-  design. So "wait for the verdicts" had no in-turn implementation, and ending the
-  turn was the only way to act on it. The reviewer prompt now spawns the fan-out
-  synchronously so the verdicts arrive as results inside the same turn, gives a
-  named degraded exit for skeptics that do not return, and states the marker as
-  unconditional on every path (#318).
-
-  Recovery is the same as any markerless skip, and the work is almost always
-  salvageable: read the branch (`git log`, `git diff main...z/ticket-<N>`), confirm
-  the tree is clean and the suite green, then move the ticket back to Review and
-  let the next loop re-spawn a reviewer on it. Do **not** move it to Done on the
-  strength of the summary — that summary is the reviewer's own single read, and the
-  skeptic pass it describes never landed.
-- **Only QUOTED markers.** Skip note: `only QUOTED its exit markers (…)`. A marker
-  inside a fenced code block, or one whose payload is still the contract's own
-  `<placeholder>` (`BUILT: <one-line summary>`), is the stage echoing its
-  instructions, not reporting. Read the transcript and move the ticket by hand.
-- **Two different markers of that stage.** The stage reported two verdicts and
-  nothing can say which it meant. Skip note:
-  `reported 2 different exit markers (…), so no single verdict can be read`. This
-  applies even when one of them is on line 1 — a `REVIEW-APPROVE` followed by a
-  `REVIEW-FINDINGS` must not ship the diff its own next line calls defective. Fix it
-  by hand; do not guess.
-- **A `MERGED` that is neither the first nor the closing line.** Skip note:
-  `mentioned MERGED on a line of its own but did not CLOSE with it`. `MERGED` is the
-  only marker held to that stricter rule, because it is terminal — it sets the ticket
-  Done, and batch cleanup then deletes the branch — and nothing re-reads the PR
-  state. Check the PR yourself: if it really did land, move the ticket to Done by
-  hand; if it did not, return the ticket to Ready.
-
-Two things that are **not** markers, so they never rescue a ticket: a marker inside a
-sentence (`I will report BUILT: once the suite finishes` — it has to start its own
-line), and, below line 1, an **indented** marker. A line-1 marker is still accepted
-indented; the scan below it is not.
-
-The one shape that will read as a verdict when you might not want it to: a
-fully-formed marker line at column 0 sitting in prose that disowns it. Zero
-occurrences in this repo's corpus, against the 80 real tickets that refusing it
-outright would cost, so it is accepted on purpose — but each verdict that could do
-damage has a mechanism behind it. `BUILT` is re-verified against the lane worktree,
-`REVIEW-APPROVE` is scored off its own marker line only (so a number in prose or in a
-quoted diff cannot vouch for it, and a bare approve scores null and will not merge),
-and `MERGED` is restricted to the first or closing line.
-
-`QA-PASS` is the exception, deliberately: it keeps the loose rule, and a false pass is
-bounded only by the blinded reviewer and the merge gate's own suite run downstream.
-The known hazard is a QA agent **echoing** a marker line out of the ticket's own
-Acceptance Criteria — and this repo files tickets that contain them. If a lane
-advanced past QA and you cannot find evidence the criteria were exercised, read that
-stage's transcript first.
-
-For the first case, recover it exactly as the dead-worker section below describes. For
-the others, read the stage's transcript
-(`~/.zstack/projects/<slug>/loop/runs/<runId>/t<N>/` — the runId is in that
+Recovery by hand: read the branch (`git log`, `git diff main...z/ticket-<N>`)
+and the stage's artifacts under
+`~/.zstack/projects/<slug>/loop/runs/<runId>/t<N>/` (the runId is in that
 drain's `state.json`, or the archived copy inside the run directory itself; a
-pre-#322 drain used `loop/transcripts/ticket-<N>/`), decide what the stage
-actually concluded, and move the ticket by hand.
+pre-#322 drain used `loop/transcripts/ticket-<N>/`). If the tree is clean and
+the suite green, move the ticket back to the stage's status (Review for a
+reviewer that never reported; QA for a QA agent) and let the next loop re-spawn
+that stage. Do **not** move it to Done on the strength of a prose summary in
+the transcript — a summary is not a verdict, which is the entire contract.
+
+One hazard this contract closed outright (#312): a QA agent echoing a
+`QA-PASS:`-shaped line out of the ticket's own Acceptance Criteria used to be
+read as a pass. An echo in prose is now inert; a verdict exists only as a
+deliberately written file, validated against the spawn's own
+runId/ticket/stage/attempt. A stage can still deliberately write a FALSE
+verdict — that is bounded the same way it always was: a `BUILT` is re-verified
+against the worktree's git facts, reviewer quorum is counted off the skeptic
+verdict files on disk (never the reviewer's own tally), and the merge gate
+re-runs the suite itself before anything lands.
 
 ## A ticket was Skipped with a dead-worker note but its worktree has real uncommitted changes
 
-The stage agent died without emitting an exit marker. That parses as CONFUSED,
-which skips the ticket — the right answer when the agent could not do the job, the
-wrong one when it simply never said it did (a builder that backgrounds its own test
-run and stops to wait for it is the case that started this).
+The stage agent died without writing its verdict file — or returned one `loop
+outcome` refused (both are the same state to the loop: budget spent, no usable
+report). The right answer when the agent could not do the job, the wrong one
+when it simply never said it did (a builder that backgrounds its own test run
+and stops to wait for it is the case that started this).
 
 What the loop does now: the dead-worker probe collects the lane worktree's
 `git status --porcelain --branch`, and a lane whose worker died holding uncommitted

@@ -73,8 +73,8 @@ bun -e "import {readFileSync,writeFileSync} from 'node:fs';
 
 # 3. Build BOTH prompts via the CLI (the constructor is the contract). off = the
 #    single pass; always = the super-truth fan-out. Same input file, no key added.
-bun "$REPO/lib/stage-prompts.ts" prompt reviewer "$OUT/input.json" --adversarial-mode off    > "$OUT/single.txt"
-bun "$REPO/lib/stage-prompts.ts" prompt reviewer "$OUT/input.json" --adversarial-mode always  > "$OUT/adversarial.txt"
+bun "$REPO/lib/stage-prompts.ts" prompt reviewer "$OUT/input.json" --adversarial-mode off --verdict-path "$OUT/verdict.json" --run run-20260101-000000-aaaa --ticket 151 --attempt 1 --skeptic-dirs '["/tmp/sk1","/tmp/sk2","/tmp/sk3"]' > "$OUT/single.txt"
+bun "$REPO/lib/stage-prompts.ts" prompt reviewer "$OUT/input.json" --adversarial-mode always --verdict-path "$OUT/verdict.json" --run run-20260101-000000-aaaa --ticket 151 --attempt 1 --skeptic-dirs '["/tmp/sk1","/tmp/sk2","/tmp/sk3"]' > "$OUT/adversarial.txt"
 
 for i in $(seq 1 "$RUNS"); do
   # 4. Drive each prompt through a fresh live Agent (local Claude Code). The

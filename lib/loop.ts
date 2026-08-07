@@ -7,7 +7,7 @@
 // scheduling or transition decision in prose. No Date.now() outside the CLI
 // edge; every pure function takes nowMs.
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { atomicWrite, handleCliError, parseFlags, readJson, str } from "./cli.ts";
 import {
   BOARD_STATUSES,
@@ -49,6 +49,7 @@ import { validateWatchdogMinutes } from "./config-schema.ts";
 // this file only through stage-prompts.ts's `import type { Stage }`, which is
 // erased, so there is no import cycle at run time.
 import { isRunId, mintRunId, readAgentMetas, subagentsDirFor, subtreeActivityMs, spawnTag, type AgentMeta } from "./transcripts.ts";
+import { quorumFromDisk, readVerdict, type QuorumFromDisk, type StageVerdict } from "./verdict.ts";
 
 // -- ticket states ------------------------------------------------------------
 
@@ -482,42 +483,10 @@ export type StageOutcome =
   | { kind: "confused"; note: string }
   | { kind: "merged"; note: string };
 
-// Confidence token off a REVIEW-APPROVE marker note: `confidence=NN` where NN
-// is 0-100 (issue #62's safety gate). `\d{1,3}` matched at a FIXED position
-// right after the literal "confidence=" backtracks over 3/2/1 digits, so the
-// trailing `(?!\d)` rejects every length at that position when a 4th digit
-// follows -- `confidence=1000` has no match, not a truncated 100. A missing
-// token or a value outside 0-100 both return null; the caller (the gate)
-// decides what null means, never a parse-time throw on user-authored prose.
-export function parseReviewerConfidence(note: string): number | null {
-  const m = note.match(/\bconfidence=(\d{1,3})(?!\d)/i);
-  if (!m) return null;
-  const n = Number(m[1]);
-  return n >= 0 && n <= 100 ? n : null;
-}
-
-// Skeptic-delivery denominator off a reviewer marker note: `skeptics=<k>/<of>`
-// (issue #191), the number of skeptic verdicts the reviewer actually held out of
-// the 3 it spawned. The confidence token alone cannot express this and hides the
-// exact case that made #62's gate unsafe: ONE skeptic reporting "cannot refute"
-// aggregates to confidence=100, clears the default floor of 70, and merges as
-// though three independent reviews agreed. The denominator is the missing fact.
-//
-// Absent token -> null, which the gate reads as "this review had no fan-out" and
-// never blocks on (a single-pass prompt emits no `skeptics=`, by design). Same
-// no-throw contract as parseReviewerConfidence: these are model-authored prose,
-// so an unparseable value is a decision for the gate, not a crash. `of` is
-// carried rather than assumed 3 so a future skeptic count needs no reparse; a
-// received count above `of` is incoherent (nobody delivered 4 of 3) and reads as
-// null rather than being clamped into a pass.
-export function parseSkepticQuorum(note: string): { received: number; of: number } | null {
-  const m = note.match(/\bskeptics=(\d{1,2})\/(\d{1,2})(?!\d)/i);
-  if (!m) return null;
-  const received = Number(m[1]);
-  const of = Number(m[2]);
-  if (of < 1 || received > of) return null;
-  return { received, of };
-}
+// The confidence and skeptic-quorum numbers ride the reviewer verdict's typed
+// evidence fields since #323 (outcomeFromVerdict below); the regex token
+// parsers that bounded them inside untrusted prose (#62, #191) deleted with
+// the marker scanner they served.
 
 // The three git facts a BUILT claim is checked against (#177), read from the
 // lane's OWN worktree by the orchestrator (z-loop/SKILL.md collects them).
@@ -661,418 +630,66 @@ export function builtGuardFailure(facts: BuilderCommitFacts): string | null {
   );
 }
 
-// The machine-parsed exit contract every stage prompt ends with
-// (lib/stage-prompts.ts). Marker -> outcome, per stage; a final message that
-// carries none of its stage's markers on a line of its own is CONFUSED by
-// definition -- the no-token-burn rule turns unparseable output into a skip,
-// never a retry loop.
-// Each entry takes the full `note` (human-facing text, both sides of the marker)
-// and `rest` -- the marker's OWN payload, the remainder of the marker line.
+// -- verdict -> outcome (#323, epic #321 contract C2) --------------------------
 //
-// They are separate arguments because #62's confidence floor and #191's skeptic
-// quorum are gates, and each of their two tokens has a SAFE direction to read
-// from. Scoring both off the whole note let a bare `REVIEW-APPROVE:` be vouched
-// for by a `confidence=100` written anywhere else in the message -- including
-// inside a fenced diff hunk the reviewer merely quoted, i.e. text the BUILDER
-// wrote. So:
+// The stage's report is a FILE (lib/verdict.ts), never prose. This mapping is
+// the whole surviving surface of what used to be a 400-line marker scanner
+// (the final-message parser, its fence tracker, and the token-position
+// discipline for confidence= and skeptics=): a validated verdict maps 1:1 onto the same
+// StageOutcome union every reducer already speaks, and every number rides a
+// typed field instead of a regex over untrusted prose.
 //
-//   confidence -- `rest` ONLY. A number found anywhere else can only INFLATE the
-//     score, so a number the reviewer did not attach to its verdict is refused.
-//     Absent means null, which resolveOutcome already treats as a truth-check
-//     failure, so refusing fails CLOSED.
-//   skeptics   -- `rest` first, else anywhere in the note. A denominator can only
-//     ever BLOCK (a null never blocks; #191's floor blocks on a low `k`), so
-//     reading a wider net is the pessimistic direction. An honest "only 1 of 3
-//     reported" in the prose still stops the merge, and a quoted `3/3` cannot
-//     override a real `1/3` on the marker line, because the marker line is read
-//     first.
+// An INVALID verdict never reaches this function. The caller (the `outcome`
+// CLI) routes it to the dead-stage machinery -- one respawn with the same
+// inputs, then the #209 salvage inspection -- because a stage that returned
+// without a usable verdict is indistinguishable from one that died: both spent
+// the budget and left no report. The old parser's CONFUSED-on-unparseable skip
+// is gone with the parser; #312's forgery (a QA agent echoing `QA-PASS` out of
+// the ticket's own Acceptance Criteria) is inert because an echo in prose is
+// not a file.
 //
-// Measured over every retained reviewer message in this repo: 82 approves put
-// `confidence=` on the marker line and 0 put it only elsewhere; 8 put `skeptics=`
-// on the marker line and 0 put it only elsewhere. So this costs nothing real in
-// either direction -- it only removes the ways a gate could be fooled.
-//
-// `MERGED` takes `rest`, not the note, for a different reason: the orchestrator
-// writes a merge lane's note into the completion note's PR-URL slot, and a rescued
-// mid-message marker would put model-authored multi-line prose there. Its own
-// payload IS the URL.
-interface MarkerEvidence {
-  note: string; // human-facing text for the outcome
-  rest: string; // the winning marker line's own payload
-  markerLines: string[]; // every accepted line of the winning marker, payload only
-  unquoted: string; // the message with fenced regions dropped
-}
-const MARKERS: Record<Stage, Record<string, (ev: MarkerEvidence) => StageOutcome>> = {
-  builder: {
-    "BUILT": () => ({ kind: "built" }),
-    "NEEDS-INPUT": (ev) => ({ kind: "needs-input", note: ev.note }),
-    "BLOCKED": (ev) => ({ kind: "stage-blocked", note: ev.note }),
-    "CONFUSED": (ev) => ({ kind: "confused", note: ev.note }),
-  },
-  qa: {
-    "QA-PASS": () => ({ kind: "qa-pass" }),
-    "QA-BUGS": (ev) => ({ kind: "qa-bugs", note: ev.note }),
-    "NEEDS-HUMAN": (ev) => ({ kind: "human-question", note: ev.note }),
-    "BLOCKED": (ev) => ({ kind: "stage-blocked", note: ev.note }),
-    "CONFUSED": (ev) => ({ kind: "confused", note: ev.note }),
-  },
-  reviewer: {
-    "REVIEW-APPROVE": (ev) => ({
-      kind: "review-approve",
-      confidence: lowestConfidence(ev.markerLines),
-      // The LOWER of the two sources, not the marker's if present: `??` would have
-      // let a marker-line `3/3` hide a `1/3` the reviewer disclosed in its prose,
-      // which is the value the quorum floor exists to see.
-      skeptics: lowerQuorum(
-        pessimisticSkepticQuorum(ev.markerLines.join("\n")),
-        pessimisticSkepticQuorum(ev.unquoted)
-      ),
-    }),
-    "REVIEW-FINDINGS": (ev) => ({ kind: "review-findings", note: ev.note }),
-    "NEEDS-HUMAN": (ev) => ({ kind: "human-question", note: ev.note }),
-    "BLOCKED": (ev) => ({ kind: "stage-blocked", note: ev.note }),
-    "CONFUSED": (ev) => ({ kind: "confused", note: ev.note }),
-  },
-  merge: {
-    // `rest` is the URL, but fall back to the note when the payload is empty: an
-    // agent that writes `MERGED:` and puts the URL on the NEXT line would otherwise
-    // complete the ticket with an empty prUrl.
-    "MERGED": (ev) => ({ kind: "merged", note: ev.rest.trim() || ev.note }),
-    "NEEDS-HUMAN": (ev) => ({ kind: "human-question", note: ev.note }),
-    "BLOCKED": (ev) => ({ kind: "stage-blocked", note: ev.note }),
-    "CONFUSED": (ev) => ({ kind: "confused", note: ev.note }),
-  },
-};
-
-// Markers the SCAN will only accept on the closing line -- the message's last
-// non-empty line -- rather than anywhere. The line-1 fast path is untouched.
-//
-// The test is damage, not position: a verdict with no downstream re-check that is
-// also TERMINAL earns the stricter rule. `MERGED` is the only one. It sets the
-// ticket Done and pushes it into mergedThisRun (which the end-of-loop ship reads,
-// and after which batch cleanup deletes the branch), and nothing re-reads the PR
-// state -- so a merge agent that narrates a red gate and mentions the PR it WOULD
-// have opened could mark a ticket Done over an unmerged branch. Cost, measured
-// over the retained corpus: 3 real messages put MERGED mid-message against 5 that
-// close with it. Losing 3 rescues means a human sees a merged PR next to a Skipped
-// ticket, which is loud and recoverable; the false Done is silent.
-//
-// `qa-pass` deliberately stays unrestricted (17 real mid-message occurrences, and
-// a false pass still has to clear the blinded reviewer and then the merge gate's
-// own suite run). `review-approve` needs no position rule now that its score is
-// read off the marker line: a bare approve scores null, which the truth-check
-// gate already refuses to merge on.
-const CLOSING_LINE_ONLY: Partial<Record<Stage, ReadonlySet<string>>> = {
-  merge: new Set(["MERGED"]),
-};
-
-// A marker line: an ALL-CAPS token (hyphens allowed) then a colon, at the very
-// start of the line. The #307 scan below applies it to the line with only
-// TRAILING whitespace stripped, so a LEADING indent disqualifies the line while a
-// TRAILING stray `\r` (what a `\r\r\n` payload leaves behind after the `\r?\n`
-// split) cannot silently cost a stage its verdict. The line-1 fast path trims BOTH
-// ends, unchanged since the contract shipped -- so an indented marker is still
-// accepted there and only there.
-const MARKER_LINE = /^([A-Z][A-Z-]*):\s*(.*)$/;
-
-// A fenced-code delimiter line: up to three leading spaces, then a RUN of at least
-// three backticks or tildes, then an optional info string. Markers inside a fence
-// are QUOTED, not reported (see the scan), and a fence's contents sit at COLUMN 0 --
-// so the leading-whitespace rule above does nothing about them and this is the check
-// that does.
-//
-// Three CommonMark rules are implemented, and each one is load-bearing because
-// missing it turns a quoted marker back into a live verdict:
-//   1. The run length is captured, not just the first three characters, and a fence
-//      closes only on a run of the SAME character at least as long as the opener. A
-//      plain boolean toggle is wrong on NESTED fences, which is not hypothetical: an
-//      agent documenting the exit contract writes ````markdown ... ``` ... ```` , and
-//      a toggle flips OFF at the inner delimiter.
-//   2. A CLOSING fence carries nothing but the delimiter. ```ts is an opener's info
-//      string, never a closer -- without this, "``` still inside the block" ends the
-//      fence early and exposes every marker below it.
-//   3. A backtick opener's info string may not contain a backtick (so `` `a` `` in
-//      prose is an inline code span, not a fence).
-// At most three leading spaces, per CommonMark, so a deeply indented delimiter
-// inside a block cannot change fence state.
-const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
-
-// A marker payload that OPENS with the exit contract's own placeholder, e.g.
-// `BUILT: <one-line summary>`. Anchored at the start but NOT at the end, because the
-// contract's real lines carry a trailing description on the same line
-// (`QA-PASS: <one-line evidence summary>       everything above verified green`) --
-// a full-match rule missed a verbatim paste, i.e. exactly the input it exists for.
-// A stage that pastes one line of its instructions is
-// quoting the contract, not reporting a verdict, and no real verdict is a bare
-// angle-bracket token: measured over every retained stage final message in this
-// repo (507 messages, 135 with a marker off line 1), zero real verdicts match.
-// The angle-bracket content must contain a SPACE, or be one of the contract's
-// single-word placeholders. Almost every placeholder the contract puts at the START
-// of a payload is multi-word (`<one-line summary>`, `<the PR URL>`, `<numbered
-// findings>`, `<the judgment call>`, `<what makes no sense>`), and the things a real
-// verdict legitimately opens with are single tokens: a markdown autolink
-// (`MERGED: <https://github.com/o/r/pull/7>`) or an identifier
-// (`NEEDS-HUMAN: <API_KEY> is missing`). A bare space rule discarded those --
-// refusing a landed PR, which drops the ticket out of mergedThisRun and breaks
-// stacked-chain handling -- so the space is the general test and `reason`, the one
-// single-word template, is named. tests/loop.test.ts derives the full placeholder
-// list from the four RENDERED prompts and asserts every one is excluded, so this
-// stays correct if the contract's wording ever changes.
-const PLACEHOLDER_PAYLOAD = /^<(?:[^>]*\s[^>]*|reason)>(\s|$)/;
-
-// Every `<token>=` occurrence in a text, as suffixes. parseReviewerConfidence and
-// parseSkepticQuorum each read only the FIRST token in whatever they are given, so
-// scanning for the lowest value means handing them each occurrence separately --
-// otherwise `confidence=95, corrected to confidence=40` reads 95, which is the
-// opposite of the pessimistic rule these helpers exist to implement.
-function tokenSuffixes(text: string, token: string): string[] {
-  return text.split(new RegExp(`(?=\\b${token}=)`, "i"));
-}
-
-// The pessimistic reading of every `skeptics=k/of` token: the LOWEST `k`. #191's
-// quorum floor blocks on a low denominator, so the minimum is the fail-closed
-// direction, and it is immune to a `3/3` outranking a real `1/3` whichever order
-// they appear in -- which the first-match read was not.
-function pessimisticSkepticQuorum(text: string): { received: number; of: number } | null {
-  let worst: { received: number; of: number } | null = null;
-  for (const part of tokenSuffixes(text, "skeptics")) {
-    const q = parseSkepticQuorum(part);
-    if (q && (worst === null || q.received < worst.received)) worst = q;
-  }
-  return worst;
-}
-
-// The lowest `confidence=` anywhere in the given texts, or null if none carried one.
-// Callers pass the winning marker's OWN lines, so a number elsewhere in the message
-// -- prose, or a diff hunk the reviewer pasted -- can never score the gate.
-function lowestConfidence(texts: string[]): number | null {
-  let low: number | null = null;
-  for (const t of texts) {
-    for (const part of tokenSuffixes(t, "confidence")) {
-      const c = parseReviewerConfidence(part);
-      if (c !== null && (low === null || c < low)) low = c;
+// The reviewer's quorum is COUNTED, never believed (#266/#231): `quorum` comes
+// from verdict.ts quorumFromDisk over the skeptic verdict FILES the reviewer
+// listed, so a self-reported tally cannot vouch for verdicts that are not on
+// disk, and a skeptic that reported after the reviewer returned still counts
+// because the gate reads the directory, not the reviewer's memory. Confidence
+// comes off the verdict's own evidence field; a missing or out-of-range value
+// scores null, which the #62 truth-check gate refuses to merge on -- unchanged.
+export function outcomeFromVerdict(v: StageVerdict, quorum: QuorumFromDisk | null): StageOutcome {
+  const note = (v.notes ?? "").trim() || `(${v.result} with empty notes)`;
+  switch (v.result) {
+    case "BUILT":
+      return { kind: "built" };
+    case "NEEDS-INPUT":
+      return { kind: "needs-input", note };
+    case "QA-PASS":
+      return { kind: "qa-pass" };
+    case "QA-BUGS":
+      return { kind: "qa-bugs", note };
+    case "REVIEW-APPROVE": {
+      const raw = (v.evidence as { confidence?: unknown } | undefined)?.confidence;
+      const confidence = typeof raw === "number" && Number.isFinite(raw) && raw >= 0 && raw <= 100 ? raw : null;
+      const skeptics = quorum === null ? null : { received: quorum.received, of: quorum.of };
+      return { kind: "review-approve", confidence, skeptics };
     }
-  }
-  return low;
-}
-
-// The lower of two quorum readings, either of which may be absent.
-function lowerQuorum(
-  a: { received: number; of: number } | null,
-  b: { received: number; of: number } | null
-): { received: number; of: number } | null {
-  if (!a) return b;
-  if (!b) return a;
-  return a.received <= b.received ? a : b;
-}
-
-// The note a LINE-1 marker carries: the remainder of its own line plus every line
-// after it. Unchanged since the contract shipped.
-function markerNote(lines: string[], markerIdx: number, rest: string): string {
-  return [rest, ...lines.slice(markerIdx + 1)].join("\n").trim();
-}
-
-// The note a marker found by the #307 scan carries: the remainder of its own line,
-// then every OTHER line in document order -- both the prose above it and the prose
-// below.
-//
-// Both halves are load-bearing, because the real corpus holds both shapes. The
-// dominant one (71 of the 80 mid-message cases measured) is a one-line headline,
-// then the marker, then the evidence block BELOW it; #207 and #192, the two
-// tickets that motivated this ticket, put their acceptance-criteria prose ABOVE a
-// closing marker. Keeping only one side would rescue the ticket and then discard
-// the reason -- the same loss #307 exists to close, since this note becomes
-// `qaNotes` / `reviewNotes` for the rebuilding builder, and an empty one sends a
-// fresh agent to fix bugs nobody described.
-//
-// The marker's own remainder goes FIRST. parseReviewerConfidence and
-// parseSkepticQuorum both read the FIRST `confidence=` / `skeptics=` token in the
-// note, so hoisting the marker line means a token the reviewer put ON its verdict
-// wins over any number in its surrounding prose.
-//
-// It does not make the read airtight, and the residual is WIDER here than on the
-// line-1 path, which is worth saying plainly rather than calling it unchanged. A
-// marker line carrying no token at all still scores off the prose -- that much the
-// line-1 path has always done, since a `confidence=` written BELOW a line-1 marker
-// has always landed in its note. What is new is the reach: prose ABOVE the marker
-// was previously unreadable and now vouches for it too, so
-// `<prose: confidence=95 skeptics=3/3>` + a bare `REVIEW-APPROVE:` clears both
-// #62's floor and #191's quorum on numbers the reviewer never claimed. Same
-// fail-open class, one more direction to reach it; pinned deliberately in
-// tests/loop.test.ts so it cannot drift into being an accident. Closing it means
-// scoring `rest` alone, which is a change to MARKERS.reviewer affecting BOTH
-// paths, not to this function.
-function scanMarkerNote(lines: string[], markerIdx: number, rest: string): string {
-  return [rest, ...lines.slice(0, markerIdx), ...lines.slice(markerIdx + 1)].join("\n").trim();
-}
-
-export function parseStageResult(stage: Stage, finalMessage: string): StageOutcome {
-  const lines = finalMessage.split(/\r?\n/);
-  const firstIdx = lines.findIndex((l) => l.trim() !== "");
-
-  // #307: a stage that did the work, spelled its marker correctly, and put it
-  // anywhere but line 1 used to be CONFUSED by definition -- and CONFUSED skips
-  // the ticket AFTER the stage has spent its whole budget, so the loop pays for
-  // the work and then discards it. Loop 16 lost 3 of 3 tickets that way; two of
-  // them (#207 builder, #192 QA, both haiku) closed a prose acceptance-criteria
-  // summary with `BUILT:` / `QA-PASS:` as the LAST line, work committed, suite
-  // green. A marker that is present, correctly spelled, and unambiguous is not
-  // unparseable output, so scan every line before falling back.
-  //
-  // ONE pass collects every candidate, and only then is the verdict chosen. The
-  // line-1 fast path is still preferred, but it no longer SHORT-CIRCUITS: the
-  // quoted-marker and contradiction guards below apply to it too. Skipping them
-  // there was a hole -- a line-1 `MERGED: <the PR URL>` (the contract's own
-  // template) completed a ticket, and a line-1 `REVIEW-APPROVE` shipped a diff its
-  // own next line called defective. AC3's "additive" promise is about WELL-FORMED
-  // messages, and every one of those still parses exactly as before; a message that
-  // quotes its template or reports two verdicts was never well-formed.
-  //
-  // LAST hit wins, and it does NOT have to be the closing line. That was measured,
-  // not assumed: over every retained stage final message in this repo (507 with
-  // text, 135 carrying a marker off line 1), only 55 put it on the closing line
-  // while 80 put it mid-message -- 71 of those as the SECOND non-empty line, the
-  // dominant real shape of a one-line headline, the verdict, then the evidence
-  // block. A closing-line-only rule would have skipped all 80, re-opening #307 for
-  // the majority of the very population it was filed about.
-  //
-  // What IS excluded is a marker the stage was QUOTING rather than reporting, which
-  // is the mechanism behind the fail-open worth caring about, and it is excluded by
-  // mechanism instead of by position:
-  //   - inside a fenced code block. Fence contents sit at COLUMN 0, so the
-  //     leading-whitespace rule never touched them; FENCE_LINE is what does.
-  //   - a payload that is still the contract's own `<placeholder>`, which is what a
-  //     stage pasting one line of its instructions produces.
-  // Both cost nothing on the real corpus (0 of the 80 mid-message hits sit in a
-  // fence, 0 carry a placeholder) and both close a route an agent can actually take,
-  // since every stage prompt hands it the literal marker strings.
-  //
-  // The residual, stated plainly: a stage that writes a fully-formed marker line at
-  // column 0 in the middle of prose that disowns it ("if the tests pass I will
-  // write REVIEW-APPROVE: confidence=95 ...") is still read as reporting it. That
-  // shape appears zero times in the corpus, and refusing it outright costs 80 real
-  // tickets, so it is accepted -- but only where it is bounded, and each bound is a
-  // mechanism rather than a hope:
-  //   built           re-verified against the lane worktree (builtGuardFailure).
-  //   review-approve  scored off the MARKER LINE only, so a narrated or quoted
-  //                   number cannot vouch for it; a bare approve scores null, which
-  //                   the truth-check gate refuses to merge on.
-  //   merged          CLOSING_LINE_ONLY -- terminal and never re-read, so it does
-  //                   not get the loose rule at all.
-  //   qa-pass         unbounded here BY CHOICE, and the one verdict where the
-  //                   residual is live: 17 real mid-message occurrences make the
-  //                   strict rule expensive, and a false pass still has to clear
-  //                   the blinded reviewer and then the merge gate's own suite run.
-  //                   The open hazard is a QA agent ECHOING a marker line out of the
-  //                   ticket's own Acceptance Criteria (this repo files tickets that
-  //                   contain them -- #307 does). Closing that needs the stage's
-  //                   input payload here, which this function does not have; see the
-  //                   #307 follow-up note in docs/user-guide/troubleshooting.md.
-  const hits: { idx: number; marker: string; rest: string }[] = [];
-  const unquoted: string[] = []; // fenced regions dropped, for token scanning
-  let quoted = 0;
-  // The OPEN fence's delimiter run, or null outside a fence. See FENCE_LINE for the
-  // three CommonMark rules that decide when this opens and closes.
-  let fence: string | null = null;
-  let lastNonEmpty = -1;
-  for (const [idx, line] of lines.entries()) {
-    const trimmedEnd = line.replace(/\s+$/, "");
-    if (trimmedEnd !== "") lastNonEmpty = idx;
-    const f = trimmedEnd.match(FENCE_LINE);
-    if (f) {
-      const delim = f[1]!;
-      const info = f[2]!;
-      if (fence === null) {
-        // An opener may carry an info string -- but a BACKTICK opener's info string
-        // may not contain a backtick, or `` `x` `` in prose would open a fence.
-        if (!(delim[0] === "`" && info.includes("`"))) fence = delim;
-      } else if (delim[0] === fence[0] && delim.length >= fence.length && info.trim() === "") {
-        // A closer carries the delimiter and nothing else. Without the info check,
-        // "``` still inside the block" ends the fence early and exposes every
-        // marker below it.
-        fence = null;
-      }
-      continue;
+    case "REVIEW-FINDINGS":
+      return { kind: "review-findings", note };
+    case "NEEDS-HUMAN":
+      return { kind: "human-question", note };
+    case "MERGED": {
+      const url = (v.evidence as { prUrl?: unknown } | undefined)?.prUrl;
+      return { kind: "merged", note: typeof url === "string" && url !== "" ? url : note };
     }
-    if (fence === null) unquoted.push(trimmedEnd);
-    const hit = trimmedEnd.match(MARKER_LINE);
-    if (!hit || !MARKERS[stage][hit[1]!]) continue;
-    if (fence !== null || PLACEHOLDER_PAYLOAD.test(hit[2]!.trim())) {
-      quoted++;
-      continue;
-    }
-    hits.push({ idx, marker: hit[1]!, rest: hit[2]! });
+    case "BLOCKED":
+      return { kind: "stage-blocked", note };
+    case "CONFUSED":
+      return { kind: "confused", note };
+    default:
+      // readVerdict enforces the per-stage union, so this is a caller bug
+      // (e.g. a skeptic verdict handed to the lane path), not stage output.
+      throw new ZError(`outcomeFromVerdict: result ${JSON.stringify(v.result)} has no lane outcome mapping.`);
   }
-  // A line-1 marker is matched on the FULLY trimmed line, so an indented one is
-  // still accepted there and only there -- unchanged since the contract shipped.
-  // It joins `hits` (deduped by index) so the contradiction guard can see it.
-  const firstTrimmed = firstIdx === -1 ? "" : lines[firstIdx]!.trim();
-  const fm = firstTrimmed.match(MARKER_LINE);
-  if (
-    fm &&
-    MARKERS[stage][fm[1]!] &&
-    !PLACEHOLDER_PAYLOAD.test(fm[2]!.trim()) &&
-    !hits.some((h) => h.idx === firstIdx)
-  ) {
-    hits.unshift({ idx: firstIdx, marker: fm[1]!, rest: fm[2]! });
-  } else if (fm && MARKERS[stage][fm[1]!] && PLACEHOLDER_PAYLOAD.test(fm[2]!.trim())) {
-    quoted++;
-  }
-  const distinct = [...new Set(hits.map((h) => h.marker))].sort();
-  const snippet = finalMessage.trim().slice(0, 200);
-
-  // Two DIFFERENT markers of the same stage is genuinely unparseable: the stage
-  // reported two verdicts and nothing here can say which it meant. Resolving that
-  // silently by position would be worse than the skip, so it stays CONFUSED and
-  // names both. Checked BEFORE any winner is chosen -- including before the line-1
-  // preference -- because "the first one wins" is exactly how a reviewer's
-  // REVIEW-APPROVE shipped a diff its own REVIEW-FINDINGS called defective.
-  if (distinct.length > 1) {
-    return {
-      kind: "confused",
-      note: `Stage "${stage}" reported ${distinct.length} different exit markers (${distinct.join(", ")}), so no single verdict can be read. Message began: ${JSON.stringify(snippet)}`,
-    };
-  }
-
-  // The winner: the line-1 marker when there is one (its note keeps the shipped
-  // "remainder plus every line after" shape), else the last hit.
-  const leading = hits[0]?.idx === firstIdx ? hits[0] : undefined;
-  const last = hits[hits.length - 1];
-  const winner = leading ?? last;
-  if (!winner) {
-    // fall through to the CONFUSED notes below
-  } else if (CLOSING_LINE_ONLY[stage]?.has(winner.marker) && winner.idx !== firstIdx && winner.idx !== lastNonEmpty) {
-    return {
-      kind: "confused",
-      note: `Stage "${stage}" mentioned ${winner.marker} on a line of its own but did not CLOSE with it. ${winner.marker} is terminal and nothing re-reads it, so the loop only accepts it as the first or the last line -- put it on line 1. Message began: ${JSON.stringify(snippet)}`,
-    };
-  } else {
-    return MARKERS[stage][winner.marker]!({
-      note: leading
-        ? markerNote(lines, winner.idx, winner.rest)
-        : scanMarkerNote(lines, winner.idx, winner.rest),
-      rest: winner.rest,
-      markerLines: hits.filter((h) => h.marker === winner.marker).map((h) => h.rest),
-      unquoted: unquoted.join("\n"),
-    });
-  }
-
-  // A stage whose ONLY markers were quoted ones gets told that, rather than the
-  // generic "no marker" note: the difference is what a human needs to recover the
-  // ticket, since the message does contain the marker they are about to go looking
-  // for.
-  if (quoted > 0) {
-    return {
-      kind: "confused",
-      note: `Stage "${stage}" only QUOTED its exit markers (${quoted} occurrence(s) inside a code fence or still carrying the contract's <placeholder>) and never reported one. Message began: ${JSON.stringify(snippet)}`,
-    };
-  }
-  return {
-    kind: "confused",
-    note: `Stage "${stage}" ended without a recognized exit marker (${Object.keys(MARKERS[stage]).join(", ")}). Message began: ${JSON.stringify(snippet)}`,
-  };
 }
-
 // -- actions ------------------------------------------------------------------
 
 export type Action =
@@ -2672,19 +2289,23 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
 export function recordOutcome(
   state: LoopState,
   ticket: number,
-  finalMessage: string,
+  outcome: StageOutcome,
   nowMs: number,
   git?: BuilderCommitFacts
 ): LoopState {
   const next = structuredClone(state);
   const lane = next.lanes.find((l) => l.ticket === ticket);
   if (!lane) throw new ZError(`No lane holds #${ticket} to record an outcome on.`);
-  const outcome = parseStageResult(lane.stage, finalMessage);
-  if (outcome.kind === "built" && git) {
+  // #323: the outcome arrives already mapped from a VALIDATED verdict file
+  // (outcomeFromVerdict); this reducer never sees prose. The #177 guard is
+  // unchanged -- a BUILT is still re-verified against the worktree's own git
+  // facts, whatever the verdict claimed.
+  const recorded = structuredClone(outcome);
+  if (recorded.kind === "built" && git) {
     const unverified = builtGuardFailure(git);
-    if (unverified) outcome.unverified = unverified;
+    if (unverified) recorded.unverified = unverified;
   }
-  lane.outcome = outcome;
+  lane.outcome = recorded;
   lane.lastActivityMs = nowMs;
   return next;
 }
@@ -4543,10 +4164,47 @@ export function main(argv: string[]): number {
     }
     if (cmd === "outcome") {
       const ticket = Number(positionals[1]);
-      if (!Number.isInteger(ticket) || !positionals[2]) throw new ZError("Usage: loop outcome <state.json> <ticket> <msg.txt> [--now <ms>]");
+      const verdictFile = str(flags, "verdict");
+      if (!Number.isInteger(ticket) || verdictFile === undefined) {
+        throw new ZError("Usage: loop outcome <state.json> <ticket> --verdict <verdict.json> [--now <ms>]");
+      }
       const state = readState(statePath);
-      const message = readText(positionals[2]);
-      const next = recordOutcome(state, ticket, message, nowMs, builderFactsFromFlags(state, ticket, flags));
+      const lane = state.lanes.find((l) => l.ticket === ticket);
+      if (!lane) throw new ZError(`No lane holds #${ticket} to record an outcome on.`);
+      // #323: the verdict FILE is the stage's report; prose is never read. The
+      // expected spawn identity comes from what the orchestrator itself knows --
+      // the state's runId and the lane's current stage/attempt -- so a verdict
+      // copied from another spawn's directory can never speak for this one.
+      const expect = { runId: state.runId, ticket, stage: lane.stage, attempt: stageAttempt(lane) };
+      const check = readVerdict(verdictFile, expect);
+      if (!check.ok) {
+        // Missing or INVALID = the dead-stage path, never a CONFUSED skip: the
+        // stage spent its budget and left no usable report, which is the same
+        // state as dying mid-run. Record a dead probe (with the worktree facts
+        // when the caller collected them, same as any death) so the reducer's
+        // existing respawn-once-then-salvage machinery (#209, MAX_DEAD_RESPAWNS)
+        // decides recovery. stdout says which path was taken, as JSON, so the
+        // SKILL branches on data.
+        const porcelainFlag = str(flags, "porcelain");
+        const porcelain = porcelainFlag !== undefined ? readText(porcelainFlag) : undefined;
+        const next = recordProbe(state, ticket, false, nowMs, porcelain);
+        atomicWrite(statePath, JSON.stringify(next, null, 2));
+        console.log(JSON.stringify({ invalidVerdict: check.reason }));
+        return 0;
+      }
+      // Reviewer verdicts carry their quorum COUNTED off the skeptic verdict
+      // files on disk (#266/#231) -- the run root is derived from the state
+      // file's own location, the one place the layout is anchored.
+      let quorum: QuorumFromDisk | null = null;
+      if (lane.stage === "reviewer") {
+        const listed = (check.verdict.evidence as { skepticVerdictPaths?: unknown } | undefined)?.skepticVerdictPaths;
+        if (Array.isArray(listed) && listed.length > 0) {
+          const runRoot = join(dirname(resolve(statePath)), "runs", state.runId);
+          quorum = quorumFromDisk(listed.filter((p): p is string => typeof p === "string"), runRoot, expect);
+          for (const reason of quorum.invalid) console.error(`outcome: skeptic verdict rejected -- ${reason}`);
+        }
+      }
+      const next = recordOutcome(state, ticket, outcomeFromVerdict(check.verdict, quorum), nowMs, builderFactsFromFlags(state, ticket, flags));
       atomicWrite(statePath, JSON.stringify(next, null, 2));
       console.log(JSON.stringify(next.lanes.find((l) => l.ticket === ticket)!.outcome));
       return 0;

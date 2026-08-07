@@ -22,6 +22,7 @@ import {
   type LaneState,
   type LoopState,
   type Stage,
+  type StageOutcome,
 } from "../../lib/loop.ts";
 import { completionNote, reviewerPrompt, type CompletionNoteInput } from "../../lib/stage-prompts.ts";
 import { costOfFiles, expandGlob, loadRates, ratesPath } from "../../lib/cost.ts";
@@ -61,21 +62,24 @@ interface BoardItem {
 
 // -- happy-path oracle + run derivation ---------------------------------------
 
-// The outcome every stage returns on a fully-successful run. Feeding these back
-// through recordOutcome is exactly what the orchestrator does when a stage agent
-// finishes; here they resolve instantly so the derivation is synchronous.
-export function happyOutcome(stage: Stage, ticket: number): string {
+// The outcome every stage returns on a fully-successful run. Since #323 the
+// orchestrator maps a VALIDATED verdict file onto these same StageOutcome
+// shapes (outcomeFromVerdict); feeding them back through recordOutcome is
+// exactly that path with the file I/O already done, so the derivation stays
+// synchronous and the fixture asserts the post-verdict contract.
+export function happyOutcome(stage: Stage, ticket: number): StageOutcome {
   switch (stage) {
     case "builder":
-      return "BUILT: acceptance criteria pass, tests green, committed.";
+      return { kind: "built" };
     case "qa":
-      return "QA-PASS: functional and technical checks green.";
+      return { kind: "qa-pass" };
     case "reviewer":
-      // confidence=100 clears the default 70 floor (issue #62) so the derived
-      // happy-path run still reaches Done instead of parking Blocked.
-      return "REVIEW-APPROVE: confidence=100 every criterion verified against the diff.";
+      // confidence 100 clears the default 70 floor (issue #62) so the derived
+      // happy-path run still reaches Done instead of parking Blocked; skeptics
+      // null models the single-pass review (no fan-out on the fixture board).
+      return { kind: "review-approve", confidence: 100, skeptics: null };
     case "merge":
-      return `MERGED: https://github.com/acme/fixture-app/pull/${ticket}`;
+      return { kind: "merged", note: `https://github.com/acme/fixture-app/pull/${ticket}` };
   }
 }
 
@@ -243,7 +247,7 @@ export function assertReviewerBlindness(runDir: string, ticketNumbers: number[])
       // arg (inputPath) is irrelevant to the blindness gate -- assertReviewerInput
       // runs first and only inspects the input object's keys -- so pass the
       // recorded input's own path.
-      reviewerPrompt(input as Parameters<typeof reviewerPrompt>[0], path);
+      reviewerPrompt(input as Parameters<typeof reviewerPrompt>[0], path, { path: "/tmp/verdict.json", runId: "run-20260101-000000-aaaa", ticket: n, attempt: 1 });
       checked.push(n);
     } catch (e) {
       return fail("reviewer-blindness", `reviewer input for #${n} is not blinded: ${(e as Error).message}`);

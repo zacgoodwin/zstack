@@ -30,6 +30,43 @@ import {
 // Type-only: erased at build, so this cannot introduce a runtime cycle (and
 // lib/loop.ts imports nothing from here -- it only names this module in prose).
 import type { Stage } from "./loop.ts";
+// #323: the exit contract is a verdict FILE, and its instruction text is owned
+// by the module that READS the file (lib/verdict.ts), so writer and reader can
+// never drift. verdict.ts imports nothing from here; no cycle.
+import { verdictInstructions, verdictPath, type ExpectedSpawn } from "./verdict.ts";
+
+// The spawn identity + artifact paths every constructor needs since #323: the
+// verdict file it must tell the stage to write, and the spawn coordinates that
+// go INSIDE that file's envelope. `skepticDirs` is reviewer-only -- the three
+// pre-computed skeptic artifact directories whose verdict paths the briefs
+// name (composed by the orchestrator off `transcripts dest`, never by the
+// reviewer, which is #265's enforceability).
+export interface VerdictTarget {
+  path: string; // the stage's own verdict.json (verdict.ts `path` verb)
+  runId: string;
+  ticket: number;
+  attempt: number;
+  skepticDirs?: string[];
+}
+
+// The opacity boundary (#190/#322): the runId and attempt are stamped into the
+// verdict ENVELOPE the stage copies, which unavoidably tells a reviewer its
+// attempt number. That was weighed: the blindness contract's four-key input is
+// untouched (VerdictTarget is a constructor parameter, never an input key),
+// and a verdict file that cannot name its spawn cannot be validated against
+// it -- mis-addressed verdicts were exactly how attempts collided (#210). The
+// diff/AC/ticket the reviewer judges still carry no prior-review narrative.
+function spawnFor(t: VerdictTarget, stage: "builder" | "qa" | "reviewer" | "merge" | "skeptic"): ExpectedSpawn {
+  return { runId: t.runId, ticket: t.ticket, stage, attempt: t.attempt };
+}
+
+// Wiring-bug tripwire for the stages whose input also names the ticket: a
+// VerdictTarget composed for another lane must never stamp this lane's prompt.
+function assertTicketMatch(t: VerdictTarget, ticketNumber: number): void {
+  if (t.ticket !== ticketNumber) {
+    throw new ZError(`VerdictTarget is for ticket #${t.ticket} but this prompt is for #${ticketNumber}.`);
+  }
+}
 
 // The four stages as a runtime list, for CLI validation. Kept beside the
 // type-only import so a change to the union fails typecheck here.
@@ -124,6 +161,11 @@ BLOCKED: could not read stage prompt at ${promptPath}`;
 // regenerated rather than protected. Merge is excluded: it runs `gh pr merge`,
 // not a gauntlet, and H9 already refuses to blind-skip a dead merge worker.
 //
+// (#323 note: "parsed as CONFUSED" became "read as a dead stage" above -- a
+// missing or invalid verdict file routes to the respawn-then-salvage machinery,
+// never a silent skip. The affordability sentence and the one-message design
+// are unchanged.)
+//
 // #307 added the affordability sentence, which is why this is a function of the
 // stage rather than one constant. Run 16's #286 builder backgrounded `bun test`
 // and ended its turn to await the completion notification -- the rule above told
@@ -149,7 +191,7 @@ BLOCKED: could not read stage prompt at ${promptPath}`;
 // fails no test.
 function foregroundRule(stage: Stage): string {
   return `## Verification runs in the FOREGROUND
-Every command you verify with -- the test suite, typecheck, build, anything you would cite as evidence -- must run to completion IN THE FOREGROUND before your final message. Never background a gate and end your turn waiting on it: no one will wake you (this loop sends a stage agent exactly one message, by design), so the run's result reaches nobody. The same goes for anything else you are waiting on, a sub-agent included: report what you actually hold. Ending your turn with a background job still pending is parsed as CONFUSED, the same as any final message with no marker, and CONFUSED skips this ticket -- the worst outcome available to you. Waiting is affordable: this repo's full suite runs 128-234s measured, against the ${DEFAULT_STAGE_WATCHDOG_MINUTES[stage]} minutes of silence your stage's watchdog allows by default. If a check is too slow to finish, report what you actually ran and what you did not.`;
+Every command you verify with -- the test suite, typecheck, build, anything you would cite as evidence -- must run to completion IN THE FOREGROUND before you write your verdict file. Never background a gate and end your turn waiting on it: no one will wake you (this loop sends a stage agent exactly one message, by design), so the run's result reaches nobody. The same goes for anything else you are waiting on, a sub-agent included: report what you actually hold. Ending your turn with a background job still pending and no verdict file written is read as a dead stage -- your work is inspected, but your judgment of it is lost. Waiting is affordable: this repo's full suite runs 128-234s measured, against the ${DEFAULT_STAGE_WATCHDOG_MINUTES[stage]} minutes of silence your stage's watchdog allows by default. If a check is too slow to finish, write the verdict naming what you actually ran and what you did not.`;
 }
 
 // #307, the other half. Every exit contract already said the marker must be the
@@ -183,12 +225,10 @@ Every command you verify with -- the test suite, typecheck, build, anything you 
 // precisely for the paths that went wrong, since "I have no verdict" needs a
 // sanctioned way to be said or it gets said by saying nothing. Shared by all four
 // stages -- every one of them can be mid-something when its budget runs out.
-function markerPositionRule(example: string): string {
-  return `
-POSITION IS PART OF THE CONTRACT: the marker is line 1, column 1. A summary followed by \`${example}: ...\` is a FAILURE of this contract even though the marker is spelled correctly -- line 1 is the only position the loop is guaranteed to read. Nothing precedes it: no "Perfect!", no criteria table, no code fence. Everything you want to say goes on the lines AFTER it.
-
-EXACTLY ONE MARKER, ON EVERY PATH OUT OF THIS STAGE. Not only when the work went well: whether you finished, failed, ran out of budget, or something you were counting on never arrived, your final message carries exactly one of these markers. There is no path out of this stage that ends without one, and there is no state of the work that earns you an exception. If you are unable to reach a verdict, that IS the verdict -- say it with \`BLOCKED:\` or \`CONFUSED:\` and name what stopped you. Those are real, actionable outcomes a human can pick up. Ending your turn silent is not the careful choice or the honest one: it is parsed as CONFUSED with nothing in it, and it throws away everything this stage just did.`;
-}
+// (#307/#318's markerPositionRule lived here until #323: position and
+// existence rules for a marker LINE stop mattering when the verdict is a file.
+// The every-path-out-carries-a-verdict half of that hard-won lesson survives
+// inside lib/verdict.ts's verdictInstructions, which every prompt renders.)
 
 // #209: the briefing a stage gets when it is a RE-SPAWN of a worker that died
 // without ever reporting. Its predecessor's changes are still in the worktree,
@@ -221,7 +261,8 @@ export interface BuilderPromptInput {
 // Derived from docs/user-guide/spec/WORKER SAMPLE.md (unattended discipline, exit
 // contract, anti-loophole) and PRINCIPLES.md (ponytail ladder, tests + evals +
 // docs in the same diff, latent vs deterministic).
-export function builderPrompt(i: BuilderPromptInput, inputPath: string, tag?: string): string {
+export function builderPrompt(i: BuilderPromptInput, inputPath: string, verdict: VerdictTarget, tag?: string): string {
+  assertTicketMatch(verdict, i.ticketNumber);
   const bounce = i.qaNotes
     ? `\n## QA findings from the previous pass\n\n${i.investigateFirst ? "Bugs survived a rebuild once already. Run the /investigate skill on these findings FIRST and root-cause them before changing any code -- a symptom patch here earns a third strike and blocks the ticket.\n\n" : ""}Read the findings you must address from \`qaNotes\` in ${inputPath}.\n`
     : "";
@@ -256,12 +297,9 @@ ${bounce}${review}${commit}${respawn}
 
 ${foregroundRule("builder")}
 
-## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
-BUILT: <one-line summary>            all acceptance criteria pass, tests green in the worktree, work committed on ${i.branch} -- VERIFIED before the lane advances: \`git status --porcelain\` empty AND HEAD off ${i.baseBranch}. A BUILT with work still uncommitted sends this lane straight back to you.
-NEEDS-INPUT: <the exact question>    a human decision is required; stop immediately, commit nothing half-wired
-BLOCKED: <reason>                    cannot proceed (broken dependency, failing environment) after a real attempt
-CONFUSED: <what makes no sense>      the ticket cannot be understood as written
-${markerPositionRule("BUILT")}`;
+${verdictInstructions("builder", verdict.path, spawnFor(verdict, "builder"))}
+
+Result meanings for this stage: "BUILT" = all acceptance criteria pass, tests green in the worktree, work committed on ${i.branch} -- VERIFIED before the lane advances: \`git status --porcelain\` empty AND HEAD off ${i.baseBranch}; a BUILT with work still uncommitted sends this lane straight back to you. "NEEDS-INPUT" = a human decision is required; stop immediately, commit nothing half-wired. "BLOCKED" = cannot proceed (broken dependency, failing environment) after a real attempt. "CONFUSED" = the ticket cannot be understood as written.`;
 }
 
 // -- QA -----------------------------------------------------------------------
@@ -278,7 +316,8 @@ export interface QaPromptInput {
 
 // PROCESS.md steps 11-16: functional + technical, as a fresh context that
 // distrusts the builder's own claims.
-export function qaPrompt(i: QaPromptInput, inputPath: string, tag?: string): string {
+export function qaPrompt(i: QaPromptInput, inputPath: string, verdict: VerdictTarget, tag?: string): string {
+  assertTicketMatch(verdict, i.ticketNumber);
   const web = i.webTarget
     ? "\n- This ticket has a web-facing target: use the gstack /qa skill -- spin the site up and drive it as a real user. UI claims without a driven browser check do not count as verified."
     : "";
@@ -296,13 +335,9 @@ ${respawnSection(i.respawnNotes, inputPath)}
 
 ${foregroundRule("qa")}
 
-## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
-QA-PASS: <one-line evidence summary>       everything above verified green
-QA-BUGS: <numbered findings>               each with concrete repro steps (do X, expect Y, got Z)
-NEEDS-HUMAN: <the judgment call>           a human must decide; state the question precisely
-BLOCKED: <reason>                          the worktree cannot be exercised at all
-CONFUSED: <what makes no sense>
-${markerPositionRule("QA-PASS")}`;
+${verdictInstructions("qa", verdict.path, spawnFor(verdict, "qa"))}
+
+Result meanings for this stage: "QA-PASS" = everything above verified green (put the one-line evidence summary in notes, and the suite's real exit code and counts in evidence). "QA-BUGS" = numbered findings in notes, each with concrete repro steps (do X, expect Y, got Z). "NEEDS-HUMAN" = a human must decide; state the question precisely. "BLOCKED" = the worktree cannot be exercised at all. "CONFUSED" = the ticket makes no sense as written. A pass you did not verify is the one unforgivable verdict: the merge gate re-runs the suite itself and a red run there is evidence against every claim in your file.`;
 }
 
 // -- adversarial reviewer -----------------------------------------------------
@@ -390,7 +425,24 @@ export function adversarialActive(mode: AdversarialMode, diffLineCount: number, 
 // additionally folds in the super-truth skeptic fan-out and stamps the same
 // token onto REVIEW-FINDINGS too. The token rides inside the marker's note, so
 // loop.ts's marker regex parses it unchanged regardless of branch.
-export function reviewerPrompt(input: ReviewerPromptInput, inputPath: string, adversarial: boolean = false, tag?: string): string {
+// One skeptic's complete brief (#265): composed HERE, deterministically, so
+// blindness and the verdict path are enforceable rather than whatever prose
+// the reviewer improvises. The reviewer is told to pass each brief VERBATIM as
+// an Agent spawn's prompt; the only thing it may not do is edit them. Each
+// brief carries its own verdict-file contract, so a skeptic's report is a file
+// the ORCHESTRATOR counts (#266) -- the reviewer summarizing "3/3 agreed" has
+// no effect on the quorum the merge gate reads.
+export function skepticBrief(k: number, input: ReviewerPromptInput, inputPath: string, dir: string, spawn: ExpectedSpawn): string {
+  return `You are SKEPTIC ${k} of 3, a fresh context inside the zstack dev loop, blinded exactly as your reviewer is: your ONLY inputs are the ticket body, the acceptance criteria, and the diff, read from ${inputPath} (fields \`ticketBody\`, \`acceptanceCriteria\`, \`diff\`), plus the throwaway worktree at ${input.worktreePath} (yours to execute; nothing you do in it lands anywhere). No other skeptic's verdict reaches you and yours reaches no one but the loop.
+
+Your task is to REFUTE that the diff satisfies the acceptance criteria: find the one criterion it violates, the edge it breaks, a test that passes without the change. Concrete evidence only -- file:line, a command you ran, an input that misbehaves.
+
+${verdictInstructions("skeptic", verdictPath(dir), spawn)}
+
+Result meanings: "REFUTED" = you found concrete evidence the diff fails a criterion -- name it in notes with file:line and the failing input. "UPHELD" = you genuinely tried and could not refute it; notes says what you attacked. "CONFUSED" = the inputs are unusable. Put your lens ("refutation") and the one claim you checked hardest in evidence.`;
+}
+
+export function reviewerPrompt(input: ReviewerPromptInput, inputPath: string, verdict: VerdictTarget, adversarial: boolean = false, tag?: string): string {
   assertReviewerInput(input);
   // ponytail: N=3 skeptics is a fixed ceiling (no config knob this ticket); a
   // per-project skeptic count is a follow-on if 3 proves too few/many.
@@ -431,40 +483,39 @@ export function reviewerPrompt(input: ReviewerPromptInput, inputPath: string, ad
   // "wait" stops being a coherent action rather than a discouraged one. The degraded
   // path is then named explicitly, because a reviewer holding k < 3 needs a
   // sanctioned exit or it invents the silent one again.
+  const skepticDirs = verdict.skepticDirs ?? [];
+  if (adversarial && skepticDirs.length !== 3) {
+    throw new ZError(
+      `An adversarial reviewer prompt needs exactly 3 skeptic artifact directories (verdict.skepticDirs), got ${skepticDirs.length}. The orchestrator composes them off \`transcripts dest\`; the reviewer never invents paths.`
+    );
+  }
+  const briefs = adversarial
+    ? skepticDirs
+        .map((dir, idx) => {
+          const k = idx + 1;
+          return `### Skeptic ${k}'s brief -- pass VERBATIM as one Agent spawn's prompt (edit nothing)\n\n<<<SKEPTIC-${k}-BRIEF\n${skepticBrief(k, input, inputPath, dir, spawnFor(verdict, "skeptic"))}\nSKEPTIC-${k}-BRIEF`;
+        })
+        .join("\n\n")
+    : "";
   const superTruth = adversarial
     ? `
 ## Super-truth pass (adversarial mode active)
-This card's blast radius earned an adversarial review; do NOT trust your single read. Spawn 3 INDEPENDENT skeptic sub-agents with the Agent tool -- nested \`claude -p\` is denied by the classifier, so use the Agent tool, not headless claude. Give each skeptic ONLY the four inputs you were given (this ticket, the acceptance criteria, the diff, the throwaway worktree); they are blinded exactly as you are. Task each one to REFUTE that the diff satisfies the acceptance criteria: find the one criterion it violates, the edge it breaks, a test that passes without the change. They work in isolation -- no skeptic sees another's verdict.
+This card's blast radius earned an adversarial review; do NOT trust your single read. Spawn 3 INDEPENDENT skeptic sub-agents with the Agent tool -- nested \`claude -p\` is denied by the classifier, so use the Agent tool, not headless claude. Their briefs are WRITTEN FOR YOU below, one per skeptic, each already carrying the blinded inputs pointer and its own verdict-file contract. Pass each brief verbatim as that spawn's prompt; the composition is not yours to edit -- a reworded brief is how blindness leaks and how verdict files end up where nothing counts them.
 
-COLLECT THEM INSIDE THIS TURN. Spawn all three in ONE message, as three Agent tool calls each carrying \`run_in_background: false\`. That flag is the entire mechanism: it makes the three verdicts come back as tool results in this same turn, where you can read them, and the three still run concurrently because they were launched together. The DEFAULT is a background spawn, whose only delivery channel is a task notification BETWEEN turns -- and you get no next turn, because this loop sends a stage agent exactly one message by design. A backgrounded skeptic is one you will never hear from, however long you wait.
+COLLECT THEM INSIDE THIS TURN. Spawn all three in ONE message, as three Agent tool calls each carrying \`run_in_background: false\`. That flag is the entire mechanism: it makes the three returns come back as tool results in this same turn, and the three still run concurrently because they were launched together. The DEFAULT is a background spawn, whose only delivery channel is a task notification BETWEEN turns -- and you get no next turn, because this loop sends a stage agent exactly one message by design. A backgrounded skeptic is one you will never hear from, however long you wait.
 
-You therefore never wait for a skeptic. Once those three tool calls return you are holding every verdict you will ever hold: nothing is outstanding, nothing needs pinging, no notification is coming. Do not spawn replacements, do not re-ping, and do not end your turn to "wait", "check back", or "await completion notifications" -- those are not slower routes to a verdict, they are how this ticket gets thrown away. Three reviews in one run ended a turn on exactly those words; all three were skipped with green, committed work, and every skeptic reported minutes later into a lane that had already closed.
+You therefore never wait for a skeptic, and you never re-count for one either: each skeptic reports by WRITING ITS OWN VERDICT FILE, and the loop counts those files itself -- a skeptic that lands after you return still counts, and a tally you write cannot vouch for a file that is not there. Once your three tool calls return, read whichever skeptic verdict files exist, weigh any refutation's evidence in your own judgment, and write YOUR verdict. Do not spawn replacements, do not re-ping, and do not end your turn to "wait", "check back", or "await completion notifications" -- three reviews in one run ended a turn on exactly those words, all three thrown away with green, committed work.
 
-DEGRADED COLLECTION -- your named exit when you do not get three. A skeptic can error, return nothing usable, or be refused; \`k\` is then however many usable verdicts you actually hold, 0 <= k <= 3. That is a delivery race, not evidence about the diff, and it is never a reason to withhold a marker:
-- k >= 1: emit REVIEW-APPROVE or REVIEW-FINDINGS on the k verdicts you hold, carrying the honest \`skeptics=<k>/3\`. Whether k is enough is the quorum gate's call downstream, not yours, and staying silent does not defer that decision -- it destroys it.
-- k = 0: emit REVIEW-APPROVE or REVIEW-FINDINGS off your own single read with \`skeptics=0/3\`; or, if the fan-out failed so badly you cannot judge the diff at all, emit \`CONFUSED: skeptic collection failed -- <what happened>\`. A CONFUSED that names its reason is a real verdict a human can act on. A final message with no marker is not.
+In your verdict file's evidence, set "skepticVerdictPaths" to the paths of ONLY the skeptic verdict files that exist when you look (0-3 of them; list none that you cannot read). Set "confidence" off this table over the k verdicts you actually hold -- do no arithmetic:
+- k=3: 3 UPHELD -> 100, 2 -> 67, 1 -> 33, 0 -> 0
+- k=2: 2 UPHELD -> 100, 1 -> 50, 0 -> 0
+- k=1: 1 UPHELD -> 100, 0 -> 0
+- k=0: nobody looked. Your OWN single-pass certainty that every criterion holds -- never 100, which would claim three independent agreements that never happened.
+A criterion any skeptic REFUTED with concrete evidence is a finding, not a vote to be outnumbered -- surface it in your notes. An honest short list costs this card one more review pass; a padded one merges a diff nobody refuted.
 
-Report BOTH tokens in your marker: \`skeptics=<k>/3\` -- the number of verdicts you actually received -- and \`confidence=<0-100>\`, the share of THOSE k that could not refute the diff. Read it off this table; do no arithmetic:
-- k=3: 3 unrefuted -> 100, 2 -> 67, 1 -> 33, 0 -> 0
-- k=2: 2 unrefuted -> 100, 1 -> 50, 0 -> 0
-- k=1: 1 unrefuted -> 100, 0 -> 0
-- k=0: nobody looked. Report \`skeptics=0/3\` and, as the confidence, YOUR OWN single-pass certainty that every criterion holds -- never 100, which would claim three independent agreements that never happened.
-A criterion any skeptic refutes with concrete evidence is a finding, not a vote to be outnumbered -- surface it. An honest low \`k\` costs this card one more review pass; an inflated one merges a diff nobody refuted, so report the number you actually have.
+${briefs}
 `
     : "";
-  // REVIEW-FINDINGS' confidence token rides inside the marker's note only on
-  // the super-truth pass (#59's aggregation); findings already bounce to the
-  // builder regardless of any score, so parsing/logging it there is out of
-  // #62's scope. REVIEW-APPROVE is different: #62's safety gate reads it
-  // unconditionally, so that marker always carries the literal
-  // confidence=<0-100> token below -- self-assessed on a single pass,
-  // aggregated across skeptics when the super-truth pass ran.
-  const conf = adversarial ? "confidence=<0-100> " : "";
-  // #191's denominator token, adversarial-only for the same reason the fan-out
-  // is: with no skeptics there is no `k` to report, and a single-pass prompt that
-  // demanded one would invite an invented number. So the inactive branch stays
-  // byte-identical (reviewer-single-pass.golden.txt).
-  const skept = adversarial ? "skeptics=<k>/3 " : "";
   return `${spawnStamp(tag)}You are an ADVERSARIAL REVIEWER in a fresh context, running UNATTENDED inside the zstack dev loop. You are blinded by design: your ONLY inputs are the ticket, its acceptance criteria, the diff, and a throwaway worktree of the head commit. There is no PR description, no plan rationale, no builder or QA transcript -- and any claim you cannot verify from these inputs yourself is unverified. Your job is to find the reasons this diff should NOT merge.
 
 ## Your inputs (read from the file -- do not look anywhere else)
@@ -482,13 +533,9 @@ Run the typecheck and the tests this diff touches here. Nothing you do in it lan
 ${superTruth}
 ${foregroundRule("reviewer")}
 
-## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
-REVIEW-APPROVE: confidence=<0-100> ${skept}<one-line evidence summary>   every criterion verified against the diff, typecheck + touched tests green -- confidence is your certainty every criterion holds (aggregated per the super-truth pass above when it ran); a score below the project's configured floor will NOT merge
-REVIEW-FINDINGS: ${conf}${skept}<numbered findings>          each with file:line and why it blocks the merge
-NEEDS-HUMAN: <the judgment call>              a genuine spec ambiguity a human must settle
-BLOCKED: <reason>                             the throwaway worktree is unusable -- can't check out or execute the diff at all
-CONFUSED: <what makes no sense>
-${markerPositionRule("REVIEW-APPROVE")}`;
+${verdictInstructions("reviewer", verdict.path, spawnFor(verdict, "reviewer"))}
+
+Result meanings for this stage: "REVIEW-APPROVE" = every criterion verified against the diff, typecheck + touched tests green; evidence.confidence is your certainty every criterion holds, 0-100 (${adversarial ? "read it off the super-truth table above" : "self-assessed on this single pass"}), and a score below the project's configured floor will NOT merge -- an approve with no usable confidence is refused by the gate, never waved through. "REVIEW-FINDINGS" = numbered findings in notes, each with file:line and why it blocks the merge. "NEEDS-HUMAN" = a genuine spec ambiguity a human must settle. "BLOCKED" = the throwaway worktree is unusable -- can't check out or execute the diff at all. "CONFUSED" = the inputs make no sense${adversarial ? `, including a skeptic fan-out so broken you cannot judge the diff at all (name what happened in notes)` : ""}.`;
 }
 
 // -- merge --------------------------------------------------------------------
@@ -539,7 +586,8 @@ export interface MergePromptInput {
   statePath?: string;
 }
 
-export function mergePrompt(i: MergePromptInput, inputPath: string, tag?: string): string {
+export function mergePrompt(i: MergePromptInput, inputPath: string, verdict: VerdictTarget, tag?: string): string {
+  assertTicketMatch(verdict, i.ticketNumber);
   const stacked = i.stackedOn.length
     ? `\n## Stacked chain (PROCESS.md step 18 -- order is not optional)
 This branch stacks on ticket(s) #${i.stackedOn.join(", #")}. Their PRs merge FIRST, each WITHOUT deleting its branch (deleting a base branch closes every dependent PR). After each parent lands, retarget this PR to ${i.baseBranch} (gh pr edit --base ${i.baseBranch}). Delete branches only after the whole batch has landed.
@@ -594,12 +642,9 @@ Run it AGAIN -- the same command, byte for byte -- after any change you make to 
 3. Merge with gh pr merge only when the gate exited 0. Never pass --delete-branch: branch cleanup happens once at batch end, after every dependent PR has landed.
 4. Do not close the ticket issue and do not comment on it -- the orchestrator posts the completion note.
 
-## Exit contract -- your FINAL message MUST START with exactly one of these markers (machine-parsed):
-MERGED: <the PR URL>
-NEEDS-HUMAN: <the judgment call>
-BLOCKED: <reason -- what failed and what you tried>
-CONFUSED: <what makes no sense>
-${markerPositionRule("MERGED")}`;
+${verdictInstructions("merge", verdict.path, spawnFor(verdict, "merge"))}
+
+Result meanings for this stage: "MERGED" = gh pr merge succeeded on a green gate; evidence.prUrl is the PR's URL and evidence.mergeSha the merged commit. "NEEDS-HUMAN" = a judgment call only a human can make. "BLOCKED" = what failed and what you tried (a nonzero gate or claim exit lands here, with its message). "CONFUSED" = the inputs make no sense.`;
 }
 
 // -- completion note ----------------------------------------------------------
@@ -671,10 +716,18 @@ export function planEdgesComment(edges: CompletionEdge[]): string {
 
 const USAGE = `stage-prompts <command> [args]
 
-  prompt <builder|qa|merge> <input.json>            print the stage prompt built from the typed input
-  prompt reviewer <input.json> [--adversarial-mode <off|non-trivial|always>] [--labels <json-array>]
+  prompt <builder|qa|merge> <input.json> --verdict-path <file> --run <runId> --ticket <n> --attempt <k>
+                                                    print the stage prompt built from the typed input.
+                                                    The --verdict-* flags name the verdict FILE the stage
+                                                    must write and the spawn its envelope must carry
+                                                    (#323, \`verdict path\` composes the file path)
+  prompt reviewer <input.json> --verdict-path <f> --run <id> --ticket <n> --attempt <k>
+                 [--adversarial-mode <off|non-trivial|always>] [--labels <json-array>]
+                 [--skeptic-dirs <json-array-of-3-dirs>]
                                                     print the reviewer prompt; the flags decide the
-                                                    super-truth fan-out deterministically (diff size + labels + mode)
+                                                    super-truth fan-out deterministically (diff size + labels + mode).
+                                                    Adversarial requires --skeptic-dirs: the briefs name each
+                                                    skeptic's verdict file, composed by the orchestrator (#265)
   ... [--spawn-tag <tag>]                           any stage: stamp an inert first line naming this spawn, so
                                                     \`transcripts collect\` can find the agent's own transcript
                                                     (\`transcripts tag\` prints the value). Omitted -> no stamp.
@@ -688,6 +741,26 @@ const USAGE = `stage-prompts <command> [args]
   note <input.json>                                 print the completion note (CompletionNoteInput)
   plan-edges <edges.json>                           print the plan-time "Needs input" edges comment
                                                     (CompletionEdge[]); prints nothing for an empty list`;
+
+// The four --verdict-* flags every `prompt` invocation carries since #323: the
+// file the stage must write and the spawn coordinates its envelope must name.
+// One reader so the five flags cannot be half-parsed at two call sites.
+function verdictTargetFromFlags(flags: Record<string, string | boolean>): VerdictTarget {
+  const path = str(flags, "verdict-path");
+  const runId = str(flags, "run");
+  const ticketRaw = str(flags, "ticket");
+  const attemptRaw = str(flags, "attempt");
+  if (path === undefined || runId === undefined || ticketRaw === undefined || attemptRaw === undefined) {
+    throw new ZError(
+      `prompt requires --verdict-path <file> --run <runId> --ticket <n> --attempt <k> (#323): the stage's exit contract IS the verdict file, so a prompt without its target cannot be obeyed.`
+    );
+  }
+  const ticket = Number(ticketRaw);
+  const attempt = Number(attemptRaw);
+  if (!Number.isInteger(ticket) || ticket <= 0) throw new ZError(`--ticket must be a positive integer, got ${JSON.stringify(ticketRaw)}.`);
+  if (!Number.isInteger(attempt) || attempt <= 0) throw new ZError(`--attempt must be a positive integer, got ${JSON.stringify(attemptRaw)}.`);
+  return { path, runId, ticket, attempt };
+}
 
 export function main(argv: string[]): number {
   const cmd = argv[0];
@@ -747,14 +820,32 @@ export function main(argv: string[]): number {
         // assertReviewerInput; guard a missing diff so activation computes, then
         // the four-key gate throws the real "blinded by design" error.
         const active = adversarialActive(mode, countDiffLines(typeof input.diff === "string" ? input.diff : ""), labels);
+        // #323: an adversarial reviewer additionally needs its three skeptic
+        // artifact directories, orchestrator-composed (`transcripts dest` +
+        // /skeptic-<k>) so the briefs' verdict paths are enforceable (#265).
+        let skepticDirs: string[] | undefined;
+        const dirsArg = str(flags, "skeptic-dirs");
+        if (dirsArg !== undefined) {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(dirsArg);
+          } catch (e) {
+            throw new ZError(`--skeptic-dirs must be a JSON array of 3 directory paths: ${(e as Error).message}`);
+          }
+          if (!Array.isArray(parsed) || parsed.some((d) => typeof d !== "string")) {
+            throw new ZError(`--skeptic-dirs must be a JSON array of directory paths.`);
+          }
+          skepticDirs = parsed as string[];
+        }
         // Pointer prompt (ticket #57): reviewer reads its payload from the input
         // file by ABSOLUTE path; the flag-derived `active` selects the fan-out.
-        // --spawn-tag (#190) is a fourth POSITIONAL scalar, same as mode/labels:
-        // it never enters the blinded four-key input JSON.
-        console.log(reviewerPrompt(input, resolve(path), active, spawnTagFlag));
+        // --spawn-tag (#190) is a POSITIONAL scalar, same as mode/labels: it
+        // never enters the blinded four-key input JSON, and neither does the
+        // verdict target (a constructor parameter).
+        console.log(reviewerPrompt(input, resolve(path), { ...verdictTargetFromFlags(flags), skepticDirs }, active, spawnTagFlag));
         return 0;
       }
-      const builders: Record<string, (i: any, inputPath: string, tag?: string) => string> = {
+      const builders: Record<string, (i: any, inputPath: string, verdict: VerdictTarget, tag?: string) => string> = {
         builder: builderPrompt,
         qa: qaPrompt,
         merge: mergePrompt,
@@ -763,7 +854,7 @@ export function main(argv: string[]): number {
       if (!build) throw new ZError(`Unknown stage "${stage}". Valid: builder, qa, reviewer, merge.`);
       // The pointer prompt references this input file by ABSOLUTE path, so the
       // worker (a fresh Agent with its own CWD) resolves it unambiguously.
-      console.log(build(input, resolve(path), spawnTagFlag));
+      console.log(build(input, resolve(path), verdictTargetFromFlags(flags), spawnTagFlag));
       return 0;
     }
     if (cmd === "stub") {
