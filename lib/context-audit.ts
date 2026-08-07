@@ -69,7 +69,7 @@ import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
 import { handleCliError, parseFlags, str } from "./cli.ts";
 import { ZError } from "./config.ts";
-import { GLOB_META, SYNTHETIC_MODEL, expandGlob, parseLine } from "./cost.ts";
+import { GLOB_META, SYNTHETIC_MODEL, expandGlob, parseLine, transcriptsUnder } from "./cost.ts";
 import { mangleProjectDir, resolveSessionTranscript } from "./context-budget.ts";
 
 // -- phases -------------------------------------------------------------------
@@ -636,6 +636,11 @@ const USAGE = `context-audit <command> [args]
   audit [<transcript.jsonl>...]   attribute billed input by component. With no
                                   paths, audits the session transcript resolved
                                   from --project-dir (default: cwd).
+    --run-dir <dir>               sweep every transcript under ONE run root
+                                  (runs/<runId>, or any subtree of it) instead
+                                  of naming paths -- the #322 run-scoped form,
+                                  so an audit can never absorb another run's
+                                  files. Mutually exclusive with positionals.
     --project-dir <dir>           resolve the newest session under that cwd
     --drain-only                  show only loop-issued (drain steady-state) rows
     --json                        machine-readable rollup
@@ -676,7 +681,18 @@ export function main(argv: string[]): number {
     // GLOB_META is imported, not restated, so this classifier and the splitting
     // expandGlob does can never disagree about what a glob is.
     let sweep = positionals.length > 1;
-    if (positionals.length > 0) {
+    // #322: the run-scoped sweep. The enumeration root is fixed in code (same
+    // rationale as z-cost's --run-dir): a sweep of one run can never absorb a
+    // neighboring run's transcripts, and there is no shell glob to mis-quote.
+    const runDirFlag = str(flags, "run-dir");
+    if (runDirFlag !== undefined && positionals.length > 0) {
+      throw new ZError(`--run-dir replaces positional paths; pass one or the other.`);
+    }
+    if (runDirFlag !== undefined) {
+      sweep = true;
+      paths = transcriptsUnder(runDirFlag);
+      if (paths.length === 0) throw new ZError(`No transcript .jsonl files under ${runDirFlag}.`);
+    } else if (positionals.length > 0) {
       for (const p of positionals) {
         // An existing file is a literal path, whatever characters are in its
         // name. Globbing it first let Bun.Glob read "session[1].jsonl" as a

@@ -48,7 +48,7 @@ import { validateWatchdogMinutes } from "./config-schema.ts";
 // transcripts. Runtime-safe in this direction -- transcripts.ts reaches back into
 // this file only through stage-prompts.ts's `import type { Stage }`, which is
 // erased, so there is no import cycle at run time.
-import { readAgentMetas, subagentsDirFor, subtreeActivityMs, spawnTag, type AgentMeta } from "./transcripts.ts";
+import { isRunId, mintRunId, readAgentMetas, subagentsDirFor, subtreeActivityMs, spawnTag, type AgentMeta } from "./transcripts.ts";
 
 // -- ticket states ------------------------------------------------------------
 
@@ -322,6 +322,21 @@ export interface LaneState {
 }
 
 export interface LoopState {
+  // #322 (epic #321, contract C1): the on-disk state contract version. Written
+  // as STATE_SCHEMA_VERSION on every ingest; enforced by readState at every CLI
+  // read. Absent = a v1 (pre-runId) file, which the new binary refuses to
+  // resume -- never auto-upgrades -- because a v1 drain's artifacts live in the
+  // old glob-scoped layout its own binary knows how to finish. Optional on the
+  // TYPE only so the hundreds of hand-built reducer fixtures keep compiling;
+  // every state that reaches disk carries it.
+  schemaVersion?: number;
+  // #322: this drain's artifact root -- runs/<runId>/ under the state dir.
+  // Minted by ingest exactly when no previous state exists (mintRunId,
+  // lib/transcripts.ts, where the format and lifecycle rule are documented);
+  // carried verbatim across every resume; retired when end-of-loop archives
+  // state.json into the run directory. Same optionality rationale as
+  // schemaVersion.
+  runId?: string;
   tickets: TicketSnapshot[];
   lanes: LaneState[];
   // #223 review: the SESSION of the invocation that last ingested into this file
@@ -398,6 +413,55 @@ export interface LoopState {
   // ceiling, captured once like the other knobs; 0/absent disables the gate.
   contextTokens?: number;
   contextTokenLimit?: number;
+}
+
+// The state contract this binary reads and writes. Bumped when the on-disk
+// shape changes incompatibly; the refusal rules live in assertStateCompatible.
+export const STATE_SCHEMA_VERSION = 2;
+
+// A LoopState whose provenance has been checked -- what every CLI command
+// actually operates on. The intersection is what lets call sites use runId
+// without a non-null assertion.
+export type CompatibleState = LoopState & { schemaVersion: number; runId: string };
+
+// The migration contract (#322 AC5), exact and loud in both directions:
+//   - no schemaVersion       -> a v1 file. Refused with the remedy: finish or
+//                               --reconcile that drain with the OLD binary, or
+//                               delete state.json to start a fresh run. Never
+//                               auto-upgraded: v1 artifacts live in the old
+//                               layout only the old binary prices correctly.
+//   - schemaVersion > ours   -> a newer binary wrote it. Refused: update the
+//                               pack (z-update) instead of misreading it.
+// A v2 file without a well-formed runId is corrupt (ingest always writes both),
+// and corrupt is loud, never a silent re-mint -- re-minting would strand the
+// run's existing artifacts under a directory nothing points at anymore.
+export function assertStateCompatible(s: LoopState, path: string): CompatibleState {
+  if (s.schemaVersion === undefined) {
+    throw new ZError(
+      `State file ${path} predates the run-id contract (no schemaVersion -- a v1 state). ` +
+        `This binary does not auto-upgrade in-flight state: finish or --reconcile that drain with the zstack ` +
+        `version that started it, or delete the state file to start a fresh run (a fresh ingest mints a new runId).`
+    );
+  }
+  if (!Number.isInteger(s.schemaVersion) || s.schemaVersion < STATE_SCHEMA_VERSION) {
+    throw new ZError(
+      `State file ${path} carries schemaVersion ${JSON.stringify(s.schemaVersion)}, which no zstack binary writes ` +
+        `(v1 files carry none; this binary writes ${STATE_SCHEMA_VERSION}). The file is corrupt -- fix or delete it.`
+    );
+  }
+  if (s.schemaVersion > STATE_SCHEMA_VERSION) {
+    throw new ZError(
+      `State file ${path} carries schemaVersion ${s.schemaVersion}; this binary understands ${STATE_SCHEMA_VERSION}. ` +
+        `The binary is older than the state -- run /z-update, then retry.`
+    );
+  }
+  if (typeof s.runId !== "string" || !isRunId(s.runId)) {
+    throw new ZError(
+      `State file ${path} is schemaVersion ${s.schemaVersion} but its runId ${JSON.stringify(s.runId)} is not a ` +
+        `run-<yyyymmdd>-<hhmmss>-<4hex> id. Ingest always writes both together, so the file is corrupt -- fix or delete it.`
+    );
+  }
+  return s as CompatibleState;
 }
 
 // -- stage outcomes -----------------------------------------------------------
@@ -4069,6 +4133,15 @@ const USAGE = `loop <command> [args]
                                                      --session is this invocation's SESSION (SKILL Step 1's
                                                      "$ME-$(date +%s)"): a change means a NEW RUN, which
                                                      re-earns #223's bounded park with a fresh confirm read
+                                                     A FIRST ingest (no state.json) also mints the run's
+                                                     artifact identity: state.json gains runId (the
+                                                     runs/<runId>/ root every transcript and cost read is
+                                                     keyed by, #322) and schemaVersion ${STATE_SCHEMA_VERSION}. A resume keeps
+                                                     the stored runId verbatim.
+
+  Every command refuses a state file from the wrong era (#322): one with no
+  schemaVersion is a v1 drain (finish it with the old binary, or delete
+  state.json for a fresh run); one with a NEWER schemaVersion needs /z-update.
 
   --now defaults to the wall clock; tests pass it explicitly. It is MILLISECONDS
   since the epoch (a non-numeric value is rejected: \`next\` persists it).`;
@@ -4106,7 +4179,18 @@ function readPrevState(path: string): LoopState | null {
         `Refusing to silently reset lanes and mergedThisRun.`
     );
   }
-  return s as LoopState;
+  // #322: a PRESENT previous state must also pass the version contract -- an
+  // ingest over a v1 file would otherwise resume its lanes while writing a v2
+  // header, splitting one drain's artifacts across two layouts.
+  return assertStateCompatible(s as LoopState, path);
+}
+
+// Every non-ingest command's state read (#322): shape-agnostic readJson plus the
+// version contract. The one deliberate difference from readPrevState: a MISSING
+// file is an error here (these commands operate on an existing drain), while
+// readPrevState's ENOENT means "first ingest".
+function readState(path: string): CompatibleState {
+  return assertStateCompatible(readJson(path) as LoopState, path);
 }
 
 // The numeric ingest knobs, in one table: each is optional, and each reaches
@@ -4297,7 +4381,7 @@ export function main(argv: string[]): number {
       // conflict) while the orchestrator keeps ticking other lanes.
       const stamp = (v: MergeGateVerdict | null): void => {
         if (gateState === undefined) return;
-        atomicWrite(gateState, JSON.stringify(recordMergeGate(readJson(gateState) as LoopState, gateTicket!, v, now), null, 2));
+        atomicWrite(gateState, JSON.stringify(recordMergeGate(readState(gateState), gateTicket!, v, now), null, 2));
       };
       stamp(null); // an attempt is starting -- survives a killed gauntlet
       let verdict: MergeGateVerdict;
@@ -4385,7 +4469,7 @@ export function main(argv: string[]): number {
     if (!statePath) throw new ZError(`Usage:\n${USAGE}`);
 
     if (cmd === "next") {
-      const state = readJson(statePath) as LoopState;
+      const state = readState(statePath);
       // #248: the heads are read HERE, by the loop, not passed in by whoever
       // called it. That is what makes the commit binding an enforcement rather
       // than another thing the orchestrator could forget to do.
@@ -4423,7 +4507,7 @@ export function main(argv: string[]): number {
     }
     if (cmd === "apply") {
       if (!positionals[1]) throw new ZError("Usage: loop apply <state.json> <action.json> [--now <ms>]");
-      const state = readJson(statePath) as LoopState;
+      const state = readState(statePath);
       const action = readJson(positionals[1]) as Action;
       atomicWrite(statePath, JSON.stringify(applyAction(state, action, nowMs), null, 2));
       console.log(`applied ${action.kind}${"ticket" in action ? ` #${action.ticket}` : ""}`);
@@ -4460,7 +4544,7 @@ export function main(argv: string[]): number {
     if (cmd === "outcome") {
       const ticket = Number(positionals[1]);
       if (!Number.isInteger(ticket) || !positionals[2]) throw new ZError("Usage: loop outcome <state.json> <ticket> <msg.txt> [--now <ms>]");
-      const state = readJson(statePath) as LoopState;
+      const state = readState(statePath);
       const message = readText(positionals[2]);
       const next = recordOutcome(state, ticket, message, nowMs, builderFactsFromFlags(state, ticket, flags));
       atomicWrite(statePath, JSON.stringify(next, null, 2));
@@ -4473,7 +4557,7 @@ export function main(argv: string[]): number {
       if (!Number.isInteger(ticket) || (verdict !== "alive" && verdict !== "dead")) {
         throw new ZError("Usage: loop probe <state.json> <ticket> <alive|dead> [--now <ms>]");
       }
-      const state = readJson(statePath) as LoopState;
+      const state = readState(statePath);
       // #209: only a DEAD probe has leftovers to judge, so the flag is read only
       // there -- passing it with `alive` would be recording a fact about a
       // worktree the live worker is still writing.
@@ -4488,14 +4572,14 @@ export function main(argv: string[]): number {
     if (cmd === "attempt") {
       const ticket = Number(positionals[1]);
       if (!Number.isInteger(ticket)) throw new ZError("Usage: loop attempt <state.json> <ticket>");
-      const state = readJson(statePath) as LoopState;
+      const state = readState(statePath);
       const lane = state.lanes?.find((l) => l.ticket === ticket);
       if (!lane) throw new ZError(`No lane holds #${ticket}, so it has no stage to count spawns for.`);
       console.log(stageAttempt(lane));
       return 0;
     }
     if (cmd === "heartbeat") {
-      const state = readJson(statePath) as LoopState;
+      const state = readState(statePath);
       // The explicit form: the caller already has the number, so nothing is read
       // off disk. Used by the gate tests and available to any caller that
       // observed the subtree itself.
@@ -4531,9 +4615,11 @@ export function main(argv: string[]): number {
         console.error(`loop heartbeat: ${(e as Error).message}; every lane keeps its current watchdog baseline.`);
         return 0;
       }
-      let next = state;
+      // Widened back to LoopState: the reducers return the base type, and the
+      // version header they spread through is already proven by readState.
+      let next: LoopState = state;
       for (const lane of state.lanes ?? []) {
-        const observed = subtreeActivityMs(subagentsDir, spawnTag(slug, lane.ticket, lane.stage, stageAttempt(lane)), metas);
+        const observed = subtreeActivityMs(subagentsDir, spawnTag(slug, state.runId, lane.ticket, lane.stage, stageAttempt(lane)), metas);
         const activity = clampToNow(observed, nowMs);
         next = recordActivity(next, lane.ticket, activity);
         const after = next.lanes.find((l) => l.ticket === lane.ticket)!;
@@ -4549,7 +4635,7 @@ export function main(argv: string[]): number {
     if (cmd === "claim-lost") {
       const ticket = Number(positionals[1]);
       if (!Number.isInteger(ticket)) throw new ZError("Usage: loop claim-lost <state.json> <ticket>");
-      const state = readJson(statePath) as LoopState;
+      const state = readState(statePath);
       atomicWrite(statePath, JSON.stringify(markClaimLost(state, ticket, nowMs), null, 2));
       console.log(`#${ticket} claimed by another session; out of this batch`);
       return 0;
@@ -4567,7 +4653,7 @@ export function main(argv: string[]): number {
             `  is the exact set Board.claim() would accept, and that is the only set that clears the flag.`
         );
       }
-      const state = readJson(statePath) as LoopState;
+      const state = readState(statePath);
       // `me` is passed so the parser can refuse an UNVERIFIABLE read that would
       // CLEAR the flag (#223 review): this is the one state-changing caller.
       const assignees = parseAssignees(readJson(file), ticket, me);
@@ -4589,7 +4675,7 @@ export function main(argv: string[]): number {
     if (cmd === "claim-confirm-failed") {
       const ticket = Number(positionals[1]);
       if (!Number.isInteger(ticket)) throw new ZError("Usage: loop claim-confirm-failed <state.json> <ticket>");
-      const state = readJson(statePath) as LoopState;
+      const state = readState(statePath);
       atomicWrite(statePath, JSON.stringify(recordConfirmAttempt(state, ticket, nowMs), null, 2));
       // This verb takes its ticket from prose with no file to cross-check it
       // against, so a mistyped number is a real input. recordConfirmAttempt
@@ -4604,12 +4690,12 @@ export function main(argv: string[]): number {
       return 0;
     }
     if (cmd === "human-needed") {
-      const state = readJson(statePath) as LoopState;
+      const state = readState(statePath);
       console.log(JSON.stringify(humanNeededStatus(state)));
       return 0;
     }
     if (cmd === "human-needed-ack") {
-      const state = readJson(statePath) as LoopState;
+      const state = readState(statePath);
       atomicWrite(statePath, JSON.stringify(markHumanNeededNotified(state), null, 2));
       console.log("human-needed notification acknowledged");
       return 0;
@@ -4666,8 +4752,19 @@ export function main(argv: string[]): number {
         if (raw !== undefined) cfg[camel(flag)] = Number(raw);
       }
       const state = ingestBoardItems(prev, items, bodies, cfg as Parameters<typeof ingestBoardItems>[3], confirmedGone);
-      atomicWrite(statePath, JSON.stringify(state, null, 2));
-      console.log(`${state.tickets.length} ticket(s), ${state.lanes.length} lane(s)`);
+      // #322: the version header and the run identity, stamped at the ONE place
+      // state reaches disk from nothing. A previous state (readPrevState already
+      // enforced its contract) keeps its runId across every re-ingest -- the
+      // lifecycle rule says a resume is the same run; only a first ingest (prev
+      // === null, i.e. no state.json) mints. nowMs is the CLI boundary's clock,
+      // so tests pin the minted stamp with --now.
+      const stamped: CompatibleState = {
+        ...state,
+        schemaVersion: STATE_SCHEMA_VERSION,
+        runId: prev?.runId ?? mintRunId(nowMs),
+      };
+      atomicWrite(statePath, JSON.stringify(stamped, null, 2));
+      console.log(`${stamped.tickets.length} ticket(s), ${stamped.lanes.length} lane(s), run ${stamped.runId}`);
       return 0;
     }
     console.error(`Unknown command "${cmd}".\n\n${USAGE}`);

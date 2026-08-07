@@ -4,6 +4,12 @@ All notable changes to zstack are documented here. Format follows [Keep a Change
 
 There is no `[Unreleased]` section: since 1.1.0.0 every PR opens its own version heading at merge time, written by `bun lib/version.ts claim` rather than by hand. Do not add one, and do not edit a version heading or VERSION/package.json directly — see [docs/user-guide/z-loop.md](docs/user-guide/z-loop.md#version-claiming).
 
+## [1.2.0.0] - 2026-08-07
+
+### Added
+
+C1 of epic #321: every artifact of a drain now lives under runs/<runId>/ and cost is keyed by run. A first ingest mints the id; z-cost takes --run-dir/--state-dir/--legacy instead of positional globs; the loop refuses v1 state files with a named remedy. Kills the glob-based cost family: attempt-collision overwrites (#210), cross-run Actual absorption (#212), the 365-dollar report on a 2-dollar batch (#309), z-cost's silent first-file pricing (#319), legacy-shape mis-bucketing (#211), the unverifiable #254 measurement (#261), and the inflated report total (#176).
+
 ## [1.1.1.0] - 2026-08-07
 
 ### Fixed

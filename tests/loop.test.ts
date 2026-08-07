@@ -104,6 +104,9 @@ import {
 import type { BoardStatus } from "../lib/loop.ts";
 import { ALLOWED_LANE_KEYS } from "../evals/e2e/assertions.ts";
 
+// Fixture runId for spawnTag call sites (#322); matches transcripts.test.ts's.
+const RUN_A = "run-20260101-000000-aaaa";
+
 const REPO_ROOT = join(import.meta.dir, "..");
 
 // -- source pinning -----------------------------------------------------------
@@ -135,7 +138,9 @@ function approve(confidence: number | null, skeptics: { received: number; of: nu
 }
 
 function state(tickets: TicketSnapshot[], lanes: LaneState[] = [], maxLanes = 3, watchdogMinutes = 10): LoopState {
-  return { tickets, lanes, maxLanes, watchdogMinutes, mergedThisRun: [] };
+  // schemaVersion/runId (#322): every fixture that reaches DISK must pass the
+  // CLI boundary's readState contract; pure-reducer tests just carry them.
+  return { schemaVersion: 2, runId: RUN_A, tickets, lanes, maxLanes, watchdogMinutes, mergedThisRun: [] };
 }
 
 // The happy-path final message per stage, for simulation. The reviewer's
@@ -5182,7 +5187,7 @@ describe("loop CLI", () => {
       const s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: now - 25 * 60_000 })]);
       writeFileSync(statePath, JSON.stringify(s));
       // attempt 1 for a lane with no bounces: the tag of the spawn running RIGHT NOW.
-      writeAgent(subagents, "q1", { tag: spawnTag("demo", 1, "qa", 1) });
+      writeAgent(subagents, "q1", { tag: spawnTag("demo", RUN_A, 1, "qa", 1) });
       writeAgent(subagents, "k1", { parent: "q1", at: new Date(appended).toISOString() });
       const { exitCode, stdout } = runHeartbeat(statePath, subagents, now);
       expect(exitCode).toBe(0);
@@ -5205,8 +5210,8 @@ describe("loop CLI", () => {
       const alive = dead + 10 * 60_000; // attempt 2, still writing
       const s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: 0, qaBounces: 1 })]);
       writeFileSync(statePath, JSON.stringify(s));
-      writeAgent(subagents, "old", { tag: spawnTag("demo", 1, "qa", 1), at: new Date(dead).toISOString() });
-      writeAgent(subagents, "new", { tag: spawnTag("demo", 1, "qa", 2), at: new Date(alive).toISOString() });
+      writeAgent(subagents, "old", { tag: spawnTag("demo", RUN_A, 1, "qa", 1), at: new Date(dead).toISOString() });
+      writeAgent(subagents, "new", { tag: spawnTag("demo", RUN_A, 1, "qa", 2), at: new Date(alive).toISOString() });
       expect(runHeartbeat(statePath, subagents, alive + 60_000).exitCode).toBe(0);
       expect(lanesOf(statePath)[0].lastActivityMs).toBe(alive);
       rmSync(subagents, { recursive: true, force: true });
@@ -5243,7 +5248,7 @@ describe("loop CLI", () => {
       const now = Date.parse("2026-08-04T12:00:00.000Z");
       const s = state([ticket(1, "QA")], [lane(1, "qa", { lastActivityMs: now - 30 * 60_000 })]);
       writeFileSync(statePath, JSON.stringify(s));
-      writeAgent(subagents, "q1", { tag: spawnTag("demo", 1, "qa", 1), at: new Date(now + 3 * 60 * 60_000).toISOString() });
+      writeAgent(subagents, "q1", { tag: spawnTag("demo", RUN_A, 1, "qa", 1), at: new Date(now + 3 * 60 * 60_000).toISOString() });
       expect(runHeartbeat(statePath, subagents, now).exitCode).toBe(0);
       expect(lanesOf(statePath)[0].lastActivityMs).toBe(now); // clipped, not now+3h
       // ...so the lane is still watchdog-eligible on its own budget rather than

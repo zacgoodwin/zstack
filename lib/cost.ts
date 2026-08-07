@@ -29,10 +29,11 @@
 // assistant message it prices. If Claude Code ever renames one, this throws
 // loudly instead of silently under/over-billing (tests/cost.test.ts pins this
 // with a mutated-fixture canary).
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { handleCliError, parseFlags, str } from "./cli.ts";
 import { ZError } from "./config.ts";
+import { isRunId } from "./run-id.ts";
 import { loadRates, priceTokens, priceTokensUnrounded, ratesPath, resolveRate, roundCents, type RatesFile } from "./estimate.ts";
 
 export { loadRates, ratesPath } from "./estimate.ts";
@@ -499,11 +500,42 @@ export function expandGlob(pattern: string, cwd: string = process.cwd()): string
   return matches.map((m) => (isAbsolute(m) ? m : join(scanCwd, m))).sort();
 }
 
-// -- CLI ---------------------------------------------------------------------
-const USAGE = `z-cost <glob-pattern> [--rates <path>] [--json] [--by-file]
+// -- run-scoped input selection (#322) ----------------------------------------
 
-  glob-pattern: Claude Code transcript jsonl files for a ticket's agents,
-                e.g. "$HOME/.claude/projects/*/*.jsonl"
+// Every .jsonl under one run root (or any subtree of it -- pass
+// runs/<id>/t<N> to price one ticket), enumerated by a glob whose ROOT is
+// fixed in code. This is what replaced the caller-supplied glob: the two cost
+// bugs it closes were both glob-shaped ("$STATE_DIR/transcripts/*/*.jsonl"
+// matched every run ever recorded, #309; a shell-expanded glob handed N
+// positionals and only the first was priced, #319).
+export function transcriptsUnder(dir: string): string[] {
+  let st;
+  try {
+    st = statSync(dir);
+  } catch {
+    throw new ZError(
+      `Run directory ${dir} does not exist. It is created when the loop collects its first stage transcripts; ` +
+        `for a pre-#322 layout, price it explicitly with --legacy "<glob>".`
+    );
+  }
+  if (!st.isDirectory()) throw new ZError(`${dir} is not a directory.`);
+  return expandGlob(join(dir, "**", "*.jsonl"));
+}
+
+// -- CLI ---------------------------------------------------------------------
+const USAGE = `z-cost (--run-dir <dir> | --state-dir <dir> [--run <runId>] | --legacy "<glob>") [--rates <path>] [--json] [--by-file]
+
+  --run-dir:    price every transcript under ONE run root -- any subtree works,
+                so runs/<id> prices the whole run and runs/<id>/t151 prices
+                one ticket. The enumeration happens here, never in the shell,
+                so an unquoted glob can no longer price only its first file
+                (#319) and a run can no longer absorb history (#309)
+  --state-dir:  the project's loop state dir (holds state.json + runs/).
+                --run picks the run; omitted, the CURRENT run is read from
+                state.json's runId
+  --legacy:     a quoted glob over pre-#322 transcript files (the old
+                $STATE_DIR/transcripts/... layout). The ONLY way old-layout
+                files are ever read; removed in 1.3.0.0
   --json:       emit the CostResult object (total, by_model with tokens and
                 dollars, requests, lines_parsed, skippedSynthetic) so
                 consumers like z-loop's Actual field-set parse JSON, never
@@ -529,14 +561,67 @@ export async function main(argv: string[]): Promise<number> {
 
   try {
     const { positionals, flags } = parseFlags(argv, ["json", "by-file"]);
-    const pattern = positionals[0];
     const ratesFilePath = str(flags, "rates") ?? ratesPath();
     const jsonOut = flags.json === true;
     const byFile = flags["by-file"] === true;
-    if (!pattern) throw new ZError(`Usage: ${USAGE}`);
 
-    const files = expandGlob(pattern);
-    if (files.length === 0) throw new ZError(`No files matched "${pattern}".`);
+    // #319's exact mechanism, refused loudly: an UNQUOTED glob is expanded by
+    // the shell into N positionals, and the old CLI priced positionals[0] and
+    // silently ignored the rest -- an Actual that looked reasonable and was
+    // wrong. There is no positional form anymore, so that path cannot recur.
+    if (positionals.length > 0) {
+      throw new ZError(
+        `z-cost no longer takes positional patterns (got ${JSON.stringify(positionals[0])}${positionals.length > 1 ? ` and ${positionals.length - 1} more -- an unquoted glob, the #319 silent-undercount` : ""}). ` +
+          `Use --run-dir <dir> for the current layout, or --legacy "<quoted glob>" for pre-#322 transcripts.`
+      );
+    }
+
+    const runDir = str(flags, "run-dir");
+    const stateDir = str(flags, "state-dir");
+    const runFlag = str(flags, "run");
+    const legacy = str(flags, "legacy");
+    const modes = [runDir, stateDir, legacy].filter((v) => v !== undefined).length;
+    if (modes !== 1) {
+      throw new ZError(`Pass exactly one of --run-dir, --state-dir, or --legacy.\n\nUsage: ${USAGE}`);
+    }
+    if (runFlag !== undefined && stateDir === undefined) {
+      throw new ZError(`--run selects a run under --state-dir; pass them together (or point --run-dir at the run root directly).`);
+    }
+
+    let files: string[];
+    if (legacy !== undefined) {
+      files = expandGlob(legacy);
+      if (files.length === 0) throw new ZError(`No files matched "${legacy}".`);
+    } else if (runDir !== undefined) {
+      files = transcriptsUnder(runDir);
+      if (files.length === 0) throw new ZError(`No transcript .jsonl files under ${runDir}.`);
+    } else {
+      // --state-dir: resolve the run from the flag or the state file itself,
+      // so "price the current run" needs nothing copied by hand.
+      let runId = runFlag;
+      if (runId === undefined) {
+        const statePath = join(stateDir!, "state.json");
+        let parsed: any;
+        try {
+          parsed = JSON.parse(readFileSync(statePath, "utf8"));
+        } catch (e) {
+          throw new ZError(
+            `Cannot read ${statePath} to resolve the current run (${(e as Error).message}). ` +
+              `Pass --run <runId> explicitly, or --run-dir <dir>.`
+          );
+        }
+        runId = parsed?.runId;
+      }
+      if (typeof runId !== "string" || !isRunId(runId)) {
+        throw new ZError(
+          `No usable runId: got ${JSON.stringify(runId)} (expected run-<yyyymmdd>-<hhmmss>-<4hex>). ` +
+            `A state.json without one predates #322 -- price that drain with --legacy.`
+        );
+      }
+      const dir = join(stateDir!, "runs", runId);
+      files = transcriptsUnder(dir);
+      if (files.length === 0) throw new ZError(`No transcript .jsonl files under ${dir}.`);
+    }
 
     const rates = loadRates(ratesFilePath);
     const result = costOfFiles(files, rates, { byFile });

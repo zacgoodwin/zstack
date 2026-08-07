@@ -201,7 +201,7 @@ describe("synthetic transcript entries are skipped, not priced (ticket #30)", ()
     console.log = (...a: unknown[]) => void logs.push(a.join(" "));
     let code: number;
     try {
-      code = await main(["--json", pattern, "--rates", ratesFile]);
+      code = await main(["--json", "--legacy", pattern, "--rates", ratesFile]);
     } finally {
       console.log = orig;
     }
@@ -218,7 +218,7 @@ describe("synthetic transcript entries are skipped, not priced (ticket #30)", ()
     console.log = (...a: unknown[]) => void logs.push(a.join(" "));
     let code: number;
     try {
-      code = await main([file]);
+      code = await main(["--legacy", file]);
     } finally {
       console.log = orig;
     }
@@ -339,7 +339,7 @@ describe("expandGlob: absolute patterns (ticket #22)", () => {
     console.error = (...a: unknown[]) => void logs.push(a.join(" "));
     let code: number;
     try {
-      code = await main(["--json", pattern]);
+      code = await main(["--json", "--legacy", pattern]);
     } finally {
       console.error = origError;
     }
@@ -381,7 +381,7 @@ describe("expandGlob: UNC patterns are refused (ticket #22 rework)", () => {
     console.error = (...a: unknown[]) => void logs.push(a.join(" "));
     let code: number;
     try {
-      code = await main(["--json", "//myserver/share/*.jsonl"]);
+      code = await main(["--json", "--legacy", "//myserver/share/*.jsonl"]);
     } finally {
       console.error = origError;
     }
@@ -552,7 +552,7 @@ describe("z-cost --json output (item 16b)", () => {
     console.log = (...a: unknown[]) => void logs.push(a.join(" "));
     let code: number;
     try {
-      code = await main(["--json", pattern, "--rates", ratesFile]);
+      code = await main(["--json", "--legacy", pattern, "--rates", ratesFile]);
     } finally {
       console.log = orig;
     }
@@ -709,7 +709,7 @@ describe("--by-file attribution (ticket #83)", () => {
     console.log = (...a: unknown[]) => void logs.push(a.join(" "));
     let code: number;
     try {
-      code = await main(["--json", pattern, "--rates", ratesFile]);
+      code = await main(["--json", "--legacy", pattern, "--rates", ratesFile]);
     } finally {
       console.log = orig;
     }
@@ -766,7 +766,7 @@ describe("--by-file attribution (ticket #83)", () => {
     console.log = (...a: unknown[]) => void logs.push(a.join(" "));
     let code: number;
     try {
-      code = await main(["--by-file", pattern, "--rates", ratesFile]);
+      code = await main(["--by-file", "--legacy", pattern, "--rates", ratesFile]);
     } finally {
       console.log = orig;
     }
@@ -957,7 +957,7 @@ describe("cross-stage duplicate guard (ticket #152)", () => {
     console.error = (...a: unknown[]) => void logs.push(a.join(" "));
     let code: number;
     try {
-      code = await main(["--by-file", pattern, "--rates", ratesFile]);
+      code = await main(["--by-file", "--legacy", pattern, "--rates", ratesFile]);
     } finally {
       console.error = origError;
     }

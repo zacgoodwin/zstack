@@ -44,9 +44,15 @@ import { KNOWN_STAGES } from "./cost.ts";
 // The marker literal is owned by the module that EMITS it, so the format has one
 // definition and this reader can never drift from the writer.
 import { SPAWN_TAG_MARKER } from "./stage-prompts.ts";
+import { isRunId, stageDest } from "./run-id.ts";
+
+// -- run identity (#322, contract C1) ------------------------------------------
+// Lives in lib/run-id.ts (cost.ts needs it too, and transcripts<->cost would
+// cycle); re-exported here so the tag/dest/collect surface stays one import.
+export { isRunId, mintRunId, stageDest } from "./run-id.ts";
 
 // A stage spawn's identity: a deterministic, OPAQUE digest of
-// <slug>/t<ticket>/<stage>/<attempt>.
+// <slug>/<runId>/t<ticket>/<stage>/<attempt>.
 //
 // Opaque is the whole point, and it is the reviewer's blindness contract that
 // forces it (stage-prompts.ts assertReviewerInput). The tag is stamped into the
@@ -58,12 +64,20 @@ import { SPAWN_TAG_MARKER } from "./stage-prompts.ts";
 // contract says don't rather than measure it. Hashing removes the question.
 //
 // Deterministic, not a nonce: the orchestrator computes it twice from the same
-// four facts (once for --spawn-tag, once for --tag) with nothing to remember in
+// five facts (once for --spawn-tag, once for --tag) with nothing to remember in
 // between, and a re-collection recomputes the same string. Traceability is not
 // lost -- collect's --name carries the readable <stage>-<attempt> and its --dest
 // the ticket, so the manifest and the written filenames still say what a file is.
-export function spawnTag(slug: string, ticket: number, stage: string, attempt: number): string {
-  const digest = createHash("sha256").update(`${slug}/t${ticket}/${stage}/${attempt}`).digest("hex");
+//
+// The runId component (#322/#210): without it, attempt 1 of a stage in run B
+// minted the SAME tag as attempt 1 in run A, so a resumed ticket's collection
+// matched BOTH spawns' transcripts and the newer overwrote the older. With the
+// run folded into the digest, a tag names one spawn of one run, ever.
+export function spawnTag(slug: string, runId: string, ticket: number, stage: string, attempt: number): string {
+  if (!isRunId(runId)) {
+    throw new ZError(`spawnTag: "${runId}" is not a runId (run-<yyyymmdd>-<hhmmss>-<4hex>).`);
+  }
+  const digest = createHash("sha256").update(`${slug}/${runId}/t${ticket}/${stage}/${attempt}`).digest("hex");
   return `zs-${digest.slice(0, 12)}`;
 }
 
@@ -742,10 +756,18 @@ export function collectTranscripts(opts: {
 
 const USAGE = `transcripts <command> [args]
 
-  tag --slug <slug> --ticket <n> --stage <stage> --attempt <k>
+  tag --slug <slug> --run <runId> --ticket <n> --stage <stage> --attempt <k>
         print the opaque spawn tag for one stage spawn (deterministic; the same
-        four facts always print the same tag). Pass the SAME string to
-        \`stage-prompts prompt ... --spawn-tag\` and to \`collect --tag\`.
+        five facts always print the same tag). --run is the state.json runId
+        (run-<yyyymmdd>-<hhmmss>-<4hex>) so a re-used attempt number in a LATER
+        run can never collide with an earlier run's spawn (#210). Pass the SAME
+        string to \`stage-prompts prompt ... --spawn-tag\` and to \`collect --tag\`.
+
+  dest --state-dir <dir> --run <runId> --ticket <n> --stage <stage> --attempt <k>
+        print the canonical artifact directory for one stage spawn:
+        <state-dir>/runs/<runId>/t<n>/<stage>-<k>. The ONLY composer of this
+        path -- the SKILL passes its output to \`collect --dest\` verbatim, so
+        the layout lives in code, not prose.
 
   collect --tag <tag> --dest <dir> --name <stage>-<attempt>
           [--project-dir <dir>] [--subagents-dir <dir>]
@@ -784,7 +806,27 @@ export function main(argv: string[]): number {
           `--stage must be one of ${[...KNOWN_STAGES].join(", ")}, got ${JSON.stringify(stage)}.`
         );
       }
-      console.log(spawnTag(requireFlag(flags, "slug"), ticket, stage, attempt));
+      const runId = requireFlag(flags, "run");
+      if (!isRunId(runId)) {
+        throw new ZError(
+          `--run must be a runId (run-<yyyymmdd>-<hhmmss>-<4hex>, the state.json "runId" field), got ${JSON.stringify(runId)}.`
+        );
+      }
+      console.log(spawnTag(requireFlag(flags, "slug"), runId, ticket, stage, attempt));
+      return 0;
+    }
+    if (cmd === "dest") {
+      const ticketArg = requireFlag(flags, "ticket");
+      const attemptArg = requireFlag(flags, "attempt");
+      const ticket = Number(ticketArg);
+      const attempt = Number(attemptArg);
+      if (!Number.isInteger(ticket) || ticket <= 0) throw new ZError(`--ticket must be a positive integer, got ${JSON.stringify(ticketArg)}.`);
+      if (!Number.isInteger(attempt) || attempt <= 0) throw new ZError(`--attempt must be a positive integer, got ${JSON.stringify(attemptArg)}.`);
+      const stage = requireFlag(flags, "stage");
+      if (!KNOWN_STAGES.has(stage)) {
+        throw new ZError(`--stage must be one of ${[...KNOWN_STAGES].join(", ")}, got ${JSON.stringify(stage)}.`);
+      }
+      console.log(stageDest(requireFlag(flags, "state-dir"), requireFlag(flags, "run"), ticket, stage, attempt));
       return 0;
     }
     if (cmd === "collect") {
