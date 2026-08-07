@@ -20,16 +20,19 @@ import { test, expect, describe } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  hasExitMarker,
   readTrialGrade,
   scoreTrial,
   scoreRun,
   formatReport,
   requiredPasses,
+  REVIEWER_MARKERS,
   TRIAL_PASS_THRESHOLD,
   TRIALS,
   type DefectKey,
   type TrialGrade,
 } from "../evals/lib/recall.ts";
+import { reviewerPrompt } from "../lib/stage-prompts.ts";
 
 const REVIEWER_DIR = join(import.meta.dir, "..", "evals", "reviewer");
 
@@ -227,6 +230,104 @@ describe("scoreRun", () => {
     expect(scoreRun([tie], DEFECTS).pass).toBe(false);
     expect(scoreRun([win, win, win], DEFECTS).pass).toBe(true);
     expect(scoreRun([win, win, tie], DEFECTS).pass).toBe(false);
+  });
+});
+
+// ============================================================================
+// 3b. The #318 marker gate -- did the reviewer stage report at all?
+// ============================================================================
+//
+// The grader has always been asked which exit marker the loop would read from
+// each trial's final message, and until #318 nothing scored the answer. That is
+// precisely the defect loop 17 hit: an adversarial reviewer ends its turn waiting
+// for skeptic verdicts that can never reach it, emits no marker, is parsed as
+// CONFUSED, and its ticket is Skipped with green committed work on the branch.
+// This harness is the only lane that drives the real prompt through a real
+// fan-out, so it is the only lane where that is observable at all.
+//
+// The threshold is 100%, unlike the recall gate's 4/5, and the asymmetry is the
+// point: a missing marker is not a quality reading to average, it is a finished
+// ticket thrown away plus a full reviewer stage paid for nothing.
+
+describe("exit-marker gate (#318)", () => {
+  const win = grade([false, false, false], [true, true, true]);
+  const silent = (mode: "single" | "adversarial", reported = "NONE") =>
+    grade([false, false, false], [true, true, true], mode === "single" ? { singleMarker: reported } : { adversarialMarker: reported });
+
+  test("every reviewer marker counts as reported, CONFUSED included", () => {
+    // CONFUSED is a verdict a human can act on. The graded property is that the
+    // stage REPORTED, not that it approved -- the prompt names CONFUSED as the
+    // sanctioned exit when skeptic collection fails, so scoring it as a miss would
+    // punish the exact behavior the fix asks for.
+    for (const m of REVIEWER_MARKERS) expect(hasExitMarker(m)).toBe(true);
+    expect(REVIEWER_MARKERS).toContain("CONFUSED");
+  });
+
+  test("the decorations a live grader adds do not change the reading", () => {
+    expect(hasExitMarker("REVIEW-APPROVE: confidence=88 skeptics=0/3 all criteria hold")).toBe(true);
+    expect(hasExitMarker("  `REVIEW-FINDINGS`  ")).toBe(true);
+    expect(hasExitMarker("review-approve")).toBe(true);
+  });
+
+  test("absence in every shape a grader reports it is a miss", () => {
+    for (const absent of ["NONE", "none", "", "   ", "no marker was emitted", "(the message ends mid-collection)"]) {
+      expect(hasExitMarker(absent)).toBe(false);
+    }
+  });
+
+  test("one silent stage in one trial fails the whole run, on either mode", () => {
+    for (const mode of ["single", "adversarial"] as const) {
+      const run = scoreRun([win, win, win, win, silent(mode)], DEFECTS);
+      // Recall passed outright -- this is not a recall failure riding along.
+      expect(run.passes).toBe(5);
+      expect(run.markersPass).toBe(false);
+      expect(run.pass).toBe(false);
+      // Named, so the artifacts do not have to be re-read to find it.
+      expect(run.markerMisses).toEqual([{ trial: 5, mode, reported: "NONE" }]);
+    }
+  });
+
+  test("the two gates are independent and ANDed", () => {
+    const tie = grade([true, true, true], [true, true, true]);
+    // Markers fine, recall short.
+    const recallOnly = scoreRun([win, win, win, tie, tie], DEFECTS);
+    expect(recallOnly.markersPass).toBe(true);
+    expect(recallOnly.pass).toBe(false);
+    // Recall fine, one marker missing.
+    const markerOnly = scoreRun([win, win, win, win, silent("adversarial")], DEFECTS);
+    expect(markerOnly.passes).toBeGreaterThanOrEqual(requiredPasses(5));
+    expect(markerOnly.pass).toBe(false);
+    // Both fine.
+    const clean = scoreRun([win, win, win, win, win], DEFECTS);
+    expect(clean.markersPass).toBe(true);
+    expect(clean.pass).toBe(true);
+  });
+
+  test("the report names the missing marker's trial and mode", () => {
+    const run = scoreRun([win, silent("adversarial", "")], DEFECTS);
+    const report = formatReport(run, DEFECTS, 2);
+    // 2 trials x 2 modes = 4 reviewer stages, one of them silent.
+    expect(report).toContain("exit marker reported: 3/4 reviewer stages");
+    expect(report).toContain("pass threshold: 4/4");
+    expect(report).toContain('MISSING MARKER: trial 2, adversarial pass reported "(empty)"');
+  });
+
+  test("a clean run says so without emitting a MISSING MARKER line", () => {
+    const report = formatReport(scoreRun([win, win], DEFECTS), DEFECTS, 2);
+    expect(report).toContain("exit marker reported: 4/4 reviewer stages");
+    expect(report).not.toContain("MISSING MARKER");
+  });
+
+  // The marker names are a contract with lib/stage-prompts.ts, not a local list:
+  // a stage whose marker is renamed there and not here would score every trial as
+  // silent and fail the eval for a reason that has nothing to do with the review.
+  test("every scored marker is one the reviewer prompt actually prints", () => {
+    const prompt = reviewerPrompt(
+      { ticketBody: "b", acceptanceCriteria: "a", diff: "d", worktreePath: "/tmp/wt" },
+      "/loop/tmp/input-42.json",
+      true
+    );
+    for (const m of REVIEWER_MARKERS) expect(prompt).toContain(`${m}:`);
   });
 });
 

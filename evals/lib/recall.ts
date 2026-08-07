@@ -22,6 +22,63 @@ export const TRIAL_PASS_THRESHOLD = 4;
 export const TRIALS = 5;
 
 /**
+ * The reviewer stage's exit markers, as lib/stage-prompts.ts prints them.
+ *
+ * #318's paid lane. run.sh's grader has always reported which marker the loop
+ * would read from each trial's final message, and nothing scored it -- so loop
+ * 17's actual failure (an adversarial reviewer that ends its turn awaiting
+ * skeptic verdicts, emits NO marker, and gets its ticket Skipped with green
+ * committed work) was invisible to the one eval that drives the real prompt
+ * through a real fan-out. The measurement existed; the gate did not.
+ *
+ * CONFUSED is on this list deliberately. The graded property is that a verdict
+ * was REPORTED, not that it was favorable: a reviewer that cannot judge the diff
+ * and says so is behaving correctly, and the prompt now names that exit
+ * explicitly for exactly this case. What fails is silence.
+ */
+export const REVIEWER_MARKERS = [
+  "REVIEW-APPROVE",
+  "REVIEW-FINDINGS",
+  "NEEDS-HUMAN",
+  "BLOCKED",
+  "CONFUSED",
+] as const;
+
+/**
+ * Did the grader report a real exit marker for this mode's final message?
+ *
+ * The grader is asked for the marker the LOOP would read, so its answer is
+ * already the thing under test; this only classifies it. Tolerant of the
+ * decorations a live grader adds (a trailing `: <summary>`, surrounding
+ * backticks, whitespace) because none of those change which marker was reported,
+ * and strict about everything else: "NONE", an empty string, and any prose the
+ * grader wrote instead of a marker all count as ABSENT. Absent is the defect.
+ */
+export function hasExitMarker(reported: string): boolean {
+  const head = reported.trim().replace(/^[`"']+/, "").split(/[\s:`"']/)[0]?.toUpperCase() ?? "";
+  return (REVIEWER_MARKERS as readonly string[]).includes(head);
+}
+
+/**
+ * The marker threshold is 100%, not a ratio like the recall gate's 4/5.
+ *
+ * A missing marker is not a quality signal that can be traded off against a good
+ * run -- it is the loop losing a finished ticket, and it costs a full reviewer
+ * stage (~$0.70 measured in loop 17) to produce nothing. One occurrence in N
+ * trials is a reproduction of #318, so one occurrence fails the run.
+ */
+export function markerMisses(grades: TrialGrade[]): { trial: number; mode: "single" | "adversarial"; reported: string }[] {
+  const misses: { trial: number; mode: "single" | "adversarial"; reported: string }[] = [];
+  grades.forEach((g, i) => {
+    for (const mode of ["single", "adversarial"] as const) {
+      const reported = mode === "single" ? g.singleMarker : g.adversarialMarker;
+      if (!hasExitMarker(reported)) misses.push({ trial: i + 1, mode, reported: reported.trim() || "(empty)" });
+    }
+  });
+  return misses;
+}
+
+/**
  * How many winning trials a run of `total` trials needs.
  *
  * The contract is the RATIO 4/5, not the bare count 4: a hard-coded 4 makes
@@ -70,6 +127,10 @@ export interface RunScore {
   perDefect: Record<string, { single: number; adversarial: number }>;
   meanSingleUnmatched: number;
   meanAdversarialUnmatched: number;
+  /** #318: every trial-mode whose final message carried no exit marker at all. */
+  markerMisses: { trial: number; mode: "single" | "adversarial"; reported: string }[];
+  /** #318: 100% of trial-modes reported a marker. Independent of the recall gate. */
+  markersPass: boolean;
   pass: boolean;
 }
 
@@ -160,6 +221,12 @@ export function scoreRun(grades: TrialGrade[], defects: DefectKey[], threshold =
     };
   }
   const passes = trials.filter((t) => t.pass).length;
+  // #318: two independent gates, ANDed. Recall asks whether the fan-out is worth
+  // its cost; the marker gate asks whether the stage reported at all. A run that
+  // wins on recall while losing a ticket to silence has not passed -- the lost
+  // ticket is strictly the more expensive failure, since it discards work that is
+  // already finished, committed and green.
+  const misses = markerMisses(grades);
   return {
     trials,
     passes,
@@ -168,7 +235,9 @@ export function scoreRun(grades: TrialGrade[], defects: DefectKey[], threshold =
     perDefect,
     meanSingleUnmatched: mean(grades.map((g) => g.singleUnmatched)),
     meanAdversarialUnmatched: mean(grades.map((g) => g.adversarialUnmatched)),
-    pass: passes >= threshold,
+    markerMisses: misses,
+    markersPass: misses.length === 0,
+    pass: passes >= threshold && misses.length === 0,
   };
 }
 
@@ -193,6 +262,19 @@ export function formatReport(run: RunScore, defects: DefectKey[], total: number)
     `adversarial named strictly more planted defects in ${run.passes}/${total} trials ` +
       `(pass threshold: ${requiredPasses(total)}/${total}, from the rubric's ${TRIAL_PASS_THRESHOLD}/${TRIALS})`
   );
+  // #318. Reported as a fraction of trial-MODES (2 per trial) because both the
+  // single pass and the fan-out are live reviewer stages here, and either can lose
+  // a ticket to silence. Named individually on failure: which trial and which mode
+  // is the whole diagnostic, and a bare count would send someone back to the raw
+  // artifacts to find it.
+  const modes = total * 2;
+  lines.push(
+    `exit marker reported: ${modes - run.markerMisses.length}/${modes} reviewer stages ` +
+      `(pass threshold: ${modes}/${modes} -- a stage that reports no marker is parsed as CONFUSED and SKIPS its ticket, #318)`
+  );
+  for (const m of run.markerMisses) {
+    lines.push(`  MISSING MARKER: trial ${m.trial}, ${m.mode} pass reported "${m.reported}"`);
+  }
   return lines.join("\n");
 }
 

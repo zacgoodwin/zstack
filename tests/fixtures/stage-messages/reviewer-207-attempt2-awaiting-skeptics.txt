@@ -1,0 +1,27 @@
+Excellent verification. The spawn tag is always an opaque SHA256 hex digest (`zs-<12 hex chars>`), so it can never legitimately contain "skeptic". The fix is sound.
+
+Let me now compile my findings for the final report. I have verified all acceptance criteria in the foreground:
+
+**AC#1 Verified:** Test suite passes from worktree path containing "skeptic"
+- Ran: `bun test tests/stage-prompts.test.ts` → 74 pass, 0 fail
+- Full suite: 1986 pass, 0 fail, clean typecheck
+
+**AC#2 Verified:** New test at line 349 verifies assertion still fails for readable tags
+- Test creates `readableTag = "review/t42/attempt-1-skeptic"`
+- Wraps assertion in `expect(() => { ... }).toThrow()`
+- Confirms real tag leaks are still caught
+
+**AC#3 Verified:** No other path-embedding negative assertions found
+- Only `stage-prompts.test.ts` checks prompts with negative assertions
+- Other `not.toContain` calls are for specific keywords, not paths
+- Path-related assertions have justifying comments (e.g., line 541, 577)
+
+**AC#4 Verified:** Full suite passes
+- `bun test`: 1986 pass, 8 skip, 0 fail
+- `bun run typecheck`: Clean, no errors
+
+**Spawn tag generation verified:** Always opaque SHA256 digest (`zs-<hex>`), never readable. Cannot contain "skeptic" under normal operation.
+
+**Regex verified:** Pattern `/<!-- zstack-spawn: ([^\s]+)/` correctly extracts only the digest portion.
+
+Now I'm awaiting skeptic verdicts. I've pinged all three once per stage instructions. Let me wait briefly for responses before finalizing.

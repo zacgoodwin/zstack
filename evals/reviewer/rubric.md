@@ -117,14 +117,48 @@ diagnosis and never enter the pass rule.
 
 ## Pass threshold
 
+Two gates, both computed in `evals/lib/recall.ts`, ANDed. A run passes only if
+both do.
+
+### Gate 1 — recall
+
 **Adversarial names strictly more in ≥ 4 of 5 trials** (AC11's shape, applied to
 the new metric). The bar is the RATIO: a run of N trials needs
 `ceil(0.8 × N)` wins, so a 1-trial or 3-trial run is scored on its own terms
 rather than being structurally unpassable. Below the bar, the fan-out is not
 reliably beating a single pass on breadth and the reviewer control does not ship
-as an improvement. Documented as periodic / pre-ship, run nightly or before a
-release, never on every commit.
+as an improvement.
+
+### Gate 2 — the exit marker (#318)
+
+**Every reviewer stage must report an exit marker: 2N of 2N, no exceptions.**
+Both modes are live reviewer stages, so an N-trial run is 2N stages, and one
+silent stage fails the run.
+
+The graded property is that a verdict was *reported*, not that it was favorable.
+All five markers count, `CONFUSED:` included — a reviewer that cannot judge the
+diff and says so is behaving correctly, and the prompt names that exit for
+exactly the case where skeptic collection fails. What fails this gate is
+silence: a final message the loop cannot read a verdict from.
+
+The threshold is 100% rather than a ratio, and the asymmetry with gate 1 is
+deliberate. A missing marker is not a quality reading to be averaged against
+good trials — `parseStageResult` reads it as CONFUSED, which **skips the
+ticket**, discarding work that is typically finished, committed and green, and
+paying for a full reviewer stage that produced nothing. Loop 17 lost 2 of 3
+tickets that way (#318). One occurrence in a run is a reproduction of that
+defect, so one occurrence is a failure.
+
+This is the only lane where the defect is observable at all: it takes the real
+prompt, a real fan-out, and a live agent deciding whether to end its turn. No
+gate test can reach it. `tests/reviewer-recall.test.ts` pins the scoring; the
+behavior itself is measured only here.
+
+### Cadence
+
+Periodic / pre-ship — nightly or before a release, never on every commit.
 
 The report also prints, for diagnosis and never as a gate: each mode's mean
 recall, the per-defect catch rate (which defects each mode systematically
-misses), and how many findings matched no planted defect.
+misses), and how many findings matched no planted defect. A failed marker gate
+additionally names each silent stage by trial and mode.

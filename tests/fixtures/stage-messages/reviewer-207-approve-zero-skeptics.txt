@@ -1,0 +1,17 @@
+Perfect! I've verified AC#3 - all negative assertions are either checking specific phrases or non-path-bearing subjects. The key fix correctly narrowed the "skeptic" assertion to only check the spawn tag, not the entire prompt with embedded paths.
+
+Let me now prepare my final verdict. I've completed comprehensive verification:
+
+**AC#1** (test passes with "skeptic" in path): ✓ Verified - new test at line 334 passes with injected skeptic-containing path
+**AC#2** (test still catches genuine skeptic in tag): ✓ Verified - test at line 349 wraps expectation in toThrow() to verify it fails
+**AC#3** (no path-bearing negative assertions remain): ✓ Verified - all `not.toContain` calls are safe
+**AC#4** (tests + typecheck pass): ✓ Verified - 74 tests pass, typecheck clean
+
+The implementation correctly:
+- Extracts the spawn tag from the first line using regex: `/<!-- zstack-spawn: ([^\s]+)/`
+- Checks only the tag, not the whole prompt
+- Added two new test cases that verify both acceptance criteria
+- Includes clear comments explaining the fix
+
+REVIEW-APPROVE: confidence=88 skeptics=0/3 All four acceptance criteria verified: tests pass with path containing "skeptic", assertion still catches genuine tag leaks, no unaddressed path-bearing assertions remain, full suite green
+Every criterion holds: AC#1 verified by new test at line 334 passing with skeptic-containing path injection; AC#2 verified by test at line 349 with expect().toThrow() wrapper catching genuine tag leak; AC#3 verified by audit of all not.toContain calls across suite (all safe after narrowing); AC#4 verified by 74 passing tests and clean typecheck. Implementation correctly extracts spawn tag with regex and checks only the tag, immune to repo checkout location. Comments document the fix rationale and reference the ticket.

@@ -422,6 +422,132 @@ describe("single-page ceiling guards", () => {
     expect(calls.some((c) => c.op === "AddAssignees" || c.op === "UserId")).toBe(false);
   });
 
+  // #192, AC2. The mirror image of the test above, and the reason the docs page
+  // was wrong: `fieldGet` queries Q_FIELD_VALUE and `item` queries Q_ITEM_LOOKUP,
+  // and NEITHER query selects `assignees` at all -- so no assignee count can make
+  // either fail. troubleshooting.md listed `field-get` among the guarded commands,
+  // which sends an operator hunting an error that command cannot emit.
+  test("field-get and item succeed on an issue whose assignee list is over the ceiling (#192)", async () => {
+    const oversized = { pageInfo: { hasNextPage: true }, nodes: Array.from({ length: 11 }, (_, i) => ({ login: `u${i}` })) };
+    const calls: Call[] = [];
+    const board = new Board(
+      CFG,
+      makeExecutor({
+        calls,
+        overrides: {
+          FieldValue: {
+            repository: {
+              issue: {
+                assignees: oversized,
+                projectItems: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: [
+                    {
+                      project: { number: 1 },
+                      fieldValueByName: { __typename: "ProjectV2ItemFieldSingleSelectValue", name: "sonnet" },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+          ItemLookup: {
+            repository: {
+              issue: {
+                number: 5,
+                title: "T5",
+                url: "http://x/5",
+                body: "b",
+                assignees: oversized,
+                projectItems: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: [{ project: { number: 1 }, fieldValues: { pageInfo: { hasNextPage: false }, nodes: [] } }],
+                },
+              },
+            },
+          },
+        },
+      })
+    );
+    expect(await board.fieldGet(5, "Model")).toBe("sonnet");
+    expect((await board.item(5)).present).toBe(true);
+    // Neither command took the lookup() path, which is WHY the guard cannot fire:
+    // if either ever started routing through it, this assertion fails and the
+    // canary below would demand the docs page name it.
+    expect(calls.some((c) => c.op === "IssueLookup")).toBe(false);
+  });
+
+  // #192 doc canary. The guarded-command list on the troubleshooting page is a
+  // claim about the code, so it is derived from the code rather than trusted:
+  // walk lib/board.ts's own call graph from each CLI verb and ask which ones
+  // transitively reach lookup(), the only method that asserts the assignees
+  // ceiling. #148 shipped the list by hand and got `field-get` wrong; a hand-
+  // maintained list drifts again the next time a verb changes its query path.
+  test("troubleshooting.md's assignees-guarded command list matches the real lookup() callers (#192)", () => {
+    const src = readFileSync(join(REPO_ROOT, "lib", "board.ts"), "utf8");
+
+    // Board methods: a header at 2-space indent, body running to the next header.
+    const heads = [...src.matchAll(/^ {2}(?:private |public |protected )?(?:async )?(\w+)\(/gm)].map((m) => ({
+      name: m[1]!,
+      at: m.index!,
+    }));
+    expect(heads.length).toBeGreaterThan(20); // the scan found a class, not nothing
+    const callees: Record<string, string[]> = {};
+    heads.forEach((h, i) => {
+      const body = src.slice(h.at, heads[i + 1]?.at ?? src.length);
+      callees[h.name] = [...body.matchAll(/this\.(\w+)\(/g)].map((m) => m[1]!);
+    });
+    const reachesLookup = (start: string): boolean => {
+      const seen = new Set<string>();
+      const stack = [start];
+      while (stack.length > 0) {
+        const n = stack.pop()!;
+        if (n === "lookup") return true;
+        if (seen.has(n)) continue;
+        seen.add(n);
+        for (const c of callees[n] ?? []) stack.push(c);
+      }
+      return false;
+    };
+
+    // CLI verbs: each `case "<cmd>": {` block in main()'s switch, and the
+    // board.<method>() calls inside it.
+    const cases = [...src.matchAll(/^ {6}case "([\w-]+)": \{/gm)].map((m) => ({ cmd: m[1]!, at: m.index! }));
+    expect(cases.length).toBeGreaterThan(10);
+    const guarded = cases
+      .filter((c, i) => {
+        const blk = src.slice(c.at, cases[i + 1]?.at ?? src.length);
+        return [...blk.matchAll(/board\.(\w+)\(/g)].some((m) => reachesLookup(m[1]!));
+      })
+      .map((c) => c.cmd)
+      .sort();
+
+    // Sanity on the derivation itself, so a regex that silently matched nothing
+    // cannot make the canary vacuously agree with an empty list.
+    expect(guarded).toContain("claim");
+    expect(guarded).not.toContain("field-get");
+    expect(guarded).not.toContain("item");
+
+    // The page's list, read out of the bullet rather than restated here.
+    const doc = readFileSync(join(REPO_ROOT, "docs", "user-guide", "troubleshooting.md"), "utf8");
+    const lines = doc.split(/\r?\n/);
+    // The names live on the bullet's FIRST line; the sentence that identifies the
+    // bullet wraps onto the next one. Find the sentence, then walk back to the
+    // bullet it belongs to.
+    const marker = lines.findIndex((l) => l.includes("resolve a single issue through"));
+    expect(marker).toBeGreaterThan(-1);
+    let head = marker;
+    while (head >= 0 && !lines[head]!.startsWith("- ")) head--;
+    expect(head).toBeGreaterThan(-1);
+    const listed = [...lines[head]!.matchAll(/`([\w-]+)`/g)].map((m) => m[1]!).sort();
+    expect(listed).toEqual(guarded);
+
+    // ...and the page states the exclusion positively, so an operator debugging a
+    // field-get failure is told the guard is irrelevant instead of inferring it
+    // from a name's absence.
+    expect(doc).toContain("**`field-get` and `item` are NOT on that list**");
+  });
+
   test("milestones overflow throws instead of a bogus 'not found'", async () => {
     const board = new Board(
       CFG,

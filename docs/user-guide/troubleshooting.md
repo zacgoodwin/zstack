@@ -199,6 +199,42 @@ Four cases deliberately still skip:
 - **No marker anywhere.** The stage did not finish (the classic shape is an agent
   that backgrounded `bun test` and ended its turn to await a notification nobody
   will send). Skip note: `ended without a recognized exit marker (…)`.
+
+  **The reviewer variant of this is the most expensive one, and it looks like a
+  success.** An adversarial reviewer spawns its three skeptics, completes its own
+  verification, writes an accurate summary saying every criterion holds — and then
+  closes on a sentence about waiting. The real ones, from loop 17:
+
+  > Three skeptic agents are now running in the background … **Waiting for skeptic
+  > completion notifications.**
+
+  …and, on a different ticket and a different attempt:
+
+  > Now I'm awaiting skeptic verdicts. I've pinged all three once per stage
+  > instructions. **Let me wait briefly for responses before finalizing.**
+
+  Both tickets were Skipped with green, committed, QA-passed work on the branch,
+  and every skeptic then reported minutes later into a lane that had already
+  closed — two of them carrying real defects nobody ever read. The tell is the
+  closing sentence: the message ends mid-collection rather than mid-work, so the
+  ticket looks reviewed and is not. Search a suspect transcript for `waiting`,
+  `awaiting`, or `notification` near its end.
+
+  Why it happened: sub-agents spawn in the background by default, and a background
+  sub-agent's only delivery channel is a notification **between** turns — a channel
+  a stage agent does not have, since the loop sends it exactly one message by
+  design. So "wait for the verdicts" had no in-turn implementation, and ending the
+  turn was the only way to act on it. The reviewer prompt now spawns the fan-out
+  synchronously so the verdicts arrive as results inside the same turn, gives a
+  named degraded exit for skeptics that do not return, and states the marker as
+  unconditional on every path (#318).
+
+  Recovery is the same as any markerless skip, and the work is almost always
+  salvageable: read the branch (`git log`, `git diff main...z/ticket-<N>`), confirm
+  the tree is clean and the suite green, then move the ticket back to Review and
+  let the next loop re-spawn a reviewer on it. Do **not** move it to Done on the
+  strength of the summary — that summary is the reviewer's own single read, and the
+  skeptic pass it describes never landed.
 - **Only QUOTED markers.** Skip note: `only QUOTED its exit markers (…)`. A marker
   inside a fenced code block, or one whose payload is still the contract's own
   `<placeholder>` (`BUILT: <one-line summary>`), is the stage echoing its
@@ -657,12 +693,22 @@ one depends on where it happens:
   other item still comes back, and the offending ticket number is printed on
   stderr as `OVER-CEILING: #N …`. The tick is never wedged over one runaway
   ticket. Fix the named ticket (see below) and it rejoins the next snapshot.
-- **`claim` / `move` / `comment` / `field-get` / `field-set` / `link` / `release`**
-  (anything that looks up a single issue): an assignees list over 10 throws loud —
-  `assignees for issue #N (ceiling: 10 assignees per issue) exceeds its single
-  query page and would be silently truncated` — and refuses to act. This guards
-  `claim()`'s "sole assignee is me" ownership check: a silently truncated
-  10-assignee page could otherwise misjudge a ticket it should have refused.
+- **`assignees` / `claim` / `comment` / `field-set` / `link` / `move` / `release`**
+  (the commands that resolve a single issue through `lookup()`): an assignees list
+  over 10 throws loud — `assignees for issue #N (ceiling: 10 assignees per issue)
+  exceeds its single query page and would be silently truncated` — and refuses to
+  act. This guards `claim()`'s "sole assignee is me" ownership check: a silently
+  truncated 10-assignee page could otherwise misjudge a ticket it should have
+  refused.
+- **`field-get` and `item` are NOT on that list**, and the distinction is the
+  point rather than an omission: `fieldGet()` queries `Q_FIELD_VALUE` and `item()`
+  queries `Q_ITEM_LOOKUP`, neither of which reads `assignees` at all. Both keep
+  working on an issue with 40 assignees, and neither can ever emit the error
+  above — so an oversized assignee list is not the explanation for a `field-get`
+  or `item` failure. (Both still enforce the 20-boards-per-issue `projectItems`
+  ceiling, which is a different error string.) `tests/board.test.ts` pins this
+  list against the real `lookup()` caller set, so the page cannot drift from the
+  code.
 
 Either way, the fix is the same: reduce what's on the issue.
 

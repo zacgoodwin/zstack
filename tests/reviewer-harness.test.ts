@@ -258,8 +258,13 @@ describe("mocked end-to-end: evals/reviewer/run.sh", () => {
   test("a genuine graded failure still fails the threshold, exit 1 -- not masked as a harness error", () => {
     const r = runEval(REVIEWER_DIR, ["1"], { MOCK_CLAUDE_PASS: "false" });
     expect(r.stdout).toContain("in 0/1 trials");
-    expect(r.stdout).toContain("FAIL: below threshold");
+    // #318 added a second gate, so the verdict line names both possible causes.
+    expect(r.stdout).toContain("FAIL: recall below threshold, or a reviewer stage reported no exit marker");
     expect(r.exitCode).toBe(1);
+    // ...and this failure is the RECALL one: the mock still emits markers, so the
+    // marker gate passed and did not contribute to the exit code.
+    expect(r.stdout).toContain("exit marker reported: 2/2 reviewer stages");
+    expect(r.stdout).not.toContain("MISSING MARKER");
   }, E2E_TIMEOUT_MS);
 
   test("ungradeable output reports HARNESS ERROR and exit 2, never a score", () => {
@@ -326,7 +331,10 @@ describe("mocked end-to-end: evals/reviewer-severity/run.sh", () => {
     );
     expect(prompt).toContain("Super-truth pass");
     expect(prompt).toContain("skeptics=<k>/3");
-    expect(prompt).toContain("Delivery is BEST-EFFORT");
+    // #318 replaced #191's "Delivery is BEST-EFFORT / check at most once" wording
+    // with a named degraded exit, which is what this fixture actually exercises:
+    // a reviewer holding fewer than three verdicts must still report one.
+    expect(prompt).toContain("DEGRADED COLLECTION");
   });
 
   // The mock stands in for a real reviewer, so its canned starved output must
