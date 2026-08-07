@@ -324,8 +324,9 @@ records the result. It never re-derives a scheduling decision in prose.
     put it mid-message, 71 of those as the second non-empty line (a one-line
     headline, the verdict, then the evidence block). A "must be the closing line"
     rule would skip all 80 and re-open #307 for the majority of its own population.
-    The whole change rescues **135 of 507** real messages with **zero** verdicts
-    changed in any other direction.
+    The whole change rescues **132 of 507** real messages — the 135 candidates
+    less the 3 mid-message `MERGED`s the stricter rule below still refuses — with
+    **zero** verdicts changed in any other direction.
   - **What is excluded is a marker the stage was quoting**, filtered by mechanism
     rather than position: a marker inside a fenced code block (fenced content sits
     at column 0, so the line-leading rule alone never excluded it), and a marker

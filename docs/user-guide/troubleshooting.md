@@ -190,8 +190,9 @@ lands as `BUILT` / `QA-PASS` and the lane advances. The note carries the prose o
 **both** sides of the marker, so QA's repro steps and a reviewer's `file:line`
 findings reach the rebuilding builder whichever side they were written on.
 
-Measured over this repo's own retained transcripts, that rescues 135 of 507 real
-stage messages and changes no other verdict.
+Measured over this repo's own retained transcripts, that rescues 132 of 507 real
+stage messages — 135 carry a marker off line 1, less the 3 mid-message `MERGED`s
+the stricter rule below still refuses — and changes no other verdict.
 
 Four cases deliberately still skip:
 

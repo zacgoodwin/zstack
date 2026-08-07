@@ -687,9 +687,19 @@ ACTUAL=$("$Z_COST" --json "$STATE_DIR/transcripts/ticket-<N>/*.jsonl" | jq -r .t
 The expiry decision is inside `next` (silent past `watchdogMinutes` →
 `check-worker`; probe recorded dead → `skip`). Your only duties: keep calling
 `next` at least once a minute while waiting, answer `check-worker` honestly
-from the harness's task list, and never let a lane idle unprobed. A stage that
-returns a `CONFUSED:` final message routes to `skip` automatically — comment
-its confusion note into the ticket when you execute the skip.
+from the harness's task list, and never let a lane idle unprobed. A stage whose
+final message is UNREADABLE routes to `skip` automatically — comment the
+confusion note `outcome` produced into the ticket when you execute the skip.
+Unreadable is `parseStageResult`'s call, never a `CONFUSED:` string you look for
+yourself, and since **#307** it is a narrow set: no marker anywhere, only QUOTED
+markers (inside a fenced code block, or still carrying the contract's
+`<placeholder>`), two DIFFERENT markers of that stage, or a `MERGED` that is
+neither the first nor the closing line. A correctly spelled marker on a line of
+its own **anywhere else** is now read as the verdict and the lane advances, so a
+stage that closed with `BUILT:` after a prose summary is no longer a skip. The
+note names which shape it was;
+[troubleshooting.md → A ticket was Skipped but its branch carries a finished, committed, green diff](../docs/user-guide/troubleshooting.md#a-ticket-was-skipped-but-its-branch-carries-a-finished-committed-green-diff)
+covers recovering each by hand.
 
 **Per-stage budgets and the ceiling (#256).** `watchdogMinutes` is resolved per
 STAGE, not once per run: the shipped defaults are builder 25 / qa 15 /
