@@ -18,6 +18,7 @@ import {
   recordMergeGate,
   recordOutcome,
   type LoopState,
+  type StageOutcome,
   type Stage,
   type TicketSnapshot,
 } from "../../lib/loop.ts";
@@ -28,6 +29,8 @@ const PROMPT_PATH = "/home/dev/.zstack/projects/demo/loop/tmp/prompt-1.txt";
 
 // A representative ABSOLUTE input path, the shape z-loop writes per ticket.
 const INPUT_PATH = "/home/dev/.zstack/projects/demo/loop/tmp/input-1.json";
+// #323 fixture: the verdict target every prompt constructor now requires.
+const vt = (ticket: number) => ({ path: "/tmp/verdict.json", runId: "run-20260101-000000-aaaa", ticket, attempt: 1 });
 
 export interface Payloads {
   ticketBody: string;
@@ -64,17 +67,20 @@ function afterPromptBytes(stage: Stage, p: Payloads): number {
     case "builder":
       return builderPrompt(
         { ticketNumber: 1, ticketTitle: "Ticket 1", ticketBody: p.ticketBody, worktreePath: ".worktrees/ticket-1", branch: "z/ticket-1-demo", baseBranch: "main" },
-        INPUT_PATH
+        INPUT_PATH,
+        vt(1)
       ).length;
     case "qa":
       return qaPrompt(
         { ticketNumber: 1, ticketBody: p.ticketBody, worktreePath: ".worktrees/ticket-1", branch: "z/ticket-1-demo", qaPass: 1, webTarget: false },
-        INPUT_PATH
+        INPUT_PATH,
+        vt(1)
       ).length;
     case "reviewer":
       return reviewerPrompt(
         { ticketBody: p.ticketBody, acceptanceCriteria: p.acceptanceCriteria, diff: p.diff, worktreePath: "/tmp/review-1" },
-        INPUT_PATH
+        INPUT_PATH,
+        vt(1)
       ).length;
     case "merge":
       return mergePrompt(
@@ -82,7 +88,8 @@ function afterPromptBytes(stage: Stage, p: Payloads): number {
         // the stamping form of the gate command, so the measured prompt is the
         // one the orchestrator actually builds.
         { ticketNumber: 1, prTitle: "Ticket 1", branch: "z/ticket-1-demo", baseBranch: "main", worktreePath: ".worktrees/ticket-1", stackedOn: [], statePath: "loop/state.json" },
-        INPUT_PATH
+        INPUT_PATH,
+        vt(1)
       ).length;
   }
 }
@@ -125,13 +132,15 @@ bun "$PACK/lib/loop.ts" next "$STATE"`;
 
 export const AFTER_TICK = `ACTION=$("$PACK/bin/z-loop-tick" --slug "$SLUG" --state "$STATE" --tmp "$TMP")`;
 
-const HAPPY: Record<Stage, string> = {
-  builder: "BUILT: ok",
-  qa: "QA-PASS: ok",
-  // confidence=100 clears the default 70 floor (issue #62) so the happy-path
+// StageOutcome literals since #323: recordOutcome takes the already-mapped
+// verdict, so the simulation feeds it what outcomeFromVerdict would produce.
+const HAPPY: Record<Stage, StageOutcome> = {
+  builder: { kind: "built" },
+  qa: { kind: "qa-pass" },
+  // confidence 100 clears the default 70 floor (issue #62) so the happy-path
   // drain actually reaches merge instead of fail-closing to Blocked.
-  reviewer: "REVIEW-APPROVE: confidence=100 ok",
-  merge: "MERGED: https://pr/1",
+  reviewer: { kind: "review-approve", confidence: 100, skeptics: null },
+  merge: { kind: "merged", note: "https://pr/1" },
 };
 
 export interface DrainStats {

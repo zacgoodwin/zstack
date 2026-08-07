@@ -93,6 +93,7 @@ function stagePromptWithTag(tag: string): string {
       baseBranch: "main",
     },
     "/tmp/input-151.json",
+    { path: "/tmp/t151/verdict.json", runId: RUN_A, ticket: 151, attempt: 1 }, // #323
     tag
   );
 }
@@ -976,6 +977,7 @@ describe("transcripts CLI (#190)", () => {
     expect(reviewerPrompt(
       { ticketBody: "b", acceptanceCriteria: "a", diff: "d", worktreePath: "/w" },
       "/tmp/input-151.json",
+      { path: "/tmp/t151/verdict.json", runId: RUN_A, ticket: 151, attempt: 2, skepticDirs: ["/tmp/s1", "/tmp/s2", "/tmp/s3"] }, // #323
       true,
       out
     )).toContain(`${SPAWN_TAG_MARKER} ${out}`);

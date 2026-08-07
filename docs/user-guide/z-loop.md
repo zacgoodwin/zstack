@@ -172,7 +172,10 @@ records the result. It never re-derives a scheduling decision in prose.
   a pure function of the diff's changed-line count, the issue's labels, and the
   `adversarialMode` knob (default `non-trivial`: a ≥ 10-line diff OR a
   `security`/`migration`/`payments`/`auth` label; `off` never, `always` every
-  card). The confidence rides in the reviewer's exit marker.
+  card). The confidence rides on the reviewer's verdict file
+  (`evidence.confidence`, #323), and the three skeptic briefs are composed by
+  `stage-prompts` and embedded verbatim in the reviewer's prompt — composition
+  is enforced, never improvised (#265).
 - **The skeptics are collected inside the reviewer's own turn.** The fan-out is
   spawned as three concurrent sub-agents in a single message, each *synchronous*,
   so the verdicts come back to the reviewer as results it can read before it
@@ -182,25 +185,27 @@ records the result. It never re-derives a scheduling decision in prose.
   to wait is finished, permanently, and its skeptics report into a lane that has
   already closed. Loop 17 lost two tickets to exactly that, both with green,
   committed, QA-passed diffs (#318).
-- **A degraded collection still reports.** If fewer than three verdicts come
-  back, the reviewer does not wait and does not retry: it judges on the `k` it
-  holds and emits its normal marker with an honest `skeptics=<k>/3`, letting the
-  quorum gate below decide whether `k` was enough. If the fan-out failed badly
-  enough that it cannot judge the diff at all, it emits
-  `CONFUSED: skeptic collection failed — <what happened>`. Either way a verdict
-  is reported. **Every stage's exit marker is unconditional**: whether the stage
-  finished, failed, ran out of budget, or lost something it was counting on, its
-  final message carries exactly one marker. Silence is not a cautious report of
-  an incomplete run — it parses as CONFUSED and skips the ticket, throwing away
-  whatever the stage did.
+- **A degraded collection still reports.** Each skeptic writes its OWN verdict
+  file, and the loop counts those files itself (#266) — so the reviewer never
+  waits, never retries, and never tallies: it lists in its verdict's
+  `evidence.skepticVerdictPaths` only the files that exist when it looks, and
+  the quorum gate below counts them off disk (a skeptic landing after the
+  reviewer returned still counts, #231). If the fan-out failed badly enough
+  that it cannot judge the diff at all, it writes a `CONFUSED` verdict naming
+  what happened. **Every stage's verdict file is unconditional** (#323):
+  whether the stage finished, failed, ran out of budget, or lost something it
+  was counting on, it writes the file with the honest result. Silence is not a
+  cautious report of an incomplete run — a missing or invalid verdict routes
+  to the dead-stage machinery (one re-spawn, then the #209 salvage
+  inspection), and the stage's own judgment of its work is lost.
 - **A low-confidence approval does not merge.** The reviewer always reports a
   self-assessed (or, on a super-truth pass, skeptic-aggregated) `confidence`
-  0–100 on its `REVIEW-APPROVE`. An approval below `minReviewerConfidence`
-  (default 70) never reaches the merge gate: per `reviewerBelowThresholdAction`
-  (default `block`) it parks the ticket Blocked with
-  `truth-check failed (confidence X/100)`, bounces it back to the builder
-  (`retry`), or is ignored entirely (`off`). A `REVIEW-APPROVE` with no
-  parseable confidence is treated the same as a sub-floor score — fail-closed,
+  0–100 on its `REVIEW-APPROVE` verdict's evidence. An approval below
+  `minReviewerConfidence` (default 70) never reaches the merge gate: per
+  `reviewerBelowThresholdAction` (default `block`) it parks the ticket Blocked
+  with `truth-check failed (confidence X/100)`, bounces it back to the builder
+  (`retry`), or is ignored entirely (`off`). A `REVIEW-APPROVE` with no usable
+  confidence value is treated the same as a sub-floor score — fail-closed,
   never a silent merge — whenever the gate is on.
 - **A red suite does not merge, and the agent has no say.** Before a merge agent
   is spawned, the loop itself runs the gauntlet in the lane's worktree and
@@ -211,17 +216,20 @@ records the result. It never re-derives a scheduling decision in prose.
   [The merge green gate](#the-merge-green-gate).
 - **A confidence with nobody behind it does not merge either.** The aggregated
   confidence is computed over the skeptics that actually *reported*, so ONE
-  skeptic answering "cannot refute" is `confidence=100` — which clears the
-  default floor of 70 and merges as though three independent reviews agreed. Sub-
-  agent delivery is best-effort (run 10 measured deliveries of 0 of 3), so the
-  reviewer now reports the denominator too: `skeptics=<k>/3`. Below config
+  skeptic answering "cannot refute" is confidence 100 — which clears the
+  default floor of 70 and merges as though three independent reviews agreed.
+  Sub-agent delivery is best-effort (run 10 measured deliveries of 0 of 3), so
+  the denominator is COUNTED, never believed (#266): each skeptic writes its
+  own verdict file, and `loop outcome` counts the valid files at the paths the
+  reviewer listed — a self-reported tally cannot vouch for a file that is not
+  on disk, and one that landed late still counts (#231). Below config
   `minSkepticQuorum` (default 2) the ticket does not merge; it re-spawns the
   **reviewer** once — a thin review is not a bad diff, and rebuilding something
   nobody faulted fixes nothing — and if the second reviewer also cannot reach
   quorum, parks Blocked naming the delivery failure and saying the diff itself was
   never faulted. That retry has its own budget, separate from `maxReviewBounces`,
   so a delivery race never consumes the rebuild a genuine finding needs. A
-  single-pass review reports no `skeptics=` token and is untouched by this gate.
+  single-pass review lists no skeptic paths and is untouched by this gate.
 - **Reviewer->builder bounces are capped.** A `REVIEW-FINDINGS` and a
   `reviewerBelowThresholdAction: "retry"` both send the ticket back to the
   builder from Review, and both draw on the same per-lane budget: at config
@@ -284,13 +292,13 @@ records the result. It never re-derives a scheduling decision in prose.
   says so on stderr and that lane falls back to the old stage-age behavior — the
   observation never parks a lane on its own absence.
 - **A stage that died without ever reporting can still be recovered.** A stage
-  agent's exit contract is parsed from its final message, so a worker that ends
-  its turn with no marker reads as CONFUSED — and a CONFUSED skips the ticket.
-  That is the right answer when the agent could not do the job and the wrong one
-  when it simply never said it did: run 11's #170 builder addressed both reviewer
-  findings, backgrounded its own `bun test`, and stopped to wait for a run nobody
-  could report back to, with the finished diff sitting uncommitted in its
-  worktree. So the dead-worker probe now collects that worktree's
+  agent's report is the verdict FILE it writes (#323), so a worker that ends
+  its turn without one — or with one `loop outcome` refuses — is a dead stage.
+  Skipping outright is the right answer when the agent could not do the job and
+  the wrong one when it simply never said it did: run 11's #170 builder
+  addressed both reviewer findings, backgrounded its own `bun test`, and
+  stopped to wait for a run nobody could report back to, with the finished diff
+  sitting uncommitted in its worktree. So the dead-worker probe collects that worktree's
   `git status --porcelain --branch` too, and a lane whose worker died holding
   **uncommitted changes** re-spawns that same stage ONCE (`respawn`) instead of
   being skipped — a fresh agent, never a resumed conversation, so nothing latent
@@ -323,93 +331,37 @@ records the result. It never re-derives a scheduling decision in prose.
   no more durable there than after a skip.
   Every stage prompt that runs the gauntlet now also states the other half: run
   verification in the FOREGROUND, because ending a turn with a background job
-  still pending is parsed as CONFUSED. Each of those prompts prices the wait too —
-  this repo's full suite runs 128-234s measured, against that stage's own watchdog
-  budget in minutes — so foreground is visibly affordable rather than merely
-  mandatory.
-- **A marker on a line of its own is read wherever it sits; a QUOTED one is not.**
-  The exit contract asks every stage to open its final message with the marker, and
-  the parser used to read nothing else, so a stage that wrote a prose summary and
-  put a correctly spelled `BUILT:` anywhere else was CONFUSED by definition —
-  skipped after spending its whole budget, work committed and green, ticket left for
-  a human. That was the dominant failure of loop 16: 3 of 3 tickets, two models, two
-  stage kinds, $2.33 paid for nothing merged. So the first line is still read first,
-  and when it is not a marker the whole message is scanned for line-leading markers
-  of that stage and the **last** one is the verdict. Last, not first, so a stage
-  narrating "I will close with `BLOCKED:` if the dependency is broken" cannot
-  pre-commit a verdict it goes on to contradict.
-  - **Position is not the filter, because the corpus says it cannot be.** Measured
-    over every retained stage final message in this repo — 507 with text, 135
-    carrying a marker off line 1 — only 55 put it on the closing line while **80**
-    put it mid-message, 71 of those as the second non-empty line (a one-line
-    headline, the verdict, then the evidence block). A "must be the closing line"
-    rule would skip all 80 and re-open #307 for the majority of its own population.
-    The whole change rescues **132 of 507** real messages — the 135 candidates
-    less the 3 mid-message `MERGED`s the stricter rule below still refuses — with
-    **zero** verdicts changed in any other direction.
-  - **What is excluded is a marker the stage was quoting**, filtered by mechanism
-    rather than position: a marker inside a fenced code block (fenced content sits
-    at column 0, so the line-leading rule alone never excluded it), and a marker
-    whose payload **opens with** the contract's own `<placeholder>` — what pasting
-    one instruction line produces, and the contract's real lines carry a trailing
-    description after the placeholder, so the match cannot be anchored at both ends.
-    Both cost nothing on the real corpus (0 of the 80 hits are fenced, 0 carry a
-    placeholder) and both close a route an agent can actually take, since every
-    stage prompt hands it the literal marker strings. Such a message gets its own
-    note: `only QUOTED its exit markers`.
-  - **Fence tracking follows CommonMark**, and each rule is load-bearing rather than
-    pedantry — skipping any one of them turned a quoted marker back into a live
-    verdict in a reproducible probe. A fence closes only on a run of the **same
-    character, at least as long** as the opener (so a ``` block nested in a ````
-    block cannot re-open the outer one); a **closing** delimiter carries nothing
-    else (so `` ``` still inside the block `` is content, not a closer); a backtick
-    opener's info string may not contain a backtick (so an inline code span in prose
-    does not open a fence); and a delimiter takes at most three leading spaces.
-  - **Both positions get every guard.** The line-1 preference is not a
-    short-circuit: the quoted-marker and contradiction checks run over the whole
-    message first, then the verdict is chosen. That closes two holes a line-1-only
-    fast path had — a line-1 `MERGED: <the PR URL>` (the contract's own template)
-    completed a ticket, and a line-1 `REVIEW-APPROVE` shipped a diff its own next
-    line called defective. Every **well-formed** message still parses exactly as it
-    did before; a message that quotes its template or reports two verdicts was never
-    well-formed.
-  - **The residual, and what bounds each verdict.** A stage that writes a
-    fully-formed marker line at column 0 inside prose that disowns it ("if the tests
-    pass I will write `REVIEW-APPROVE: confidence=95 …`") is still read as reporting
-    it. Zero occurrences in the corpus against 80 real tickets that refusing it
-    outright would cost, so it is accepted — but only where a mechanism bounds it:
-    - `BUILT` — re-verified against the lane worktree (a dirty tree or a HEAD still
-      at the base bounces the lane back to the builder).
-    - `REVIEW-APPROVE` — its `confidence=` is the **lowest on the marker's own
-      lines**, so a number narrated in prose, or quoted inside a pasted diff hunk,
-      cannot score the gate, and a stage that narrates a high score then reports a
-      real lower one is held to the real one. A bare approve scores null, which the
-      truth-check gate refuses to merge on. `skeptics=` takes the **lowest**
-      denominator anywhere outside a fence, because a denominator can only ever
-      *block* — so an honest "only 1 of 3 came back" in prose still stops the merge,
-      and a quoted `3/3` cannot outrank a real `1/3` in either order.
-    - `MERGED` — accepted on the **first or the closing line only**, and its note is
-      only its own payload, because the orchestrator writes that note into the
-      completion note's PR-URL slot. It is terminal and nothing re-reads it, so it
-      does not get the loose rule. Cost: 3 real messages, against a false Done that
-      would delete an unmerged branch at batch cleanup.
-    - `QA-PASS` — the one verdict where the residual is live, by choice: 17 real
-      mid-message occurrences make the strict rule expensive, and a false pass still
-      has to clear the blinded reviewer and then the merge gate's own suite run. The
-      open hazard is a QA agent echoing a marker line out of the ticket's own
-      Acceptance Criteria — this repo files tickets that contain them. Closing that
-      needs the stage's input payload at parse time; it is a follow-up, not shipped
-      here.
-  - Two **different** markers of one stage is a genuine contradiction and stays
-    CONFUSED naming both, judged before last-hit-wins so whichever landed last
-    cannot resolve it. A scanned marker's note carries the prose on **both** sides
-    of it with the marker's own remainder first, so QA's numbered repros and a
-    reviewer's `file:line` findings reach the rebuilding builder whichever side of
-    the marker they were written on, and a `skeptics=k/3` denominator in the
-    surrounding prose still counts against the quorum floor. A well-formed message
-    parses off line 1 exactly as before, and a message with no marker anywhere is
-    CONFUSED exactly as before: the widening rescues a stage that finished and said
-    so awkwardly, never one that did not finish.
+  still pending and no verdict file written is a dead stage. Each of those
+  prompts prices the wait too — this repo's full suite runs 128-234s measured,
+  against that stage's own watchdog budget in minutes — so foreground is
+  visibly affordable rather than merely mandatory.
+- **A stage's report is a FILE, never prose (#323).** Each stage writes
+  `verdict.json` into its own run-scoped artifact directory — the exact path is
+  rendered into its prompt — with a fixed envelope (schema, runId, ticket,
+  stage, attempt), a `result` from that stage's own union, per-stage
+  `evidence`, and one-line `notes`. `loop outcome` validates the file against
+  the spawn the loop itself made: unreadable JSON, a mis-addressed envelope
+  (wrong run/ticket/stage/attempt — a verdict copied from another spawn's
+  directory), a result outside the union, or a pasted `<placeholder>` are all
+  INVALID, and INVALID routes to the dead-stage recovery above, never a blind
+  skip and never a reinterpretation.
+
+  This replaced the marker era outright. Through v1.2.x a stage reported by
+  opening its final message with a marker line (`BUILT:`, `QA-PASS:`, …), and
+  the loop carried a 400-line scanner — fence tracking, quoted-marker and
+  placeholder guards, last-hit-wins position rules, per-token safe-direction
+  reading for `confidence=` and `skeptics=` — to bound what untrusted prose
+  could claim (#307, #318). The scanner's own header conceded the hole it
+  could not close: a QA agent echoing a `QA-PASS:` line out of the ticket's
+  own Acceptance Criteria read as a pass (#312). A file deletes the problem
+  class: an echo in prose is inert, there is no position to get wrong, and a
+  "verdict" the stage merely narrated does not exist. What a stage CAN still
+  do is deliberately write a false verdict — bounded the same way the marker
+  era's residual was, by mechanism: `BUILT` is re-verified against the lane
+  worktree's git facts, reviewer quorum is counted off the skeptic verdict
+  files on disk (#266), `MERGED` still faces the merge gate's own suite run,
+  and (#324, contract C3) the board-side confirmation that the PR really
+  landed.
 - **Actual per ticket.** After each stage the ticket's transcripts are priced with
   `bin/z-cost` (dedup by requestId) and written to the Actual field. A stage that
   died without reporting is priced too, at the moment it is found dead and before

@@ -60,6 +60,19 @@ function normTitle(t: string): string {
   return t.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
+// A fence delimiter line, CommonMark rules (#314, ported from the #307 fix
+// that lived in lib/loop.ts until the marker parser retired in #323 -- this
+// file is now the fence tracker's ONE owner):
+//   - at most 3 leading spaces (4+ is an indented code block, not a fence);
+//   - an opener may carry an info string, but a BACKTICK opener's info string
+//     may not contain a backtick, or `` `x` `` in prose would open a fence;
+//   - a closer carries the SAME delimiter char, at LEAST the opener's length,
+//     and nothing else -- without the length rule a ```` fence closes on the
+//     ``` it quotes (the nested-fence bug #307 fixed and #314 filed here), and
+//     without the empty-info rule "``` still inside the block" ends the fence
+//     early and exposes every heading-shaped line below it.
+const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+
 // Collects real markdown headings in document order, skipping any that fall
 // inside a fenced code block. A ticket's `## Plan` routinely embeds a bash fence
 // with "# comment" lines and file listings; without fence-awareness those would
@@ -67,17 +80,22 @@ function normTitle(t: string): string {
 export function parse(md: string): { headings: Heading[]; lines: string[] } {
   const lines = md.split(/\r?\n/);
   const headings: Heading[] = [];
-  let fence = ""; // the open fence marker char ("`" or "~"), "" when outside
+  // The OPEN fence's delimiter run, or null outside a fence (see FENCE_LINE).
+  let fence: string | null = null;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const f = line.match(/^\s*(`{3,}|~{3,})/);
+    const f = line.replace(/\s+$/, "").match(FENCE_LINE);
     if (f) {
-      const marker = f[1][0];
-      if (!fence) fence = marker;
-      else if (marker === fence) fence = "";
+      const delim = f[1]!;
+      const info = f[2]!;
+      if (fence === null) {
+        if (!(delim[0] === "`" && info.includes("`"))) fence = delim;
+      } else if (delim[0] === fence[0] && delim.length >= fence.length && info.trim() === "") {
+        fence = null;
+      }
       continue;
     }
-    if (fence) continue;
+    if (fence !== null) continue;
     const m = line.match(/^(#{1,6})\s+(.+?)\s*$/);
     if (m) headings.push({ line: i, level: m[1].length, title: m[2].trim() });
   }

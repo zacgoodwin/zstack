@@ -65,6 +65,7 @@ import {
   type LaneState,
   type LoopState,
   type Stage,
+  type StageOutcome,
   type TicketSnapshot,
 } from "../lib/loop.ts";
 import { Board, type GraphQLData, type GraphQLExecutor } from "../lib/board.ts";
@@ -119,11 +120,11 @@ function lane(ticketNumber: number, stage: Stage, over: Partial<LaneState> = {})
 function state(tickets: TicketSnapshot[], lanes: LaneState[] = [], maxLanes = 3): LoopState {
   return { tickets, lanes, maxLanes, watchdogMinutes: 10, mergedThisRun: [] };
 }
-const HAPPY: Record<Stage, string> = {
-  builder: "BUILT: ok",
-  qa: "QA-PASS: ok",
-  reviewer: "REVIEW-APPROVE: confidence=100 ok", // clears the default 70 floor (issue #62)
-  merge: "MERGED: https://pr/1",
+const HAPPY: Record<Stage, StageOutcome> = {
+  builder: { kind: "built" },
+  qa: { kind: "qa-pass" },
+  reviewer: { kind: "review-approve", confidence: 100, skeptics: null }, // clears the default 70 floor (issue #62)
+  merge: { kind: "merged", note: "https://pr/1" },
 };
 // The green verdict `loop merge-gate --state` stamps on a lane (#178): without
 // one, nextAction never advances a lane into the merge stage.

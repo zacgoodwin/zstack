@@ -18,8 +18,22 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { extractJsonObject, readGradeVerdict, verdictToken } from "../evals/lib/grade.ts";
-import { parseReviewerConfidence, parseSkepticQuorum } from "../lib/loop.ts";
+// #323 deleted the loop's marker-token parsers (verdicts are files now). The
+// reviewer EVAL's mock still speaks the marker shape its fixtures were graded
+// under, so this test file carries its own local readers of that fixture
+// format -- they describe the mock, not the loop.
+const fixtureConfidence = (s: string): number | null => {
+  const m = s.match(/\bconfidence=(\d{1,3})(?!\d)/i);
+  return m && Number(m[1]) <= 100 ? Number(m[1]) : null;
+};
+const fixtureQuorum = (s: string): { received: number; of: number } | null => {
+  const m = s.match(/\bskeptics=(\d{1,2})\/(\d{1,2})(?!\d)/i);
+  return m ? { received: Number(m[1]), of: Number(m[2]) } : null;
+};
 import { adversarialActive, reviewerPrompt, type AdversarialMode } from "../lib/stage-prompts.ts";
+
+// #323 fixture verdict target for prompt construction in these tests.
+const VT_FIXTURE = { path: "/tmp/verdict.json", runId: "run-20260101-000000-aaaa", ticket: 151, attempt: 1, skepticDirs: ["/tmp/sk1", "/tmp/sk2", "/tmp/sk3"] };
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const REVIEWER_DIR = join(REPO_ROOT, "evals", "reviewer");
@@ -327,14 +341,16 @@ describe("mocked end-to-end: evals/reviewer-severity/run.sh", () => {
     const prompt = reviewerPrompt(
       { ticketBody: "b", acceptanceCriteria: "a", diff: "d", worktreePath: "/w" },
       "/tmp/input.json",
+      VT_FIXTURE,
       adversarialActive(mode as AdversarialMode, 0, [])
     );
     expect(prompt).toContain("Super-truth pass");
-    expect(prompt).toContain("skeptics=<k>/3");
-    // #318 replaced #191's "Delivery is BEST-EFFORT / check at most once" wording
-    // with a named degraded exit, which is what this fixture actually exercises:
-    // a reviewer holding fewer than three verdicts must still report one.
-    expect(prompt).toContain("DEGRADED COLLECTION");
+    // #323: the denominator is counted off skeptic verdict FILES; the prompt
+    // demands the paths list instead of a self-reported skeptics= token, and
+    // the degraded exit (#318/#191) is "list ONLY what exists" + the k-table.
+    expect(prompt).toContain("skepticVerdictPaths");
+    expect(prompt).toContain("ONLY the skeptic verdict files that exist");
+    expect(prompt).toContain("k=0: nobody looked");
   });
 
   // The mock stands in for a real reviewer, so its canned starved output must
@@ -348,9 +364,9 @@ describe("mocked end-to-end: evals/reviewer-severity/run.sh", () => {
     });
     const out = proc.stdout.toString();
     expect(out.trimStart().startsWith("REVIEW-APPROVE:")).toBe(true); // a marker, never a silent turn
-    expect(parseSkepticQuorum(out)).toEqual({ received: 0, of: 3 }); // an honest denominator
+    expect(fixtureQuorum(out)).toEqual({ received: 0, of: 3 }); // an honest denominator
     // NOT inflated: 0 verdicts must not carry confidence=100.
-    expect(parseReviewerConfidence(out)).not.toBe(100);
-    expect(parseReviewerConfidence(out)).toBeGreaterThan(0);
+    expect(fixtureConfidence(out)).not.toBe(100);
+    expect(fixtureConfidence(out)).toBeGreaterThan(0);
   });
 });

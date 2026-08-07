@@ -4,6 +4,12 @@ All notable changes to zstack are documented here. Format follows [Keep a Change
 
 There is no `[Unreleased]` section: since 1.1.0.0 every PR opens its own version heading at merge time, written by `bun lib/version.ts claim` rather than by hand. Do not add one, and do not edit a version heading or VERSION/package.json directly — see [docs/user-guide/z-loop.md](docs/user-guide/z-loop.md#version-claiming).
 
+## [1.2.1.0] - 2026-08-07
+
+### Fixed
+
+C2 of epic #321: stage outcomes are verdict FILES, never prose. Each stage writes a schema-validated verdict.json into its run-scoped directory; the loop validates it against its own spawn record, routes missing/invalid to respawn-then-salvage, counts reviewer quorum off skeptic verdict files on disk, and composes skeptic briefs deterministically. Kills the forgeable QA-PASS (#312), the duplicate fence tracker (#314), unbounded stage returns (#262), the self-reported skeptic tally (#266), improvised skeptic briefs (#265), the prose post-conflict re-gate (#249), invisible late skeptic verdicts (#231), and prose-judged worker liveness (#257).
+
 ## [1.2.0.0] - 2026-08-07
 
 ### Added

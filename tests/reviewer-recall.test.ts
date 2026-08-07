@@ -34,6 +34,9 @@ import {
 } from "../evals/lib/recall.ts";
 import { reviewerPrompt } from "../lib/stage-prompts.ts";
 
+// #323 fixture verdict target for prompt construction in these tests.
+const VT_FIXTURE = { path: "/tmp/verdict.json", runId: "run-20260101-000000-aaaa", ticket: 151, attempt: 1, skepticDirs: ["/tmp/sk1", "/tmp/sk2", "/tmp/sk3"] };
+
 const REVIEWER_DIR = join(import.meta.dir, "..", "evals", "reviewer");
 
 const DEFECTS: DefectKey[] = [
@@ -318,16 +321,19 @@ describe("exit-marker gate (#318)", () => {
     expect(report).not.toContain("MISSING MARKER");
   });
 
-  // The marker names are a contract with lib/stage-prompts.ts, not a local list:
-  // a stage whose marker is renamed there and not here would score every trial as
-  // silent and fail the eval for a reason that has nothing to do with the review.
-  test("every scored marker is one the reviewer prompt actually prints", () => {
+  // The result names are a contract with lib/stage-prompts.ts, not a local list:
+  // a result value renamed there and not here would score every trial as silent
+  // and fail the eval for a reason that has nothing to do with the review. Since
+  // #323 the values ride the verdict file's result union, which the prompt
+  // renders verbatim from lib/verdict.ts.
+  test("every scored result value is one the reviewer prompt actually prints", () => {
     const prompt = reviewerPrompt(
       { ticketBody: "b", acceptanceCriteria: "a", diff: "d", worktreePath: "/tmp/wt" },
       "/loop/tmp/input-42.json",
+      VT_FIXTURE,
       true
     );
-    for (const m of REVIEWER_MARKERS) expect(prompt).toContain(`${m}:`);
+    for (const m of REVIEWER_MARKERS) expect(prompt).toContain(`"${m}"`);
   });
 });
 
