@@ -143,6 +143,30 @@ function isOneHopLag(lane: LaneState, boardStatus: BoardStatus, skipQa = false):
   return boardStatus === PRECEDING_BOARD_STATUS[lane.stage];
 }
 
+// #330: does this Done reading come from the loop's OWN merge landing, reflected
+// back through GitHub rather than through `complete`? The merge prompt's PR body
+// carries `Closes #N` (by design -- z-loop/SKILL.md Step 6), so `gh pr merge`
+// closes the issue and the project's built-in workflow moves its card to Done
+// BEFORE the loop ever reads a PR state -- a raw board Done that looks, at this
+// layer, identical to a human dragging the card (parkedByHuman below) or to a
+// genuine stage/status desync (the guard below it). Both would stop the lane at
+// exactly the boundary #324's Done gate exists to own, so this shape is neither:
+// it is routed to the ordinary `merged` resolution in resolveOutcome, which
+// never trusts a raw Done -- `confirm-merge`'s `pr-state --pr` read is the only
+// thing allowed to move this ticket to Done for real (#313). Safe even if a
+// human really did drag the card: a PR that turns out NOT merged reads back a
+// positive divergence (confirmMerged) and parks Blocked with it named, which is
+// strictly more correct than believing the board.
+//
+// Scoped tight on purpose: ONLY a merge-stage lane that already carries a
+// `merged` outcome, ONLY when the board reads exactly Done. A merge lane with NO
+// recorded outcome yet -- nothing for GitHub to have auto-closed -- dragged to
+// Done (or to Blocked/Questions/Skipped, which no automation this pack wires up
+// ever sets) is still a human's call, stopped exactly as before.
+function autoClosedByOwnMerge(lane: LaneState, ticketStatus: BoardStatus | undefined): boolean {
+  return lane.stage === "merge" && lane.outcome?.kind === "merged" && ticketStatus === "Done";
+}
+
 // Per-stage model routing (issue #82). The merge stage is mechanical (`gh pr
 // create`, a conflict check, `gh pr merge`) and never needs the ticket's
 // build-tier model -- Loop run 2 billed every merge spawn at the ticket's full
@@ -1497,6 +1521,13 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
   //    approval) is stopped, so a mid-stage worker is never killed -- it finishes,
   //    records its outcome, and is caught here on the following tick. Merge
   //    approvals still wait for the gate below.
+  //    EXCEPT (#330) a merge-stage lane whose OWN `merged` outcome is what put
+  //    the ticket at Done: the merge prompt's `Closes #N` makes GitHub auto-close
+  //    the issue, and the project's built-in workflow reads that as Done before
+  //    the loop's own `complete` ever runs -- indistinguishable here from a human
+  //    move, but it is the loop's own landing reflected back, so it is routed to
+  //    the #324 Done gate (confirm-merge -> complete) instead of stopped. See
+  //    autoClosedByOwnMerge.
   const parkedByHuman = reconcileBoardMoves(tickets, lanes);
 
   // 1a. #273: lanes whose TICKET left the loop's reach -- a human dragged it into
@@ -1571,7 +1602,14 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
 
   for (const lane of lanes) {
     if (!lane.outcome) continue;
-    if (parkedByHuman.has(lane.ticket)) {
+    // #330: computed once per lane and consulted by BOTH stops below -- the
+    // auto-close collision is invisible to either check on its own (parkedByHuman
+    // classifies by status alone; the desync guard classifies by status-vs-stage
+    // alone), so both need the same exemption or the second one just reproduces
+    // the bug the first one was fixed for, under a different note.
+    const t = byNumber.get(lane.ticket);
+    const autoClosed = autoClosedByOwnMerge(lane, t?.status);
+    if (parkedByHuman.has(lane.ticket) && !autoClosed) {
       return {
         kind: "stop-lane",
         ticket: lane.ticket,
@@ -1605,8 +1643,11 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
     // lagged-write case, and every other lane's progress survives.
     // A missing snapshot cannot reach here: the #202 ghost pass at the top of
     // this function stopped it before any claim or transition.
-    const t = byNumber.get(lane.ticket);
-    if (t && t.status !== STATUS_FOR_STAGE[lane.stage]) {
+    // #330: a merge lane's OWN Done (autoClosed) is not a desync either -- Done
+    // is not STATUS_FOR_STAGE.merge ("Review") on ANY reading of it, lagged write
+    // or human move alike, so without this exemption this guard would just
+    // stop-lane on a different note the instant the check above stopped doing it.
+    if (!autoClosed && t && t.status !== STATUS_FOR_STAGE[lane.stage]) {
       if (
         isOneHopLag(lane, t.status, t.skipQa ?? false) &&
         lane.lastWroteStatus === STATUS_FOR_STAGE[lane.stage]
