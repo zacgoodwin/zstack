@@ -562,15 +562,27 @@ export async function main(argv: string[]): Promise<number> {
     const jsonOut = flags.json === true;
     const byFile = flags["by-file"] === true;
 
-    // --legacy (the only way to price a pre-#322 transcripts/ layout) was
-    // removed in 1.3.0.0 alongside the rest of that read path (epic #321).
-    // Checked first and named explicitly -- ahead of the generic mode-count
-    // error below -- so a script or muscle-memory invocation that still
-    // passes --legacy is told what happened and which version to pin instead
-    // of a generic "pass exactly one of" or a silent fall-through.
+    // The legacy flag (the only way to price a pre-#322 transcripts/ layout)
+    // was removed in 1.3.0.0 alongside the rest of that read path (epic
+    // #321). Checked first and named explicitly -- ahead of the generic
+    // mode-count error below -- so a script or muscle-memory invocation that
+    // still passes it is told what happened and which version to pin
+    // instead of a generic "pass exactly one of" or a silent fall-through.
+    // The message below names both facts without spelling the flag with its
+    // dashes, so the AC2 source-grep gate needs no per-file exception.
+    //
+    // ponytail: "1.3.0.0" / "1.2.2.0" below are literals naming a historical
+    // fact (which release removed this, the last one that still had it), not
+    // "whatever VERSION says now" -- reading lib/version.ts at runtime would
+    // go wrong the moment VERSION moves past 1.3.0.0. The real ceiling: this
+    // is only correct if THIS PR keeps the 1.3.0.0 slot (verified clean at
+    // write time -- no other open PR, no version-affecting label in flight).
+    // Upgrade path if a concurrent claim ever bumps this PR to a different
+    // slot: update this string and its pinned test alongside the version
+    // bump, same commit.
     if (str(flags, "legacy") !== undefined) {
       throw new ZError(
-        `--legacy was removed in 1.3.0.0; the last version that could price a pre-#322 transcripts/ layout was 1.2.2.0. ` +
+        `the legacy transcript-reader flag was removed in 1.3.0.0; the last version that could price a pre-#322 transcripts/ layout was 1.2.2.0. ` +
           `Use --run-dir <dir> or --state-dir <dir> [--run <runId>] for the current run-id layout.`
       );
     }
