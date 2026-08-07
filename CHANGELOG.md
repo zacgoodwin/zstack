@@ -8,8 +8,6 @@ There is no `[Unreleased]` section: since 1.1.0.0 every PR opens its own version
 
 ### Fixed
 
-### Fixed
-
 - **A stage that finishes its work no longer loses the ticket over where it put its exit marker (#307).** The loop read only the first line of a stage agent's final message, so a builder or QA agent that wrote a prose summary and put a correctly spelled `BUILT:` / `QA-PASS:` anywhere else was recorded as CONFUSED and its ticket Skipped — after the stage had spent its full budget, with the work committed and the suite green. That was the dominant failure of loop 16: 3 of 3 tickets, two models, two stage kinds, $2.33 paid for nothing merged. A marker on a line of its own is now read wherever it sits, which rescues 132 of the 507 real stage messages retained in this repo's transcripts with zero verdicts changed in any other direction.
 - **A marker a stage was only QUOTING no longer reads as a verdict.** Markers inside a fenced code block, and payloads still carrying the contract's own `<placeholder>`, are ignored and reported as `only QUOTED its exit markers`. Fence tracking follows CommonMark, so a nested or info-string-carrying delimiter cannot re-open a block and expose the marker inside it.
 - **`MERGED` is accepted only as the first or the closing line, and its note is only the PR URL.** It is the one verdict that is terminal and never re-read, so a merge agent narrating a failed gate can no longer mark a ticket Done over an unmerged branch, and model-authored prose can no longer land in the completion note's URL slot.
