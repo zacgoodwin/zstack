@@ -275,7 +275,9 @@ stage's transcript first.
 
 For the first case, recover it exactly as the dead-worker section below describes. For
 the others, read the stage's transcript
-(`~/.zstack/projects/<slug>/loop/transcripts/ticket-<N>/`), decide what the stage
+(`~/.zstack/projects/<slug>/loop/runs/<runId>/t<N>/` — the runId is in that
+drain's `state.json`, or the archived copy inside the run directory itself; a
+pre-#322 drain used `loop/transcripts/ticket-<N>/`), decide what the stage
 actually concluded, and move the ticket by hand.
 
 ## A ticket was Skipped with a dead-worker note but its worktree has real uncommitted changes

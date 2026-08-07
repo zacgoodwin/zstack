@@ -80,7 +80,10 @@ SESSION="$ME-$(date +%s)"   # names this loop in the lock (second-invocation ref
 STATE_DIR="$HOME/.zstack/projects/$SLUG/loop"
 STATE="$STATE_DIR/state.json"; TMP="$STATE_DIR/tmp"
 LOCKS="$HOME/.zstack/projects/$SLUG/locks"
-mkdir -p "$TMP" "$STATE_DIR/transcripts" "$HOME/.zstack/projects/$SLUG/reports" "$LOCKS"
+# No transcripts/ dir anymore (#322): every artifact of a drain lives under
+# runs/<runId>/, whose id ingest mints into state.json (Step 1 reads it into
+# $RUN_ID). `transcripts collect` creates each stage's directory itself.
+mkdir -p "$TMP" "$HOME/.zstack/projects/$SLUG/reports" "$LOCKS"
 ```
 
 ---
@@ -246,6 +249,13 @@ bun "$PACK/lib/loop.ts" ingest "$STATE" "$TMP/items.json" "$TMP/bodies.json" \
   --max-review-bounces "$MAX_REVIEW_BOUNCES" --min-skeptic-quorum "$MIN_SKEPTIC_QUORUM" \
   --ticket-limit "$TICKET_LIMIT" --context-token-limit "$CONTEXT_TOKEN_LIMIT" \
   --session "$SESSION"
+# The run's artifact identity (#322): minted by a FIRST ingest, carried verbatim
+# by every later one. Everything below that touches a transcript or a dollar --
+# `transcripts tag`/`dest`, both z-cost calls, the end-of-loop report -- is keyed
+# by it, so a resumed batch keeps writing into the same runs/<RUN_ID>/ root and a
+# fresh drain can never absorb an old one's files (#309/#212).
+RUN_ID=$(jq -r .runId "$STATE")
+RUN_ROOT="$STATE_DIR/runs/$RUN_ID"
 ```
 
 `--session "$SESSION"` is not a config knob, and it is passed here AND by every
@@ -508,10 +518,14 @@ the input file, never through your context; ticket #57, Leak 1):
 
    ```bash
    ATTEMPT=$(bun "$PACK/lib/loop.ts" attempt "$STATE" <N>)
-   TAG=$(bun "$PACK/lib/transcripts.ts" tag --slug "$SLUG" --ticket <N> --stage <stage> --attempt "$ATTEMPT")
+   TAG=$(bun "$PACK/lib/transcripts.ts" tag --slug "$SLUG" --run "$RUN_ID" --ticket <N> --stage <stage> --attempt "$ATTEMPT")
    bun "$PACK/lib/stage-prompts.ts" prompt <stage> "$TMP/input-<N>.json" > "$TMP/prompt-<N>.txt"
    STUB=$(bun "$PACK/lib/stage-prompts.ts" stub <stage> "$TMP/prompt-<N>.txt" --spawn-tag "$TAG")
    ```
+
+   `--run "$RUN_ID"` folds the run into the tag's digest (#322/#210): the same
+   attempt number in a LATER run can no longer mint the tag an earlier run used,
+   so a resumed ticket's collection can never match two spawns.
 
    **Never read `prompt-<N>.txt` yourself, and never pass its contents to the
    Agent.** `$STUB` is a ~480-byte pointer at that file and is the ONLY thing
@@ -586,13 +600,16 @@ the input file, never through your context; ticket #57, Leak 1):
 or is found DEAD at `check-worker`, which spent money just the same (#209) —
 collect its transcripts with `lib/transcripts.ts` — never by picking files
 yourself. Recompute the same tag the spawn was stamped with (step 1b above; same
-four facts, same digest), then collect:
+five facts, same digest), and let the `dest` verb compose the directory (#322 —
+the layout lives in code; a prose-assembled path is how attempts collided in
+#210 and runs bled together in #212):
 
 ```bash
 ATTEMPT=$(bun "$PACK/lib/loop.ts" attempt "$STATE" <N>)
-TAG=$(bun "$PACK/lib/transcripts.ts" tag --slug "$SLUG" --ticket <N> --stage <stage> --attempt "$ATTEMPT")
+TAG=$(bun "$PACK/lib/transcripts.ts" tag --slug "$SLUG" --run "$RUN_ID" --ticket <N> --stage <stage> --attempt "$ATTEMPT")
+DEST=$(bun "$PACK/lib/transcripts.ts" dest --state-dir "$STATE_DIR" --run "$RUN_ID" --ticket <N> --stage <stage> --attempt "$ATTEMPT")
 bun "$PACK/lib/transcripts.ts" collect --tag "$TAG" \
-  --dest "$STATE_DIR/transcripts/ticket-<N>" --name "<stage>-$ATTEMPT" > "$TMP/collected-<N>.json"
+  --dest "$DEST" --name "<stage>-$ATTEMPT" > "$TMP/collected-<N>.json"
 ```
 
 `collect` finds the stage agent by its stamped tag and copies **it plus every
@@ -678,7 +695,11 @@ per ticket (`stageOfFile` splits on the first `-`, so a `-sub-` file buckets und
 the stage that spawned it):
 
 ```bash
-ACTUAL=$("$Z_COST" --json "$STATE_DIR/transcripts/ticket-<N>/*.jsonl" | jq -r .total)
+# --run-dir, never a glob (#322): the enumeration happens inside z-cost from a
+# root fixed here, so a shell-expanded pattern can no longer price only its
+# first file (#319), and THIS run's t<N> subtree can never absorb a previous
+# run's attempts on the same ticket (#212).
+ACTUAL=$("$Z_COST" --json --run-dir "$RUN_ROOT/t<N>" | jq -r .total)
 "$Z_BOARD" field-set <N> Actual "$ACTUAL" --slug "$SLUG"
 ```
 
@@ -719,8 +740,8 @@ stage-spawn subtree has appended NOTHING to its transcripts — not how long the
 stage has been running. `z-loop-tick` reads that for you: every tick, after the
 ingest and before `next`, it runs
 `bun "$PACK/lib/loop.ts" heartbeat "$STATE" --slug "$SLUG" --project-dir "$PWD"`,
-which resolves each live lane's spawn tag (`spawnTag(slug, ticket, stage,
-attempt)` — recomputed from the lane, never stored) and moves its baseline
+which resolves each live lane's spawn tag (`spawnTag(slug, runId, ticket, stage,
+attempt)` — recomputed from the lane and the state's own runId, never stored) and moves its baseline
 forward to the newest record in that subtree, the stage agent's own plus every
 descendant's. Nothing here is yours to judge and there is no extra command to
 run. Two properties worth knowing when you read a tick's stderr: the move is
@@ -935,21 +956,28 @@ bug for everything found — step 23 has no exceptions.
   money" instead of just "how much did the ticket cost":
 
   ```bash
-  "$Z_COST" --json --by-file "$STATE_DIR/transcripts/*/*.jsonl" > "$TMP/cost-by-file.json"
+  "$Z_COST" --json --by-file --run-dir "$RUN_ROOT" > "$TMP/cost-by-file.json"
   bun "$PACK/lib/endloop.ts" spend-by-stage "$TMP/cost-by-file.json" > "$TMP/spend-by-stage.json"
   ```
 
+  `--run-dir "$RUN_ROOT"`, never a glob across `$STATE_DIR` (#322): the old
+  `transcripts/*/*.jsonl` pattern matched every run ever recorded, which is
+  how loop 16's report priced a $2.33 batch at $365.07 (#309). This run's
+  root prices this run's spend, exactly.
+
   Splice `"$TMP/spend-by-stage.json"`'s array into `report-input.json` as
   `spendByStage` verbatim — omit the key entirely on a batch with zero
-  drained tickets (no transcripts glob to price) rather than pricing an
-  empty pattern.
+  drained tickets (an empty run root) rather than pricing an empty directory.
 
 ```bash
-bun "$PACK/lib/endloop.ts" report "$TMP/report-input.json" \
-  > "$HOME/.zstack/projects/$SLUG/reports/loop-$(date +%Y%m%d-%H%M%S).md"
+REPORT="$RUN_ROOT/report.md"
+bun "$PACK/lib/endloop.ts" report "$TMP/report-input.json" > "$REPORT"
+cp "$REPORT" "$HOME/.zstack/projects/$SLUG/reports/loop-$(date +%Y%m%d-%H%M%S).md"
 ```
 
-That file is the loop's report — nothing else builds one.
+That file is the loop's report — nothing else builds one. It lives IN the run
+directory (#322: a run's artifacts are one subtree), and the copy under
+`reports/` keeps the flat all-runs listing z-status and humans already read.
 
 Then **Notify** `work-complete` with the SAME `EndLoopReportInput` numbers so the
 message can never disagree with the report — slug `$SLUG`, `loopCount`
@@ -964,6 +992,17 @@ jq -n --arg slug "$SLUG" --argjson lc "$LOOP_COUNT" \
   '{slug:$slug, loopCount:$lc, done:$done, questions:$q, blocked:$b, skipped:$s, totalDollars:$dollars, verdict:$verdict}' \
   > "$TMP/notify-work-complete.json"
 bun "$PACK/lib/notify.ts" send work-complete "$TMP/notify-work-complete.json" --slug "$SLUG"
+```
+
+**5b. Archive the state file into its run (#322).** The drain is over and the
+report is written, so the run is closed: move `state.json` into the run root it
+named. This is the WHOLE lifecycle mechanism — the next `/z-loop` finds no
+state.json, so its first ingest mints a fresh runId, and this run's artifacts
+can never absorb the next run's (#212). The archived copy keeps the final
+snapshot readable next to the transcripts it explains:
+
+```bash
+mv "$STATE" "$RUN_ROOT/state.json"
 ```
 
 **6. Persist the loop counter LAST** (H17) — only now that the report is written

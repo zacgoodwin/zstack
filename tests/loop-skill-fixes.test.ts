@@ -151,11 +151,14 @@ describe("ticket #83 AC4: stage-named transcript copies, --by-file in report ass
     expect(step4).toContain("builder`/`qa`/`reviewer`/`merge`");
   });
 
-  test("Step 7a's report assembly calls z-cost --by-file over every stage's transcripts", () => {
+  test("Step 7a's report assembly calls z-cost --by-file over THIS run's root (#322, was the #309 history glob)", () => {
     const step7a = section(zLoop(), "## Step 7a");
     expect(step7a).not.toBe("");
     expect(step7a).toContain("--by-file");
-    expect(step7a).toContain('"$STATE_DIR/transcripts/*/*.jsonl"');
+    // The run-scoped form replaced the all-runs glob that priced a $2.33 batch
+    // at $365.07 (#309); the old pattern must never come back.
+    expect(step7a).toContain('--by-file --run-dir "$RUN_ROOT"');
+    expect(step7a).not.toContain('"$STATE_DIR/transcripts/*/*.jsonl"');
   });
 
   test("Step 7a feeds the --by-file result through endloop.ts spend-by-stage, into spendByStage", () => {

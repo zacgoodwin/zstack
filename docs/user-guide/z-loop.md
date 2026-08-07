@@ -417,9 +417,16 @@ records the result. It never re-derives a scheduling decision in prose.
   located, since the spawn tag is keyed on the attempt number and the re-spawn
   moves that number on. So a ticket recovered by a re-spawn carries the cost of
   **both** spawns, not just the one that finished.
-- **Per-stage transcript layout.** Each stage's copy lands at
-  `~/.zstack/projects/<slug>/state/transcripts/ticket-<N>/<stage>-<attempt>.jsonl`
-  — `<stage>` is `builder`/`qa`/`reviewer`/`merge`, `<attempt>` is that lane's
+- **Per-stage transcript layout (#322).** Every artifact of a drain lives under
+  that run's own root: a first ingest mints `runId` (`run-<yyyymmdd>-<hhmmss>-<4hex>`)
+  into `state.json`, and each stage's copy lands at
+  `~/.zstack/projects/<slug>/loop/runs/<runId>/t<N>/<stage>-<attempt>/<stage>-<attempt>.jsonl`
+  (the directory is composed by `lib/transcripts.ts dest`, never by hand). At
+  end-of-loop the state file and the report are archived into the same root, so
+  one run's spend can never absorb another's (#309, #212) and a re-run attempt
+  gets its own directory instead of overwriting (#210). Pre-#322 layouts stay
+  priceable via `z-cost --legacy "<glob>"` until 1.3.0.0.
+  `<stage>` is `builder`/`qa`/`reviewer`/`merge`, `<attempt>` is that lane's
   1-based spawn count for the stage (a QA bounce, a reviewer bounce, an
   uncommitted-work re-spawn, and a dead-worker re-spawn each re-spawn builder —
   so `builder-3.jsonl` might follow two bounces of different kinds, not
@@ -1250,8 +1257,10 @@ for the batch just drained, not just "how much did each ticket cost":
 | other | $0.00 |
 ```
 
-It's built from `bin/z-cost --json --by-file` over every stage transcript in
-the batch (`state/transcripts/*/*.jsonl`), folded per-stage by
+It's built from `bin/z-cost --json --by-file --run-dir` over every stage
+transcript in THIS run's root (`loop/runs/<runId>/`, #322 — never a glob
+across runs, which is how loop 16 priced a $2.33 batch at $365.07, #309),
+folded per-stage by
 `lib/endloop.ts`'s `sumByStage`. All five rows always render, `$0.00`
 included — a run with no reviewer bounces still shows the full shape instead
 of a table that grows and shrinks between loops. `other` catches any
@@ -1469,8 +1478,9 @@ ratio is stable:
 ```bash
 # orchestrator side
 bin/z-context-audit audit ~/.claude/projects/<mangled-cwd>/*.jsonl --json | jq .totalBilled
-# lane-subagent side (z-cost, which has always deduped)
-bin/z-cost '~/.zstack/projects/<slug>/loop/transcripts/*/*.jsonl' --json \
+# lane-subagent side (z-cost, which has always deduped). One run's root; add
+# --legacy '<glob>' instead to price a pre-#322 transcripts/ layout.
+bin/z-cost --json --run-dir ~/.zstack/projects/<slug>/loop/runs/<runId> \
   | jq '[.by_model[].tokens | .fresh_input_tokens + .cached_input_tokens] | add'
 ```
 

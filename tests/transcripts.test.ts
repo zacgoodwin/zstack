@@ -38,6 +38,10 @@ import {
   subtreeActivityMs,
 } from "../lib/transcripts.ts";
 
+// One fixture runId for every tag in this file (#322): the tests about run
+// DISJOINTNESS mint their own second id next to it.
+const RUN_A = "run-20260101-000000-aaaa";
+
 const tmpPaths: string[] = [];
 function mkTmp(): string {
   const d = mkdtempSync(join(tmpdir(), "zstack-transcripts-"));
@@ -228,8 +232,8 @@ function backgroundSkeptics(dir: string, parent: string, kids: string[], finishe
 // The run-10 shape: two reviewers with three skeptics each, all in one flat
 // directory. Returns the two tags.
 function twoReviewersWithSkeptics(dir: string): { t1: string; t2: string } {
-  const t1 = spawnTag("zstack", 151, "reviewer", 1);
-  const t2 = spawnTag("zstack", 164, "reviewer", 1);
+  const t1 = spawnTag("zstack", RUN_A, 151, "reviewer", 1);
+  const t2 = spawnTag("zstack", RUN_A, 164, "reviewer", 1);
   writeAgent(dir, "r1", { prompt: stagePromptWithTag(t1), description: "Review ticket 151" });
   writeAgent(dir, "r2", { prompt: stagePromptWithTag(t2), description: "Review ticket 164" });
   // Interleaved ids, so neither an alphabetical nor an insertion-order sweep
@@ -245,18 +249,18 @@ function twoReviewersWithSkeptics(dir: string): { t1: string; t2: string } {
 
 describe("spawnTag (#190)", () => {
   test("is deterministic across calls", () => {
-    expect(spawnTag("zstack", 151, "reviewer", 2)).toBe(spawnTag("zstack", 151, "reviewer", 2));
+    expect(spawnTag("zstack", RUN_A, 151, "reviewer", 2)).toBe(spawnTag("zstack", RUN_A, 151, "reviewer", 2));
   });
 
   test("distinguishes every one of its four facts", () => {
-    const base = spawnTag("zstack", 151, "reviewer", 1);
-    expect(spawnTag("other", 151, "reviewer", 1)).not.toBe(base);
-    expect(spawnTag("zstack", 152, "reviewer", 1)).not.toBe(base);
-    expect(spawnTag("zstack", 151, "qa", 1)).not.toBe(base);
+    const base = spawnTag("zstack", RUN_A, 151, "reviewer", 1);
+    expect(spawnTag("other", RUN_A, 151, "reviewer", 1)).not.toBe(base);
+    expect(spawnTag("zstack", RUN_A, 152, "reviewer", 1)).not.toBe(base);
+    expect(spawnTag("zstack", RUN_A, 151, "qa", 1)).not.toBe(base);
     // The attempt is the fact the reviewer's own transcript cannot otherwise
     // supply: run 10 had both "Review ticket 153" and "Review ticket 153
     // attempt 2" in one directory.
-    expect(spawnTag("zstack", 151, "reviewer", 2)).not.toBe(base);
+    expect(spawnTag("zstack", RUN_A, 151, "reviewer", 2)).not.toBe(base);
   });
 
   // The blindness reason the tag is a digest at all (lib/stage-prompts.ts
@@ -265,7 +269,7 @@ describe("spawnTag (#190)", () => {
   // rejected the diff -- prior-narrative context the four-key gate exists to
   // keep out.
   test("leaks none of its inputs in plain text", () => {
-    const tag = spawnTag("zstack", 151, "reviewer", 2);
+    const tag = spawnTag("zstack", RUN_A, 151, "reviewer", 2);
     expect(tag).not.toContain("zstack");
     expect(tag).not.toContain("151");
     expect(tag).not.toContain("reviewer");
@@ -333,7 +337,7 @@ describe("findRootAgents (#190)", () => {
     const dir = mkTmp();
     twoReviewersWithSkeptics(dir);
     const { metas } = readAgentMetas(dir);
-    expect(findRootAgents(dir, spawnTag("zstack", 999, "reviewer", 1), metas)).toEqual([]);
+    expect(findRootAgents(dir, spawnTag("zstack", RUN_A, 999, "reviewer", 1), metas)).toEqual([]);
   });
 
   // The structural half of the filter. A reviewer that pasted its own prompt
@@ -343,7 +347,7 @@ describe("findRootAgents (#190)", () => {
   // by construction rather than by a heuristic.
   test("excludes a descendant that echoed its parent's tag", () => {
     const dir = mkTmp();
-    const tag = spawnTag("zstack", 151, "reviewer", 1);
+    const tag = spawnTag("zstack", RUN_A, 151, "reviewer", 1);
     writeAgent(dir, "r1", { prompt: stagePromptWithTag(tag) });
     writeAgent(dir, "echo", { parent: "r1", prompt: `Refute this. My parent said: ${stagePromptWithTag(tag)}` });
     const { metas } = readAgentMetas(dir);
@@ -355,7 +359,7 @@ describe("findRootAgents (#190)", () => {
   // result, never this agent's own identity.
   test("ignores the tag when it appears past the first line", () => {
     const dir = mkTmp();
-    const tag = spawnTag("zstack", 151, "reviewer", 1);
+    const tag = spawnTag("zstack", RUN_A, 151, "reviewer", 1);
     writeAgent(dir, "r1", {
       extraLines: [JSON.stringify({ type: "assistant", message: { content: stagePromptWithTag(tag) } })],
     });
@@ -365,7 +369,7 @@ describe("findRootAgents (#190)", () => {
 
   test("ignores the tag when it sits past the bounded first-line prefix", () => {
     const dir = mkTmp();
-    const tag = spawnTag("zstack", 151, "reviewer", 1);
+    const tag = spawnTag("zstack", RUN_A, 151, "reviewer", 1);
     writeAgent(dir, "huge", { prompt: `${"x".repeat(70_000)}\u0020${SPAWN_TAG_MARKER} ${tag}` });
     const { metas } = readAgentMetas(dir);
     expect(findRootAgents(dir, tag, metas)).toEqual([]);
@@ -501,7 +505,7 @@ describe("subtree liveness (#209)", () => {
 
   test("a stage with no sub-agents at all is done immediately (every builder/qa/merge)", () => {
     const dir = mkTmp();
-    const tag = spawnTag("zstack", 151, "builder", 1);
+    const tag = spawnTag("zstack", RUN_A, 151, "builder", 1);
     writeAgent(dir, "b1", { prompt: stagePromptWithTag(tag) });
     const r = collect(dir, tag, "builder-1");
     expect(r.subtreeDone).toBe(true);
@@ -519,7 +523,7 @@ describe("subtree liveness (#209)", () => {
 
   test("liveness is transitive: a live grandchild holds the worktree too", () => {
     const dir = mkTmp();
-    const tag = spawnTag("zstack", 151, "reviewer", 1);
+    const tag = spawnTag("zstack", RUN_A, 151, "reviewer", 1);
     writeAgent(dir, "r1", { prompt: stagePromptWithTag(tag) });
     writeAgent(dir, "s1", { parent: "r1" });
     writeAgent(dir, "g1", { parent: "s1" });
@@ -556,7 +560,7 @@ describe("subtree liveness (#209)", () => {
   // half-written meta is likeliest at SPAWN, when the child is youngest.
   test("AC7: an unreadable meta hides a LIVE child, so the subtree is not done", () => {
     const dir = mkTmp();
-    const tag = spawnTag("zstack", 66, "reviewer", 1);
+    const tag = spawnTag("zstack", RUN_A, 66, "reviewer", 1);
     writeAgent(dir, "r1", { prompt: stagePromptWithTag(tag) });
     writeAgent(dir, "s1", { parent: "r1", meta: '{"agentType":"general-pur' }); // truncated mid-write
     appendRunning(dir, "s1"); // last record is a tool_use written 5s ago
@@ -572,7 +576,7 @@ describe("subtree liveness (#209)", () => {
   // bad sidecar anywhere in a shared directory would wedge every teardown.
   test("an unreadable meta whose agent has come to rest does not block removal", () => {
     const dir = mkTmp();
-    const tag = spawnTag("zstack", 66, "reviewer", 1);
+    const tag = spawnTag("zstack", RUN_A, 66, "reviewer", 1);
     writeAgent(dir, "r1", { prompt: stagePromptWithTag(tag) });
     writeAgent(dir, "s1", { parent: "r1", meta: "{oops" });
     appendFinalAnswer(dir, "s1"); // returned, and quiet since
@@ -714,7 +718,7 @@ describe("subtreeActivityMs (#256)", () => {
   // A tagged stage agent with `kids` beneath it, none of them having written
   // anything yet. Returns the tag.
   function stageWithKids(dir: string, ticket: number, stage: "builder" | "qa" | "reviewer", kids: string[], root: string): string {
-    const tag = spawnTag("zstack", ticket, stage, 1);
+    const tag = spawnTag("zstack", RUN_A, ticket, stage, 1);
     writeAgent(dir, root, { prompt: stagePromptWithTag(tag), description: `Stage ${stage} of ${ticket}` });
     for (const k of kids) writeAgent(dir, k, { parent: root, description: `child ${k} of ${root}` });
     return tag;
@@ -758,7 +762,7 @@ describe("subtreeActivityMs (#256)", () => {
     expect(subtreeActivityMs(join(dir, "never-created"), tag)).toBeUndefined();
     // a tag no parentless agent carries (prompt built without --spawn-tag, or the
     // spawn has not written its first line yet)
-    expect(subtreeActivityMs(dir, spawnTag("zstack", 999, "qa", 1))).toBeUndefined();
+    expect(subtreeActivityMs(dir, spawnTag("zstack", RUN_A, 999, "qa", 1))).toBeUndefined();
     // a subtree that has written nothing datable at all
     const undated = stageWithKids(dir, 152, "qa", [], "q2");
     expect(subtreeActivityMs(dir, undated)).toBeUndefined();
@@ -893,7 +897,7 @@ describe("collectTranscripts (#190)", () => {
   test("collects a lone stage agent with no sub-agents", () => {
     const dir = mkTmp();
     const dest = join(mkTmp(), "ticket-151");
-    const tag = spawnTag("zstack", 151, "builder", 1);
+    const tag = spawnTag("zstack", RUN_A, 151, "builder", 1);
     writeAgent(dir, "b1", { prompt: stagePromptWithTag(tag) });
     const r = collectTranscripts({ subagentsDir: dir, tag, dest, name: "builder-1" });
     expect(r.descendants).toBe(0);
@@ -908,7 +912,7 @@ describe("collectTranscripts (#190)", () => {
     const dest = join(mkTmp(), "ticket-151");
     twoReviewersWithSkeptics(dir);
     expect(() =>
-      collectTranscripts({ subagentsDir: dir, tag: spawnTag("zstack", 999, "reviewer", 1), dest, name: "reviewer-1" })
+      collectTranscripts({ subagentsDir: dir, tag: spawnTag("zstack", RUN_A, 999, "reviewer", 1), dest, name: "reviewer-1" })
     ).toThrow(/No stage transcript carries spawn tag/);
     expect(() => readdirSync(dest)).toThrow();
   });
@@ -916,7 +920,7 @@ describe("collectTranscripts (#190)", () => {
   test("throws when one tag matches two orchestrator spawns", () => {
     const dir = mkTmp();
     const dest = join(mkTmp(), "ticket-151");
-    const tag = spawnTag("zstack", 151, "reviewer", 1);
+    const tag = spawnTag("zstack", RUN_A, 151, "reviewer", 1);
     writeAgent(dir, "r1", { prompt: stagePromptWithTag(tag) });
     writeAgent(dir, "r1dup", { prompt: stagePromptWithTag(tag) });
     expect(() => collectTranscripts({ subagentsDir: dir, tag, dest, name: "reviewer-1" })).toThrow(
@@ -929,7 +933,7 @@ describe("collectTranscripts (#190)", () => {
     // so a corrupt one costs nothing but a stderr line.
     const dir = mkTmp();
     const dest = join(mkTmp(), "ticket-151");
-    const tag = spawnTag("zstack", 151, "reviewer", 1);
+    const tag = spawnTag("zstack", RUN_A, 151, "reviewer", 1);
     writeAgent(dir, "r1", { prompt: stagePromptWithTag(tag), meta: "{broken" });
     writeAgent(dir, "s1", { parent: "r1" });
     let r!: ReturnType<typeof collectTranscripts>;
@@ -964,9 +968,9 @@ describe("subagentsDirFor (#190)", () => {
 describe("transcripts CLI (#190)", () => {
   test("tag prints the same value the constructors stamp", () => {
     const out = captureStdout(() =>
-      expect(main(["tag", "--slug", "zstack", "--ticket", "151", "--stage", "reviewer", "--attempt", "2"])).toBe(0)
+      expect(main(["tag", "--slug", "zstack", "--run", RUN_A, "--ticket", "151", "--stage", "reviewer", "--attempt", "2"])).toBe(0)
     ).trim();
-    expect(out).toBe(spawnTag("zstack", 151, "reviewer", 2));
+    expect(out).toBe(spawnTag("zstack", RUN_A, 151, "reviewer", 2));
     // The round trip the whole mechanism rests on: the CLI's tag is what the
     // emitted prompt actually carries.
     expect(reviewerPrompt(
@@ -982,12 +986,12 @@ describe("transcripts CLI (#190)", () => {
   // leaving the reviewer row. Rejected at the source instead.
   test("tag rejects a stage with no spend-by-stage row", () => {
     const err = captureStderr(() =>
-      expect(main(["tag", "--slug", "z", "--ticket", "1", "--stage", "revewier", "--attempt", "1"])).toBe(1)
+      expect(main(["tag", "--slug", "z", "--run", RUN_A, "--ticket", "1", "--stage", "revewier", "--attempt", "1"])).toBe(1)
     );
     expect(err).toContain("--stage must be one of builder, qa, reviewer, merge");
     for (const stage of ["builder", "qa", "reviewer", "merge"]) {
       captureStdout(() =>
-        expect(main(["tag", "--slug", "z", "--ticket", "1", "--stage", stage, "--attempt", "1"])).toBe(0)
+        expect(main(["tag", "--slug", "z", "--run", RUN_A, "--ticket", "1", "--stage", stage, "--attempt", "1"])).toBe(0)
       );
     }
   });
@@ -1002,11 +1006,11 @@ describe("transcripts CLI (#190)", () => {
 
   test("tag rejects a non-integer ticket or attempt", () => {
     const err = captureStderr(() =>
-      expect(main(["tag", "--slug", "z", "--ticket", "abc", "--stage", "qa", "--attempt", "1"])).toBe(1)
+      expect(main(["tag", "--slug", "z", "--run", RUN_A, "--ticket", "abc", "--stage", "qa", "--attempt", "1"])).toBe(1)
     );
     expect(err).toContain("--ticket must be a positive integer");
     const err2 = captureStderr(() =>
-      expect(main(["tag", "--slug", "z", "--ticket", "1", "--stage", "qa", "--attempt", "0"])).toBe(1)
+      expect(main(["tag", "--slug", "z", "--run", RUN_A, "--ticket", "1", "--stage", "qa", "--attempt", "0"])).toBe(1)
     );
     expect(err2).toContain("--attempt must be a positive integer");
   });
@@ -1041,7 +1045,7 @@ describe("transcripts CLI (#190)", () => {
         main([
           "collect",
           "--tag",
-          spawnTag("zstack", 999, "reviewer", 1),
+          spawnTag("zstack", RUN_A, 999, "reviewer", 1),
           "--dest",
           dest,
           "--name",

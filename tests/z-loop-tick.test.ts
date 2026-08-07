@@ -81,6 +81,8 @@ function seedDrainedPrevState(statePath: string): void {
   writeFileSync(
     statePath,
     JSON.stringify({
+      schemaVersion: 2,
+      runId: "run-20260101-000000-aaaa", // #322: on-disk states carry the header
       tickets: [{ number: 9, title: "prior", status: "Done", dependsOn: [] }],
       lanes: [],
       maxLanes: 3,
@@ -175,6 +177,8 @@ function writeLaneState(path: string): void {
   writeFileSync(
     path,
     JSON.stringify({
+      schemaVersion: 2,
+      runId: "run-20260101-000000-aaaa", // #322
       tickets: [
         { number: 1, title: "T1", status: "Building", dependsOn: [] },
         { number: 2, title: "T2", status: "Building", dependsOn: [] },
@@ -235,7 +239,15 @@ describe("z-loop-tick", () => {
       { stdout: "pipe", stderr: "pipe" }
     );
     expect(ing.exitCode).toBe(0);
-    expect(readFileSync(tickState, "utf8")).toBe(readFileSync(expectedState, "utf8"));
+    // #322: the runId is the ONE field designed to differ between two
+    // independent first ingests (each mints its own), so it is normalized out
+    // of the byte-compare -- and asserted well-formed on both sides so a
+    // reverted mint can't hide behind the normalization.
+    const normRun = (s: string) => {
+      expect(s).toMatch(/"runId": "run-\d{8}-\d{6}-[0-9a-f]{4}"/);
+      return s.replace(/run-\d{8}-\d{6}-[0-9a-f]{4}/g, "run-NORMALIZED");
+    };
+    expect(normRun(readFileSync(tickState, "utf8"))).toBe(normRun(readFileSync(expectedState, "utf8")));
     // ...and that the wrapper really passed it, rather than both sides omitting it.
     expect(JSON.parse(readFileSync(tickState, "utf8")).runSession).toBe("test-session");
 
@@ -321,7 +333,10 @@ describe("z-loop-tick", () => {
       { stdout: "pipe", stderr: "pipe" }
     );
     expect(ing.exitCode).toBe(0);
-    expect(readFileSync(tickState, "utf8")).toBe(readFileSync(expectedState, "utf8"));
+    // Same #322 normalization as the sibling test above: two first ingests
+    // legitimately mint two runIds; everything else must match byte-for-byte.
+    const normRun2 = (s: string) => s.replace(/run-\d{8}-\d{6}-[0-9a-f]{4}/g, "run-NORMALIZED");
+    expect(normRun2(readFileSync(tickState, "utf8"))).toBe(normRun2(readFileSync(expectedState, "utf8")));
   }, TICK_TIMEOUT_MS);
 
   test("missing a required flag fails loudly, prints no Action", () => {

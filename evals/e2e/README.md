@@ -59,7 +59,7 @@ the `sample-run` fixture uses:
 | `reports/invocations-*.jsonl` | `skill-invoker record` | deploy-chain / audit cadence |
 | `notes/note-<N>.json` | completion-note input per Done ticket | completion-notes edges |
 | `stage-inputs/ticket-<N>-reviewer.json` | reviewer stage input | reviewer-blindness |
-| `transcripts/ticket-<N>/*.jsonl` | per-stage Claude Code transcripts | actuals (z-cost) |
+| `runs/<runId>/t<N>/<stage>-<attempt>/*.jsonl` | per-stage Claude Code transcripts (#322 run-scoped layout) | actuals (z-cost --run-dir) |
 
 ## Traceability: every Definition of Done item → its assertion
 
