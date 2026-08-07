@@ -17,6 +17,7 @@ import {
   applyAction,
   nextAction,
   recordMergeGate,
+  confirmMerged,
   recordOutcome,
   type Action,
   type LaneState,
@@ -107,7 +108,10 @@ export function happyOutcome(stage: Stage, ticket: number): StageOutcome {
 // taken -- nothing latent, and they are what makes "no merge without a green
 // gate, and never on a base or a commit that has since moved" enforceable in
 // the reducer.
-export const ALLOWED_LANE_KEYS = new Set(["ticket", "stage", "lastActivityMs", "stageStartedMs", "qaBounces", "reviewBounces", "quorumRetries", "commitRetries", "respawns", "workerDead", "worktreeDirty", "outcome", "lastWroteStatus", "goneReason", "mergeGate", "mergeGateRuns", "mergeGateBase"]);
+// mergeObserved/mergeConfirmAttempts (#324) are the loop's own board-side
+// proof that a merge verdict's PR landed, and its read-pacing counter --
+// scheduling facts the loop collects, never anything a stage agent carried.
+export const ALLOWED_LANE_KEYS = new Set(["ticket", "stage", "lastActivityMs", "stageStartedMs", "qaBounces", "reviewBounces", "quorumRetries", "commitRetries", "respawns", "workerDead", "worktreeDirty", "outcome", "lastWroteStatus", "goneReason", "mergeGate", "mergeGateRuns", "mergeGateBase", "mergeObserved", "mergeConfirmAttempts"]);
 const FORBIDDEN_LANE_KEY = /conversation|session|context|thread|agent.?id|history|transcript/i;
 
 export interface SimTrace {
@@ -154,6 +158,12 @@ export function deriveRun(initial: LoopState, oracle = happyOutcome): SimTrace {
     // let the scheduler emit the advance it now guards.
     if (action.kind === "merge-gate") {
       state = recordMergeGate(state, action.ticket, { green: true, attempts: 1, failCount: 0, note: "merge gate GREEN on attempt 1: 0 fail, exit 0" }, now);
+      continue;
+    }
+    // #324's Done gate: on a clean success GitHub agrees the verdict's PR
+    // merged, so the board read comes back MERGED and `complete` unlocks.
+    if (action.kind === "confirm-merge") {
+      state = confirmMerged(state, action.ticket, { found: true, state: "MERGED", url: `https://github.com/acme/fixture-app/pull/${action.ticket}`, number: action.pr }, action.pr);
       continue;
     }
     if (action.kind === "complete") completionOrder.push(action.ticket);

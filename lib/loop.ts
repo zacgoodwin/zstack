@@ -197,6 +197,14 @@ export interface TicketSnapshot {
   // every recorded attempt was a failed READ, which the note says instead.
   claimedByOtherLogin?: string;
   skipQa?: boolean; // #130: carries the `skip-qa` issue label -> builder advances straight to reviewer
+  // #324 (contract C3): true when this snapshot was CARRIED FORWARD from the
+  // previous state rather than observed in the current board read. Carry-forward
+  // is still the safe default for the ticket itself (#138), but it is no longer
+  // EVIDENCE: a dependency satisfies its dependents only while observed, so a
+  // carried Done earns one targeted re-read (confirmTargets) instead of a
+  // dependent building on a status nobody has seen lately (#274). Cleared the
+  // moment any read or lookup shows the ticket.
+  carriedForward?: boolean;
 }
 
 // One concurrent lane. DELIBERATELY carries no conversation/session/context id:
@@ -298,6 +306,18 @@ export interface LaneState {
   // positive proof the ticket is back in a driven status (see the revival clause
   // there); an absence never clears it.
   goneReason?: { kind: "unsupported-status"; status: string } | { kind: "confirmed-gone" };
+  // #324 (#313): the board-side observation that this lane's merge verdict is
+  // TRUE -- the exact PR the verdict named, read back from GitHub as MERGED
+  // (board.ts pr-state --pr, folded in by `loop confirm-merged`). nextAction
+  // refuses to emit `complete` for a merged outcome until this is present and
+  // names the same PR; a positive NOT-merged answer parks the lane with the
+  // divergence instead. A verdict alone was never proof; this is the proof.
+  mergeObserved?: { number: number; url: string; mergeSha?: string };
+  // #324: confirm-merge read attempts recorded for this lane (the ask itself
+  // and failed reads alike), so an unreadable PR state retries with pacing and
+  // then parks instead of livelocking the drain -- same bounded discipline as
+  // #223's claim confirms. Absent reads as 0.
+  mergeConfirmAttempts?: number;
   // #178: the loop-owned merge gate's verdict for this lane, stamped by
   // `loop merge-gate --state <state.json> --ticket <N>`. nextAction will not
   // emit an advance to the merge stage until this reads green, so a merge agent
@@ -376,6 +396,16 @@ export interface LoopState {
   // (stacked-chain rule: branches are deleted only after the whole batch), so a
   // dependent's merge stage must know to retarget onto the base branch.
   mergedThisRun?: number[];
+  // #324 (#274/#292): what a targeted lookup POSITIVELY proved about a
+  // dependency that is off the board, keyed by issue number. "closed" = the
+  // issue is closed, i.e. it shipped and its human closed it -- the dep is
+  // satisfied. "open" = the issue is open but off the project: it left the
+  // board WITHOUT being Done, and a dependent building on it would use a base
+  // that never got it -- the dep is dead and the dependent parks. Accumulated
+  // across ticks (a gone issue's number never comes back), and the one place
+  // absence-derived facts are allowed precisely because each entry required a
+  // positive read to exist.
+  depsGone?: Record<string, "closed" | "open">;
   // Safety control (issue #63): the batch's committed size at ingest-time-zero,
   // and whether the mid-run breakdown notification already fired for THIS
   // batch's threshold crossing. Both are captured once and carried across
@@ -754,6 +784,12 @@ export type Action =
   // The `loop next` CLI records the ask as it emits this, so the throttle and
   // the bounded park never depend on that answer arriving.
   | { kind: "confirm-claim"; ticket: number }
+  // #324 (#313): read the exact PR a merge verdict named and fold the answer
+  // back (`z-board pr-state --pr <pr>` then `loop confirm-merged`). nextAction
+  // stays pure; the ask itself is recorded by the CLI so the bounded park never
+  // depends on the answer arriving. `complete` is unreachable without the
+  // observation this action exists to collect.
+  | { kind: "confirm-merge"; ticket: number; pr: number }
   | { kind: "context-clear" }
   | { kind: "drain-complete" };
 
@@ -1332,10 +1368,42 @@ function resolveOutcome(lane: LaneState, qaLimits: QaBounceLimits, reviewerGate:
       // a single pass and never blocks here (that case is #62's floor's job).
       return quorumAction(lane, reviewerGate, o.skeptics);
     }
-    case "merged":
-      return { kind: "complete", ticket, note: o.note };
+    case "merged": {
+      // #324 (#313): a merge VERDICT alone never completes a ticket. Done
+      // requires the board-side observation that the exact PR the verdict
+      // named is MERGED on GitHub (lane.mergeObserved, folded in by `loop
+      // confirm-merged` off a `z-board pr-state --pr` read). Until that
+      // observation exists the lane asks for it -- bounded like #223's claim
+      // confirms, so an unreadable PR state parks instead of livelocking.
+      const pr = prNumberFromUrl(o.note);
+      if (pr === null) {
+        // A verdict whose prUrl does not name a PR number can never be
+        // confirmed against anything: park it with the divergence named.
+        return { kind: "park", ticket, status: "Blocked", note: `merge verdict carries no readable PR number (got ${JSON.stringify(o.note)}); cannot confirm the PR landed, refusing to mark Done (#313)` };
+      }
+      if (lane.mergeObserved?.number === pr) {
+        return { kind: "complete", ticket, note: o.note };
+      }
+      if ((lane.mergeConfirmAttempts ?? 0) >= MAX_MERGE_CONFIRM_ATTEMPTS) {
+        return { kind: "park", ticket, status: "Blocked", note: `merge verdict names PR #${pr} but ${MAX_MERGE_CONFIRM_ATTEMPTS} board reads could not observe it merged; a human must check the PR and move the ticket (#313)` };
+      }
+      return { kind: "confirm-merge", ticket, pr };
+    }
   }
 }
+
+// The PR number a merge verdict's URL names -- .../pull/<n>, GitHub's one
+// canonical shape. Anything else is null and the caller refuses to guess.
+export function prNumberFromUrl(url: string): number | null {
+  const m = url.trim().match(/\/pull\/(\d+)(?:[/#?].*)?$/);
+  return m ? Number(m[1]) : null;
+}
+
+// How many recorded confirm-merge reads (asks and failed reads alike) a lane
+// spends before the divergence parks it for a human. Three matches the #223
+// bounded-park spirit: enough to ride out a transient API failure, never an
+// unbounded livelock.
+export const MAX_MERGE_CONFIRM_ATTEMPTS = 3;
 
 // Attaches a resync-on-lag correction (#116) to an advance action, when
 // nextAction's desync guard below judged this ticket's board read to be one
@@ -1547,7 +1615,7 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
     // here on its next tick instead of being read as "already merged" (the
     // out-of-set assumption mergeOrderProbe below makes for every OTHER dep).
     const deadMergeReady = mergeReady
-      .map((l) => ({ ticket: l.ticket, dead: deadDeps(byNumber.get(l.ticket)!, byNumber) }))
+      .map((l) => ({ ticket: l.ticket, dead: deadDeps(byNumber.get(l.ticket)!, byNumber, state.depsGone) }))
       .filter((x) => x.dead.length > 0)
       .sort((a, b) => a.ticket - b.ticket);
     if (deadMergeReady.length > 0) {
@@ -1688,7 +1756,7 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
     .filter((t) => inBatch === undefined || inBatch.has(t.number))
     .sort((a, b) => a.number - b.number);
   for (const t of unclaimed) {
-    const dead = deadDeps(t, byNumber);
+    const dead = deadDeps(t, byNumber, state.depsGone);
     if (dead.length > 0) {
       const states = dead.map((d) => `#${d} (${byNumber.get(d)!.status})`).join(", ");
       return { kind: "park", ticket: t.number, status: "Blocked", note: `Blocked by dependencies that cannot complete in this batch: ${states}.` };
@@ -1703,7 +1771,7 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
   const contextGated = contextTokenLimit > 0 && (state.contextTokens ?? 0) >= contextTokenLimit;
 
   // 5. Claim the next ticket into a free lane -- unless context-gated.
-  const claimable = claimableTickets(tickets, lanes, state.batchTickets);
+  const claimable = claimableTickets(tickets, lanes, state.batchTickets, state.depsGone);
   if (!contextGated && claimable.length > 0 && lanes.length < maxLanes) {
     const t = claimable[0];
     return { kind: "claim", ticket: t.number, stage: claimStage(t.status) };
@@ -2266,6 +2334,10 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
     // transition. The orchestrator performs the read and folds the answer back
     // through claimConfirmed, which is what actually rewrites the flag.
     case "confirm-claim":
+    // #324: confirm-merge is the same shape for the Done gate -- a request for
+    // one `pr-state --pr` read, folded back through `loop confirm-merged`,
+    // which is the write. The CLI records the ask as it emits this.
+    case "confirm-merge":
     // #131: context-clear is a mid-batch PAUSE, not a state transition -- the
     // orchestrator releases the loop lock, keeps worktrees/branches and the
     // un-drained state.json, and exits WITHOUT the end-of-loop stage. A pure
@@ -2275,6 +2347,62 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
     case "drain-complete":
       return next;
   }
+}
+
+// -- #324: the Done gate's read cycle ------------------------------------------
+
+// The `next` CLI stamps this as it EMITS a confirm-merge, so the bounded park
+// can never depend on the orchestrator writing an outcome back -- the same
+// enforcement shape #223 gave the claim confirms.
+export function recordMergeConfirmAsk(state: LoopState, ticket: number): LoopState {
+  const next = structuredClone(state);
+  const lane = next.lanes.find((l) => l.ticket === ticket);
+  if (!lane) throw new ZError(`No lane holds #${ticket} to record a merge-confirm ask on.`);
+  lane.mergeConfirmAttempts = (lane.mergeConfirmAttempts ?? 0) + 1;
+  return next;
+}
+
+// What `z-board pr-state --pr <n>` printed, folded back onto the lane. Three
+// answers, three directions:
+//   - found + MERGED + the right number -> the observation `complete` requires
+//     (mergeObserved), attempts cleared;
+//   - found + NOT merged -> a POSITIVE divergence: the verdict claimed a merge
+//     GitHub says did not happen. Attempts jump to the cap so the very next
+//     `next` parks the lane with the divergence named (#313 AC1) -- no more
+//     reads are owed to a positive answer;
+//   - not found -> proof of nothing (#138). The ask was already counted by
+//     recordMergeConfirmAsk; the flag is left untouched and the retry is one
+//     emission away, bounded by MAX_MERGE_CONFIRM_ATTEMPTS.
+export interface PrStateRead {
+  found: boolean;
+  state?: string;
+  url?: string;
+  number?: number;
+  mergeSha?: string;
+}
+
+export function confirmMerged(state: LoopState, ticket: number, read: PrStateRead, expectedPr: number): LoopState {
+  const next = structuredClone(state);
+  const lane = next.lanes.find((l) => l.ticket === ticket);
+  if (!lane) throw new ZError(`No lane holds #${ticket} to fold a merge confirmation into.`);
+  if (!read.found) return next; // #138: absence proves nothing; the ask is already on the clock
+  if (read.number !== expectedPr) {
+    throw new ZError(
+      `pr-state read answers PR #${read.number}, but lane #${ticket}'s merge verdict names PR #${expectedPr}. ` +
+        `Folding a different PR's state into this lane would confirm the wrong merge -- re-run the read with --pr ${expectedPr}.`
+    );
+  }
+  if (read.state === "MERGED") {
+    lane.mergeObserved = {
+      number: expectedPr,
+      url: read.url ?? "",
+      ...(typeof read.mergeSha === "string" ? { mergeSha: read.mergeSha } : {}),
+    };
+    delete lane.mergeConfirmAttempts;
+  } else {
+    lane.mergeConfirmAttempts = MAX_MERGE_CONFIRM_ATTEMPTS;
+  }
+  return next;
 }
 
 // Records a finished stage agent's final message on its lane (pure).
@@ -2774,7 +2902,12 @@ export function ingestBoardItems(
   // lookup (lib/board.ts `item`); absence from `items` proves nothing and never
   // lands here. Default [] = no confirm pass ran, which degrades to pure
   // carry-forward.
-  confirmedGone: number[] = []
+  confirmedGone: number[] = [],
+  // #324: what those same lookups proved about each gone issue's own state
+  // (applyConfirmations.goneStates) -- accumulated into LoopState.depsGone so a
+  // gone DEPENDENCY resolves to satisfied ("closed": it shipped) or dead
+  // ("open": it left un-Done, #292) instead of silently satisfying by absence.
+  goneStates: Record<string, "closed" | "open"> = {}
 ): LoopState {
   const prevByNumber = new Map((prev?.tickets ?? []).map((t) => [t.number, t]));
   // Every caller is protected here, not just the CLI: a status the loop does
@@ -2862,6 +2995,16 @@ export function ingestBoardItems(
       status: STATUS_FOR_STAGE[l.stage],
       dependsOn: [],
     });
+  }
+  // #324: stamp what each snapshot actually rests on. An OBSERVED ticket is a
+  // fresh object with no carriedForward; everything else in the merge -- a prev
+  // clone the read did not show, a tombstone -- is marked, which is what makes
+  // "Done, but nobody has seen it lately" visibly different from "Done in this
+  // read" to the dependency gate (#274). Positive observation clears it by
+  // construction (the observed object replaces the marked clone).
+  {
+    const observedNums = new Set(observed.map((t) => t.number));
+    for (const [n, t] of merged) if (!observedNums.has(n)) t.carriedForward = true;
   }
   const tickets = [...merged.values()].sort((a, b) => a.number - b.number);
   // Deliberately built from the OBSERVED items only, not the merged set: this map
@@ -3095,13 +3238,18 @@ export function ingestBoardItems(
     // contract.) The list still never GROWS or re-selects, which is what #131 and
     // #157 protect.
     batchTickets: startingFreshBatch
-      ? selectBatch(tickets, cfg?.ticketLimit ?? DEFAULT_TICKET_LIMIT)
+      ? selectBatch(tickets, cfg?.ticketLimit ?? DEFAULT_TICKET_LIMIT, { ...(prev?.depsGone ?? {}), ...goneStates })
       : prev!.batchTickets?.filter((n) => !gone.has(n)),
     // contextTokens is a LIVE per-tick reading -- always taken fresh from cfg,
     // never preserved from prev (an unresolvable/absent reading degrades to 0,
     // which never gates). contextTokenLimit is captured once like the knobs.
     contextTokens: cfg?.contextTokens ?? 0,
     contextTokenLimit: cfg?.contextTokenLimit ?? prev?.contextTokenLimit ?? DEFAULT_CONTEXT_TOKEN_LIMIT,
+    // #324: positive proof about gone issues accumulates for the life of the
+    // state file -- a closed issue's number never reopens as a different fact,
+    // and re-buying the same lookup every tick is the waste confirmTargets
+    // already refuses.
+    depsGone: { ...(prev?.depsGone ?? {}), ...goneStates },
   };
 }
 
@@ -3636,17 +3784,48 @@ export function observeLaneHeads(state: LoopState, root: string = process.cwd())
 // The tickets whose absence from a read is worth confirming: the in-flight lanes
 // (a stuck lane is the failure carry-forward alone would leave behind) and this
 // batch's allow-list. Everything else on the board costs nothing to carry.
-export function confirmTargets(prev: LoopState | null, items: BoardItemLike[]): number[] {
-  if (!prev) return [];
+export function confirmTargets(prev: LoopState | null, items: BoardItemLike[], bodies?: Record<string, string>): number[] {
   const present = new Set(items.map((it) => it.number));
+  // #324 (#274): DEPENDENCIES are watched too. A dep absent from the read used
+  // to satisfy its dependents by default; now it earns one lookup, whose answer
+  // either splices it back in (observed status decides), or proves it gone with
+  // the issue's own open/closed state deciding shipped-vs-abandoned. Deps come
+  // from the previous snapshot's own dependsOn AND -- on a first ingest, where
+  // there is no previous state -- from the bodies of the tickets just read, so
+  // a fresh batch whose dep shipped last month is confirmable before
+  // batchTickets is captured.
+  // Only the deps whose ANSWER can change a decision this run: dependencies of
+  // laned, batch, or workable tickets. A parked ticket's dep costs a lookup and
+  // buys nothing until the ticket is workable again, and on a 68-ticket board
+  // "deps of everything" is a quota bill, not a safety property.
+  const deps = new Set<number>();
+  const watchedDependents = new Set<number>([
+    ...(prev?.lanes ?? []).map((l) => l.ticket),
+    ...(prev?.batchTickets ?? []),
+    ...(prev?.tickets ?? []).filter((t) => isWorkableStatus(t.status) && !t.claimedByOther).map((t) => t.number),
+  ]);
+  for (const t of prev?.tickets ?? []) {
+    if (!watchedDependents.has(t.number)) continue;
+    for (const d of t.dependsOn) deps.add(d);
+  }
+  if (bodies) {
+    for (const it of items) {
+      const body = bodies[String(it.number)];
+      if (typeof body === "string") for (const d of parseDependsOn(body)) deps.add(d);
+    }
+  }
+  const alreadyProven = new Set(Object.keys(prev?.depsGone ?? {}).map(Number));
+  if (!prev) {
+    return [...deps].filter((n) => !present.has(n)).sort((a, b) => a - b);
+  }
   // #273: a lane already carrying a goneReason is awaiting its stop-lane, and a
   // lookup can prove nothing new about it -- it was marked BY a positive
   // observation. Spending one on it re-buys evidence already in hand, which is
   // the same "one lookup and one log line each" waste the batchTickets
   // subtraction below exists to prevent.
   const marked = new Set((prev.lanes ?? []).filter((l) => l.goneReason !== undefined).map((l) => l.ticket));
-  const watched = new Set<number>([...(prev.lanes ?? []).map((l) => l.ticket), ...(prev.batchTickets ?? [])]);
-  return [...watched].filter((n) => !present.has(n) && !marked.has(n)).sort((a, b) => a - b);
+  const watched = new Set<number>([...(prev.lanes ?? []).map((l) => l.ticket), ...(prev.batchTickets ?? []), ...deps]);
+  return [...watched].filter((n) => !present.has(n) && !marked.has(n) && !alreadyProven.has(n)).sort((a, b) => a - b);
 }
 
 // One single-ticket lookup's answer (lib/board.ts `item` prints exactly this).
@@ -3656,6 +3835,10 @@ export interface ItemLookupResult {
   item?: BoardItemLike;
   body?: string;
   reason?: string;
+  // #324: the ISSUE's own open/closed state when the lookup found the issue but
+  // not the project item -- what tells a gone dependency's two meanings apart
+  // (#274/#292). Absent on issue-not-found and on pre-#324 lookup files.
+  issueState?: "OPEN" | "CLOSED";
 }
 
 // Folds confirm-pass lookups into a read: a ticket the lookup found is SPLICED
@@ -3668,9 +3851,15 @@ export function applyConfirmations(
   items: BoardItemLike[],
   bodies: Record<string, string>,
   lookups: ItemLookupResult[]
-): { items: BoardItemLike[]; bodies: Record<string, string>; confirmedGone: number[]; notes: string[] } {
+): { items: BoardItemLike[]; bodies: Record<string, string>; confirmedGone: number[]; goneStates: Record<string, "closed" | "open">; notes: string[] } {
   const present = new Set(items.map((it) => it.number));
-  const out = { items: [...items], bodies: { ...bodies }, confirmedGone: [] as number[], notes: [] as string[] };
+  const out = {
+    items: [...items],
+    bodies: { ...bodies },
+    confirmedGone: [] as number[],
+    goneStates: {} as Record<string, "closed" | "open">,
+    notes: [] as string[],
+  };
   for (const l of lookups ?? []) {
     if (typeof l?.number !== "number" || present.has(l.number)) continue;
     if (l.present && l.item) {
@@ -3682,11 +3871,16 @@ export function applyConfirmations(
       );
     } else if (!l.present) {
       out.confirmedGone.push(l.number);
+      // #324: the issue's own state is what a gone DEPENDENCY's dependents key
+      // on (#274/#292). CLOSED = it shipped; anything else -- open off-project,
+      // a deleted issue, a pre-#324 lookup file with no state -- fails CLOSED
+      // to "open": nothing may build on a dep that cannot be proven shipped.
+      out.goneStates[String(l.number)] = l.issueState === "CLOSED" ? "closed" : "open";
       out.notes.push(
         // #273: this note used to end "releasing its lane", which was the prose
         // half of the defect -- ingest never released anything an orchestrator
         // could act on. A lane is only ever released by an applied stop-lane.
-        `read missed #${l.number}; single-ticket lookup confirms it is gone from the board (${l.reason ?? "not-on-project"}); dropping it from state, and any lane still holding it is stopped by the next action.`
+        `read missed #${l.number}; single-ticket lookup confirms it is gone from the board (${l.reason ?? "not-on-project"}, issue ${l.issueState ?? "state unknown"}); dropping it from state, and any lane still holding it is stopped by the next action.`
       );
     } else {
       out.notes.push(`read missed #${l.number}; its lookup answered nothing usable -- carrying it forward unchanged.`);
@@ -3711,11 +3905,21 @@ const USAGE = `loop <command> [args]
                                                      "next" will not advance a lane to merge without a green one
   next <state.json> [--now <ms>]                     print the next Action as JSON (writes only to record a confirm-claim ask)
   apply <state.json> <action.json> [--now <ms>]      apply an Action, rewrite the state file
-  outcome <state.json> <ticket> <msg.txt> [--now <ms>]  parse a stage's final message onto its lane
+  outcome <state.json> <ticket> --verdict <verdict.json> [--now <ms>]
+          validate the stage's VERDICT FILE (#323) against the lane's own spawn
+          and record its outcome; prose is never read. A missing/INVALID
+          verdict is recorded as a dead probe (stdout: {"invalidVerdict":...})
+          and the dead-stage machinery routes recovery.
           a BUILDER lane also REQUIRES its worktree's git facts (#177), which a
           BUILT is verified against: --porcelain <file> (git status --porcelain
           --branch) --head-sha <sha> (git rev-parse HEAD) --base-sha <sha>
           (git merge-base <baseBranch> HEAD)
+  confirm-merged <state.json> <ticket> --pr-state <file> [--now <ms>]
+          fold a \`z-board pr-state --pr <n>\` read back onto the lane whose
+          merge verdict named that PR (#324/#313): MERGED stamps the
+          observation \`complete\` requires; a positive NOT-merged answer jumps
+          the attempts to the cap so the next tick parks the divergence;
+          found:false proves nothing (#138) and the bounded retry stands
   probe <state.json> <ticket> <alive|dead> [--now <ms>] record an aliveness probe
           a DEAD probe should also carry the lane worktree's dirtiness (#209),
           which is what lets a stage that died holding finished work be re-spawned
@@ -4124,6 +4328,12 @@ export function main(argv: string[]): number {
       if (action.kind === "confirm-claim") {
         atomicWrite(statePath, JSON.stringify(recordConfirmAttempt(state, action.ticket, nowMs), null, 2));
       }
+      // #324: same enforcement shape for the Done gate -- the ask is stamped by
+      // the verb that hands the action over, so the bounded park arrives even
+      // if the orchestrator never folds an answer back.
+      if (action.kind === "confirm-merge") {
+        atomicWrite(statePath, JSON.stringify(recordMergeConfirmAsk(state, action.ticket), null, 2));
+      }
       return 0;
     }
     if (cmd === "apply") {
@@ -4225,6 +4435,36 @@ export function main(argv: string[]): number {
       atomicWrite(statePath, JSON.stringify(nextState, null, 2));
       const dirty = nextState.lanes.find((l) => l.ticket === ticket)?.worktreeDirty;
       console.log(`#${ticket} ${verdict}${dirty === undefined ? "" : dirty ? " (worktree holds uncommitted work)" : " (worktree clean)"}`);
+      return 0;
+    }
+    if (cmd === "confirm-merged") {
+      // #324: fold a `z-board pr-state --pr <n>` read back onto the lane whose
+      // merge verdict named that PR. The expected PR comes from the lane's own
+      // recorded outcome -- never from a flag someone could mistype.
+      const ticket = Number(positionals[1]);
+      const readFile = str(flags, "pr-state");
+      if (!Number.isInteger(ticket) || readFile === undefined) {
+        throw new ZError("Usage: loop confirm-merged <state.json> <ticket> --pr-state <file> [--now <ms>]");
+      }
+      const state = readState(statePath);
+      const lane = state.lanes.find((l) => l.ticket === ticket);
+      if (!lane) throw new ZError(`No lane holds #${ticket}.`);
+      if (lane.outcome?.kind !== "merged") {
+        throw new ZError(`Lane #${ticket} carries no merged outcome to confirm (outcome: ${lane.outcome?.kind ?? "none"}).`);
+      }
+      const expected = prNumberFromUrl(lane.outcome.note);
+      if (expected === null) throw new ZError(`Lane #${ticket}'s merge verdict carries no readable PR number (${JSON.stringify(lane.outcome.note)}).`);
+      const read = readJson(readFile) as PrStateRead;
+      const next = confirmMerged(state, ticket, read, expected);
+      atomicWrite(statePath, JSON.stringify(next, null, 2));
+      const after = next.lanes.find((l) => l.ticket === ticket)!;
+      console.log(
+        JSON.stringify(
+          after.mergeObserved
+            ? { confirmed: true, pr: expected, mergeSha: after.mergeObserved.mergeSha }
+            : { confirmed: false, pr: expected, found: read.found, state: read.state, attempts: after.mergeConfirmAttempts ?? 0 }
+        )
+      );
       return 0;
     }
     if (cmd === "attempt") {

@@ -61,6 +61,7 @@ import {
   parseAssignees,
   recordConfirmAttempt,
   recordMergeGate,
+  confirmMerged,
   recordOutcome,
   type LaneState,
   type LoopState,
@@ -124,7 +125,7 @@ const HAPPY: Record<Stage, StageOutcome> = {
   builder: { kind: "built" },
   qa: { kind: "qa-pass" },
   reviewer: { kind: "review-approve", confidence: 100, skeptics: null }, // clears the default 70 floor (issue #62)
-  merge: { kind: "merged", note: "https://pr/1" },
+  merge: { kind: "merged", note: "https://x/pull/1" },
 };
 // The green verdict `loop merge-gate --state` stamps on a lane (#178): without
 // one, nextAction never advances a lane into the merge stage.
@@ -1224,6 +1225,10 @@ describe("control 4: lane cap enforced at the locks layer", () => {
         s = recordMergeGate(s, a.ticket, GREEN_GATE, 0); // #178: the loop gates every merge; green here
         continue;
       }
+      if (a.kind === "confirm-merge") {
+        s = confirmMerged(s, a.ticket, { found: true, state: "MERGED", url: "https://x/pull/1", number: a.pr }, a.pr); // #324
+        continue;
+      }
       if (a.kind === "claim") writeLaneLock(locksDir, { ticket: a.ticket, stage: a.stage, session: "s", claimedAt: 0 });
       else if (a.kind === "advance") writeLaneLock(locksDir, { ticket: a.ticket, stage: a.to, session: "s", claimedAt: 0 });
       else if (a.kind === "park" || a.kind === "skip" || a.kind === "complete" || a.kind === "stop-lane") removeLaneLock(locksDir, a.ticket);
@@ -1446,6 +1451,10 @@ describe("control 6: wave reconciliation (mid-loop human moves)", () => {
       }
       if (a.kind === "merge-gate") {
         s = recordMergeGate(s, a.ticket, GREEN_GATE, 0);
+        continue;
+      }
+      if (a.kind === "confirm-merge") {
+        s = confirmMerged(s, a.ticket, { found: true, state: "MERGED", url: "https://x/pull/1", number: a.pr }, a.pr); // #324
         continue;
       }
       s = applyAction(s, a, 0);

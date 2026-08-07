@@ -659,7 +659,7 @@ describe("z-loop-tick", () => {
 
     const log = proc.stderr.toString();
     expect(log).toContain("read missed #1");
-    expect(log).toContain("gone from the board (not-on-project)");
+    expect(log).toContain("gone from the board (not-on-project, issue state unknown)");
     // The note must NOT claim the tick released the lane -- it did not (#273).
     expect(log).not.toContain("releasing its lane");
     expect(log).toContain("stopped by the next action");

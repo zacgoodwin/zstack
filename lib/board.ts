@@ -163,8 +163,20 @@ const Q_PR_STATE = `query PrState($owner: String!, $repo: String!, $branch: Stri
   repository(owner: $owner, name: $repo) {
     pullRequests(headRefName: $branch, first: 20, orderBy: { field: CREATED_AT, direction: DESC }) {
       pageInfo { hasNextPage }
-      nodes { number url state }
+      nodes { number url state mergeCommit { oid } }
     }
+  }
+}`;
+
+// One PR by NUMBER (#324, contract C3): the Done gate's question is "did PR #n
+// land", asked about the exact PR the merge verdict named -- a branch-keyed
+// read answers a subtly different question (which PR is newest on this branch)
+// and #313's whole point is that the verdict's own PR must be the one
+// confirmed. mergeCommit rides along so the observation can be recorded
+// against a commit, not just a state string.
+const Q_PR_BY_NUMBER = `query PrByNumber($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) { number url state mergeCommit { oid } }
   }
 }`;
 
@@ -211,7 +223,7 @@ const Q_OPEN_PR_VERSIONS = `query OpenPrVersions($owner: String!, $repo: String!
 const Q_ITEM_LOOKUP = `query ItemLookup($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     issue(number: $number) {
-      number title url body
+      number title url body state
       milestone { title }
       labels(first: 20) { pageInfo { hasNextPage } nodes { name } }
       projectItems(first: 20) {
@@ -332,7 +344,13 @@ export interface BoardItem {
 // a caller can key the answer without tracking which call it came from.
 export type ItemLookup =
   | { number: number; present: true; item: BoardItem; body: string }
-  | { number: number; present: false; reason: "not-on-project" | "issue-not-found" };
+  // #324: `issueState` distinguishes the two ways to be off the board, which
+  // mean OPPOSITE things to a dependent (#274/#292): a CLOSED issue left
+  // because it shipped (its human reviewed Done and closed it) -- the dep is
+  // satisfied; an OPEN issue off the project left un-Done -- building on it
+  // would use a base that never got it. Absent on issue-not-found (there is no
+  // issue to have a state).
+  | { number: number; present: false; reason: "not-on-project" | "issue-not-found"; issueState?: "OPEN" | "CLOSED" };
 
 export interface CreatedIssue {
   number: number;
@@ -592,10 +610,11 @@ export class Board {
     // can never come back; both are safe to confirm, with the reason recorded.
     if (!issue) return { number: n, present: false, reason: "issue-not-found" };
     assertSinglePage(issue.projectItems, `projectItems for issue #${n} (ceiling: 20 boards per issue)`);
+    const issueState = issue.state === "CLOSED" ? "CLOSED" : "OPEN";
     const node = (issue.projectItems?.nodes ?? []).find(
       (i: any) => i.project?.number === this.cfg.projectNumber
     );
-    if (!node) return { number: n, present: false, reason: "not-on-project" };
+    if (!node) return { number: n, present: false, reason: "not-on-project", issueState };
     const item = toItem({ content: issue, fieldValues: node.fieldValues });
     if (!item) {
       throw new ZError(`Issue #${n} resolved to a project item with no readable content.`);
@@ -933,7 +952,7 @@ export class Board {
   // merged" -- a network failure throws, but a branch whose PR was never opened
   // and a branch whose PR list we simply could not see look the same from here.
   // lib/reconcile.ts fails closed on undefined for exactly that reason (#138).
-  async prState(branch: string): Promise<{ state: string; url: string; number: number } | undefined> {
+  async prState(branch: string): Promise<{ state: string; url: string; number: number; mergeSha?: string } | undefined> {
     const data = await this.gql(Q_PR_STATE, {
       owner: this.cfg.owner,
       repo: this.cfg.repo,
@@ -944,7 +963,39 @@ export class Board {
     assertSinglePage(prs, `pullRequests for branch "${branch}" (ceiling: 20 PRs per branch)`);
     const nodes: any[] = prs.nodes ?? [];
     const pr = nodes.find((n) => String(n?.state) === "MERGED") ?? nodes[0];
-    return pr ? { state: String(pr.state), url: String(pr.url), number: Number(pr.number) } : undefined;
+    if (!pr) return undefined;
+    const sha = pr.mergeCommit?.oid;
+    return { state: String(pr.state), url: String(pr.url), number: Number(pr.number), ...(typeof sha === "string" ? { mergeSha: sha } : {}) };
+  }
+
+  // The Done gate's read (#324/#313): the exact PR a merge verdict named,
+  // by number. `found:false` is a deleted/never-existed PR and, per the #138
+  // rule every reader of this family follows, is NOT proof of an unmerged PR
+  // -- the caller fails closed. Same executor as everything here, so
+  // lib/board.ts stays the pack's only `gh` caller.
+  async prStateByNumber(n: number): Promise<{ state: string; url: string; number: number; mergeSha?: string } | undefined> {
+    const data = await this.gql(Q_PR_BY_NUMBER, {
+      owner: this.cfg.owner,
+      repo: this.cfg.repo,
+      number: n,
+    });
+    const pr = data.repository?.pullRequest;
+    if (!pr) return undefined;
+    const sha = pr.mergeCommit?.oid;
+    return { state: String(pr.state), url: String(pr.url), number: Number(pr.number), ...(typeof sha === "string" ? { mergeSha: sha } : {}) };
+  }
+
+  // Write-then-read-back (#324, extends #205): the move, followed by a read of
+  // the Status field the move claims to have set. The caller (loop apply's
+  // proof gate) compares `observed` to what it expected -- a crash between the
+  // two halves leaves a board AHEAD of state by one hop, which the resync
+  // guard already recovers, while a silently-failed write (the #205 family)
+  // becomes visible the moment it happens instead of N stages later.
+  async moveConfirmed(n: number, status: string): Promise<{ moved: boolean; reason?: "not-on-project"; observed?: string }> {
+    const res = await this.moveIfPresent(n, status);
+    if (!res.moved) return res;
+    const observed = await this.fieldGet(n, "Status");
+    return { moved: true, observed: observed === null ? undefined : String(observed) };
   }
 
   // The open-PR version queue: which slot every outstanding PR has claimed.
@@ -1360,7 +1411,14 @@ export async function main(
       case "move": {
         const n = requireInt(positionals[0], "issue");
         const status = positionals[1];
-        if (!status) throw new ZError("Usage: z-board move <N> <S> [--if-present]");
+        if (!status) throw new ZError("Usage: z-board move <N> <S> [--if-present] [--confirm]");
+        // #324: --confirm reads the Status back after the write and reports the
+        // observed value, so the caller's proof gate compares instead of hoping.
+        // Composes with --if-present (a gone ticket reports moved:false).
+        if (flags["confirm"]) {
+          console.log(JSON.stringify({ ticket: n, status, ...(await board.moveConfirmed(n, status)) }));
+          return 0;
+        }
         if (flags["if-present"]) {
           console.log(JSON.stringify(await board.moveIfPresent(n, status)));
           return 0;
@@ -1437,8 +1495,17 @@ export async function main(
       // lib/board.ts the pack's sole `gh` caller: the SKILL row used to shell out
       // to `gh pr view` directly.
       case "pr-state": {
+        // #324: `--pr <n>` asks about the exact PR a merge verdict named; the
+        // positional branch form answers "what happened to this branch's PR".
+        const prNumber = str(flags, "pr");
+        if (prNumber !== undefined) {
+          const n = requireInt(prNumber, "--pr");
+          const pr = await board.prStateByNumber(n);
+          console.log(JSON.stringify(pr ? { pr: n, found: true, ...pr } : { pr: n, found: false }));
+          return 0;
+        }
         const branch = positionals[0];
-        if (!branch) throw new ZError("Usage: z-board pr-state <branch>");
+        if (!branch) throw new ZError("Usage: z-board pr-state <branch> | pr-state --pr <number>");
         const pr = await board.prState(branch);
         console.log(JSON.stringify(pr ? { branch, found: true, ...pr } : { branch, found: false }));
         return 0;
