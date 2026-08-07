@@ -4,6 +4,12 @@ All notable changes to zstack are documented here. Format follows [Keep a Change
 
 There is no `[Unreleased]` section: since 1.1.0.0 every PR opens its own version heading at merge time, written by `bun lib/version.ts claim` rather than by hand. Do not add one, and do not edit a version heading or VERSION/package.json directly — see [docs/user-guide/z-loop.md](docs/user-guide/z-loop.md#version-claiming).
 
+## [1.3.0.0] - 2026-08-07
+
+### Added
+
+Remove legacy pre-#322 transcript reader, cutting unused code paths and improving long-term maintainability.
+
 ## [1.2.2.0] - 2026-08-07
 
 ### Fixed
