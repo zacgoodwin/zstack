@@ -2364,18 +2364,38 @@ export function applyAction(state: LoopState, action: Action, nowMs: number): Lo
       // still go HERE, in one write with the lane, or the state briefly says the
       // loop owns work it has already torn the worker down for.)
       //
-      // #178: a lane dropped at the MERGE stage whose ticket the board already
-      // shows Done landed its PR -- a human dragging the merging card to Done
-      // mid-run is the reachable case (nextAction:1329's parkedByHuman
-      // stop-lane). `complete` is the only other resolution that records into
+      // #178, revised by #330: a lane dropped at the MERGE stage whose ticket
+      // the board already shows Done may have landed its PR without going
+      // through `complete` -- before #330, ANY merge-stage lane reading Done
+      // here meant exactly that, because the loop's own auto-close (`Closes
+      // #N`) was the only way GitHub could put a merge-stage ticket at Done.
+      // `complete` is the only OTHER resolution that records into
       // `mergedThisRun`, so without this the base every OTHER lane's green
       // verdict is bound to never moves, and each of them keeps a pre-parent
-      // gauntlet as live merge permission. Derived from state rather than
-      // carried on the action on purpose: the SKILL hand-builds stop-lane rows,
-      // and a fact a hand-builder can omit is a fact that will be omitted.
+      // gauntlet as live merge permission.
+      //
+      // #330 fixed the routing itself: a merge-stage lane whose OWN outcome is
+      // `merged` now never reaches stop-lane at all (autoClosedByOwnMerge
+      // above diverts it to the Done gate, confirm-merge -> complete, which
+      // pushes `mergedThisRun` on ITS OWN terminal case below). So the only
+      // shape that can still reach a stop-lane action at the MERGE stage with
+      // the ticket at Done is a lane whose outcome is NOT `merged` -- a human
+      // really did drag the card, and nothing landed. Recording THAT as landed
+      // is the false positive #330's review caught: a stacked dependent reads
+      // the false `mergedThisRun` entry and retargets onto this ticket as an
+      // already-merged parent, re-running its claim+gate against a base that
+      // never moved -- the exact corruption this file's #330 comments name as
+      // the harm auto-close misrouting causes, now inverted onto this branch.
+      // Reusing autoClosedByOwnMerge (rather than re-deriving stage+status
+      // here) keeps the routing decision and this bookkeeping decision as one
+      // predicate: the two cannot drift apart the way they did before #330 was
+      // caught by review. Derived from state rather than carried on the
+      // action on purpose: the SKILL hand-builds stop-lane rows, and a fact a
+      // hand-builder can omit is a fact that will be omitted.
       const stopping = next.lanes.find((l) => l.ticket === action.ticket);
       const landed =
-        stopping?.stage === "merge" && next.tickets.find((t) => t.number === action.ticket)?.status === "Done";
+        stopping !== undefined &&
+        autoClosedByOwnMerge(stopping, next.tickets.find((t) => t.number === action.ticket)?.status);
       dropLane(next, action.ticket);
       if (landed && !(next.mergedThisRun ?? []).includes(action.ticket)) {
         (next.mergedThisRun ??= []).push(action.ticket);

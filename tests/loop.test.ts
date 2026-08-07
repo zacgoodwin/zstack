@@ -7073,10 +7073,24 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
         // -- MERGED is the only outcome autoClosedByOwnMerge ever exempts, so
         // nothing the loop did explains the board's Done, and the human-stop
         // meaning holds exactly as it did before #330.
-        const s = state([ticket(7, "Done")], [lane(7, "merge", { outcome: { kind: "stage-blocked", note: "merge conflict" } })]);
+        let s = state([ticket(7, "Done")], [lane(7, "merge", { outcome: { kind: "stage-blocked", note: "merge conflict" } })]);
         const a = nextAction(s, 0);
         expect(a).toMatchObject({ kind: "stop-lane", ticket: 7 });
         expect((a as { note: string }).note).toContain("A human moved #7 to Done");
+        // Review catch: applyAction's own `landed` guess (#178) used to derive
+        // "landed" from stage+status alone, with no outcome check -- so THIS
+        // shape (a stop-lane at the merge stage with the ticket at Done) still
+        // got recorded into `mergedThisRun` even though nothing merged. Once
+        // #330 diverts every genuine merged+Done lane away from stop-lane
+        // entirely (AC1), that old heuristic could no longer see a single true
+        // positive -- every lane still reaching stop-lane here has a non-merged
+        // outcome by construction, so recording it as landed is ALWAYS wrong.
+        // A stacked dependent would read this false `mergedThisRun` entry and
+        // retarget onto #7 as an already-merged parent, re-running its
+        // claim+gate against a base that never moved.
+        s = applyAction(s, a, 0);
+        expect(s.mergedThisRun).toEqual([]);
+        expect(s.lanes).toEqual([]); // still dropped -- only the false "landed" record is fixed
       });
 
       test("AC3: confirm-merged folding a positive MERGED read then completes, recording mergedThisRun", () => {
