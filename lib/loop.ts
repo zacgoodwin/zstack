@@ -1601,6 +1601,12 @@ export function nextAction(state: LoopState, nowMs: number, laneHeads?: LaneHead
   }
 
   for (const lane of lanes) {
+    // #330 companion pin (AC2): an outcome-less lane is not at a boundary yet,
+    // so it is skipped here BEFORE either stop check below ever runs -- a
+    // merge worker still mid-`gh pr merge` (no outcome recorded) is deferred
+    // to `wait`, never stopped and never auto-close-routed, until it reports
+    // one. Pre-existing and general (every stage, not just merge); #330 only
+    // ever needed to correct what happens once a lane HAS reported one.
     if (!lane.outcome) continue;
     // #330: computed once per lane and consulted by BOTH stops below -- the
     // auto-close collision is invisible to either check on its own (parkedByHuman

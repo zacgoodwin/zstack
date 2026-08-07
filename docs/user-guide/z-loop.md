@@ -1580,10 +1580,17 @@ sticks (#324; a raw board Done is never proof by itself, #313). This is safe
 even on the off chance a human really did drag the card while the merge was
 in flight: if the PR turns out not to be merged, the read comes back a
 positive divergence and the lane parks Blocked naming it, which beats
-believing the board either way. A merge-stage lane with **no** `MERGED`
-verdict yet dragged to Done — nothing the loop did explains that Done — still
-stops the lane exactly as above; only the exact `merged` + Done combination is
-ever read as the loop's own landing.
+believing the board either way. A merge-stage lane with a *recorded* outcome
+that is not `merged` (a real conflict, say) dragged to Done — nothing the loop
+did explains that Done — still stops the lane exactly as above. A merge-stage
+lane with **no** outcome recorded at all is a different shape: the worker may
+still be mid-`gh pr merge`, and the check above only ever runs once a lane has
+reached a boundary (an outcome recorded) — the same reasoning that already
+holds a dead merge worker at `check-worker` instead of skipping it (#14) — so
+`next` returns `wait` and defers the read to that boundary rather than risk
+stopping a live merge. Only a *recorded* `merged` + Done combination is ever
+read as the loop's own landing; every other Done at this stage either stops
+(a recorded non-merged outcome) or waits (none recorded yet).
 
 ## Done when
 

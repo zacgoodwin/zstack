@@ -7093,6 +7093,24 @@ describe("merge gate: the loop decides green/red, never the agent (#178)", () =>
         expect(s.lanes).toEqual([]); // still dropped -- only the false "landed" record is fixed
       });
 
+      // Companion pin (AC2): the IDENTICAL Done board state as the test just
+      // above, but with NO outcome recorded at all, is a different shape --
+      // the merge worker may still be mid-`gh pr merge`, and the human-stop
+      // check (parkedByHuman/autoClosed) never even runs for an outcome-less
+      // lane; step 1's per-lane loop skips it before either check, deferring
+      // to this lane's own boundary (same general rule every other stage
+      // gets, not something #330 introduced). Reviewer attempt 2 on this
+      // ticket blocked because the ORIGINAL AC wording asked for `stop-lane`
+      // here instead -- which would mean killing a lane that might still be
+      // mid-merge, the same class of hazard #14's H9 already guards the
+      // dead-worker watchdog against -- so the ticket's wording was corrected
+      // rather than the code. Pinned as its own case so a future change to
+      // the exemption cannot silently start stopping an in-flight worker.
+      test("Companion pin: the same Done board state with NO recorded outcome returns wait, never stop-lane", () => {
+        const s = state([ticket(7, "Done")], [lane(7, "merge")]);
+        expect(nextAction(s, 0)).toEqual({ kind: "wait" });
+      });
+
       test("AC3: confirm-merged folding a positive MERGED read then completes, recording mergedThisRun", () => {
         let s = state([ticket(7, "Done")], [lane(7, "merge", { outcome: { kind: "merged", note: "https://x/pull/1" } })]);
         s = confirmMerged(s, 7, { found: true, state: "MERGED", url: "https://x/pull/1", number: 1 }, 1);
