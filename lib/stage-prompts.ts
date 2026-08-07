@@ -169,9 +169,25 @@ Every command you verify with -- the test suite, typecheck, build, anything you 
 // token that stage would actually have gotten wrong. Placed LAST in every prompt,
 // after the marker list, because that is the closing instruction the agent reads
 // immediately before acting on it.
+//
+// #318 added the unconditional half. Position was stated as a contract; EXISTENCE
+// was only ever implied by "your FINAL message MUST START with one of these", and
+// an agent that believes its work is unfinished does not read that as binding --
+// it reads it as describing the finished case and stops short of it. Every
+// markerless exit in the corpus has this shape: the stage was waiting on something
+// (a backgrounded suite in #170/#286, backgrounded skeptics in #149/#178/#205 and
+// again in loop 17's #192/#207) and treated silence as the honest report of an
+// incomplete run. It is the opposite: silence parses as CONFUSED, which SKIPS the
+// ticket and discards work that is usually finished, committed and green. So the
+// closer now says the marker is unconditional and names the two markers that exist
+// precisely for the paths that went wrong, since "I have no verdict" needs a
+// sanctioned way to be said or it gets said by saying nothing. Shared by all four
+// stages -- every one of them can be mid-something when its budget runs out.
 function markerPositionRule(example: string): string {
   return `
-POSITION IS PART OF THE CONTRACT: the marker is line 1, column 1. A summary followed by \`${example}: ...\` is a FAILURE of this contract even though the marker is spelled correctly -- line 1 is the only position the loop is guaranteed to read. Nothing precedes it: no "Perfect!", no criteria table, no code fence. Everything you want to say goes on the lines AFTER it.`;
+POSITION IS PART OF THE CONTRACT: the marker is line 1, column 1. A summary followed by \`${example}: ...\` is a FAILURE of this contract even though the marker is spelled correctly -- line 1 is the only position the loop is guaranteed to read. Nothing precedes it: no "Perfect!", no criteria table, no code fence. Everything you want to say goes on the lines AFTER it.
+
+EXACTLY ONE MARKER, ON EVERY PATH OUT OF THIS STAGE. Not only when the work went well: whether you finished, failed, ran out of budget, or something you were counting on never arrived, your final message carries exactly one of these markers. There is no path out of this stage that ends without one, and there is no state of the work that earns you an exception. If you are unable to reach a verdict, that IS the verdict -- say it with \`BLOCKED:\` or \`CONFUSED:\` and name what stopped you. Those are real, actionable outcomes a human can pick up. Ending your turn silent is not the careful choice or the honest one: it is parsed as CONFUSED with nothing in it, and it throws away everything this stage just did.`;
 }
 
 // #209: the briefing a stage gets when it is a RE-SPAWN of a worker that died
@@ -391,12 +407,42 @@ export function reviewerPrompt(input: ReviewerPromptInput, inputPath: string, ad
   // gate reads. The k-to-confidence mapping is given as a lookup table, never a
   // formula -- arithmetic in a model reply is exactly what PRINCIPLES.md forbids,
   // and for k <= 3 the whole space is nine entries.
+  //
+  // #318: #191's block above was still not enough, and loop 17 showed why. It told
+  // the reviewer to "check for outstanding verdicts AT MOST ONCE per skeptic, then
+  // stop waiting" -- which presumes verdicts arrive on some channel the reviewer can
+  // poll. They do not. The Agent tool spawns in the BACKGROUND by default, and a
+  // background sub-agent's only delivery channel is a task notification BETWEEN
+  // turns; a stage agent is sent exactly one message by design (PROCESS.md), so the
+  // between-turns channel does not exist for it. "Check once" is therefore an
+  // instruction whose only available implementation is "end the turn and see what
+  // arrives" -- and ending the turn is what loses the ticket. Loop 17 lost 2 of 3
+  // tickets to exactly that reading, on green committed diffs: the #192 reviewer
+  // closed on "Waiting for skeptic completion notifications." and #207's second
+  // attempt on "I've pinged all three once per stage instructions. Let me wait
+  // briefly for responses." Both were parsed as CONFUSED and skipped; every skeptic
+  // then reported minutes later into a lane already closed, two of them carrying
+  // real reproducible defects.
+  //
+  // So the fix is mechanical, not exhortative: name the flag that makes collection
+  // happen INSIDE the turn (`run_in_background: false`, three calls in one message
+  // so they still run concurrently), and make the verdicts arrive as tool results
+  // the reviewer simply reads. With that, there is nothing outstanding to poll and
+  // "wait" stops being a coherent action rather than a discouraged one. The degraded
+  // path is then named explicitly, because a reviewer holding k < 3 needs a
+  // sanctioned exit or it invents the silent one again.
   const superTruth = adversarial
     ? `
 ## Super-truth pass (adversarial mode active)
 This card's blast radius earned an adversarial review; do NOT trust your single read. Spawn 3 INDEPENDENT skeptic sub-agents with the Agent tool -- nested \`claude -p\` is denied by the classifier, so use the Agent tool, not headless claude. Give each skeptic ONLY the four inputs you were given (this ticket, the acceptance criteria, the diff, the throwaway worktree); they are blinded exactly as you are. Task each one to REFUTE that the diff satisfies the acceptance criteria: find the one criterion it violates, the edge it breaks, a test that passes without the change. They work in isolation -- no skeptic sees another's verdict.
 
-Delivery is BEST-EFFORT and you must report how many verdicts arrived. A skeptic can die, time out, or come back with nothing usable; that is a delivery race, not evidence about the diff. Check for outstanding verdicts AT MOST ONCE per skeptic, then stop waiting and reconcile the \`k\` verdicts you actually hold (0 <= k <= 3). Do not spawn replacements. Do NOT end your turn without one of the exit markers below -- a final message with no marker is parsed as CONFUSED and SKIPS this ticket, which is the worst outcome available to you. "Still waiting on a skeptic" is not an exception to that, it is the single most common way a review is lost: three reviews in one run ended a turn on exactly those words and had to be rescued by hand.
+COLLECT THEM INSIDE THIS TURN. Spawn all three in ONE message, as three Agent tool calls each carrying \`run_in_background: false\`. That flag is the entire mechanism: it makes the three verdicts come back as tool results in this same turn, where you can read them, and the three still run concurrently because they were launched together. The DEFAULT is a background spawn, whose only delivery channel is a task notification BETWEEN turns -- and you get no next turn, because this loop sends a stage agent exactly one message by design. A backgrounded skeptic is one you will never hear from, however long you wait.
+
+You therefore never wait for a skeptic. Once those three tool calls return you are holding every verdict you will ever hold: nothing is outstanding, nothing needs pinging, no notification is coming. Do not spawn replacements, do not re-ping, and do not end your turn to "wait", "check back", or "await completion notifications" -- those are not slower routes to a verdict, they are how this ticket gets thrown away. Three reviews in one run ended a turn on exactly those words; all three were skipped with green, committed work, and every skeptic reported minutes later into a lane that had already closed.
+
+DEGRADED COLLECTION -- your named exit when you do not get three. A skeptic can error, return nothing usable, or be refused; \`k\` is then however many usable verdicts you actually hold, 0 <= k <= 3. That is a delivery race, not evidence about the diff, and it is never a reason to withhold a marker:
+- k >= 1: emit REVIEW-APPROVE or REVIEW-FINDINGS on the k verdicts you hold, carrying the honest \`skeptics=<k>/3\`. Whether k is enough is the quorum gate's call downstream, not yours, and staying silent does not defer that decision -- it destroys it.
+- k = 0: emit REVIEW-APPROVE or REVIEW-FINDINGS off your own single read with \`skeptics=0/3\`; or, if the fan-out failed so badly you cannot judge the diff at all, emit \`CONFUSED: skeptic collection failed -- <what happened>\`. A CONFUSED that names its reason is a real verdict a human can act on. A final message with no marker is not.
 
 Report BOTH tokens in your marker: \`skeptics=<k>/3\` -- the number of verdicts you actually received -- and \`confidence=<0-100>\`, the share of THOSE k that could not refute the diff. Read it off this table; do no arithmetic:
 - k=3: 3 unrefuted -> 100, 2 -> 67, 1 -> 33, 0 -> 0

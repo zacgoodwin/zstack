@@ -253,14 +253,19 @@ describe("pointer prompts are size-invariant to the payload (AC1)", () => {
   // invariance assertion is unaffected -- so the number moved and every other
   // stage kept 4 KB. #209 moved it once more for the same reason: the shared
   // foreground rule (~0.7 KB of fixed text) now goes to the reviewer too, which
-  // is where the markerless exits were actually observed.
+  // is where the markerless exits were actually observed. #318 moves them a third
+  // time, and for both halves of the same fix: the unconditional-marker closer
+  // (~0.6 KB) goes to EVERY stage, so every band rises, and the rewritten
+  // skeptic-collection block adds ~1.5 KB to the adversarial reviewer alone.
+  // Same reasoning each time -- these are FIXED instructions, so invariance (the
+  // real contract, asserted on the line below the cap) is untouched.
   const CASES: { stage: string; build: (payload: string, ac: string) => string; cap: number; payloads: string[] }[] = [
-    { stage: "builder", build: (b) => builderPrompt({ ...BUILDER_INPUT, ticketBody: b }, INPUT_PATH), cap: 4096, payloads: [HUGE] },
-    { stage: "qa", build: (b) => qaPrompt({ ...QA_INPUT, ticketBody: b }, INPUT_PATH), cap: 4096, payloads: [HUGE] },
-    { stage: "reviewer", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH), cap: 4096, payloads: [HUGE, AC] },
+    { stage: "builder", build: (b) => builderPrompt({ ...BUILDER_INPUT, ticketBody: b }, INPUT_PATH), cap: 5120, payloads: [HUGE] },
+    { stage: "qa", build: (b) => qaPrompt({ ...QA_INPUT, ticketBody: b }, INPUT_PATH), cap: 5120, payloads: [HUGE] },
+    { stage: "reviewer", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH), cap: 5120, payloads: [HUGE, AC] },
     // The adversarial reviewer branch fans out skeptics but STILL points at the
     // file for its payload -- it must stay size-invariant too.
-    { stage: "reviewer (adversarial)", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH, true), cap: 6144, payloads: [HUGE, AC] },
+    { stage: "reviewer (adversarial)", build: (b, ac) => reviewerPrompt({ ...REVIEWER_INPUT, ticketBody: b, diff: b, acceptanceCriteria: ac }, INPUT_PATH, true), cap: 8192, payloads: [HUGE, AC] },
     // Merge carries a second mandatory command block (the Step 0 version claim,
     // with its own absolute CLI path and six flags), so it sits in the same
     // higher band the adversarial reviewer does. Still payload-invariant, which
@@ -346,20 +351,103 @@ describe("adversarial reviewer prompt", () => {
     expect(stripped).toBe(SINGLE_PASS_BASELINE);
   });
 
-  // #191: the three run-10 failure modes the block now names explicitly.
-  // Reviewers hung on a skeptic that never reported, ended a turn with no marker
-  // (CONFUSED -> the ticket is SKIPPED), or reported confidence=100 holding zero
-  // verdicts -- which #62's gate read as three independent agreements.
-  test("the super-truth block makes delivery best-effort with a mandatory denominator", () => {
+  // #191: the three run-10 failure modes the block names explicitly. Reviewers hung
+  // on a skeptic that never reported, ended a turn with no marker (CONFUSED -> the
+  // ticket is SKIPPED), or reported confidence=100 holding zero verdicts -- which
+  // #62's gate read as three independent agreements. #318 replaced #191's
+  // "check AT MOST ONCE per skeptic, then stop waiting" with in-turn collection:
+  // there is no polling channel to check, so the instruction's only available
+  // reading was "end the turn and see", which is the very failure. The mandatory
+  // denominator (this test's other half) is unchanged.
+  test("the super-truth block still demands the denominator and forbids replacements", () => {
     const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
-    expect(active).toContain("Delivery is BEST-EFFORT");
-    expect(active).toContain("AT MOST ONCE per skeptic");
     expect(active).toContain("Do not spawn replacements");
-    expect(active).toContain("Do NOT end your turn without one of the exit markers");
+    // #318: the polling instruction is GONE, not merely counterweighted. Its
+    // presence alongside the new text would leave the failing reading available.
+    expect(active).not.toContain("AT MOST ONCE per skeptic");
+    expect(active).not.toContain("Delivery is BEST-EFFORT");
     // Both markers carry the denominator, so a starved review is legible on
     // either path.
     expect(active).toContain("REVIEW-APPROVE: confidence=<0-100> skeptics=<k>/3");
     expect(active).toContain("REVIEW-FINDINGS: confidence=<0-100> skeptics=<k>/3");
+  });
+
+  // #318 AC2: collection happens INSIDE the reviewer's own turn, and the mechanism
+  // is named rather than exhorted. `run_in_background: false` is the whole fix --
+  // the Agent tool backgrounds by default, and a background sub-agent delivers only
+  // via a between-turns notification, a channel a stage agent (sent exactly one
+  // message by design) does not have. Loop 17's reviewers were not disobeying
+  // #191's block; they were following it, because "check for outstanding verdicts"
+  // has no in-turn implementation once the spawn is backgrounded.
+  test("skeptic collection is in-turn, and names the flag that makes it so (#318)", () => {
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
+    expect(active).toContain("COLLECT THEM INSIDE THIS TURN");
+    expect(active).toContain("`run_in_background: false`");
+    // Spawned together, so in-turn does not mean serialized.
+    expect(active).toContain("Spawn all three in ONE message");
+    // The reason the default loses the verdicts, stated as mechanism.
+    expect(active).toContain("only delivery channel is a task notification BETWEEN turns");
+    expect(active).toContain("A backgrounded skeptic is one you will never hear from");
+  });
+
+  // #318 AC2, second half: a named degraded path for skeptics that do not return,
+  // which still emits a marker. Without a sanctioned way to say "I have fewer than
+  // three", the reviewer invents the unsanctioned one -- silence.
+  test("the degraded-collection path is named and still exits with a marker (#318)", () => {
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
+    expect(active).toContain("DEGRADED COLLECTION");
+    expect(active).toContain("never a reason to withhold a marker");
+    // k >= 1: report the honest tally and let the quorum gate (#191) decide.
+    expect(active).toContain("the quorum gate's call downstream, not yours");
+    // k = 0: either an honest single-read verdict, or a CONFUSED that NAMES the
+    // collection failure -- both are markers.
+    expect(active).toContain("CONFUSED: skeptic collection failed --");
+    expect(active).toContain("A final message with no marker is not.");
+  });
+
+  // #318 AC1: "wait for notifications" must not survive anywhere as an available
+  // action. Asserted as a scoped read of the super-truth block, never as a negative
+  // over the whole prompt: the prompt embeds ${inputPath} and ${worktreePath}, so a
+  // checkout under a path containing any asserted word would fail this spuriously
+  // (#207). The block is sliced out by its own headings first.
+  test("no phrasing in the super-truth block permits ending the turn to await skeptics (#318)", () => {
+    const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
+    const block = active.slice(
+      active.indexOf("## Super-truth pass"),
+      active.indexOf("## Verification runs in the FOREGROUND")
+    );
+    expect(block.length).toBeGreaterThan(500); // the slice found the block, not ""
+    expect(block).toContain("You therefore never wait for a skeptic");
+    expect(block).toContain("no notification is coming");
+    expect(block).toContain('do not end your turn to "wait"');
+    // The observed loop-17 closing sentences, as the negative example the block
+    // now rules out by name.
+    expect(block).toContain("await completion notifications");
+    expect(block).toContain("they are how this ticket gets thrown away");
+  });
+
+  // #318 AC1 + AC4: the exit marker is UNCONDITIONAL, on every stage, and that
+  // language lives in the shared closer rather than the reviewer's own branch --
+  // every stage can be mid-something when its budget runs out, and the markerless
+  // exits in the corpus span builder, QA and reviewer alike.
+  test("every stage prompt states the marker is unconditional on every path (#318)", () => {
+    const prompts: [string, string][] = [
+      ["builder", builderPrompt(BUILDER_INPUT, INPUT_PATH)],
+      ["qa", qaPrompt(QA_INPUT, INPUT_PATH)],
+      ["reviewer (single)", reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false)],
+      ["reviewer (adversarial)", reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true)],
+      ["merge", mergePrompt(MERGE_INPUT, INPUT_PATH)],
+    ];
+    for (const [stage, p] of prompts) {
+      expect(p, stage).toContain("EXACTLY ONE MARKER, ON EVERY PATH OUT OF THIS STAGE");
+      expect(p, stage).toContain("There is no path out of this stage that ends without one");
+      // "I cannot reach a verdict" gets a sanctioned way to be said, or it gets
+      // said by saying nothing.
+      expect(p, stage).toContain("If you are unable to reach a verdict, that IS the verdict");
+      expect(p, stage).toContain("Ending your turn silent is not the careful choice");
+      // It closes the prompt, after the marker list it is talking about.
+      expect(p.indexOf("EXACTLY ONE MARKER"), stage).toBeGreaterThan(p.indexOf("## Exit contract"));
+    }
   });
 
   test("the k -> confidence mapping is an enumerated table, not a formula", () => {
@@ -394,8 +482,10 @@ describe("adversarial reviewer prompt", () => {
       expect(p.indexOf("Verification runs in the FOREGROUND")).toBeLessThan(p.indexOf("## Exit contract"));
     }
     // ...and the skeptic wait is named outright where the fan-out is described.
+    // #318 moved this from "not an exception to the marker rule" to "not a thing
+    // that can happen", since the fan-out is now collected in-turn.
     const active = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, true);
-    expect(active).toContain('"Still waiting on a skeptic" is not an exception');
+    expect(active).toContain("You therefore never wait for a skeptic");
   });
 
   // The denominator is adversarial-only: with no fan-out there is no k, and
@@ -403,7 +493,8 @@ describe("adversarial reviewer prompt", () => {
   test("the single pass demands no denominator", () => {
     const inactive = reviewerPrompt(REVIEWER_INPUT, INPUT_PATH, false);
     expect(inactive).not.toContain("skeptics=");
-    expect(inactive).not.toContain("BEST-EFFORT");
+    expect(inactive).not.toContain("DEGRADED COLLECTION");
+    expect(inactive).not.toContain("run_in_background");
   });
 });
 
@@ -819,9 +910,13 @@ describe("marker position rule (#307)", () => {
       // stage would actually have gotten wrong is the one it is shown.
       expect(c.prompt).toContain(`A summary followed by \`${c.marker}: ...\` is a FAILURE`);
       expect(c.prompt).toContain('no "Perfect!"'); // the literal opener #207 and #192 both used
-      // It closes the prompt: the last instruction read before the agent acts.
+      // It closes the prompt: the last instructions read before the agent acts.
+      // #318 appended the unconditional-marker paragraph to this same block, so
+      // the closer moved one paragraph down -- position and existence are two
+      // halves of one exit contract and are stated together, in that order.
       expect(c.prompt.indexOf("POSITION IS PART OF THE CONTRACT")).toBeGreaterThan(c.prompt.indexOf("## Exit contract"));
-      expect(c.prompt.trimEnd().endsWith("Everything you want to say goes on the lines AFTER it.")).toBe(true);
+      expect(c.prompt.indexOf("EXACTLY ONE MARKER")).toBeGreaterThan(c.prompt.indexOf("POSITION IS PART OF THE CONTRACT"));
+      expect(c.prompt.trimEnd().endsWith("it throws away everything this stage just did.")).toBe(true);
     });
   }
 

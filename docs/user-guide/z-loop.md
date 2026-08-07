@@ -173,6 +173,26 @@ records the result. It never re-derives a scheduling decision in prose.
   `adversarialMode` knob (default `non-trivial`: a ≥ 10-line diff OR a
   `security`/`migration`/`payments`/`auth` label; `off` never, `always` every
   card). The confidence rides in the reviewer's exit marker.
+- **The skeptics are collected inside the reviewer's own turn.** The fan-out is
+  spawned as three concurrent sub-agents in a single message, each *synchronous*,
+  so the verdicts come back to the reviewer as results it can read before it
+  writes its final message. This is not a style preference. A backgrounded
+  sub-agent delivers only through a notification *between* turns, and a stage
+  agent is sent exactly one message by design — so a reviewer that ends its turn
+  to wait is finished, permanently, and its skeptics report into a lane that has
+  already closed. Loop 17 lost two tickets to exactly that, both with green,
+  committed, QA-passed diffs (#318).
+- **A degraded collection still reports.** If fewer than three verdicts come
+  back, the reviewer does not wait and does not retry: it judges on the `k` it
+  holds and emits its normal marker with an honest `skeptics=<k>/3`, letting the
+  quorum gate below decide whether `k` was enough. If the fan-out failed badly
+  enough that it cannot judge the diff at all, it emits
+  `CONFUSED: skeptic collection failed — <what happened>`. Either way a verdict
+  is reported. **Every stage's exit marker is unconditional**: whether the stage
+  finished, failed, ran out of budget, or lost something it was counting on, its
+  final message carries exactly one marker. Silence is not a cautious report of
+  an incomplete run — it parses as CONFUSED and skips the ticket, throwing away
+  whatever the stage did.
 - **A low-confidence approval does not merge.** The reviewer always reports a
   self-assessed (or, on a super-truth pass, skeptic-aggregated) `confidence`
   0–100 on its `REVIEW-APPROVE`. An approval below `minReviewerConfidence`

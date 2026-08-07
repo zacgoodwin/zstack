@@ -7,7 +7,16 @@
 #   CLAUDE_CMD="$HERE/mock-claude.sh" evals/reviewer/run.sh 1   # free, structural
 #   evals/reviewer/run.sh 5                                     # real, paid (nightly)
 #
-# What it measures (rubric.md holds the contract): RECALL. Both modes review one
+# What it measures (rubric.md holds the contract): RECALL, and -- since #318 -- the
+# EXIT MARKER. Two independent gates, ANDed by evals/lib/recall.ts. The marker gate
+# is the paid lane for #318: an adversarial reviewer that ends its turn awaiting
+# skeptic verdicts emits no marker, is parsed as CONFUSED, and its ticket is Skipped
+# with green committed work on the branch. This harness is the only place the real
+# prompt drives a real fan-out, so it is the only place that defect is observable.
+# Its threshold is 100% of reviewer stages, not a ratio -- one occurrence is a
+# reproduction. The grader already reported the marker per trial; nothing scored it.
+#
+# RECALL, the original contract: both modes review one
 # diff carrying many independent planted defects, and a trial passes when the
 # adversarial fan-out names strictly more of them than the single pass. The old
 # contract -- one planted needle single-pass had to MISS -- was abandoned after
@@ -111,7 +120,9 @@ echo "artifacts in $OUT"
 echo "materialized worktree in $WORKTREE"
 case "$STATUS" in
   0) echo "PASS" ;;
-  1) echo "FAIL: below threshold" ;;
+  # Either gate can produce this: recall below threshold, or a reviewer stage that
+  # reported no exit marker (#318). The report above names which, per trial.
+  1) echo "FAIL: recall below threshold, or a reviewer stage reported no exit marker" ;;
   *) echo "HARNESS ERROR: no score was taken -- rerun; do not record this run in run.md" ;;
 esac
 exit "$STATUS"

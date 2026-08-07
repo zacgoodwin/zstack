@@ -3253,6 +3253,96 @@ describe("parseStageResult finds a marker that is not the first line (#307)", ()
   });
 });
 
+// -- #318: the loop-17 reviewer messages, pinned unchanged --------------------
+
+// #318 AC3. The defect is that an adversarial reviewer ends its turn waiting for
+// skeptic verdicts that can never reach it, and the fix is entirely in the PROMPT
+// (lib/stage-prompts.ts). These are the three real final messages from loop 17
+// (session tordek-ai-1786066160), verbatim, and they exist to pin that the parser
+// is NOT the thing being changed: a prompt fix must not be able to ride along with
+// a quiet loosening of what counts as a verdict.
+//
+// The distinction matters because the tempting "fix" is to make a markerless
+// waiting-on-skeptics message parse as something salvageable. It must not. A stage
+// that ended without a verdict genuinely has no verdict -- whatever it was about to
+// conclude, it did not conclude, and inventing one from its prose is how a diff
+// nobody actually approved gets merged. #307 already widened marker POSITION as far
+// as the corpus justifies; existence is not negotiable.
+describe("the loop-17 reviewer final messages parse exactly as they do today (#318)", () => {
+  const fixture = (name: string) => readFileSync(join(import.meta.dir, "fixtures", "stage-messages", name), "utf8");
+
+  // The two that cost tickets. Both had green, committed, QA-passed work on the
+  // branch; both were Skipped. Note what they are NOT: neither is malformed, and
+  // neither is confused about the diff -- each is a complete, accurate report that
+  // simply withholds the one line the loop reads, because the agent believed it had
+  // one more step to take. There is no next turn in which to take it.
+  const AWAITING: [string, string, string][] = [
+    [
+      "#192 reviewer, attempt 1 (haiku)",
+      "reviewer-192-awaiting-skeptics.txt",
+      "Waiting for skeptic completion notifications.",
+    ],
+    [
+      "#207 reviewer, attempt 2 (haiku)",
+      "reviewer-207-attempt2-awaiting-skeptics.txt",
+      "Let me wait briefly for responses before finalizing.",
+    ],
+  ];
+
+  for (const [label, file, closer] of AWAITING) {
+    test(`${label} closes on a wait-for-skeptics sentence and is CONFUSED`, () => {
+      const msg = fixture(file);
+      // The signature a human recovering the ticket is told to recognize
+      // (troubleshooting.md): the message ENDS on the wait, mid-collection.
+      expect(msg.trimEnd().endsWith(closer)).toBe(true);
+      // Not one of this stage's markers appears anywhere in it -- the ticket was
+      // not lost to a position or spelling problem #307 would have caught.
+      for (const m of ["REVIEW-APPROVE", "REVIEW-FINDINGS", "NEEDS-HUMAN", "BLOCKED:", "CONFUSED:"]) {
+        expect(msg).not.toContain(m);
+      }
+      const out = parseStageResult("reviewer", msg);
+      expect(out.kind).toBe("confused");
+      expect(out.kind === "confused" ? out.note : "").toContain("ended without a recognized exit marker");
+    });
+  }
+
+  // The third one DID exit -- and is the reason the fix is about collection rather
+  // than about markers. It emitted a well-formed verdict carrying an honest
+  // skeptics=0/3, so #191's quorum gate correctly bounced it for a retry. One whole
+  // reviewer stage paid for, zero delivered verdicts folded in. The prompt change
+  // targets the 0, not the marker.
+  test("#207 reviewer, attempt 1 approves with an honest zero-verdict tally", () => {
+    const msg = fixture("reviewer-207-approve-zero-skeptics.txt");
+    // The marker is mid-message, not line 1: this one parses only because of #307,
+    // which is itself worth pinning here.
+    expect(msg.split(/\r?\n/)[0]).not.toMatch(/^REVIEW-APPROVE:/);
+    expect(parseStageResult("reviewer", msg)).toEqual({
+      kind: "review-approve",
+      confidence: 88,
+      skeptics: { received: 0, of: 3 },
+    });
+  });
+
+  // The fix lives in the prompt, so the prompt is where the assertion belongs: the
+  // sentences these two messages ended on are now named in the reviewer's own
+  // instructions as the thing not to do. Cross-checked here, against the real
+  // corpus text, rather than only against a phrase chosen in the test.
+  test("the reviewer prompt now rules out the exact sentences these messages ended on", () => {
+    const active = reviewerPrompt(
+      { ticketBody: "b", acceptanceCriteria: "a", diff: "d", worktreePath: "/tmp/wt" },
+      "/loop/tmp/input-42.json",
+      true
+    );
+    // "Waiting for skeptic completion notifications." (#192)
+    expect(active).toContain("await completion notifications");
+    expect(active).toContain("no notification is coming");
+    // "Let me wait briefly for responses before finalizing." (#207 attempt 2)
+    expect(active).toContain("You therefore never wait for a skeptic");
+    // ...and the mechanism that makes the wait unnecessary rather than forbidden.
+    expect(active).toContain("`run_in_background: false`");
+  });
+});
+
 // -- transition matrix + reducers ---------------------------------------------
 
 describe("transitions and reducers", () => {
