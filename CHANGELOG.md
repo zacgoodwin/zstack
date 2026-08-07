@@ -10,6 +10,12 @@ There is no `[Unreleased]` section: since 1.1.0.0 every PR opens its own version
 
 [loop] Detect livelocked drain and stop with per-lane diagnostic dump. Prevents infinite loops when lanes get stuck and improves observability by dumping detailed lane state.
 
+## [1.3.0.0] - 2026-08-07
+
+### Added
+
+Remove legacy pre-#322 transcript reader, cutting unused code paths and improving long-term maintainability.
+
 ## [1.2.2.0] - 2026-08-07
 
 ### Fixed

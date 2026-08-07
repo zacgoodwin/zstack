@@ -376,8 +376,7 @@ records the result. It never re-derives a scheduling decision in prose.
   (the directory is composed by `lib/transcripts.ts dest`, never by hand). At
   end-of-loop the state file and the report are archived into the same root, so
   one run's spend can never absorb another's (#309, #212) and a re-run attempt
-  gets its own directory instead of overwriting (#210). Pre-#322 layouts stay
-  priceable via `z-cost --legacy "<glob>"` until 1.3.0.0.
+  gets its own directory instead of overwriting (#210).
   `<stage>` is `builder`/`qa`/`reviewer`/`merge`, `<attempt>` is that lane's
   1-based spawn count for the stage (a QA bounce, a reviewer bounce, an
   uncommitted-work re-spawn, and a dead-worker re-spawn each re-spawn builder —
@@ -1524,8 +1523,7 @@ ratio is stable:
 ```bash
 # orchestrator side
 bin/z-context-audit audit ~/.claude/projects/<mangled-cwd>/*.jsonl --json | jq .totalBilled
-# lane-subagent side (z-cost, which has always deduped). One run's root; add
-# --legacy '<glob>' instead to price a pre-#322 transcripts/ layout.
+# lane-subagent side (z-cost, which has always deduped). One run's root.
 bin/z-cost --json --run-dir ~/.zstack/projects/<slug>/loop/runs/<runId> \
   | jq '[.by_model[].tokens | .fresh_input_tokens + .cached_input_tokens] | add'
 ```

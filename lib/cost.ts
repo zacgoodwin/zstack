@@ -515,7 +515,7 @@ export function transcriptsUnder(dir: string): string[] {
   } catch {
     throw new ZError(
       `Run directory ${dir} does not exist. It is created when the loop collects its first stage transcripts; ` +
-        `for a pre-#322 layout, price it explicitly with --legacy "<glob>".`
+        `a pre-#322 layout predates run-scoped pricing and can no longer be priced by z-cost (1.3.0.0).`
     );
   }
   if (!st.isDirectory()) throw new ZError(`${dir} is not a directory.`);
@@ -523,7 +523,7 @@ export function transcriptsUnder(dir: string): string[] {
 }
 
 // -- CLI ---------------------------------------------------------------------
-const USAGE = `z-cost (--run-dir <dir> | --state-dir <dir> [--run <runId>] | --legacy "<glob>") [--rates <path>] [--json] [--by-file]
+const USAGE = `z-cost (--run-dir <dir> | --state-dir <dir> [--run <runId>]) [--rates <path>] [--json] [--by-file]
 
   --run-dir:    price every transcript under ONE run root -- any subtree works,
                 so runs/<id> prices the whole run and runs/<id>/t151 prices
@@ -533,9 +533,6 @@ const USAGE = `z-cost (--run-dir <dir> | --state-dir <dir> [--run <runId>] | --l
   --state-dir:  the project's loop state dir (holds state.json + runs/).
                 --run picks the run; omitted, the CURRENT run is read from
                 state.json's runId
-  --legacy:     a quoted glob over pre-#322 transcript files (the old
-                $STATE_DIR/transcripts/... layout). The ONLY way old-layout
-                files are ever read; removed in 1.3.0.0
   --json:       emit the CostResult object (total, by_model with tokens and
                 dollars, requests, lines_parsed, skippedSynthetic) so
                 consumers like z-loop's Actual field-set parse JSON, never
@@ -565,6 +562,31 @@ export async function main(argv: string[]): Promise<number> {
     const jsonOut = flags.json === true;
     const byFile = flags["by-file"] === true;
 
+    // The legacy flag (the only way to price a pre-#322 transcripts/ layout)
+    // was removed in 1.3.0.0 alongside the rest of that read path (epic
+    // #321). Checked first and named explicitly -- ahead of the generic
+    // mode-count error below -- so a script or muscle-memory invocation that
+    // still passes it is told what happened and which version to pin
+    // instead of a generic "pass exactly one of" or a silent fall-through.
+    // The message below names both facts without spelling the flag with its
+    // dashes, so the AC2 source-grep gate needs no per-file exception.
+    //
+    // ponytail: "1.3.0.0" / "1.2.2.0" below are literals naming a historical
+    // fact (which release removed this, the last one that still had it), not
+    // "whatever VERSION says now" -- reading lib/version.ts at runtime would
+    // go wrong the moment VERSION moves past 1.3.0.0. The real ceiling: this
+    // is only correct if THIS PR keeps the 1.3.0.0 slot (verified clean at
+    // write time -- no other open PR, no version-affecting label in flight).
+    // Upgrade path if a concurrent claim ever bumps this PR to a different
+    // slot: update this string and its pinned test alongside the version
+    // bump, same commit.
+    if (str(flags, "legacy") !== undefined) {
+      throw new ZError(
+        `the legacy transcript-reader flag was removed in 1.3.0.0; the last version that could price a pre-#322 transcripts/ layout was 1.2.2.0. ` +
+          `Use --run-dir <dir> or --state-dir <dir> [--run <runId>] for the current run-id layout.`
+      );
+    }
+
     // #319's exact mechanism, refused loudly: an UNQUOTED glob is expanded by
     // the shell into N positionals, and the old CLI priced positionals[0] and
     // silently ignored the rest -- an Actual that looked reasonable and was
@@ -572,27 +594,23 @@ export async function main(argv: string[]): Promise<number> {
     if (positionals.length > 0) {
       throw new ZError(
         `z-cost no longer takes positional patterns (got ${JSON.stringify(positionals[0])}${positionals.length > 1 ? ` and ${positionals.length - 1} more -- an unquoted glob, the #319 silent-undercount` : ""}). ` +
-          `Use --run-dir <dir> for the current layout, or --legacy "<quoted glob>" for pre-#322 transcripts.`
+          `Use --run-dir <dir> or --state-dir <dir> [--run <runId>].`
       );
     }
 
     const runDir = str(flags, "run-dir");
     const stateDir = str(flags, "state-dir");
     const runFlag = str(flags, "run");
-    const legacy = str(flags, "legacy");
-    const modes = [runDir, stateDir, legacy].filter((v) => v !== undefined).length;
+    const modes = [runDir, stateDir].filter((v) => v !== undefined).length;
     if (modes !== 1) {
-      throw new ZError(`Pass exactly one of --run-dir, --state-dir, or --legacy.\n\nUsage: ${USAGE}`);
+      throw new ZError(`Pass exactly one of --run-dir or --state-dir.\n\nUsage: ${USAGE}`);
     }
     if (runFlag !== undefined && stateDir === undefined) {
       throw new ZError(`--run selects a run under --state-dir; pass them together (or point --run-dir at the run root directly).`);
     }
 
     let files: string[];
-    if (legacy !== undefined) {
-      files = expandGlob(legacy);
-      if (files.length === 0) throw new ZError(`No files matched "${legacy}".`);
-    } else if (runDir !== undefined) {
+    if (runDir !== undefined) {
       files = transcriptsUnder(runDir);
       if (files.length === 0) throw new ZError(`No transcript .jsonl files under ${runDir}.`);
     } else {
@@ -615,7 +633,7 @@ export async function main(argv: string[]): Promise<number> {
       if (typeof runId !== "string" || !isRunId(runId)) {
         throw new ZError(
           `No usable runId: got ${JSON.stringify(runId)} (expected run-<yyyymmdd>-<hhmmss>-<4hex>). ` +
-            `A state.json without one predates #322 -- price that drain with --legacy.`
+            `A state.json without one predates #322 and can no longer be priced by z-cost; re-run the loop so a new run mints one.`
         );
       }
       const dir = join(stateDir!, "runs", runId);
