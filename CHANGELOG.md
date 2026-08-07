@@ -4,6 +4,12 @@ All notable changes to zstack are documented here. Format follows [Keep a Change
 
 There is no `[Unreleased]` section: since 1.1.0.0 every PR opens its own version heading at merge time, written by `bun lib/version.ts claim` rather than by hand. Do not add one, and do not edit a version heading or VERSION/package.json directly — see [docs/user-guide/z-loop.md](docs/user-guide/z-loop.md#version-claiming).
 
+## [1.2.2.0] - 2026-08-07
+
+### Fixed
+
+C3 of epic #321: the board is authoritative and state.json is a derived cache. Done requires the exact PR a merge verdict named observed MERGED on GitHub (pr-state --pr + loop confirm-merged; a positive not-merged answer parks the divergence, an unreadable one retries bounded). Dependencies satisfy on positive evidence only: a carried dep earns one targeted read, a gone dep satisfies only when its issue is CLOSED and parks the dependent when OPEN. A confirmed pid must also beat, so a harness outliving its drain cannot pin the loop lock. clean-retained previews and scopes. Same-login operator claims are held, not stolen. Ghost lanes stop with the divergence named, and the skip-qa crash window resyncs.
+
 ## [1.2.1.0] - 2026-08-07
 
 ### Fixed
